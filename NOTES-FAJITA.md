@@ -19,6 +19,21 @@ hardware table and the plan; this file is the short handoff.
   `Image`, dtb 416041 bytes at `0x1f00000`) with
   `PATH="$HOME/.local/bin:$PATH" bash shim/build.sh`. Header fields match the
   stock image (`kernel 0x8000`, `ramdisk 0x1000000`, `tags 0x100`, 4096).
+  This is the **no-payload diagnostic** image (prints the live FDT memory
+  nodes and probes UFS, then resets) — the intended first phone test.
+- **XNU kernel built green** by CI run **39286480811** (job 118174218235,
+  7m06s; commit `f5c6ce8`). `kernel.development.sweet` 17,206,064 bytes,
+  SHA256 `3640ff15067b66df6f7e0d56606eb04b2b6ce8254504060e43c2f4d9dae33131`
+  (matches the artifact `SHA256SUMS`), copied to `xnu/out/`.
+- **Full payload boot image built**: `shim/out/shim-boot.img` 17,215,488 bytes,
+  SHA256 `10937d52fd37b1a4a3f6e36ed70328bbea59f6de7ce8d1ed7b7fd14974195571`
+  (`tools/build-fajita.sh`; payload 16,610,784 bytes, ADT 9920 bytes, cmdline
+  `debug=0xc serial=3 cpus=4 … refresh`). `mkadt.py` warns
+  `research/ipsw-x/d22ap.adt missing, no /product node` — the iPhone X
+  `/product` subtree comes from the D22AP IPSW and is needed for the iOS
+  identity (patch 0059) once the root image is built; harmless for now.
+- `tools/build-fajita.sh` bug fixed: `shim/build.sh` `cd`s into `shim/`, so
+  the payload and DTB must be passed as absolute paths (`realpath`).
 - Platform-tools are installed at `C:\Users\misia\platform-tools`
   (`adb`/`fastboot` 37.0.1); no phone is connected yet.
 - Public repo: **https://github.com/edi194/ios-fajita** (`gh` logged in as

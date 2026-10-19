@@ -25,6 +25,7 @@ CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0
 mkdir -p shim/out
 python3 tools/mkadt.py "$ADT" --highmem
 python3 tools/mkpayload.py "$XNU_KERNEL" "$ADT" "$PAYLOAD" --cmdline "$CMDLINE"
-DTB="$DTB" shim/build.sh "$PAYLOAD"
+# shim/build.sh cds into shim/, so hand it absolute paths.
+DTB=$(realpath "$DTB") shim/build.sh "$(realpath "$PAYLOAD")"
 
 echo "built: shim/out/shim-boot.img"
