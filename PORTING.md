@@ -74,6 +74,9 @@ live FDT before trusting anything board-specific.
 - `shim/shim.c`: IMEM restart reason `0x146bf65c`.
 - `shim/build.sh`: `DTB=` and `MKBOOTIMG=` overrides (OnePlus stock DTB,
   AOSP `mkbootimg.py`).
+- `tools/extract-dtb.py` (new): extract the DTBs appended to a Qualcomm
+  kernel image. The LineageOS fajita boot.img is header v1 and carries three
+  (SDM845 v1, v2, v2.1); the bring-up image uses `fajita0` (v2).
 - `tools/mkadt.py`: fajita FB, CPU count/frequencies, `qcom,kryo385`;
   keeps the `sweet-fbcon`/`sweet-ufs` node names and `xiaomi,sweet`
   compatible string because the XNU platform expert matches them.
@@ -139,8 +142,11 @@ sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
 sudo umount /mnt/iosroot
 img2simg ios16-root.img ios16-root.simg
 
-# 3. boot image (needs the stock OnePlus/LineageOS boot.img DTB)
+# 3. boot image DTB + shim
+# LineageOS fajita boot.img is header v1: the DTBs are appended to the kernel.
 python3 tools/unpack_bootv2.py backup/boot_a.img dtb/boot_unpacked
+python3 tools/extract-dtb.py dtb/boot_unpacked/kernel dtb/boot_unpacked fajita
+cp dtb/boot_unpacked/fajita0.dtb dtb/boot_unpacked/dtb   # SDM845 v2
 DTB=dtb/boot_unpacked/dtb tools/build-fajita.sh
 
 # 4. flash (A/B; keep the other slot as Android fallback)
@@ -166,9 +172,11 @@ a few boots: `fastboot set_active b` again.
    clocks/GDSC and whether ABL leaves the host in the expected state.
 4. **Touch IC variant** — read RMI4 F01 manufacturing ID; implement F01/F12
    (attention/IRQ, reset, 2D sensing) rather than the Goodix protocol.
-5. **ABL boot header** — verify `header_version`, `base`, offsets and page size
-   against the stock `boot_a.img`; the current values mirror common Qualcomm
-   `boot.img v2` but are not yet confirmed on fajita.
+5. **ABL boot header** — **confirmed** against the LineageOS 22.2 `20261013`
+   fajita `boot.img`: `kernel 0x8000`, `ramdisk 0x1000000`, `tags 0x100`,
+   `pagesize 4096`, `base 0` (that image is header v1; ours uses v2 + a `dtb`
+   section at `0x1f00000`). The stock DTBs are appended to the kernel
+   (SDM845 v1/v2/v2.1); `tools/extract-dtb.py` reads them.
 6. **Panel init** — only needed if the continuous splash is not kept; the
    downstream panel is `samsung,s6e3fc2x01` with reset/VCI/POC GPIOs above.
 

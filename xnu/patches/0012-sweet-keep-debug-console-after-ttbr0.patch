@@ -87,7 +87,7 @@ diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
 --- a/osfmk/arm64/sweet_early.c
 +++ b/osfmk/arm64/sweet_early.c
 @@ -2,7 +2,8 @@
-  * Redmi Note 10 Pro bootstrap console. No allocation, locks, ADT parsing or
+  * OnePlus 6T (fajita) bootstrap console. No allocation, locks, ADT parsing or
   * per-CPU state: panic() can reach this before a current thread exists.
   * start.s maps the splash framebuffer VA=PA as Normal Non-Cacheable memory.
 - * Stop using that mapping before arm_vm_init tears down bootstrap TTBR0.
