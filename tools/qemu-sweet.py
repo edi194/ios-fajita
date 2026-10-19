@@ -24,6 +24,9 @@ import argparse, json, os, socket, struct, subprocess, sys, time, zlib
 
 FB_BASE, FB_W, FB_H = 0x9c000000, 1080, 2400
 FB_STRIDE = FB_W * 4
+# Sweet's panel is 1080x2400 at 0x9c000000; fajita's is 1080x2340 at
+# 0x9d400000, so the defaults below only match mkadt.py for sweet.
+FB_DEFAULTS = (FB_BASE, FB_W, FB_H, FB_STRIDE)
 PAGE = 0x4000
 STUB_PA = 0x40200000	# above the dtb QEMU places at RAM base
 BOOT_LINE_LENGTH = 608
@@ -70,6 +73,31 @@ def write_png(path, raw):
     png = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', FB_W, FB_H, 8, 2, 0, 0, 0))
     png += chunk(b'IDAT', zlib.compress(b''.join(rows), 6)) + chunk(b'IEND', b'')
     open(path, 'wb').write(png)
+
+
+def symbol_values(kernel_path, name):
+    """Return the VAs of `name` in a 64-bit Mach-O (no llvm-nm needed)."""
+    data = open(kernel_path, 'rb').read()
+    magic, _, _, _, ncmds, _, _, _ = struct.unpack_from('<8I', data, 0)
+    if magic != 0xfeedfacf:
+        raise ValueError('not a 64-bit Mach-O')
+    symtab, off = None, 32
+    for _ in range(ncmds):
+        cmd, size = struct.unpack_from('<II', data, off)
+        if cmd == 0x2:			# LC_SYMTAB
+            symtab = struct.unpack_from('<4I', data, off + 8)
+        off += size
+    if symtab is None:
+        raise ValueError('no LC_SYMTAB')
+    symoff, nsyms, stroff, _ = symtab
+    out = []
+    for i in range(nsyms):
+        strx, ntype, _, _, value = struct.unpack_from('<IBBHQ', data, symoff + 16 * i)
+        if not value or ntype & 0x0e != 0x0e:	# N_SECT only
+            continue
+        if data[stroff + strx:].split(b'\0')[0] == name.encode():
+            out.append(value)
+    return out
 
 
 def payload_data(payload, va, size):
@@ -155,15 +183,27 @@ def main():
     ap.add_argument('--cpu', default='cortex-a76')	# ARMv8.2 like Kryo 470, same ID_AA64MMFR0
     ap.add_argument('--kernel', help='matching unstripped kernel, for exact framebuffer text decoding (uses llvm-nm)')
     ap.add_argument('--fail-on-panic', action='store_true', help='exit 2 for a visible panic, 3 for incomplete/blank decoding; requires --kernel')
+    # Sweet's panel is 1080x2400 at 0x9c000000; fajita's is 1080x2340 at
+    # 0x9d400000, so the defaults here match mkadt.py only for sweet.
+    ap.add_argument('--fb-base', type=lambda s: int(s, 0), default=FB_DEFAULTS[0])
+    ap.add_argument('--fb-width', type=int, default=FB_DEFAULTS[1])
+    ap.add_argument('--fb-height', type=int, default=FB_DEFAULTS[2])
+    ap.add_argument('--fb-stride', type=lambda s: int(s, 0), default=FB_DEFAULTS[3],
+                    help='bytes per line (default width*4)')
     a = ap.parse_args()
+    global FB_BASE, FB_W, FB_H, FB_STRIDE
+    FB_BASE, FB_W, FB_H = a.fb_base, a.fb_width, a.fb_height
+    FB_STRIDE = a.fb_stride or FB_W * 4
     if a.fail_on_panic and not a.kernel:
         ap.error('--fail-on-panic requires --kernel')
     payload = open(a.payload, 'rb').read()
     font = None
     if a.kernel:
-        symbols = subprocess.check_output(['llvm-nm', '--defined-only', a.kernel], text=True)
-        fonts = [int(line.split()[0], 16) for line in symbols.splitlines()
-                 if line.split()[-1:] == ['_iso_font']]
+        fonts = symbol_values(a.kernel, '_iso_font')
+        if not fonts:
+            symbols = subprocess.check_output(['llvm-nm', '--defined-only', a.kernel], text=True)
+            fonts = [int(line.split()[0], 16) for line in symbols.splitlines()
+                     if line.split()[-1:] == ['_iso_font']]
         if len(fonts) != 1:
             ap.error('kernel must contain exactly one _iso_font symbol')
         font = payload_data(payload, fonts[0], 256 * 16)
@@ -182,6 +222,7 @@ def main():
     mem_size = struct.unpack_from('<Q', payload, 0x40)[0]
     ram_gib = max(4, -(-(phys_base + mem_size - 0x40000000) // (1 << 30)))
     cmd = ['qemu-system-aarch64', '-M', 'virt,gic-version=3', '-cpu', a.cpu, '-smp', '1', '-m', f'{ram_gib}G',
+           '-nic', 'none',
            '-nographic', '-serial', f'file:{out}/serial.txt', '-qmp', f'unix:{mon},server,nowait',
            '-d', 'int,guest_errors,unimp', '-D', f'{out}/qemu.log', '-no-reboot',
            '-device', f'loader,file={out}/ram.bin,addr={phys_base:#x},force-raw=on',

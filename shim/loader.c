@@ -92,9 +92,10 @@ const char *loader_boot(uintptr_t dtb)
 		return "bad payload header";
 
 	uint64_t pa_of_va_base = p->phys_base - p->virt_base;	/* pa = va + this */
-	con_hex2("PHYS", "base=", p->phys_base, "size=", p->mem_size);
-	con_hex("VIRT", p->virt_base);
-	con_hex("ENTRY", p->entry_va);
+	con_hex("PHYS base", p->phys_base);
+	con_hex("PHYS size", p->mem_size);
+	con_hex("VIRT base", p->virt_base);
+	con_hex("ENTRY va", p->entry_va);
 
 	/* The payload must not overlap where the kernel goes. */
 	if (rd_end > p->phys_base && rd_start < p->phys_base + p->mem_size)

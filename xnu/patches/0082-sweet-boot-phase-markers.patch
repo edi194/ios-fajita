@@ -1,0 +1,241 @@
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -428,10 +428,12 @@
+ 
+ 	printf("%s\n", version); /* log kernel version */
+ 
++	printf("SWEET BF: kernel_bootstrap enter\n");
+ 	scale_setup();
+ 
+ 	kernel_bootstrap_log("vm_mem_bootstrap");
+ 	vm_mem_bootstrap();
++	printf("SWEET BF: vm_mem_bootstrap ok\n");
+ 
+ 	machine_info.memory_size = (uint32_t)mem_size;
+ #if XNU_TARGET_OS_OSX
+@@ -448,6 +450,7 @@
+ 	atm_init();
+ #endif
+ 	kernel_startup_initialize_upto(STARTUP_SUB_OSLOG);
++	printf("SWEET BF: oslog ranks ok\n");
+ 
+ #if CONFIG_UBSAN_MINIMAL
+ 	kernel_bootstrap_log("UBSan minimal runtime init");
+@@ -476,12 +479,15 @@
+ 
+ 	kernel_bootstrap_log("console_init");
+ 	console_init();
++	printf("SWEET BF: console_init ok\n");
+ 
+ 	kernel_bootstrap_log("stackshot_init");
+ 	stackshot_init();
++	printf("SWEET BF: stackshot_init ok\n");
+ 
+ 	kernel_bootstrap_log("sched_init");
+ 	sched_init();
++	printf("SWEET BF: sched_init ok\n");
+ 
+ #if CONFIG_MACF
+ 	kernel_bootstrap_log("mac_policy_init");
+@@ -489,6 +495,7 @@
+ #endif
+ 
+ 	kernel_startup_initialize_upto(STARTUP_SUB_MACH_IPC);
++	printf("SWEET BF: mach_ipc ranks ok\n");
+ 
+ 	/*
+ 	 * As soon as the virtual memory system is up, we record
+@@ -496,18 +503,24 @@
+ 	 */
+ 	kernel_bootstrap_log("PMAP_ACTIVATE_KERNEL");
+ 	PMAP_ACTIVATE_KERNEL(master_cpu);
++	printf("SWEET BF: pmap_activate ok\n");
+ 
+ 	kernel_bootstrap_log("mapping_free_prime");
+ 	mapping_free_prime();                                           /* Load up with temporary mapping blocks */
++	printf("SWEET BF: mapping_free_prime ok\n");
+ 
+ 	kernel_bootstrap_log("machine_init");
++	printf("SWEET BF: machine_init enter\n");
+ 	machine_init();
++	printf("SWEET BF: machine_init ok\n");
+ 
+ 	kernel_bootstrap_log("thread_machine_init_template");
+ 	thread_machine_init_template();
++	printf("SWEET BF: thread_machine_init_template ok\n");
+ 
+ 	kernel_bootstrap_log("clock_init");
+ 	clock_init();
++	printf("SWEET BF: clock_init ok\n");
+ 
+ 	/*
+ 	 *	Initialize the IPC, task, and thread subsystems.
+@@ -528,15 +541,18 @@
+ 
+ 	kernel_bootstrap_log("task_init");
+ 	task_init();
++	printf("SWEET BF: task_init ok\n");
+ 
+ 	kernel_bootstrap_log("thread_init");
+ 	thread_init();
++	printf("SWEET BF: thread_init ok\n");
+ 
+ 	kernel_bootstrap_log("restartable_init");
+ 	restartable_init();
+ 
+ 	kernel_bootstrap_log("workq_init");
+ 	workq_init();
++	printf("SWEET BF: workq_init ok\n");
+ 
+ 	kernel_bootstrap_log("turnstiles_init");
+ 	turnstiles_init();
+@@ -550,6 +566,7 @@
+ 	/* initialize exceptions */
+ 	kernel_bootstrap_log("exception_init");
+ 	exception_init();
++	printf("SWEET BF: exception_init ok\n");
+ 
+ #if CONFIG_SCHED_SFI
+ 	kernel_bootstrap_log("sfi_init");
+@@ -561,6 +578,7 @@
+ 	 */
+ 
+ 	kernel_bootstrap_log("kernel_thread_create");
++	printf("SWEET BF: kernel_thread_create enter\n");
+ 	result = kernel_thread_create((thread_continue_t)kernel_bootstrap_thread, NULL, MAXPRI_KERNEL, &thread);
+ 
+ 	if (result != KERN_SUCCESS) {
+@@ -575,6 +593,7 @@
+ 	thread_deallocate(thread);
+ 
+ 	kernel_bootstrap_log("load_context - done");
++	printf("SWEET BF: load_context\n");
+ 	load_context(thread);
+ 	/*NOTREACHED*/
+ }
+@@ -593,6 +612,7 @@
+ kernel_bootstrap_thread(void)
+ {
+ 	processor_t processor = current_processor();
++	printf("SWEET BF: bootstrap_thread enter\n");
+ 
+ #if (DEVELOPMENT || DEBUG)
+ 	platform_stall_panic_or_spin(PLATFORM_STALL_XNU_LOCATION_KERNEL_BOOTSTRAP);
+@@ -603,6 +623,7 @@
+ 	 * Create the idle processor thread.
+ 	 */
+ 	idle_thread_create(processor);
++	printf("SWEET BF: idle_thread_create ok\n");
+ 
+ 	/*
+ 	 * N.B. Do not stick anything else
+@@ -612,17 +633,20 @@
+ 	 */
+ 	kernel_bootstrap_thread_log("sched_startup");
+ 	sched_startup();
++	printf("SWEET BF: sched_startup ok\n");
+ 
+ 	/*
+ 	 * Thread lifecycle maintenance (teardown, stack allocation)
+ 	 */
+ 	kernel_bootstrap_thread_log("thread_daemon_init");
+ 	thread_daemon_init();
++	printf("SWEET BF: thread_daemon_init ok\n");
+ 
+ 	/*
+ 	 * Thread callout service.
+ 	 */
+ 	kernel_startup_initialize_upto(STARTUP_SUB_THREAD_CALL);
++	printf("SWEET BF: thread_call ranks ok\n");
+ 
+ 	/*
+ 	 * Remain on current processor as
+@@ -630,29 +654,36 @@
+ 	 */
+ 	kernel_bootstrap_thread_log("thread_bind");
+ 	thread_bind(processor);
++	printf("SWEET BF: thread_bind ok\n");
+ 
+ 	/*
+ 	 * Kick off memory mapping adjustments.
+ 	 */
+ 	kernel_bootstrap_thread_log("mapping_adjust");
+ 	mapping_adjust();
++	printf("SWEET BF: mapping_adjust ok\n");
+ 
+ 	/*
+ 	 *	Create the clock service.
+ 	 */
+ 	kernel_bootstrap_thread_log("clock_service_create");
+ 	clock_service_create();
++	printf("SWEET BF: clock_service_create ok\n");
+ 
+ 	/*
+ 	 *	Create the device service.
+ 	 */
+ 	device_service_create();
++	printf("SWEET BF: device_service_create ok\n");
+ 
+ 	phys_carveout_init();
++	printf("SWEET BF: phys_carveout_init ok\n");
+ 
+ #if MACH_KDP
+ 	kernel_bootstrap_log("kdp_init");
++	printf("SWEET BF: kdp_init enter\n");
+ 	kdp_init();
++	printf("SWEET BF: kdp_init ok\n");
+ #endif
+ 
+ #if ALTERNATE_DEBUGGER
+@@ -667,9 +698,11 @@
+ #if CONFIG_TELEMETRY
+ 	kernel_bootstrap_log("bootprofile_init");
+ 	bootprofile_init();
++	printf("SWEET BF: bootprofile_init ok\n");
+ #endif
+ 
+ 	kernel_startup_initialize_upto(STARTUP_SUB_SYSCTL);
++	printf("SWEET BF: sysctl ranks ok\n");
+ 
+ 	/*
+ 	 * Initialize the globals used for permuting kernel
+@@ -686,7 +719,9 @@
+ 
+ #ifdef  IOKIT
+ 	kernel_bootstrap_log("PE_init_iokit");
++	printf("SWEET BF: PE_init_iokit enter\n");
+ 	PE_init_iokit();
++	printf("SWEET BF: PE_init_iokit ok\n");
+ #endif
+ 
+ 	assert(ml_get_interrupts_enabled() == FALSE);
+@@ -696,6 +731,7 @@
+ 	 * interrupts or preemption enabled may begin enforcement.
+ 	 */
+ 	kernel_startup_initialize_upto(STARTUP_SUB_EARLY_BOOT);
++	printf("SWEET BF: early_boot ranks ok\n");
+ 
+ #if SCHED_HYGIENE_DEBUG
+ 	// Reset interrupts masked timeout before we enable interrupts
+--- a/osfmk/arm/machine_routines_common.c
++++ b/osfmk/arm/machine_routines_common.c
+@@ -1425,11 +1425,19 @@
+ void
+ machine_init(void)
+ {
++	printf("SWEET BF: machine_init: debug_log_init enter\n");
+ 	debug_log_init();
++	printf("SWEET BF: machine_init: debug_log_init ok\n");
++	printf("SWEET BF: machine_init: clock_config enter\n");
+ 	clock_config();
++	printf("SWEET BF: machine_init: clock_config ok\n");
+ 	is_clock_configured = TRUE;
+ 	if (debug_enabled) {
++		printf("SWEET BF: machine_init: pmap_map_globals enter\n");
+ 		pmap_map_globals();
++		printf("SWEET BF: machine_init: pmap_map_globals ok\n");
+ 	}
++	printf("SWEET BF: machine_init: ml_lockdown_init enter\n");
+ 	ml_lockdown_init();
++	printf("SWEET BF: machine_init: ml_lockdown_init ok\n");
+ }

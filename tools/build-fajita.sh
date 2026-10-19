@@ -13,7 +13,9 @@ export PATH="$HOME/.local/bin:$PATH"
 . tools/fajita.env
 
 XNU_KERNEL=${XNU_KERNEL:-xnu/out/kernel.development.sweet}
-DTB=${DTB:-dtb/boot_unpacked/dtb}
+# fajita2 = SDM845 v2.1, the SoC revision this unit reports (qcom,msm-id
+# 0x141/0x20001). fajita0 is v2 and fajita1 is v1.
+DTB=${DTB:-dtb/boot_unpacked/fajita2.dtb}
 ADT=${ADT:-shim/out/fajita.adt}
 PAYLOAD=${PAYLOAD:-shim/out/payload.bin}
 # Start on the A55 cluster only. Add cpus=8 once the early boot is stable.
@@ -25,7 +27,9 @@ CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress rd=ufsroot0
 mkdir -p shim/out
 python3 tools/mkadt.py "$ADT" --highmem
 python3 tools/mkpayload.py "$XNU_KERNEL" "$ADT" "$PAYLOAD" --cmdline "$CMDLINE"
-# shim/build.sh cds into shim/, so hand it absolute paths.
-DTB=$(realpath "$DTB") shim/build.sh "$(realpath "$PAYLOAD")"
+# shim/build.sh cds into shim/, so hand it absolute paths. SHIM_HDR=1 is the
+# stock fajita layout (header v1, gzipped Image.gz-dtb): a v2 header with a dtb
+# section and a raw Image does not boot on this ABL.
+SHIM_HDR=1 DTB=$(realpath "$DTB") shim/build.sh "$(realpath "$PAYLOAD")"
 
 echo "built: shim/out/shim-boot.img"

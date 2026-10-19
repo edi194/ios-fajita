@@ -14,11 +14,19 @@ import adt  # noqa: E402
 # --highmem; the live FDT is authoritative for the real size.
 PHYS_BASE = 0xb0000000
 MEM_SIZE = 0x4d000000
-# --highmem (phone only): the upper DDR bank. Fajita's downstream carve-outs
-# are all below 4G; 0xfcc00000 is a conservative 6GB-class size. Read the live
-# FDT memory nodes before widening this for 8/10GB devices.
+# --highmem (phone only): the upper DDR bank. Measured on the live FDT of this
+# unit: /memory is 0x80000000+0x100000000 and 0x180000000+0xfc8a0000, and every
+# reserved-memory carve-out is below 0xac800000, so 0x100000000..0x27c8a0000
+# (5.946 GiB) is clean RAM for xnu.
 HIGH_PHYS_BASE = 0x100000000
-HIGH_MEM_SIZE = 0xfcc00000
+HIGH_MEM_SIZE = 0x17c8a0000
+# iBoot reserves a panic-log region and describes it as /pram reg + the size in
+# /chosen/embedded-panic-log-size; pe_init.c:check_for_panic_log() then maps it
+# (ml_io_map_wcomb) and debug_log_init() uses it for the debug/panic buffer.
+# Without it gPanicBase stays 0, debug_log_init() bails out and panics are not
+# logged. Carve it out of the TOP of the ADT dram range so xnu never allocates
+# it: dram-size shrinks by the same amount.
+PANIC_LOG_SIZE = 0x100000        # 1 MiB, page aligned
 # /arm-io children are relative to this; it must not be 0 (serial_init bails)
 SOC_BASE = 0x01000000
 
@@ -70,9 +78,17 @@ def node(name, props=(), children=()):
     return n
 
 
-def build(seed=None, qemu=False, highmem=False):
+def build(seed=None, qemu=False, highmem=False, mem_size=None):
     """qemu=True: same tree, but with QEMU virt's GIC addresses and CNTFRQ (tools/qemu-sweet.py)."""
-    phys_base, mem_size = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    phys_base, mem_size_default = (HIGH_PHYS_BASE, HIGH_MEM_SIZE) if highmem else (PHYS_BASE, MEM_SIZE)
+    mem_size = mem_size if mem_size is not None else mem_size_default
+    # Panic-log region: the last PANIC_LOG_SIZE bytes of the dram range, so it is
+    # physically present but never handed out by the xnu allocator.
+    panic_pa, panic_size = 0, 0
+    if not qemu:
+        panic_size = PANIC_LOG_SIZE
+        mem_size -= panic_size
+        panic_pa = phys_base + mem_size
     gicd, gicr, timebase = (QEMU_GICD, QEMU_GICR, QEMU_TIMEBASE) if qemu else (GICD, GICR, TIMEBASE)
     seed = seed if seed is not None else os.urandom(64)
     phandle = iter(range(1, 1000))
@@ -82,6 +98,9 @@ def build(seed=None, qemu=False, highmem=False):
         ph(),
         ('dram-base', u64(phys_base)),
         ('dram-size', u64(mem_size)),
+        # pe_init.c:check_for_panic_log() reads this and /pram/reg[0]; absent
+        # means "no panic log" and debug_log_init() bails out.
+        *([('embedded-panic-log-size', u32(panic_size))] if panic_size else []),
         ('random-seed', seed),
         ('debug-enabled', u32(1)),
         ('firmware-version', cstr('sweet-shim')),
@@ -215,6 +234,8 @@ def build(seed=None, qemu=False, highmem=False):
 
     product_props = d22ap_product()
     product = [node('product', [ph()] + product_props)] if product_props else []
+    # iBoot's panic region: /pram reg = <phys size>, mapped by pe_init.c.
+    pram = [node('pram', [ph(), ('reg', u64(panic_pa, panic_size))])] if panic_pa else []
 
     # Identity of the iPhone X whose userland runs here: compatible[0] is
     # hw.model/hw.target (D22AP), model is hw.machine/hw.product
@@ -229,11 +250,18 @@ def build(seed=None, qemu=False, highmem=False):
         ('manufacturer', cstr('Apple Inc.')),
         ('#address-cells', u32(2)),
         ('#size-cells', u32(2)),
-    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + ([] if qemu else [ufs]))
+    ], [chosen, defaults, cpus, arm_io, fbcon, buttons] + product + pram + ([] if qemu else [ufs]))
 
 
 if __name__ == '__main__':
-    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv)
+    # --dram-size=0x... overrides the dram size (A/B tests, e.g. the
+    # sweet-proven 0xfcc00000); the panic region is still carved from the top.
+    override = None
+    for a in sys.argv:
+        if a.startswith('--dram-size='):
+            override = int(a.split('=', 1)[1], 0)
+    root = build(qemu='--qemu' in sys.argv, highmem='--highmem' in sys.argv,
+                 mem_size=override)
     blob = adt.serialize(root)
     open(sys.argv[1], 'wb').write(blob)
     if '--dump' in sys.argv:

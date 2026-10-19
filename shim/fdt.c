@@ -155,3 +155,29 @@ void fdt_print_memory(uintptr_t fdt)
 		}
 	}
 }
+
+/*
+ * ABL is supposed to hand the live tree over in x0, but the stock fajita boot
+ * image is header v1 with the board DTBs appended to the kernel blob (no dtb
+ * section), so an ABL that only understands v1 has nothing to pass and x0 can
+ * be 0 or stale. Fall back to scanning from _end: with an Image.gz-dtb style
+ * image ABL gunzips the kernel and writes the DTB directly after the
+ * decompressed image, i.e. at _head + _end. The MMU is off on the diagnostic
+ * path, so reading past the loaded blob cannot fault on this platform.
+ */
+uintptr_t fdt_locate(uintptr_t given)
+{
+	extern char _end[];
+	uintptr_t p = (uintptr_t)_end;
+
+	if (given && be32(given) == FDT_MAGIC)
+		return given;
+	for (uintptr_t a = p; a < p + 0x800000; a += 4) {
+		if (be32(a) != FDT_MAGIC)
+			continue;
+		uint32_t total = be32(a + 4);
+		if (total >= 0x1000 && total <= 0x400000)
+			return a;
+	}
+	return 0;
+}

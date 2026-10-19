@@ -15,12 +15,18 @@ hardware table and the plan; this file is the short handoff.
   `tools/extract-dtb.py` extracts them: `fajita0` = SDM845 **v2**
   (`msm-id 0x141 0x20000`, `board-id 0`), `fajita1` = v1, `fajita2` = v2.1.
   The first hardware image uses `fajita0` as `dtb/boot_unpacked/dtb`.
-- `shim/out/shim-boot.img` built (606208 bytes, header v2, 180224-byte
-  `Image`, dtb 416041 bytes at `0x1f00000`) with
-  `PATH="$HOME/.local/bin:$PATH" bash shim/build.sh`. Header fields match the
-  stock image (`kernel 0x8000`, `ramdisk 0x1000000`, `tags 0x100`, 4096).
-  This is the **no-payload diagnostic** image (prints the live FDT memory
-  nodes and probes UFS, then resets) — the intended first phone test.
+- **Diagnostic (no-payload) shim — WORKS ON THE PHONE**: the bootable image is
+  `shim/out/shim-diag-v1gz.img` 434176 bytes, header **v1**, kernel =
+  `Image.gz` (6994 B gz -> 180224 B raw) with the DTB appended after the gzip
+  stream at `0x2b52`, empty cpio ramdisk 97 B, fajita DTB 416041 B. Built with
+  `SHIM_HDR=1 bash shim/build.sh`. The header-v2 / raw-`Image` variants
+  (`shim-diag-boot.img` 606208 B, `shim-diag-v1.img`) are **rejected by ABL**
+  (phone drops back to fastboot ~20 s after reboot, `slot-successful:a: no`).
+  Both stock images start with `1f 8b` at the kernel offset, i.e. the bootloader
+  requires the `Image.gz-dtb` form. `tools/build-fajita.sh` now forces
+  `SHIM_HDR=1`.
+- **Payload (XNU) image kept as** `shim/out/xnu-boot.img` 17,215,488 bytes
+  (that is the old `shim/out/shim-boot.img` name, which `build.sh` overwrites).
 - **XNU kernel built green** by CI run **39286480811** (job 118174218235,
   7m06s; commit `f5c6ce8`). `kernel.development.sweet` 17,206,064 bytes,
   SHA256 `3640ff15067b66df6f7e0d56606eb04b2b6ce8254504060e43c2f4d9dae33131`
@@ -35,7 +41,8 @@ hardware table and the plan; this file is the short handoff.
 - `tools/build-fajita.sh` bug fixed: `shim/build.sh` `cd`s into `shim/`, so
   the payload and DTB must be passed as absolute paths (`realpath`).
 - Platform-tools are installed at `C:\Users\misia\platform-tools`
-  (`adb`/`fastboot` 37.0.1); no phone is connected yet.
+  (`adb`/`fastboot` 37.0.1). The connected OnePlus 6T is now reachable over
+  both `adb` and `fastboot` (see the bring-up log below).
 - Public repo: **https://github.com/edi194/ios-fajita** (`gh` logged in as
   `edi194`, needs the `workflow` scope to push `.github/workflows/`).
   First CI run: `xnu` **39283126880** (push of `c947ded`, 2026-10-19).
@@ -100,25 +107,155 @@ hardware table and the plan; this file is the short handoff.
 - The old `aosp-mirror` mkbootimg URL is 404; the correct mirror is
   `jbeich/platform_system_tools_mkbootimg`.
 
+## Phone bring-up log (2026-10-19)
+
+Observations, all from the live unit (serial intentionally not recorded here):
+
+- Windows driver: the unit is a plain WinUSB device covered by Google's VIP/PID
+  list. In Android it enumerates as `USB\VID_18D1&PID_4EE7` ("OnePlus 6T",
+  status OK) and `adb devices` shows it as `device`; in the bootloader the
+  fastboot interface is covered as well (`fastboot devices` lists it). The
+  earlier `VID_18D1&PID_D00D` / Code 28 state was a transient pre-boot mode.
+- `fastboot getvar all`: `unlocked:yes`, `Device critical unlocked:false`,
+  `Verity mode:true`, `current-slot:b`, `slot-successful:a/b=yes`,
+  `hw-revision:20001`, `variant:SDM UFS`, `product:sdm845`,
+  `boot_a`/`boot_b` = 0x4000000 (64 MiB), `dtbo` = 8 MiB, `vbmeta` = 0x10000,
+  `userdata` = 0x1B800BB000 (≈110 GiB, ext4), erase/logical block size 0x1000,
+  `parallel-download-flash:yes`.
+- **The bootloader has no partition read-back**: `fastboot fetch` fails with
+  `Unable to get max-fetch-size. Device does not support fetch command.` A dump
+  therefore has to come from Android (root) or recovery, not from fastboot.
+- Android on the unit: LineageOS 22.2 / Android 15 **userdebug**
+  (`lineage_fajita-userdebug 15 BP1A.250505.005 00a2ebac75`), booted from slot
+  `b`, `ro.debuggable=1`, verified boot state `orange`, and **Magisk is
+  installed** — `su -c id` returns `uid=0(root)`, so raw partition reads work
+  over `adb` with no extra flashing. (`adb root` itself is refused by the
+  setting; use `su -c`.)
+- **Full dump done** into `C:\Users\misia\fajita-backup` (outside the repo, no
+  git tracking): `partitions\<name>.img` for every `by-name` entry except
+  `userdata` (skipped by explicit decision — iOS overwrites it), plus the raw
+  firmware LUNs `sdb`/`sdc`/`sdd`/`sde`/`sdf` as `.raw`, plus
+  `partition-sizes.txt`. Pipeline is `adb exec-out su -c "dd if=… bs=4M"` into a
+  redirect; verified byte-exact against the device on three partitions
+  (size + SHA-256 identical for `ssd`, `devinfo`, `persist`).
+- **Pitfall (cost real time twice)**: `cmd`-based helper scripts whose text
+  contains the non-ASCII repo path (`…\Projekt domyślny`, `ś` = U+015B) get
+  mis-decoded and write to a *second* directory. Use ASCII-only paths
+  (`C:\Users\misia\fajita-backup`) or PowerShell `.ps1` files; never inline
+  PowerShell with `$_` through this shell either — it is echoed, not executed.
+- Slot plan (user-approved): flash the diagnostic shim to **`boot_a`** and
+  `fastboot --set-active=a`, leaving the working LineageOS `boot_b` untouched as
+  the fallback. Return path: `fastboot --set-active=b`. Note this differs from
+  the older plan (which assumed `a` was the active slot); `b` is active now, so
+  `a` is the safe test slot.
+- **First hardware boot of our code: SUCCESS (2026-10-19 ~19:57).** Flashed
+  `shim/out/shim-diag-v1gz.img` to `boot_a`, `--set-active=a`,
+  `fastboot reboot`. The phone left fastboot and never enumerated on USB (the
+  shim has no USB driver) — console is the AMOLED framebuffer. The photographed
+  screen showed, in order:
+  - `SHIM  fajita milestone 4: xnu loader`
+  - `DTB abl 00000000853FD000` / `DTB used 00000000853FD000` → **ABL passes a
+    live FDT in x0**; `fdt_locate()` accepted it without scanning.
+  - `INITRD lo=855FE000` (the empty ramdisk from `/chosen`) and
+    `LOADER no SWEETXNU payload`.
+  - `FDT live memory nodes` with two `MEM base`/`MEM size` pairs.
+  - The milestone-5 UFS probe: `ver=00000210` (UFS 2.1), TUR/CAP/READ all
+    `rc=00000000 ocs/st=00000000`, GPT entries read, `userdata ... fs ext4`,
+    `UFS probe done, reset in ~3 min`.
+  Conclusion: the SDM845 UFS host at `0x1d84000`, the GPT parser and the
+  read-only path all work on fajita.
+- **Live memory, measured (authoritative, from Android `/sys/firmware/fdt` and
+  `/proc/device-tree/memory/reg` on slot `b`)**:
+  - `memory` reg = `<0x0 0x80000000 0x1 0x00000000>`,
+    `<0x1 0x80000000 0x0 0xfc8a0000>` → 2..6 GiB and 6..9.946 GiB,
+    7.946 GiB total (8 GB unit, `MemTotal` 7824600 kB).
+  - Every `reserved-memory` child is below `0xac800000`, so
+    **`0x100000000` + `0x17c8a0000` (5.946 GiB) is clean RAM for XNU**.
+    `tools/fajita.env` and `mkadt.py --highmem` now use exactly that.
+  - The raw vendor DTBs in `dtb/boot_unpacked/` have a placeholder
+    `memory { reg = <0 0 0 0>; }`; only the ABL-patched live tree has the real
+    values, which is why the shim reads the live tree.
+- **SoC revision is v2.1**, not v2: live `qcom,msm-id = 0x141 0x20001`, model
+  `Qualcomm Technologies, Inc. SDM845 v2.1 MTP PVT/MP`, `qcom,board-id =
+  0x8 0x0 0x4971 0x29`. The matching DTB is therefore **`fajita2.dtb`**
+  (fajita0 = v2/0x20000, fajita1 = v1). Defaults changed in `shim/build.sh` and
+  `tools/build-fajita.sh`.
+- **Pitfall: the shim's self-reset is unreliable.** `reset()` writes the IMEM
+  restart reason `0x77665500` and calls PSCI SYSTEM_RESET, but after the
+  ~3 min diagnostic the unit did not reappear in fastboot for >5.5 min (a
+  15 s poller saw nothing); it was reachable in fastboot when polled later.
+  Plan for manual power-cycling instead of trusting the self-reset.
+- Out-of-git reference artifacts now in `C:\Users\misia\fajita-backup`:
+  `live-fdt.dtb` (564079 B, ABL-modified tree from `/sys/firmware/fdt`,
+  SHA256 `e52c8d9a99be1ab4d0487e25aeb4ca26a42166694b97501a6b8c790a452833e5`),
+  `dt-memory-reg.bin` (raw 32-byte `/memory/reg`, SHA256 `efa1a300…`).
+  Kept out of git on purpose (device artifact).
+- **XNU payload booted on the phone (2026-10-19 ~20:15).** Staged
+  `shim/out/shim-boot.img` (17,043,456 B, SHA256
+  `f1243e98eb97d746628bc23c05886b96d28cd887997748687189b0d5bff1a750`) as
+  `C:\Users\misia\fajita-flash\xnu-payload.img`, flashed to `boot_a`,
+  `--set-active=a`, `fastboot reboot`. The phone never reappeared on USB (no
+  USB driver in the kernel yet), so the AMOLED panel is the only console.
+  Observations from a photo (`IMG_0747`-era, screen text drawn rotated 90°):
+  - the shim loaded the payload and jumped; the XNU log rendered on the panel:
+    `serial: requested … configuring debugging over serial`,
+    `Log queues configured: slot count …`,
+    `vm_page_bootstrap`/zone-map lines (`zone: map zone=0xffffffe3021c2000 -
+    0xffffffe3b8be3000` …), `Long range …`, pmap lines;
+  - the last clearly readable line is
+    `debug_log_init: Error!! gPanicBase is still not initialized`
+    (`osfmk/kern/debug.c:473`), reached from `kdp_init()`
+    (`osfmk/kern/startup.c:655`) — i.e. the kernel is inside
+    `kernel_bootstrap_thread`, past `vm_mem_bootstrap`, `console_init`,
+    `sched_init`, `machine_init`, `clock_init`, `task_init`, `thread_init`,
+    `workq_init`, `kernel_thread_create`/`load_context`, `idle_thread_create`,
+    `sched_startup`, `thread_daemon_init`, `mapping_adjust`,
+    `clock_service_create`, `device_service_create` and `phys_carveout_init`.
+    Next steps after that point are `kdp_init` tail, `bootprofile_init`,
+    `STARTUP_SUB_SYSCTL`, `PE_init_iokit`, `STARTUP_SUB_EARLY_BOOT` — the hang
+    is in that window.
+  - **No panic buffer**: `gPanicBase == 0` because the ADT has neither a
+    `pram { reg = <phys size>; }` node nor `/chosen/embedded-panic-log-size`
+    (see `pexpert/arm/pe_init.c:check_for_panic_log`). Consequences: no panic
+    log/crc, and `debug_log_init()` bails. Add a panic region (a few MiB of
+    DRAM *outside* the ADT dram range, e.g. the top of the high bank, with
+    `dram-size` reduced by the same amount) before the next debugging boot.
+  - The XNU fbcon draws sideways on fajita (readable only with the phone held
+    sideways); worth fixing so photos are legible.
+- **QEMU cannot run this ADT on this host**: phys_base 4 GiB + 5.946 GiB needs
+  a ~10 GiB guest and `qemu-system-aarch64` fails with `cannot set up guest
+  memory 'mach-virt.ram': Cannot allocate memory` (host 7.4 GB, WSL 4.9 GiB).
+  Use a lowmem/`0xfcc00000` ADT for QEMU A/B tests instead.
+
 ## Next concrete actions
 
-1. CI: `xnu` run 39283126880 (pushed from `0b8929a`); on success download
-   `xnu-kernel` into `xnu/out` and run `tools/build-fajita.sh`.
-2. With the phone in fastboot, record `fastboot getvar current-slot` and the
-   SoC revision, then (after user confirmation) `fastboot flash boot_b
-   shim/out/shim-boot.img` + `fastboot --set-active=b`. Keep `boot_a` as the
-   LineageOS fallback.
-3. Confirm the diagnostic console prints the live FDT memory nodes and the
-   read-only UFS probe.
-4. Then `tools/build-fajita.sh` (ADT/payload/shim, `cpus=4`) and the XNU boot.
-5. Root image + XNU; boot to the early console; then UFS/launchd/lock screen.
-6. PM8998 keys, then the Synaptics RMI4 touch driver.
+1. Get a **readable panel log** (the text is drawn rotated): photo with the phone
+   held sideways, whole screen plus a close-up of the final lines. That pins the
+   exact last message before the stall (candidates: `kdp_init` tail,
+   `bootprofile_init`, `STARTUP_SUB_SYSCTL`, `PE_init_iokit`,
+   `STARTUP_SUB_EARLY_BOOT`).
+2. Add a **panic region** to `tools/mkadt.py`: a `pram` node
+   (`reg = <phys size>`) plus `/chosen/embedded-panic-log-size`, placed in DRAM
+   just above the end of the ADT `dram-size` (reduce `dram-size` by the same
+   amount so xnu never allocates it). This makes panics readable and stops the
+   `debug_log_init` bail-out.
+3. If the log is still ambiguous, add temporary markers around `kdp_init`,
+   `bootprofile_init`, `PE_init_iokit` and `kernel_startup_initialize_upto
+   (STARTUP_SUB_SYSCTL/EARLY_BOOT)` (new patch 0082, keep hunk counts valid and
+   re-check every patch applies), rebuild via CI, reflash.
+4. Fix the fbcon orientation on fajita (patches 0010/0012 draw sideways on a
+   1080x2340 panel) so the console is photographable.
+5. Return to Android with `fastboot --set-active=b` whenever the phone is
+   needed; `boot_b` is untouched LineageOS.
+6. Then: root image + early console, UFS/launchd/lock screen, PM8998 keys,
+   Synaptics RMI4 touch.
 
 ## Do not assume
 
 - The panel may stop scanning out after ABL hand-off; confirm with a test
-  pattern. If it does, a real DSI/MDP driver is required.
-- The live FDT memory size/carve-outs must be read from the phone before
-  widening `RAM_HIGH_SIZE`.
+  pattern. If it does, a real DSI/MDP driver is required. (The shim's own
+  console *does* render on the panel, so the framebuffer survives hand-off.)
+- The live FDT memory map is now measured (see above) — do not re-guess it, but
+  do re-check it if the unit is ever swapped for a different RAM SKU.
 - UFS 2.1 timing and the Synaptics chip variant (s3320 vs s3706b) need
   on-device confirmation.
