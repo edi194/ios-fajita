@@ -21,6 +21,9 @@ hardware table and the plan; this file is the short handoff.
   stock image (`kernel 0x8000`, `ramdisk 0x1000000`, `tags 0x100`, 4096).
 - Platform-tools are installed at `C:\Users\misia\platform-tools`
   (`adb`/`fastboot` 37.0.1); no phone is connected yet.
+- Public repo: **https://github.com/edi194/ios-fajita** (`gh` logged in as
+  `edi194`, needs the `workflow` scope to push `.github/workflows/`).
+  First CI run: `xnu` **39283126880** (push of `c947ded`, 2026-10-19).
 - **Patch series dry-run** against the exact CI source (`xnu-8796.141.3`
   from Apple's `macos-135/release.json`) with `tools` from
   `blacktop/darwin-xnu-build`: 0001–0081 apply. `0012` failed because its
