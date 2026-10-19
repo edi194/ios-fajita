@@ -48,10 +48,16 @@ hardware table and the plan; this file is the short handoff.
   `~/ios-fajita`, `apfs-fuse` is built/installed in `~/.local/bin`, and
   `mkbootimg` is installed there from
   `jbeich/platform_system_tools_mkbootimg`.
-- `~/WSL2-Linux-Kernel` (linux-msft-wsl-6.6.y) is built with
-  `CONFIG_HFSPLUS_FS=y`. GCC 15 needed one patch: `tools/lib/bpf/libbpf.c`
-  `char *next_path` -> `const char *next_path` (the build treats the
-  discarded-const warning as an error). Build is running.
+- **HFS+ unblocked**: `~/WSL2-Linux-Kernel` (`linux-msft-wsl-6.6.y`) was built
+  with `CONFIG_HFSPLUS_FS=y` (`make -j2 bzImage`; only the `bzImage` target is
+  needed, the full `all` target spends ~20 min on unused AMDGPU modules).
+  `arch/x86/boot/bzImage` (16211968 bytes, SHA256 `dcd51c79…f9eec`) is installed
+  as `C:\Users\misia\wsl-hfsplus-bzImage` via `C:\Users\misia\.wslconfig`
+  (`kernel=`, `memory=5GB`, `processors=6`, `swap=4GB`). WSL now reports
+  `6.6.123.2-microsoft-standard-WSL2+`, 4.9 GiB RAM, 6 CPUs and `hfsplus` in
+  `/proc/filesystems`. Verified round-trip: `mkfs.hfsplus` -> loop mount ->
+  write files/dirs -> `fsck.hfsplus -n` "appears to be OK". GCC 15 needed one
+  patch: `tools/lib/bpf/libbpf.c` `char *next_path` -> `const char *`.
 - No shim/ADT build or phone test yet (only the host-side `mkadt.py` test:
   9920-byte ADT with `dram 0x1_00000000/0xfcc00000`, FB `0x9d400000`,
   1080x2340, CPU MPIDR `0x000..0x700`).
@@ -59,12 +65,11 @@ hardware table and the plan; this file is the short handoff.
 ## Environment
 
 - Windows 11 Home, Ryzen 5 4500U (6c/6t), 7.4 GB RAM, 355 GB free on C:.
-- WSL2 Ubuntu is installed; WSL currently has 3.5 GiB RAM, so the kernel build
-  uses `-j2`. Set `memory=5GB` in `.wslconfig` and `wsl --shutdown` before
-  raising `JOBS`.
+- WSL2 Ubuntu (`edi194@WHEATLEY`) now runs the custom 6.6 HFS+ kernel with
+  4.9 GiB RAM and 6 CPUs (`.wslconfig`); local builds can use `-j4`.
 - Kernel builds on GitHub `macos-14` via `xnu.yml`; no local macOS needed.
-- The Linux side (shim + iOS root) needs HFS+; stock WSL2 has no
-  `CONFIG_HFSPLUS_FS`. The custom kernel is building.
+- The Linux side (shim + iOS root) needs HFS+; the custom WSL kernel provides
+  it (`hfsplus` in `/proc/filesystems`).
 - `apfs-fuse` needed two GCC15/CMake4 fixes, already in
   `tools/setup-wsl.sh`: `-DCMAKE_POLICY_VERSION_MINIMUM=3.5` and an
   `#include <cstdint>` in `ApfsLib/PList.h`.
@@ -73,10 +78,8 @@ hardware table and the plan; this file is the short handoff.
 
 ## Next concrete actions
 
-1. Finish/verify the WSL kernel build, copy `arch/x86/boot/bzImage` to
-   `C:\Users\misia\wsl-hfsplus-bzImage`, add the `[wsl2]` entry to
-   `C:\Users\misia\.wslconfig`, `wsl --shutdown`, then verify
-   `grep hfs /proc/filesystems` shows `hfsplus`.
+1. CI: `xnu` run 39283126880 (pushed from `0b8929a`); on success download
+   `xnu-kernel` into `xnu/out` and run `tools/build-fajita.sh`.
 2. With the phone in fastboot, record `fastboot getvar current-slot` and the
    SoC revision, then (after user confirmation) `fastboot flash boot_b
    shim/out/shim-boot.img` + `fastboot --set-active=b`. Keep `boot_a` as the

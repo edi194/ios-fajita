@@ -120,8 +120,14 @@ if [[ $BUILD_WSL_KERNEL -eq 1 && $IS_WSL -eq 1 ]]; then
 	elif ! grep -q '^CONFIG_HFSPLUS_FS=y' .config; then
 		echo 'CONFIG_HFSPLUS_FS=y' >>.config
 	fi
-	make -j"$JOBS"
-	sudo make modules_install headers_install
+	# GCC 15 builds tools/lib/bpf with -Werror; a const char* returned from
+	# strchr() assigned to char* is now a hard error there.
+	if grep -q 'char \*next_path;' tools/lib/bpf/libbpf.c 2>/dev/null; then
+		sed -i 's/char \*next_path;/const char *next_path;/' tools/lib/bpf/libbpf.c
+	fi
+	# Only the kernel image is needed: CONFIG_HFSPLUS_FS=y is built-in, and
+	# the full `all` target spends ~20 min on unused AMDGPU modules.
+	make -j"$JOBS" bzImage
 	winhome=$(wslpath "$(cmd.exe /c 'echo %USERPROFILE%' 2>/dev/null | tr -d '\r')")
 	cp arch/x86/boot/bzImage "$winhome/wsl-hfsplus-bzImage"
 	winpath=$(wslpath -w "$winhome/wsl-hfsplus-bzImage")
