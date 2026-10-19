@@ -226,6 +226,47 @@ Observations, all from the live unit (serial intentionally not recorded here):
   a ~10 GiB guest and `qemu-system-aarch64` fails with `cannot set up guest
   memory 'mach-virt.ram': Cannot allocate memory` (host 7.4 GB, WSL 4.9 GiB).
   Use a lowmem/`0xfcc00000` ADT for QEMU A/B tests instead.
+- **Photos: apply the EXIF orientation.** Phone photos arrive as
+  `IMG_*.jpeg` with EXIF orientation 6 (stored 4032x3024, rotate 90 deg CW).
+  Read them raw and the console text looks rotated by 90 deg, which made the
+  first reading ambiguous. Convert first, e.g. PowerShell
+  `[System.Drawing.Image]::FromFile($src)` + `RotateFlip(Rotate90FlipNone)`
+  + `Save($dst, Png)` (no PIL/ImageMagick in WSL). After rotating, the
+  `IMG_0748` screen showed the sweet IOKit bring-up (`SWEET AMFI`,
+  `SWEET platform expert registered`, `SWEET AKS`, `SWEET WDT`, `SWEET SURF`,
+  `SWEET HID`, `SWEET BATTERY`,
+  `SWEET FB: AppleCLCD 1080x2340 stride 4320 at 0x9d400000 ... presented as
+  1125x2436`) and still ended on the `debug_log_init` line, but the screen can
+  contain text from more than one boot (the console never clears), so the
+  ordering is not trustworthy. Hence patch 0082 markers below.
+- **Panic region added host-side** (`tools/mkadt.py`): `PANIC_LOG_SIZE =
+  0x100000` is carved from the TOP of the ADT dram range
+  (`dram-size` 0x17c8a0000 -> 0x17c7a0000, `/pram reg =
+  <0x27c7a0000 0x100000>`) and `/chosen/embedded-panic-log-size = 0x100000`
+  is emitted, so `pe_init.c:check_for_panic_log()` maps it and
+  `debug_log_init()` no longer bails out. `--dram-size=0x...` was added as an
+  override for A/B tests (the panic region is carved either way); the `--qemu`
+  tree is unchanged (no pram).
+- **CI run 39304781321** (commit `aa55ae1`, 7m34s, success): patch 0082 was
+  really applied (`Applying patch: .../0082-sweet-boot-phase-markers.patch`,
+  the skipped-patch guard passed). Kernel `kernel.development.sweet`
+  17,206,064 B, SHA256
+  `9023f58e339e4cbbd589b5cb779f77efa6eb02e624e3aba9f73f9048eec7e5ac`
+  (the previous one, `3640ff15...`, is kept as
+  `xnu/out/kernel.development.sweet.prev`). 44 `SWEET BF:` strings are in the
+  binary. Patch 0082 prints markers around `kernel_bootstrap`,
+  `kernel_bootstrap_thread` (`kdp_init`, `PE_init_iokit`,
+  `STARTUP_SUB_SYSCTL`/`EARLY_BOOT`, ...) and inside `machine_init`
+  (`clock_config`, `pmap_map_globals`, `ml_lockdown_init`), so the last
+  `SWEET BF:` line on screen names the exact stage of the stall.
+- **Image ready to flash** (built from that kernel + panic ADT):
+  `shim/out/shim-boot.img` 17,043,456 B, SHA256
+  `f5ebdc07d14b019e60adeecf8ecca27c22a5a1b6d0e17cd991bad113f4bf0edd`,
+  staged as `C:\Users\misia\fajita-flash\markers.img`. Verified: header v1,
+  `kernel_size=422945` (gzip 6990 + fajita2 DTB 415955), `ramdisk_size =
+  16610976` (payload), payload `phys_base=0x100000000`
+  `mem_size=0x17c7a0000` (5.945 GiB), `pram` and
+  `embedded-panic-log-size` present in the ADT.
 
 ## Next concrete actions
 
