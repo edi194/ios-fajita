@@ -32,6 +32,15 @@ hardware table and the plan; this file is the short handoff.
   `0026-stage-hfs.sh` (which CI runs first) copies `bsd/sweet_hfs/core/*`.
   Because `build.sh` silently **skips** a patch that fails `git apply
   --check`, always re-check this after editing a patch.
+- **First CI run failed** (run 39283126880, job failed in ~3.5 min):
+  `unifdef: pexpert/pexpert/arm64/SWEET.h: Premature EOF (#if line 13 depth 1)`
+  → the file had no closing `#endif`. Root cause: patch 0004 declared its
+  SWEET.h hunk as `@@ -0,0 +1,75 @@` while the body has **76** lines, so
+  `git apply` dropped the final `#endif` and still reported "applied cleanly".
+  Fixed to `+1,76`. New `tools/check-hunk-counts.py` validates every hunk
+  header against its body (all 81 files pass) and runs as the first CI step;
+  a new `Fail on skipped project patches` step fails the build if any
+  `patches/0NNN-*` is skipped.
 - Shim + ADT constants retargeted to fajita:
   - FB `0x9d400000`, 36 MiB, 1080×2340, stride 4320. `shim/mmu.c` maps the
     32 MiB block at `0x9c000000` that contains it (the FB is not block-aligned).

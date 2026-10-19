@@ -218,7 +218,7 @@ new file mode 100644
 index 0000000..a044ad0
 --- /dev/null
 +++ b/pexpert/pexpert/arm64/SWEET.h
-@@ -0,0 +1,75 @@
+@@ -0,0 +1,76 @@
 +/*
 + * Board config for the Redmi Note 10 Pro ("sweet", Qualcomm SM7150 /
 + * Snapdragon 732G) and the OnePlus 6T ("fajita", SDM845):

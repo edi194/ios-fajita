@@ -19,6 +19,7 @@ on:
     branches: [main]
     paths:
       - "xnu/patches/**"
+      - "tools/check-hunk-counts.py"
       - ".github/workflows/xnu.yml"
 
 concurrency:
@@ -40,6 +41,12 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate patch hunk counts
+        # git apply trusts the declared hunk counts: a header that undercounts
+        # its body makes git drop the trailing lines "cleanly". That is how the
+        # closing #endif vanished from pexpert/arm64/SWEET.h (patch 0004).
+        run: python3 tools/check-hunk-counts.py xnu/patches
 
       - name: Fetch build script
         run: |
@@ -72,7 +79,22 @@ jobs:
         env:
           # keep going after errors so one run reports every compile failure
           MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
-        run: bash build.sh
+        run: |
+          # tee the log so the next step can assert no project patch was skipped
+          set -o pipefail
+          bash build.sh 2>&1 | tee ../build.log
+
+      - name: Fail on skipped project patches
+        # build.sh downgrades an unappliable patch to a warning, which would
+        # silently ship a kernel missing that feature. Only our 4-digit patches
+        # are checked; blacktop's version-specific patches are expected to skip.
+        if: always()
+        run: |
+          if [ -f build.log ] && grep -E 'Skipping patch .*/patches/0[0-9]{3}-' build.log; then
+            echo "::error::one or more ios-fajita patches were not applied"
+            exit 1
+          fi
+          echo "no project patch was skipped"
 
       - name: Package build tree for local compiles
         if: always()
