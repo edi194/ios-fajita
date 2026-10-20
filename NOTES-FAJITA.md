@@ -404,6 +404,38 @@ Observations, all from the live unit (serial intentionally not recorded here):
   `vm_set_restrictions`, the end of `AppleCLCD::start`, the arm-io nub
   creation and around `StartIOKitMatching()`. All 85 patch files pass
   `check-hunk-counts.py`.
+- **console3 (0085) booted 2026-10-20** — `console3.img` (SHA256 `3716cb62…a10c`,
+  kernel `1dcf35a7…152d6`). The panel now shows the whole ordering explicitly:
+  `startIOServiceMatching enter` → `ok` → `PE_lockdown_iokit ok` →
+  `vm_set_restrictions ok` → `SWEET PE: creating arm-io nubs` → drivers →
+  `SWEET FB: start done` → **nothing**. So the ring was not the blocker (the
+  log is complete and synchronous now) and the bootstrap thread stops between
+  `vm_set_restrictions()` and `bsd_init()`.
+- **Root cause found for that stop (patch 0086)**: the only call between those
+  two prints is `kperf_init_early()`, which starts with
+  `ml_wait_max_cpus()`. That sleeps until `ml_set_max_cpus()` runs, and the
+  only SWEET caller is `SweetCPU::startAll()`. `SweetCPU` matched
+  `qcom,kryo470` (sweet/SM7150) while the fajita ADT declares the truth,
+  `qcom,kryo385` (SDM845) — so **no CPU nub ever matched**, `ml_set_max_cpus()`
+  never ran and the wait was forever. 0086 matches `qcom,kryo385`, logs every
+  CPU nub (start / skipped / phys mismatch) and adds **`sweetsmp=0`**, which
+  publishes the boot CPU and calls `ml_set_max_cpus()` without PSCI `CPU_ON`
+  or the SGI self-test, so an untested GIC/PSCI path cannot hold the boot.
+  `tools/build-fajita.sh` now boots with `cpus=1 sweetsmp=0` until userland
+  runs. All 86 patch files pass `check-hunk-counts.py`.
+- **console4 (0086) booted 2026-10-20 and reached `vfs_mountroot`** —
+  `console4.img` (17,043,456 B, SHA256 `ea08f4a8…c761`, kernel
+  `befef99b…8632`). The panel shows `BSD root: ufsroot0, major 1, minor 0` →
+  `SWEET BF: bsd_init: vfs_mountroot enter` → `hfs_ValidateHFSPIusVolumeHeader:
+  unknown Volume Signature : 681b` → `hfs_mountfs returned error=22` →
+  `cannot mount root, errno = 19, mount(2..7) failed`, then
+  `SWEET UFS: "userdata" on LUN 0: first block 0x186f40, 112640 MiB,
+  read-write, DMA at 0x104c38000` (the persistent-log writer opened the
+  partition and put its ring at the last 4100 KiB, `block 0x1d68afa`).
+  So `kperf_init_early()`/`ml_wait_max_cpus()` was the last kernel-side
+  blocker: the boot now runs the whole BSD init up to the root mount. HFS+
+  rejects `userdata` because it still holds Android ext4 — the expected state
+  before flashing the iOS root.
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
