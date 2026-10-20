@@ -436,6 +436,33 @@ Observations, all from the live unit (serial intentionally not recorded here):
   blocker: the boot now runs the whole BSD init up to the root mount. HFS+
   rejects `userdata` because it still holds Android ext4 — the expected state
   before flashing the iOS root.
+- **iOS ROOT FLASHED 2026-10-20 and the iOS 16 userland boots from it.** With
+  the user's explicit approval `fastboot flash userdata
+  C:\Users\misia\fajita-root\ios16-root.img.simg` wrote 16 sparse chunks
+  (12,145,480,060 B, SHA256 `8ce89bcd…055b`) in 378 s; `userdata` no longer has
+  Android data (GPT, bootloaders, recovery, modem, persist untouched; LineageOS
+  slot `b` still there but with an empty data set).
+  Boot `console4`/`console5` (same kernel `befef99b…`, `console5` adds
+  `sweetlog=0`): `bsd_init` → `vfs_mountroot` → HFS+ accepted →
+  `GetMasterBlock: Error 16 opening /dev/ufsroot0` (EBUSY, harmless) →
+  **`/dev/ufsroot0 on / (hfs, local, journaled, noatime)`** (read-write) →
+  bindfs on `/private/preboot/5CBE3601…/usr/standalone/firmware` fails ENOENT
+  (not required, harmless) → `data-protection`/`sepctl` ("No SEP present",
+  expected) → `finish-obliteration`/`mobile_obliterator` → **launchd starts the
+  whole daemon set**: `assetsd`, `suggestd`, `fairplayd.H2`, `medialibraryd`,
+  `peopled`, `blomd`, `duetexpertd`, `fileproviderd`, `symptomsd`, `spindump`,
+  `bluetoothd`, `nesessionmanager`, … with `SWEET AKS` answering selectors
+  0/7/17/35 and the sandbox denying `symptomsd` privilege 1002.
+  `sweetlog=0` did **not** change anything: `mount_hfs` was simply slow, not
+  deadlocked, so the persistent disk log is not implicated (keep it off during
+  bring-up anyway).
+  Boot speed: the panel is drawn one character at a time, and every daemon
+  prints `exec …`/`SWEET AKS …`, so the sampler's 120 s cadence (`SMP ---
+  sample N`, patch 0054) is the clock to read progress by; a boot to the
+  daemon phase takes >10 min on the panel. The dyld "not in trust cache"
+  flood only happens for the first process that maps the shared caches.
+  Next wall to expect: first daemon crash (`_PanicOnCrasX` is already applied
+  in the image), `watchdogd`, `backboardd`/WindowServer, then SpringBoard.
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
