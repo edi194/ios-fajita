@@ -8,7 +8,7 @@ hardware table and the plan; this file is the short handoff.
 
 - The Windows workspace is now the canonical git repo (local commit `460b7a5`,
   branch `main`, `core.autocrlf=false`). WSL builds it through the symlink
-  `~/fajita -> /mnt/c/Users/misia/Documents/Projekt domyślny`.
+  `~/fajita -> <workspace>`.
 - Stock boot image source: LineageOS 22.2 `20261013` fajita `boot.img`
   (64 MiB, SHA256 `560ca6fe0d869a152caaac14e7837a94bbcb2721640bfefcf502db445c28b770`).
   It is header v1 (no `dtb` section); the DTBs are appended to the kernel.
@@ -40,7 +40,7 @@ hardware table and the plan; this file is the short handoff.
   identity (patch 0059) once the root image is built; harmless for now.
 - `tools/build-fajita.sh` bug fixed: `shim/build.sh` `cd`s into `shim/`, so
   the payload and DTB must be passed as absolute paths (`realpath`).
-- Platform-tools are installed at `C:\Users\misia\platform-tools`
+- Platform-tools are installed at `%USERPROFILE%\platform-tools`
   (`adb`/`fastboot` 37.0.1). The connected OnePlus 6T is now reachable over
   both `adb` and `fastboot` (see the bring-up log below).
 - Public repo: **https://github.com/edi194/ios-fajita** (`gh` logged in as
@@ -75,7 +75,7 @@ hardware table and the plan; this file is the short handoff.
   - XNU early FB patches 0010/0012 use `0x9d400000` + height 2340; the
     bootstrap 32 MiB block stays `0x9c000000` and the kernel alias adds the
     20 MiB offset. Patch 0061 uses native height 2340.
-- WSL2 Ubuntu is installed (`edi194@WHEATLEY`), the repo is copied to
+- WSL2 Ubuntu is installed (`$USER@host`), the repo is copied to
   `~/ios-fajita`, `apfs-fuse` is built/installed in `~/.local/bin`, and
   `mkbootimg` is installed there from
   `jbeich/platform_system_tools_mkbootimg`.
@@ -83,7 +83,7 @@ hardware table and the plan; this file is the short handoff.
   with `CONFIG_HFSPLUS_FS=y` (`make -j2 bzImage`; only the `bzImage` target is
   needed, the full `all` target spends ~20 min on unused AMDGPU modules).
   `arch/x86/boot/bzImage` (16211968 bytes, SHA256 `dcd51c79…f9eec`) is installed
-  as `C:\Users\misia\wsl-hfsplus-bzImage` via `C:\Users\misia\.wslconfig`
+  as `%USERPROFILE%\wsl-hfsplus-bzImage` via `%USERPROFILE%\.wslconfig`
   (`kernel=`, `memory=5GB`, `processors=6`, `swap=4GB`). WSL now reports
   `6.6.123.2-microsoft-standard-WSL2+`, 4.9 GiB RAM, 6 CPUs and `hfsplus` in
   `/proc/filesystems`. Verified round-trip: `mkfs.hfsplus` -> loop mount ->
@@ -96,7 +96,7 @@ hardware table and the plan; this file is the short handoff.
 ## Environment
 
 - Windows 11 Home, Ryzen 5 4500U (6c/6t), 7.4 GB RAM, 355 GB free on C:.
-- WSL2 Ubuntu (`edi194@WHEATLEY`) now runs the custom 6.6 HFS+ kernel with
+- WSL2 Ubuntu (`$USER@host`) now runs the custom 6.6 HFS+ kernel with
   4.9 GiB RAM and 6 CPUs (`.wslconfig`); local builds can use `-j4`.
 - Kernel builds on GitHub `macos-14` via `xnu.yml`; no local macOS needed.
 - The Linux side (shim + iOS root) needs HFS+; the custom WSL kernel provides
@@ -131,7 +131,7 @@ Observations, all from the live unit (serial intentionally not recorded here):
   installed** — `su -c id` returns `uid=0(root)`, so raw partition reads work
   over `adb` with no extra flashing. (`adb root` itself is refused by the
   setting; use `su -c`.)
-- **Full dump done** into `C:\Users\misia\fajita-backup` (outside the repo, no
+- **Full dump done** into `%USERPROFILE%\fajita-backup` (outside the repo, no
   git tracking): `partitions\<name>.img` for every `by-name` entry except
   `userdata` (skipped by explicit decision — iOS overwrites it), plus the raw
   firmware LUNs `sdb`/`sdc`/`sdd`/`sde`/`sdf` as `.raw`, plus
@@ -141,7 +141,7 @@ Observations, all from the live unit (serial intentionally not recorded here):
 - **Pitfall (cost real time twice)**: `cmd`-based helper scripts whose text
   contains the non-ASCII repo path (`…\Projekt domyślny`, `ś` = U+015B) get
   mis-decoded and write to a *second* directory. Use ASCII-only paths
-  (`C:\Users\misia\fajita-backup`) or PowerShell `.ps1` files; never inline
+  (`%USERPROFILE%\fajita-backup`) or PowerShell `.ps1` files; never inline
   PowerShell with `$_` through this shell either — it is echoed, not executed.
 - Slot plan (user-approved): flash the diagnostic shim to **`boot_a`** and
   `fastboot --set-active=a`, leaving the working LineageOS `boot_b` untouched as
@@ -185,7 +185,7 @@ Observations, all from the live unit (serial intentionally not recorded here):
   ~3 min diagnostic the unit did not reappear in fastboot for >5.5 min (a
   15 s poller saw nothing); it was reachable in fastboot when polled later.
   Plan for manual power-cycling instead of trusting the self-reset.
-- Out-of-git reference artifacts now in `C:\Users\misia\fajita-backup`:
+- Out-of-git reference artifacts now in `%USERPROFILE%\fajita-backup`:
   `live-fdt.dtb` (564079 B, ABL-modified tree from `/sys/firmware/fdt`,
   SHA256 `e52c8d9a99be1ab4d0487e25aeb4ca26a42166694b97501a6b8c790a452833e5`),
   `dt-memory-reg.bin` (raw 32-byte `/memory/reg`, SHA256 `efa1a300…`).
@@ -193,7 +193,7 @@ Observations, all from the live unit (serial intentionally not recorded here):
 - **XNU payload booted on the phone (2026-10-19 ~20:15).** Staged
   `shim/out/shim-boot.img` (17,043,456 B, SHA256
   `f1243e98eb97d746628bc23c05886b96d28cd887997748687189b0d5bff1a750`) as
-  `C:\Users\misia\fajita-flash\xnu-payload.img`, flashed to `boot_a`,
+  `%USERPROFILE%\fajita-flash\xnu-payload.img`, flashed to `boot_a`,
   `--set-active=a`, `fastboot reboot`. The phone never reappeared on USB (no
   USB driver in the kernel yet), so the AMOLED panel is the only console.
   Observations from a photo (`IMG_0747`-era, screen text drawn rotated 90°):
@@ -289,7 +289,7 @@ Observations, all from the live unit (serial intentionally not recorded here):
   Patch 0082 now has 53 markers over 3 files and still passes
   `tools/check-hunk-counts.py` (all 82 patch files OK) and a `patch -p1
   --dry-run`. CI run **39310272447** (commit `8f03e44`) builds that kernel.
-- **Quick A/B image without a new kernel**: `C:\Users\misia\fajita-flash\
+- **Quick A/B image without a new kernel**: `%USERPROFILE%\fajita-flash\
   nointr.img` (17,043,456 B, SHA256
   `ae403bd8bcf31b479de6f54430486b67fa818acbe4c6df9f6a602019577fc2f8`) is the
   previous kernel (`9023f58e…`) with only `nointr_consio=1` added, flashed to
@@ -320,7 +320,7 @@ Observations, all from the live unit (serial intentionally not recorded here):
   53 `SWEET BF` strings, markers now past `spllo()` plus `initialize_screen`,
   `vm_commpage_init`, `STARTUP_SUB_LOCKDOWN`, `machine_lockdown`,
   `PE_lockdown_iokit` and `bsd_init` (entry, `vfsinit`, `vfs_mountroot`).
-  Image `C:\Users\misia\fajita-flash\markers2.img` 17,043,456 B, SHA256
+  Image `%USERPROFILE%\fajita-flash\markers2.img` 17,043,456 B, SHA256
   `2000efa676f4e6e4dcb6cf6dab0f66a1ea34a499879320d8551b006b1826e5d5`
   (payload cmdline contains `nointr_consio=1`), flashed to `boot_a` at 21:33.
 - **Root cause of the "screen stops updating" after the FB present:
@@ -330,7 +330,7 @@ Observations, all from the live unit (serial intentionally not recorded here):
   So everything after the platform expert was simply invisible, not hung.
   `sweetfb_noconsole=1` was removed from the default cmdline
   (`tools/build-fajita.sh`) for bring-up; the panel is the only console.
-  Image `C:\Users\misia\fajita-flash\nomute.img` 17,043,456 B, SHA256
+  Image `%USERPROFILE%\fajita-flash\nomute.img` 17,043,456 B, SHA256
   `42a0e67e684ced068df6d3927fdb589224dc798c27824b3737e7a6f7d29bea3c`
   (kernel `2c21c52f…`, nointr_consio=1, no sweetfb_noconsole), flashed at
   21:49.
@@ -383,7 +383,7 @@ Observations, all from the live unit (serial intentionally not recorded here):
   default cmdline next to `sweetfb_console=1`. All **84** patch files pass
   `check-hunk-counts.py`, both new patches apply with `patch -p1 --dry-run`.
 - **console2 (0083+0084, `sweetecon=1`) booted 2026-10-20 and the panel finally
-  shows the whole log** — `C:\Users\misia\fajita-flash\console2.img`
+  shows the whole log** — `%USERPROFILE%\fajita-flash\console2.img`
   (17,043,456 B, SHA256 `174da2d0…9394`, kernel `4051ad2f…ea7d`). The early
   console wraps at 72 rows (newest at the top), so the visible order is
   "newest block" then "older block". Reading it: every marker and driver comes
@@ -438,7 +438,7 @@ Observations, all from the live unit (serial intentionally not recorded here):
   before flashing the iOS root.
 - **iOS ROOT FLASHED 2026-10-20 and the iOS 16 userland boots from it.** With
   the user's explicit approval `fastboot flash userdata
-  C:\Users\misia\fajita-root\ios16-root.img.simg` wrote 16 sparse chunks
+  %USERPROFILE%\fajita-root\ios16-root.img.simg` wrote 16 sparse chunks
   (12,145,480,060 B, SHA256 `8ce89bcd…055b`) in 378 s; `userdata` no longer has
   Android data (GPT, bootloaders, recovery, modem, persist untouched; LineageOS
   slot `b` still there but with an empty data set).
@@ -515,7 +515,7 @@ Observations, all from the live unit (serial intentionally not recorded here):
 ## Next concrete actions
 
 1. Flash the new kernel and read the panel: image
-   `C:\Users\misia\fajita-flash\console1.img` (17,043,456 B, SHA256
+   `%USERPROFILE%\fajita-flash\console1.img` (17,043,456 B, SHA256
    `8e24059c…5c5e`, kernel `7f27332a…30df`, patches ≤0083) and
    `console2.img` (patches ≤0084, `sweetecon=1` in the cmdline). Flash with
    `fastboot flash boot_a <img>` then `fastboot reboot`; the phone must be
