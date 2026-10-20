@@ -259,14 +259,119 @@ Observations, all from the live unit (serial intentionally not recorded here):
   `STARTUP_SUB_SYSCTL`/`EARLY_BOOT`, ...) and inside `machine_init`
   (`clock_config`, `pmap_map_globals`, `ml_lockdown_init`), so the last
   `SWEET BF:` line on screen names the exact stage of the stall.
-- **Image ready to flash** (built from that kernel + panic ADT):
-  `shim/out/shim-boot.img` 17,043,456 B, SHA256
-  `f5ebdc07d14b019e60adeecf8ecca27c22a5a1b6d0e17cd991bad113f4bf0edd`,
-  staged as `C:\Users\misia\fajita-flash\markers.img`. Verified: header v1,
-  `kernel_size=422945` (gzip 6990 + fajita2 DTB 415955), `ramdisk_size =
-  16610976` (payload), payload `phys_base=0x100000000`
-  `mem_size=0x17c7a0000` (5.945 GiB), `pram` and
-  `embedded-panic-log-size` present in the ADT.
+- **Panic region works — first full panic dump read from the panel
+  (2026-10-19 21:11).** The stamped image (`markers.img`) panicked and XNU
+  printed the complete panic screen: zone map, panicked task/thread, 15-frame
+  backtrace, `** Stackshot Succeeded ** Bytes Traced 2171`, the original panic
+  string, boot-args, `ECID`, `Kernel version: Darwin Kernel Version 22.6.0`,
+  `kernel text base 0xfffffe0007004000`.
+  - Panic string: `panic(cpu 0 caller 0xfffffe0007ad1dc4): Console I/O from
+    interrupt-disabled context @serial_console.c:168`.
+  - Resolved with the Mach-O symtab of the kernel (no llvm-nm needed): caller
+    `_console_write.cold.3`, frames `__cnputs` → `___doprnt` →
+    `_kernel_bootstrap_thread + 0x36c`.
+  - **Cause: our own instrumentation.** `osfmk/console/serial_console.c:168`
+    (`console_io_allowed()`) panics on any printf from an interrupt-disabled
+    context once `startup_phase >= STARTUP_SUB_EARLY_BOOT`. Stock xnu calls
+    `(void) spllo()` only *after* `kernel_startup_initialize_upto(
+    STARTUP_SUB_EARLY_BOOT)`, and patch 0082's `early_boot ranks ok` marker sat
+    right there — so the kernel was healthy and our print killed it.
+  - `handshake structure not initialized` in the dump is
+    `osfmk/kdp/output_stages/out_shmem.c:499` (no shared-memory debugger);
+    harmless, not a second failure.
+  - The earlier marker-less image almost certainly died at the same silence
+    point: without `gPanicBase` the panic path could not print anything.
+- **Fixes after that panic:** markers moved past `spllo()`, new markers for
+  `initialize_screen`, `vm_commpage_init`, `STARTUP_SUB_LOCKDOWN`,
+  `machine_lockdown`, `PE_lockdown_iokit`, `bsd_init` (entry, `vfsinit`,
+  `vfs_mountroot`), and `nointr_consio=1` is now in the default cmdline
+  (`tools/build-fajita.sh`) so early prints can never trip the guard.
+  Patch 0082 now has 53 markers over 3 files and still passes
+  `tools/check-hunk-counts.py` (all 82 patch files OK) and a `patch -p1
+  --dry-run`. CI run **39310272447** (commit `8f03e44`) builds that kernel.
+- **Quick A/B image without a new kernel**: `C:\Users\misia\fajita-flash\
+  nointr.img` (17,043,456 B, SHA256
+  `ae403bd8bcf31b479de6f54430486b67fa818acbe4c6df9f6a602019577fc2f8`) is the
+  previous kernel (`9023f58e…`) with only `nointr_consio=1` added, flashed to
+  `boot_a` at 21:22 to see how far the boot gets past `EARLY_BOOT`.
+- **That A/B boot went far (photo at 21:26).** Every marker up to
+  `PE_init_iokit ok` printed, then the whole sweet platform came up on the
+  phone: `SWEET AMFI: built-in interface registered (OWL entitlements)`,
+  `calling mac_policy_init for vnguard`, `Security policy loaded: Guarded mode
+  policy (vanguard)`, `SWEET: trust caches unavailable (Image4/NPMI not
+  installed)`, `SWEET: starting device-tree platform expert`,
+  `SWEET: platform expert registered`, `SWEET AKS`, `SWEET WDT`, `SWEET SURF`,
+  `SWEET HID: buttons registered`, `SWEET HID: touch registered`,
+  `SWEET BATTERY: static fallback`, and finally
+  `SWEET FB: AppleCLCD 1080x2340 stride 4320 at 0x9d400000, default surface 1,
+  presented as 1125x2436`. So `machine_init`, `kdp_init`, `bootprofile_init`,
+  `STARTUP_SUB_SYSCTL`, `PE_init_iokit` and all the emulated drivers run on
+  hardware.
+  - After the FB present the panel shows the **start of the console ring
+    replay** (`size: 1048576`, `Firehose configured: 16 chunks, 8 to pages`,
+    `OSLog stream configured`, `OSLog stream verification: 0`,
+    `SWEET BF: oslog ranks ok`, `SWEET BF: console_init ok`) and stops there,
+    i.e. the next stop is in `spllo()`/`initialize_screen()` right after
+    `STARTUP_SUB_EARLY_BOOT` (screen takeover + ring-buffer flush), not in the
+    drivers. That image has no markers past `early_boot ranks ok`.
+- **CI run 39310272447** (commit `8f03e44`, 6m29s, success): kernel
+  17,222,448 B, SHA256
+  `2c21c52f99ce83808ae7b77c39cbb947a913f6a591c7b4bb9589322a824e0cef`,
+  53 `SWEET BF` strings, markers now past `spllo()` plus `initialize_screen`,
+  `vm_commpage_init`, `STARTUP_SUB_LOCKDOWN`, `machine_lockdown`,
+  `PE_lockdown_iokit` and `bsd_init` (entry, `vfsinit`, `vfs_mountroot`).
+  Image `C:\Users\misia\fajita-flash\markers2.img` 17,043,456 B, SHA256
+  `2000efa676f4e6e4dcb6cf6dab0f66a1ea34a499879320d8551b006b1826e5d5`
+  (payload cmdline contains `nointr_consio=1`), flashed to `boot_a` at 21:33.
+- **Root cause of the "screen stops updating" after the FB present:
+  `sweetfb_noconsole=1`.** Patch 0067 sets `sweet_console_muted = 1` on the
+  first GUI swap (AppleCLCD `presented as 1125x2436`), after which `_cnputs`
+  only appends to the persistent log and draws nothing (panics still draw).
+  So everything after the platform expert was simply invisible, not hung.
+  `sweetfb_noconsole=1` was removed from the default cmdline
+  (`tools/build-fajita.sh`) for bring-up; the panel is the only console.
+  Image `C:\Users\misia\fajita-flash\nomute.img` 17,043,456 B, SHA256
+  `42a0e67e684ced068df6d3927fdb589224dc798c27824b3737e7a6f7d29bea3c`
+  (kernel `2c21c52f…`, nointr_consio=1, no sweetfb_noconsole), flashed at
+  21:49.
+- Marker order on the phone (markers2 photo) is fully consistent with stock
+  xnu: `stackshot_init` → `sched_init` → `machine_init` (all four sub-steps) →
+  `clock_init` → `task_init` → `thread_init` → `workq_init` → `exception_init`
+  → `kernel_thread_create`/`load_context` → `bootstrap_thread` →
+  `idle_thread_create` → `sched_startup` → `thread_daemon_init` →
+  `thread_call ranks` → `thread_bind` → `mapping_adjust` →
+  `clock_service_create` → `device_service_create` → `phys_carveout_init` →
+  `kdp_init` → `bootprofile_init` → `sysctl ranks` → `PE_init_iokit` →
+  `spllo` → `initialize_screen` → `vm_commpage_init` → `lockdown ranks` →
+  `machine_lockdown` → `PE_lockdown_iokit` → platform expert + drivers + FB.
+  The `SWEET BF: console_init ok` line at the very bottom is the console ring
+  draining late, not a restart.
+- **`nomute.img` still froze at the same line** (user photo 21:5x, waited >30 s,
+  no panic). So `sweet_console_muted` was *not* the whole story. Observation:
+  everything up to the FB present is drawn live by `pexpert/arm/pe_serial.c`
+  fbcon (patch 0003, writes straight into the panel at `0x9d400000`), and the
+  last line is the *oldest* entry of the console ring — i.e. the drain stalled
+  right at its first entry, so the kernel most likely blocks afterwards inside
+  `osfmk/console/serial_console.c` (`console_write` → `console_ring_try_empty`)
+  or inside `vcputc_options` (`osfmk/console/video_console.c:1255`, takes
+  `VCPUTC_LOCK` then `gc_ops.paint_char`) once `AppleCLCD` owns the surface.
+  Panics still render, so the panic path bypasses whatever stalls.
+- **Fresh reference repo (2026-10-20): `MakrSas/ios-topaz` branch `topaz`**,
+  same sweet XNU base but 131 patches and a working panel/GUI. It already hit
+  this exact wall and solved it with **`sweetfb_console=1`**
+  (`xnu/patches/0120-topaz-console-only.patch`): `AppleCLCD::present()` returns
+  early so a GUI swap never overwrites the kernel console; the text console
+  keeps drawing directly into the panel. Other patches worth mining later:
+  `0097` unified console scanout, `0099` surface-inuse console batch, `0112`
+  console log filter, `0129` WLAN station, `0130` PMK/join, `0131` SweetSurface
+  lock results.
+- **Patch 0083 (`fajita-console-only`, port of topaz 0120)** adds the same
+  early return in `AppleCLCD::present()` gated on `sweetfb_console=1`, and the
+  boot-arg is now in the default cmdline in `tools/build-fajita.sh`.
+  `tools/check-hunk-counts.py` reports all **83** files OK.
+  (gzip 6990 + fajita2 DTB 415955), `ramdisk_size = 16610976` (the payload),
+  payload `phys_base=0x100000000` `mem_size=0x17c7a0000` (5.945 GiB), with
+  `pram` and `embedded-panic-log-size` present in the ADT.
 
 ## Next concrete actions
 

@@ -1,0 +1,24 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -313,6 +313,21 @@
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
++	static int console_only = -1;
++	/*
++	 * boot-arg sweetfb_console=1: bring-up only. Copying a GUI surface into the
++	 * panel on every swap overwrites the kernel console, which is the only log
++	 * on this board (iOS is not up yet). Same idea as ios-topaz 0120.
++	 */
++	if (console_only < 0) {
++		console_only = 0;
++		PE_parse_boot_argn("sweetfb_console", &console_only, sizeof(console_only));
++	}
++	if (console_only > 0) {
++		(void)mask;
++		return;
++	}
++
+ 
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;

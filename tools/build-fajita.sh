@@ -24,7 +24,10 @@ PAYLOAD=${PAYLOAD:-shim/out/payload.bin}
 # STARTUP_SUB_EARLY_BOOT. Early bring-up prints a lot from such contexts, and
 # the guard is what made the stamped kernel panic in kernel_bootstrap_thread
 # right before stock xnu calls spllo().
-CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_noconsole=1 sweetfb_hz=30 sweettouch=0 sweetkeys=0"}
+# sweetfb_noconsole is deliberately NOT set: it mutes the framebuffer console
+# from the first GUI swap on (patch 0067), which hides everything after
+# AppleCLCD presents (BSD init, root mount). The panel is the only console.
+CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetfb_console=1 sweettouch=0 sweetkeys=0"}
 
 [[ -f "$XNU_KERNEL" ]] || { echo "missing XNU kernel: $XNU_KERNEL" >&2; exit 1; }
 [[ -f "$DTB" ]] || { echo "missing stock DTB: $DTB (unpack the OnePlus boot.img first)" >&2; exit 1; }
