@@ -369,32 +369,86 @@ Observations, all from the live unit (serial intentionally not recorded here):
   early return in `AppleCLCD::present()` gated on `sweetfb_console=1`, and the
   boot-arg is now in the default cmdline in `tools/build-fajita.sh`.
   `tools/check-hunk-counts.py` reports all **83** files OK.
+- **Patch 0084 (`fajita-panel-console`) — the real console fix.** Reading the
+  code showed the panel text is drawn by pexpert's fbcon (`serial_putc_options`
+  → `PE_stub_putc`), and that `vcputc_options` (the Apple VC console) draws
+  nothing until `vc_initialize` runs, so the visible log is the pexpert one.
+  The lock-free bootstrap console in `osfmk/arm64/sweet_early.c` (write-
+  combining alias `SWEET_EARLY_FB_VA`, installed straight into the final kernel
+  page tables by `arm_vm_init`, inside the reserved region → permanent) is the
+  one drawing mechanism on this board that cannot stall: no ring, no VC, no
+  locks, no interrupts, no allocation. `arm_init.c` no longer disables it for
+  SWEET, and `_cnputs` hands every character to `sweet_early_console_route()`
+  when the boot-arg **`sweetecon=1`** is set. `sweetecon=1` is now in the
+  default cmdline next to `sweetfb_console=1`. All **84** patch files pass
+  `check-hunk-counts.py`, both new patches apply with `patch -p1 --dry-run`.
+- **console2 (0083+0084, `sweetecon=1`) booted 2026-10-20 and the panel finally
+  shows the whole log** — `C:\Users\misia\fajita-flash\console2.img`
+  (17,043,456 B, SHA256 `174da2d0…9394`, kernel `4051ad2f…ea7d`). The early
+  console wraps at 72 rows (newest at the top), so the visible order is
+  "newest block" then "older block". Reading it: every marker and driver comes
+  up (`AKS`, `WDT`, `SURF`, `HID buttons`, `HID touch`, `BATTERY`,
+  `AppleCLCD … presented as 1125x2436`) and then **nothing at all** — no
+  `bsd_init enter`. So the kernel (or at least this thread) stops printing
+  right there; the console was not the thing hiding output, but the ring
+  waiter plausibly *is* the block.
+- **Diagnosis for 0085**: `console_write()` reserves console-ring space before
+  draining and waits when the ring is full; `console_ring_try_empty()` bails
+  when preemption is disabled or when no one drains. The bootstrap thread
+  prints `PE_lockdown_iokit ok` and then stalls right before
+  `bsd_init enter`, while the IOKit matching thread (started by
+  `StartIOKitMatching()` inside `PE_lockdown_iokit`) keeps printing driver
+  lines and stops at the FB driver. A ring that fills with no drainer blocks
+  both. Patch **0085** therefore makes `sweetecon=1` bypass the ring entirely
+  (`console_write` → `_cnputs` directly) and adds markers at
+  `vm_set_restrictions`, the end of `AppleCLCD::start`, the arm-io nub
+  creation and around `StartIOKitMatching()`. All 85 patch files pass
+  `check-hunk-counts.py`.
+- **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
+  17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
+  SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
+  `fastboot -S 512M flash userdata …simg`), built by `tools/mkiosroot.sh` and
+  `tools/sweet-root-tweaks.py`
+  (launchd `_PanicOnCrash`→`_PanicOnCrasX`, CommCenter jobs removed,
+  `/private/var/containers/*`, logd stores as `_logd` 272, keybag,
+  dyld cache hard links, VirtualAudio disabled, `StartRecorderServer` off,
+  migration/SpringBoard/Setup prefs). Two host bugs fixed in
+  `tools/mkiosroot.sh`: coreutils here rejects numeric `install -o/-g`
+  ("invalid user: 272") → `mkdir`/`chown`/`chmod`; and the fresh-journaled-volume
+  "volume header needs minor repair" from `fsck.hfsplus -n` is now tolerated.
+  Nothing flashed yet (destructive step needs explicit user confirmation).
+- **iOS userland source downloaded (2026-10-20)**: `tools/remotezip.py` pulled
+  only the needed members of the iPhone X 20H392 IPSW
+  (`iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw`) into `~/ipsw-x`:
+  `087-86698-044.dmg` (OS rootfs, 4,730,814,044 B, SHA256 `80f426d5…2483`),
+  `087-86593-047.dmg` (Cryptex SystemOS, 2,743,074,816 B, `9cd738f3…6849`),
+  `087-86715-047.dmg` (Cryptex AppOS, 10,485,760 B, `391f2df3…4608`), plus
+  BuildManifest, root_hashes, trustcaches and the OS mtree; all CRC-32 OK.
+  Nothing of this is in git.
   (gzip 6990 + fajita2 DTB 415955), `ramdisk_size = 16610976` (the payload),
   payload `phys_base=0x100000000` `mem_size=0x17c7a0000` (5.945 GiB), with
   `pram` and `embedded-panic-log-size` present in the ADT.
 
 ## Next concrete actions
 
-1. Get a **readable panel log** (the text is drawn rotated): photo with the phone
-   held sideways, whole screen plus a close-up of the final lines. That pins the
-   exact last message before the stall (candidates: `kdp_init` tail,
-   `bootprofile_init`, `STARTUP_SUB_SYSCTL`, `PE_init_iokit`,
-   `STARTUP_SUB_EARLY_BOOT`).
-2. Add a **panic region** to `tools/mkadt.py`: a `pram` node
-   (`reg = <phys size>`) plus `/chosen/embedded-panic-log-size`, placed in DRAM
-   just above the end of the ADT `dram-size` (reduce `dram-size` by the same
-   amount so xnu never allocates it). This makes panics readable and stops the
-   `debug_log_init` bail-out.
-3. If the log is still ambiguous, add temporary markers around `kdp_init`,
-   `bootprofile_init`, `PE_init_iokit` and `kernel_startup_initialize_upto
-   (STARTUP_SUB_SYSCTL/EARLY_BOOT)` (new patch 0082, keep hunk counts valid and
-   re-check every patch applies), rebuild via CI, reflash.
-4. Fix the fbcon orientation on fajita (patches 0010/0012 draw sideways on a
-   1080x2340 panel) so the console is photographable.
-5. Return to Android with `fastboot --set-active=b` whenever the phone is
-   needed; `boot_b` is untouched LineageOS.
-6. Then: root image + early console, UFS/launchd/lock screen, PM8998 keys,
-   Synaptics RMI4 touch.
+1. Flash the new kernel and read the panel: image
+   `C:\Users\misia\fajita-flash\console1.img` (17,043,456 B, SHA256
+   `8e24059c…5c5e`, kernel `7f27332a…30df`, patches ≤0083) and
+   `console2.img` (patches ≤0084, `sweetecon=1` in the cmdline). Flash with
+   `fastboot flash boot_a <img>` then `fastboot reboot`; the phone must be
+   power-cycled (Vol- + Power) into fastboot first, it stays in the frozen XNU
+   state otherwise. Slot `a` stays the test slot, `boot_b` is LineageOS.
+2. Expected next stop once the log is visible again: `bsd_init` →
+   `vfsinit ok` → `vfs_mountroot` → `IOFindBSDRoot` waiting for an
+   `Apple_HFS` media (`userdata` still holds Android ext4). On sweet that wait
+   is silent, not a panic, so a boot that "ends" right after `BSD root` is
+   progress. Then flash the iOS root image (destructive → confirm with the
+   user first).
+3. Then: `rd=ufsroot0` root mount, `/sbin/launchd`, PM8998 keys, Synaptics
+   RMI4 touch, and eventually the port of the later ios-topaz patches
+   (console scanout, WLAN, MDP/DSI).
+4. Return to Android with the bootloader menu (slot `b`) when the phone is
+   needed; the local `fastboot` cannot `set_active`.
 
 ## Do not assume
 
