@@ -1,0 +1,121 @@
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -155,22 +155,35 @@
+  *
+  * @return 1 when the characters were drawn here, 0 to use the normal path.
+  */
+-int
+-sweet_early_console_route(const char *c, int size)
++static int
++sweet_console_boot_arg(void)
+ {
+ 	static int enabled = -1;
+ 
+ 	if (enabled < 0) {
+ 		int value = 0;
+ 		if (PE_state.bootArgs == NULL) {
+-			return 0;
++			return -1;
+ 		}
+ 		if (!PE_parse_boot_argn("sweetecon", &value, sizeof(value))) {
+-			return 0;
++			return -1;
+ 		}
+ 		enabled = value;
+ 	}
+-	if (enabled <= 0) {
++	return enabled;
++}
++
++/* True when console output should take the direct path (boot-arg sweetecon=1). */
++int
++sweet_console_direct(void)
++{
++	return sweet_console_boot_arg() > 0;
++}
++
++int
++sweet_early_console_route(const char *c, int size)
++{
++	if (sweet_console_boot_arg() <= 0) {
+ 		return 0;
+ 	}
+ 	while (size-- > 0) {
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -269,6 +269,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
+ extern int sweet_early_console_route(const char *c, int size);  /* osfmk/arm64/sweet_early.c */
++extern int sweet_console_direct(void);
+ /*
+  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+  * console text still goes to the persistent log, but is not drawn over
+@@ -544,6 +545,19 @@
+ 	int chunk_size = CPU_CONS_BUF_SIZE;
+ 	int i = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * boot-arg sweetecon=1: fully synchronous console. The ring blocks the
++	 * printing thread once it is full and nothing drains it (the drain is also
++	 * skipped whenever preemption is disabled), which stops the boot silently.
++	 * _cnputs() takes the direct path and can never wait for space.
++	 */
++	if (sweet_console_direct()) {
++		_cnputs(str, size, true);
++		return;
++	}
++#endif
++
+ 	if (__improbable(console_suspended || !is_console_initialized() || pmap_in_ppl())) {
+ 		/*
+ 		 * Output directly to console in the following cases:
+--- a/osfmk/kern/startup.c
++++ b/osfmk/kern/startup.c
+@@ -818,6 +818,7 @@
+ 	 * at the latest
+ 	 */
+ 	vm_set_restrictions(machine_info.max_cpus);
++	printf("SWEET BF: vm_set_restrictions ok\n");
+ 
+ 
+ #if KPERF
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -203,6 +203,7 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	IOLog("SWEET FB: start done\n");
+ 	return true;
+ }
+ 
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -69,7 +69,9 @@
+ 	 */
+ 	IORegistryEntry *armio = root->childFromPath("arm-io", gIODTPlane);
+ 	if (armio != NULL) {
++		IOLog("SWEET PE: creating arm-io nubs\n");
+ 		createNubs(this, IODTFindMatchingEntries(armio, kIODTExclusive, "('gic')"));
++		IOLog("SWEET PE: arm-io nubs created\n");
+ 		armio->release();
+ 	}
+ }
+--- a/iokit/Kernel/IOStartIOKit.cpp
++++ b/iokit/Kernel/IOStartIOKit.cpp
+@@ -182,7 +182,13 @@
+ {
+ 	SOCD_TRACE_XNU(START_IOKIT);
+ 	assert(gRootNub != NULL);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET BF: startIOServiceMatching enter\n");
++#endif
+ 	bool ok = gRootNub->startIOServiceMatching();
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	printf("SWEET BF: startIOServiceMatching ok\n");
++#endif
+ 	if (__improbable(!ok)) {
+ 		panic("Failed to start IOService matching");
+ 	}
