@@ -1,0 +1,94 @@
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -10,6 +10,7 @@
+ #if defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
++#include <pexpert/pexpert.h>
+ 
+ static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9d400000;
+ #define EARLY_FB early_fb
+@@ -141,4 +142,40 @@
+ 	early_disabled = 1;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
++
++/*
++ * Route console output to this lock-free panel console (boot-arg
++ * sweetecon=1). Used when the normal console path stops draining after
++ * AppleCLCD takes the panel: this one needs no locks, no allocation, no
++ * interrupt and no IOSurface, so it cannot be starved by a stopped
++ * kernel thread.
++ *
++ * The value is latched lazily: the first calls happen before the boot
++ * arguments exist, so -1 means "not parsed yet, try again later".
++ *
++ * @return 1 when the characters were drawn here, 0 to use the normal path.
++ */
++int
++sweet_early_console_route(const char *c, int size)
++{
++	static int enabled = -1;
++
++	if (enabled < 0) {
++		int value = 0;
++		if (PE_state.bootArgs == NULL) {
++			return 0;
++		}
++		if (!PE_parse_boot_argn("sweetecon", &value, sizeof(value))) {
++			return 0;
++		}
++		enabled = value;
++	}
++	if (enabled <= 0) {
++		return 0;
++	}
++	while (size-- > 0) {
++		sweet_early_putc(*c++);
++	}
++	return 1;
++}
+ #endif /* SWEET */
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -268,6 +268,7 @@
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
++extern int sweet_early_console_route(const char *c, int size);  /* osfmk/arm64/sweet_early.c */
+ /*
+  * Set by AppleCLCD (boot-arg sweetfb_noconsole=1) once the GUI presents:
+  * console text still goes to the persistent log, but is not drawn over
+@@ -286,6 +287,14 @@
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}
++	/*
++	 * boot-arg sweetecon=1: draw with the lock-free bootstrap console and
++	 * skip the ring/VC path entirely. On this board the panel is the only
++	 * console, so a console that can stall costs a whole boot cycle.
++	 */
++	if (sweet_early_console_route(c, size)) {
++		return;
++	}
+ #endif
+ 
+ 	if (disableConsoleOutput) {
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -543,7 +543,15 @@
+ 	kprintf("kprintf initialized\n");
+ 	sweet_early_mark(20, "kprintf startup complete");
+ 	if (serial_exists) {
++#if !defined(SWEET)
+ 		sweet_early_disable();
++#endif
++		/*
++		 * SWEET keeps the lock-free panel console alive after pexpert's
++		 * framebuffer console is up: _cnputs routes to it when the boot-arg
++		 * sweetecon=1 is set (patch 0084). It draws nothing otherwise, and a
++		 * panic can still reach it.
++		 */
+ 	}
+ 
+ 	serialmode = 0;

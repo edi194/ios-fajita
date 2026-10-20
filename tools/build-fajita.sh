@@ -27,7 +27,14 @@ PAYLOAD=${PAYLOAD:-shim/out/payload.bin}
 # sweetfb_noconsole is deliberately NOT set: it mutes the framebuffer console
 # from the first GUI swap on (patch 0067), which hides everything after
 # AppleCLCD presents (BSD init, root mount). The panel is the only console.
-CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetfb_console=1 sweettouch=0 sweetkeys=0"}
+# sweetfb_console=1 (patch 0083, from ios-topaz 0120) goes further and skips
+# the GUI surface copy in AppleCLCD::present(), so the panel keeps the kernel
+# text console instead of being overwritten by a swap.
+# sweetecon=1 (patch 0084) draws every console character with the lock-free
+# bootstrap console (osfmk/arm64/sweet_early.c, write-combining panel alias):
+# no console ring, no VC/AppleCLCD drawing, no locks, no interrupts. This is
+# what makes the panel log survive whatever stalls the normal console path.
+CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetfb_console=1 sweetecon=1 sweettouch=0 sweetkeys=0"}
 
 [[ -f "$XNU_KERNEL" ]] || { echo "missing XNU kernel: $XNU_KERNEL" >&2; exit 1; }
 [[ -f "$DTB" ]] || { echo "missing stock DTB: $DTB (unpack the OnePlus boot.img first)" >&2; exit 1; }
