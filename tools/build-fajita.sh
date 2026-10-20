@@ -18,7 +18,11 @@ XNU_KERNEL=${XNU_KERNEL:-xnu/out/kernel.development.sweet}
 DTB=${DTB:-dtb/boot_unpacked/fajita2.dtb}
 ADT=${ADT:-shim/out/fajita.adt}
 PAYLOAD=${PAYLOAD:-shim/out/payload.bin}
-# Start on the A55 cluster only. Add cpus=8 once the early boot is stable.
+# Single CPU for now: the boot used to stop right after "vm_set_restrictions ok"
+# because kperf_init_early() -> ml_wait_max_cpus() waited for ml_set_max_cpus()
+# and SweetCPU never started (patch 0086 fixes the match). cpus=1 + sweetsmp=0
+# keep the PSCI CPU_ON and the SGI self-test out of the way until the boot
+# reaches userland; raise both once the root mount works.
 # nointr_consio=1: console_io_allowed() (osfmk/console/serial_console.c) panics
 # on any printf from an interrupt-disabled context once startup_phase reaches
 # STARTUP_SUB_EARLY_BOOT. Early bring-up prints a lot from such contexts, and
@@ -34,7 +38,7 @@ PAYLOAD=${PAYLOAD:-shim/out/payload.bin}
 # bootstrap console (osfmk/arm64/sweet_early.c, write-combining panel alias):
 # no console ring, no VC/AppleCLCD drawing, no locks, no interrupts. This is
 # what makes the panel log survive whatever stalls the normal console path.
-CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=4 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetfb_console=1 sweetecon=1 sweettouch=0 sweetkeys=0"}
+CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=1 sweetsmp=0 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetfb_console=1 sweetecon=1 sweettouch=0 sweetkeys=0"}
 
 [[ -f "$XNU_KERNEL" ]] || { echo "missing XNU kernel: $XNU_KERNEL" >&2; exit 1; }
 [[ -f "$DTB" ]] || { echo "missing stock DTB: $DTB (unpack the OnePlus boot.img first)" >&2; exit 1; }

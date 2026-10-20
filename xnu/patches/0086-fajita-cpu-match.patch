@@ -1,0 +1,75 @@
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -44,7 +44,10 @@
+     "   {"
+     "     'IOClass'         = SweetCPU;"
+     "     'IOProviderClass' = IOPlatformDevice;"
+-    "     'IONameMatch'     = 'qcom,kryo470';"
++    /* FAJITA: the ADT says the truth (SDM845 = Kryo 385); matching the sweet
++     * string left every CPU nub unmatched, so ml_set_max_cpus() never ran and
++     * ml_wait_max_cpus() slept forever in kperf_init_early(). */
++    "     'IONameMatch'     = 'qcom,kryo385';"
+     "     'IOProbeScore'    = 10000:32;"
+     "   },"
+     "   {"
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -67,10 +67,18 @@
+ 
+ 	if (logical == NULL || reg == NULL || reg->getLength() != sizeof(uint32_t) ||
+ 	    logical->unsigned32BitValue() >= topology->num_cpus) {
++		/* Normal for CPUs past cpus=N: the platform expert only tags the
++		 * CPUs that the topology parser enabled with logical-cpu-id. */
++		IOLog("SWEET CPU: nub skipped (logical-cpu-id not in topology)\n");
+ 		return false;
+ 	}
++	IOLog("SWEET CPU: start logical=%u phys=0x%x\n",
++	    logical->unsigned32BitValue(),
++	    (unsigned)*(const uint32_t *)reg->getBytesNoCopy());
+ 	const ml_topology_cpu_t *cpu = &topology->cpus[logical->unsigned32BitValue()];
+ 	if (*(const uint32_t *)reg->getBytesNoCopy() != cpu->phys_id) {
++		IOLog("SWEET CPU: reg 0x%x != topology phys 0x%x\n",
++		    (unsigned)*(const uint32_t *)reg->getBytesNoCopy(), cpu->phys_id);
+ 		return false;
+ 	}
+ 	/* MPIDR Aff1 = core: 0x000-0x500 A55, 0x600/0x700 A76 */
+@@ -127,9 +135,16 @@
+ {
+ 	const ml_topology_info_t *topology = ml_get_topology_info();
+ 	uint32_t requested = 1;
++	int smp = 1;
+ 	PE_parse_boot_argn("cpus", &requested, sizeof(requested));
+-	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u)\n",
+-	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS);
++	/* sweetsmp=0 keeps the boot CPU only: no PSCI CPU_ON and no SGI self-test,
++	 * so a broken GIC or PSCI cannot hold the boot in these wait loops. */
++	PE_parse_boot_argn("sweetsmp", &smp, sizeof(smp));
++	IOLog("SWEET CPU: requested=%u selected=%u (limit=%u) smp=%d\n",
++	    requested, topology->num_cpus, SWEET_SMP_MAX_CPUS, smp);
++	if (smp == 0) {
++		IOLog("SWEET CPU: SMP disabled (sweetsmp=0)\n");
++	}
+ 
+ 	uint64_t deadline;
+ 	nanoseconds_to_deadline(10 * NSEC_PER_SEC, &deadline);
+@@ -148,7 +163,7 @@
+ 	if (topology->boot_cpu->cpu_id != 0 || topology->boot_cpu->phys_id != 0) {
+ 		panic("SWEET CPU: expected boot MPIDR 0 and logical CPU 0");
+ 	}
+-	for (unsigned int i = 0; i < topology->num_cpus; i++) {
++	for (unsigned int i = 0; (smp != 0) && i < topology->num_cpus; i++) {
+ 		SweetCPU *cpu = __atomic_load_n(&sweet_cpus[i], __ATOMIC_ACQUIRE);
+ 		kern_return_t kr = processor_start(cpu->machProcessor);
+ 		if (kr != KERN_SUCCESS) {
+@@ -173,8 +188,9 @@
+ 	__atomic_load_n(&sweet_cpus[topology->boot_cpu->cpu_id], __ATOMIC_ACQUIRE)->cpusRunning();
+ 	IOService::publishResource(gIOAllCPUInitializedKey, kOSBooleanTrue);
+ 	ml_set_max_cpus(topology->max_cpu_id + 1);
+-	IOLog("SWEET CPU: %u/%u CPUs initialized, SGI1 verified\n",
+-	    topology->num_cpus, topology->num_cpus);
++	IOLog("SWEET CPU: %u/%u CPUs initialized (%s)\n",
++	    topology->num_cpus, topology->num_cpus,
++	    smp != 0 ? "SGI1 verified" : "SMP disabled");
+ 	thread_terminate(current_thread());
+ }
+ 
