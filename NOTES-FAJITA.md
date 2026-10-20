@@ -463,6 +463,30 @@ Observations, all from the live unit (serial intentionally not recorded here):
   flood only happens for the first process that maps the shared caches.
   Next wall to expect: first daemon crash (`_PanicOnCrasX` is already applied
   in the image), `watchdogd`, `backboardd`/WindowServer, then SpringBoard.
+- **SMP WORKS on fajita (console7, 2026-10-20)**: `cpus=4 sweetsmp=1` — PSCI
+  `CPU_ON` and the SGI1 self-test both work on this ABL/TrustZone, so the four
+  A55 cores come up. The boot to SpringBoard now takes ~3.5 min instead of
+  10+ min on one core. `sweetsmp=0`/`cpus=1` remains the fallback.
+- **GUI presents on the panel (console6)**: dropping `sweetfb_console=1` and
+  adding `sweetfb_noconsole=1` makes `AppleCLCD::present()` copy the client
+  surface and mute the console at the first swap (patch 0067/0083). On the
+  panel: the iBoot Apple-logo splash shows through (the console had been
+  painting over it), then a dim-out and a black frame — i.e. real presents,
+  not a dead display. `console8.img` (SHA256 `24fc3ad7…219e`) is the same but
+  with SMP, to see the UI.
+- **SpringBoard reaches its root scene (console7, with console on)**:
+  `This is SpringBoard`, `FBScene - com.apple.springboard`,
+  `FBSceneManager: Added SBStartupTransitionToLockOut`,
+  `State changed from 'Initial' to 'Working'`, `SBApp: becoming to root
+  scene`, CoreAnimation matrices (`matr1x(0.17 0 0 0.17 …)`), then
+  `Crash SpringBoard[… ] Reason no 2 code 0x6` → ReportCrash → `exec
+  SpringBoard` relaunch, with `SWEET AKS: SpringBoard sel 8/35/7/17 → 0x0`.
+  `backboardd[56]` and `SpringBoard[261]` show in the sampler on their
+  mach_msg wait loops. `fairplayd.H2` and `bluetoothd` crash-loop forever —
+  ios-topaz records the same ("no hardware"); not a blocker.
+  The device clock is unset (`1969-12-31`), so anything checking certificate
+  dates (TLS, activation servers) will see an invalid time until a real RTC
+  source exists.
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
