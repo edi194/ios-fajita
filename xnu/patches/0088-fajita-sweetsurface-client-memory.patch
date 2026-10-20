@@ -66,16 +66,16 @@
  	put64(out, 0x08, ref->state->getAddress());
  	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
  	put32(out, 0x18, s->id);
-@@ -647,6 +655,9 @@
+@@ -646,6 +654,9 @@
+ 	return ret;
  }
  
- IOReturn
 +static IOReturn sweet_surface_use_task_memory(SweetSurface *s, task_t task,
 +    uint64_t address, uint64_t size);
 +
+ IOReturn
  IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
  {
- 	const char *buf = (const char *)args->structureInput;
 @@ -684,7 +695,41 @@
  	}
  	s->parentID = args->scalarInputCount > 0 ? (uint32_t)args->scalarInput[0] : 0;
@@ -118,10 +118,10 @@
  		IOBufferMemoryDescriptor *mem = NULL;
  		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
  		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
-@@ -722,6 +767,109 @@
+@@ -721,6 +766,109 @@
+ 	return ret;
  }
  
- IOReturn
 +/*
 + * Make s's pixels the memory a task already has at address (size bytes). The
 + * range stays prepared (wired) for as long as the surface lives, and every
@@ -225,9 +225,9 @@
 +	return ret;
 +}
 +
+ IOReturn
  IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
      __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
-     __unused void *reference)
 @@ -739,6 +887,9 @@
  	}
  	case kSweetSurfaceCreate:
