@@ -1,0 +1,40 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -124,6 +124,19 @@
+ 	void present(const uint8_t *rec);
+ };
+ 
++/*
++ * QuartzCore's CAMetalContextCreate polls IOServiceMatching("IOAcceleratorES")
++ * 300 times, 100 ms apart, before it proceeds without one: thirty seconds at
++ * every backboardd start. A service without MetalPluginName/MetalPluginClassName
++ * is found and then passed over by MTLRegisterDevices, which leaves the
++ * renderers as they are (same idea as ios-topaz 0138). sweetaccel=0 turns it off.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+ 
+ class IOMobileFramebufferUserClient : public IOUserClient {
+@@ -203,6 +216,17 @@
+ 	registerService();
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH);
++	uint32_t accelOn = 1;
++	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
++	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
++	if (accel != NULL && accel->init()) {
++		accel->setName("sgx");
++		if (accel->attach(this)) {
++			accel->registerService();
++			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
++		}
++	}
++	OSSafeReleaseNULL(accel);
+ 	IOLog("SWEET FB: start done\n");
+ 	return true;
+ }
