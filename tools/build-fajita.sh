@@ -38,6 +38,10 @@ PAYLOAD=${PAYLOAD:-shim/out/payload.bin}
 # bootstrap console (osfmk/arm64/sweet_early.c, write-combining panel alias):
 # no console ring, no VC/AppleCLCD drawing, no locks, no interrupts. This is
 # what makes the panel log survive whatever stalls the normal console path.
+# The persistent log (patch 0047, sweetlog, on by default) keeps the whole
+# console stream in a 4 MiB ring in the last 1025 blocks of userdata; read it
+# without filming: fastboot boot twrp.img -> adb wait-for-device ->
+# tools/sweet-log-pull.sh out.txt -> adb reboot bootloader.
 CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=1 sweetsmp=0 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetfb_console=1 sweetecon=1 sweettouch=0 sweetkeys=0"}
 
 [[ -f "$XNU_KERNEL" ]] || { echo "missing XNU kernel: $XNU_KERNEL" >&2; exit 1; }
