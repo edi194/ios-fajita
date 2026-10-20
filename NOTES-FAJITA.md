@@ -487,6 +487,53 @@ Observations, all from the live unit (serial intentionally not recorded here):
   The device clock is unset (`1969-12-31`), so anything checking certificate
   dates (TLS, activation servers) will see an invalid time until a real RTC
   source exists.
+- **Black frames after the Apple splash are expected at this stage.** With the
+  GUI allowed to present (`sweetfb_noconsole=1`), the panel shows the iBoot
+  splash uncovered by the muting console, a janky dim and then black: the
+  surfaces backboardd hands us are empty because our `SweetSurface` is the old
+  ios-sweet one — 884 lines with **no client-image/client-memory wrapping at
+  all** (`use_task_memory`, `client_address`, `IOSurfaceAddress` are absent).
+  `ios-topaz` is a different phone (Redmi Note 12 4G, `topaz`/`tapas`, SM6225)
+  and its tree has diverged, so 0132–0139 do not apply as patches: only 0131
+  does (`patch -p1 --dry-run`), 0132–0139 fail 1–5 hunks each. The work is to
+  reimplement what those patches do, in this order: wrap client images/memory
+  (0132), keep values + bulk attachments + purgeability (0133), client-address
+  surfaces (0134), detach semantics/zombie state (0135–0137), publish the
+  client-address surfaces (0139) — plus `IOAcceleratorES` (below).
+- **Patch 0087 (2026-10-20): empty `IOAcceleratorES`** — ported idea of
+  ios-topaz 0138. QuartzCore's `CAMetalContextCreate` polls
+  `IOServiceMatching("IOAcceleratorES")` 300 times 100 ms apart before it goes
+  on, i.e. 30 s at every backboardd start, which on the panel looks like a
+  dead black screen. `AppleCLCD::start()` now publishes an `IOAcceleratorES`
+  with no `MetalPluginName`/`MetalPluginClassName` (Metal finds it, passes it
+  over, renderers unchanged); `sweetaccel=0` disables it. All 87 patch files
+  pass `check-hunk-counts.py`.
+- **Patch 0088 (2026-10-20): `SweetSurface` makes surfaces of the client's own
+  memory.** This is the actual reason the panel is black after the splash. The
+  iOS 16 CoreAnimation GL renderer does not ask for fresh buffers — it wraps
+  memory it already owns (`IOSurfaceWrapClientImage`/`Memory`, and
+  `IOSurfaceAddress` in the create dictionary); our old ios-sweet
+  `SweetSurface` only ever allocated its own wired buffer, so every surface it
+  returned was empty. Ported the behaviour of ios-topaz 0132 + 0134 + 0139:
+  selectors 6/7, `IOSurfaceAddress` in `create()`, publishing those surfaces
+  (unpublished they had id 0 and the framework treated several as one),
+  `wrapDelta` in the returned base address, prepared-range lifetime via
+  `memory->complete()`, default cache mode for wrapped memory. All 88 patch
+  files pass `check-hunk-counts.py`.
+  Still missing from that series: values/bulk attachments/purgeability (0133),
+  detach semantics and zombie state pages (0135–0137) — likely needed for
+  animations and for icons that survive a view release.
+- **console9/console10 on the phone (2026-10-20)**: both still show many log
+  lines, the iBoot splash, then a *janky* jump to black. `0088` is in
+  `console10` (kernel `8519d6d5…c4ccc`), so the client-memory path is compiled
+  in, but with the console muted at the first swap the panel gives no further
+  information. `console11.img` (same kernel, `sweetfb_console=1`, `sweetfb_hz=10`)
+  keeps the kernel console on the panel so the `SWEET SURF: wrap …`,
+  `create around client memory …` and later boot lines can be filmed.
+  On the jank: there is no GPU driver, so CoreAnimation composites the
+  1080×2340 layer tree on the CPU (4×A55), while `present()` memcpys a whole
+  10 MB frame at `sweetfb_hz` (30 Hz ≈ 300 MB/s) with no vsync and with UFS
+  polled I/O competing — 10 Hz is the sensible bring-up rate.
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
