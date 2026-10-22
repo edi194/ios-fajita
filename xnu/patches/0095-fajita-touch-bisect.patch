@@ -1,0 +1,75 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -748,6 +748,15 @@
+ 	printf("SWEET TS: fajita RMI4, starting in %u s (raw %dx%d)\n", delay_s, ts_xraw, ts_yraw);
+ 	touch_wait(delay_s * 1000u);
+ 
++	int nogpio = 0, noclk = 0, nose = 0, norail = 0, perr = 0;
++
++	(void)PE_parse_boot_argn("sweetts_nogpio", &nogpio, sizeof(nogpio));
++	(void)PE_parse_boot_argn("sweetts_noclk", &noclk, sizeof(noclk));
++	(void)PE_parse_boot_argn("sweetts_nose", &nose, sizeof(nose));
++	(void)PE_parse_boot_argn("sweetts_norail", &norail, sizeof(norail));
++
++	printf("SWEET TS: mapping gcc=%#x north=%#x south=%#x se=%#x\n",
++	    FJ_GCC_PA, FJ_TLMM_NORTH, FJ_TLMM_SOUTH, FJ_SE_PA);
+ 	st.gcc = ml_io_map(FJ_GCC_PA, 0x60000);
+ 	/*
+ 	 * 0x80000 covers pins 0..127. sweet's 0x5b000 was sized for its pins (max
+@@ -757,28 +766,42 @@
+ 	st.gpio = ml_io_map(FJ_TLMM_NORTH, 0x80000);
+ 	st.gpio_s = ml_io_map(FJ_TLMM_SOUTH, 0x80000);
+ 	st.se = ml_io_map(FJ_SE_PA, 0x4000);
++	printf("SWEET TS: maps gcc=%p north=%p south=%p se=%p\n",
++	    (void *)st.gcc, (void *)st.gpio, (void *)st.gpio_s, (void *)st.se);
+ 	if (!st.gcc || !st.gpio || !st.gpio_s || !st.se) {
+ 		printf("SWEET TS: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+-	/* VDD on PM8998 ldoa28 (3.008 V), VIO 1.8 V through the gpio88 switch. */
+-	int norail = 0;
+-	int perr = 0;
+-	(void)PE_parse_boot_argn("sweetts_norail", &norail, sizeof(norail));
+ 	if (!norail) {
+ 		perr = sweet_rpmh_vreg_enable("ldoa28", 3008);
+ 	}
+ 	printf("SWEET TS: ldoa28 vote -> %d%s\n", perr, norail ? " (skipped)" : "");
+-	touch_gpio_at(st.gpio_s, FJ_GPIO_VIO, 0, 0, 1, true, true);
+-	touch_wait(10);
+-	touch_gpio_at(st.gpio, FJ_GPIO_ATTN, 0, 3, 3, false, false);   /* input, pull-up */
+-	touch_gpio_at(st.gpio, FJ_GPIO_RESET, 0, 3, 2, true, true);
+-	touch_wait(10);
+-	touch_gpio_at(st.gpio, FJ_GPIO_RESET, 0, 3, 2, true, false);   /* reset low */
+-	touch_wait(10);
+-	touch_gpio_at(st.gpio, FJ_GPIO_RESET, 0, 3, 2, true, true);
+-	touch_wait(200);
+-	if (!fajita_clocks()) {
++	if (nogpio) {
++		printf("SWEET TS: gpio writes skipped (sweetts_nogpio=1)\n");
++	} else {
++		printf("SWEET TS: gpio88 high\n");
++		touch_gpio_at(st.gpio_s, FJ_GPIO_VIO, 0, 0, 1, true, true);
++		touch_wait(10);
++		printf("SWEET TS: gpio125 input\n");
++		touch_gpio_at(st.gpio, FJ_GPIO_ATTN, 0, 3, 3, false, false);
++		printf("SWEET TS: gpio99 reset high\n");
++		touch_gpio_at(st.gpio, FJ_GPIO_RESET, 0, 3, 2, true, true);
++		touch_wait(10);
++		printf("SWEET TS: gpio99 reset low\n");
++		touch_gpio_at(st.gpio, FJ_GPIO_RESET, 0, 3, 2, true, false);
++		touch_wait(10);
++		printf("SWEET TS: gpio99 reset high again\n");
++		touch_gpio_at(st.gpio, FJ_GPIO_RESET, 0, 3, 2, true, true);
++		touch_wait(200);
++		printf("SWEET TS: reset sequence done\n");
++	}
++	if (noclk) {
++		printf("SWEET TS: clocks skipped (sweetts_noclk=1)\n");
++	} else if (!fajita_clocks()) {
++		goto out;
++	}
++	if (nose) {
++		printf("SWEET TS: SE init skipped (sweetts_nose=1)\n");
+ 		goto out;
+ 	}
+ 	if (!touch_se_init()) {
