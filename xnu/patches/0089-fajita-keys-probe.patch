@@ -1,0 +1,94 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -122,6 +122,73 @@
+ 	}
+ }
+ 
++/*
++ * Boot-arg sweetkeysprobe=1: find which SPMI peripheral carries the volume
++ * keys. Everything here is read-only: the arbiter is asked for one byte at
++ * offset 0x10 (the qpnp GPIO status register) of every candidate PPID
++ * (slave << 8 | peripheral) on PM8998/PMI8998 (fajita) and PM6150L (sweet).
++ * Candidates that answer are printed, then their status is polled and every
++ * change logged, so pressing the keys names the right register.
++ */
++#define KEYS_PROBE_MAX  32
++
++static uint16_t keys_probe_apid[KEYS_PROBE_MAX];
++static uint16_t keys_probe_ppid[KEYS_PROBE_MAX];
++static int keys_probe_count;
++
++static void
++keys_probe_thread(__unused void *arg, __unused wait_result_t result)
++{
++	uint32_t count = keys_rd(keys_core, 4) & 0x7ffu;
++	static const uint16_t candidates[] = {
++		0x00c0, 0x00c1, 0x00c2, 0x00c3, 0x00c4, 0x00c5, 0x00c6, 0x00c7,
++		0x00c8, 0x00c9, 0x00ca, 0x00cb, 0x00cc, 0x00cd, 0x00cf, 0x00d0,
++		0x00d1, 0x00d2, 0x00d4, 0x00d6,
++		0x01c0, 0x01c1, 0x01c2, 0x01c3, 0x01c4, 0x01c5,
++		0x02c0, 0x02c1, 0x02c2, 0x02c3,
++		0x04c1,
++	};
++
++	for (unsigned i = 0;
++	    i < sizeof(candidates) / sizeof(candidates[0]) && keys_probe_count < KEYS_PROBE_MAX; i++) {
++		uint16_t apid = keys_find_apid(candidates[i], count);
++		if (apid == KEYS_NO_APID) {
++			continue;
++		}
++		uint8_t status = 0, subtype = 0, en = 0, mode = 0;
++		bool ok = keys_read(apid, 0x10, &status);
++		(void)keys_read(apid, 0x05, &subtype);
++		(void)keys_read(apid, 0x46, &en);
++		(void)keys_read(apid, 0x40, &mode);
++		printf("SWEET KEYPROBE: ppid=%#05x apid=%u status=%#x/%d subtype=%#x en=%#x mode=%#x\n",
++		    candidates[i], apid, status, ok, subtype, en, mode);
++		if (!ok) {
++			continue;
++		}
++		keys_probe_ppid[keys_probe_count] = candidates[i];
++		keys_probe_apid[keys_probe_count] = apid;
++		keys_probe_count++;
++	}
++	printf("SWEET KEYPROBE: %d candidates answer; press volume up and down now\n",
++	    keys_probe_count);
++
++	uint8_t last[KEYS_PROBE_MAX];
++	for (int i = 0; i < keys_probe_count; i++) {
++		last[i] = 0xff;
++	}
++	for (;;) {
++		for (int i = 0; i < keys_probe_count; i++) {
++			uint8_t v = 0;
++			if (keys_read(keys_probe_apid[i], 0x10, &v) && v != last[i]) {
++				printf("SWEET KEYPROBE: ppid=%#05x gpio-status %#x -> %#x\n",
++				    keys_probe_ppid[i], last[i], v);
++				last[i] = v;
++			}
++		}
++		keys_wait();
++	}
++}
++
+ void
+ sweet_keys_init(void)
+ {
+@@ -151,6 +218,17 @@
+ 		    keys_version, count);
+ 		return;
+ 	}
++	int probe = 0;
++	(void)PE_parse_boot_argn("sweetkeysprobe", &probe, sizeof(probe));
++	if (probe) {
++		kern_return_t kr = kernel_thread_start(keys_probe_thread, NULL, &thread);
++		printf("SWEET KEYPROBE: scanning SPMI peripherals (read only)%s\n",
++		    kr == KERN_SUCCESS ? "" : " - thread start failed");
++		if (kr == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++		return;
++	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+ 	keys_gpio_apid = keys_find_apid(0x4c1, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
