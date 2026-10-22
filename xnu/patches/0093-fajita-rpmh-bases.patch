@@ -1,0 +1,103 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -9,13 +9,42 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+-#define RH_RSC_PA       0x18220000u
++#define RH_RSC_PA       0x18220000u     /* sweet (SM7150) default */
+ #define RH_TCS_PA       0x18220d00u
++
++/*
++ * fajita (SDM845) has the apps RSC at 0x179e0000 with its TCS at 0x179e0d00
++ * (vendor dts mailbox@179e0000), not at sweet's addresses: a TCS write at the
++ * wrong base hangs the bus and freezes the SoC. Both are boot args
++ * (rpmhrsc=, rpmhtcs=, hex) so one kernel serves both boards; the cmd-db
++ * locator (0xc3f000c) is identical on both.
++ */
++static uint32_t rh_rsc_pa = RH_RSC_PA, rh_tcs_pa = RH_TCS_PA;
++static bool rh_bases_parsed;
++
++static void
++rh_bases(void)
++{
++	uint32_t v = 0;
++
++	if (rh_bases_parsed) {
++		return;
++	}
++	rh_bases_parsed = true;
++	if (PE_parse_boot_argn("rpmhrsc", &v, sizeof(v)) && v) {
++		rh_rsc_pa = v;
++	}
++	v = 0;
++	if (PE_parse_boot_argn("rpmhtcs", &v, sizeof(v)) && v) {
++		rh_tcs_pa = v;
++	}
++}
+ #define RH_TCS_SIZE     0x3000u
+ #define RH_DICT_PA      0x0c3f000cu
+ #define RH_DRV          2u
+@@ -100,11 +129,12 @@
+ static int
+ rh_map(void)
+ {
++	rh_bases();
+ 	if (!rh_rsc) {
+-		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
++		rh_rsc = ml_io_map(rh_rsc_pa, 0x100);
+ 	}
+ 	if (!rh_tcs) {
+-		rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
++		rh_tcs = ml_io_map(rh_tcs_pa, RH_TCS_SIZE);
+ 	}
+ 	if (!rh_dict) {
+ 		rh_dict = ml_io_map(RH_DICT_PA, 8);
+@@ -120,7 +150,7 @@
+ 	unsigned count = (config >> (6u * RH_DRV)) & 0x3fu;
+ 	rh_ncpt = (config >> 27) & 0x1fu;
+ 	printf("SWEET RPMH: rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
+-	    RH_RSC_PA, RH_TCS_PA, RH_DRV, id, solver, config, count, rh_ncpt);
++	    rh_rsc_pa, rh_tcs_pa, RH_DRV, id, solver, config, count, rh_ncpt);
+ 	/* This client implements the pre-v3 layout only; do not guess v3 offsets. */
+ 	if ((major != 1 && major != 2) || config == 0xffffffffu ||
+ 	    solver == 0xffffffffu || count < RH_NORMAL_N ||
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -749,16 +749,26 @@
+ 	touch_wait(delay_s * 1000u);
+ 
+ 	st.gcc = ml_io_map(FJ_GCC_PA, 0x60000);
+-	st.gpio = ml_io_map(FJ_TLMM_NORTH, 0x5b000);
+-	st.gpio_s = ml_io_map(FJ_TLMM_SOUTH, 0x5b000);
++	/*
++	 * 0x80000 covers pins 0..127. sweet's 0x5b000 was sized for its pins (max
++	 * 90); here reset is gpio99 (offset 0x63000) and ATTN is gpio125 (0x7d000),
++	 * both past that map - the access faulted and froze the SoC.
++	 */
++	st.gpio = ml_io_map(FJ_TLMM_NORTH, 0x80000);
++	st.gpio_s = ml_io_map(FJ_TLMM_SOUTH, 0x80000);
+ 	st.se = ml_io_map(FJ_SE_PA, 0x4000);
+ 	if (!st.gcc || !st.gpio || !st.gpio_s || !st.se) {
+ 		printf("SWEET TS: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+ 	/* VDD on PM8998 ldoa28 (3.008 V), VIO 1.8 V through the gpio88 switch. */
+-	int perr = sweet_rpmh_vreg_enable("ldoa28", 3008);
+-	printf("SWEET TS: ldoa28 vote -> %d\n", perr);
++	int norail = 0;
++	int perr = 0;
++	(void)PE_parse_boot_argn("sweetts_norail", &norail, sizeof(norail));
++	if (!norail) {
++		perr = sweet_rpmh_vreg_enable("ldoa28", 3008);
++	}
++	printf("SWEET TS: ldoa28 vote -> %d%s\n", perr, norail ? " (skipped)" : "");
+ 	touch_gpio_at(st.gpio_s, FJ_GPIO_VIO, 0, 0, 1, true, true);
+ 	touch_wait(10);
+ 	touch_gpio_at(st.gpio, FJ_GPIO_ATTN, 0, 3, 3, false, false);   /* input, pull-up */
