@@ -584,6 +584,35 @@ Observations, all from the live unit (serial intentionally not recorded here):
 - **SMP raised to all eight cores**: `cpus=8 sweetsmp=1` (A55 MPIDR
   0x000–0x300 + A75 0x400–0x700); `console14.img` (SHA256 `ad9efb57…369c`) and
   the sRGB twin `console15-srgb.img` (`d08a5c87…4973`) are built.
+- **LOCK SCREEN (console14, 2026-10-22)**: with the D22 `/product` identity the
+  panel shows the iOS lock screen — `CRASH SpringBoard: 0`,
+  `Terminating app: 0`, `SWEET CPU: 8/8 CPUs initialized (SGI1 verified)` and
+  all eight cores came up through PSCI (`cpu=0..7 … came alive; SGI1 OK`).
+  So the bounding-path abort was entirely the missing device identity.
+- **Keys: power works, volume does not yet.** With `sweetkeys=1` the log shows
+  `SWEET KEYS: arb=0x50000000 apids=512 pon-apid=172 gpio4-apid=261` and
+  `key=0 down=1 pon=0x1` → `SWEET HID: key 0x30 down (1 clients)`, i.e. the
+  PON power key is read through the SPMI arbiter and delivered as HID. The
+  volume keys read `gpio4:c110=0`: the driver uses PPID `0x4c1` (PM6150L SID 4
+  GPIO4), which answers on fajita but is not PM8998. Fajita's SPMI arbiter has
+  the *same* addresses as sweet's (`core 0xc440000`, `obsrvr 0xe600000`,
+  `cnfg 0xc40a000`, PM8998 at USID 0, GPIO `pinctrl@c000`), so only the
+  peripheral number is missing. **Patch 0089** adds `sweetkeysprobe=1`, which
+  scans slave 0–4 × GPIO peripherals 0xc0–0xd6 read-only, prints every
+  candidate that answers (status/subtype/enable/mode) and then logs status
+  changes, so one boot with the volume keys pressed names the register.
+- **Touch: not ported yet.** `bsd/dev/sweet_touch.c` is a sweet-specific
+  SE7 FIFO I2C driver for Goodix GT9896 / FocalTech 54:52
+  (`TOUCH_SE_PA 0xa84000`, TLMM at `0x3900000`, `ldoc11` rail). Fajita has a
+  **Synaptics RMI4** controller at I2C 0x20 on the GENI/QUPv3 SE at
+  `0xa90000` (vendor dts `i2c@a90000`, interrupt 0x165), with IRQ GPIO 125,
+  reset GPIO 99, VIO GPIO 88 and VDD on LDO28 (per `tools/fajita.env`), so a
+  fajita branch needs: the right SE/wrapper clock registers for that SE,
+  SDM845 TLMM (0x03400000), the LDO vote, and RMI4 (16-bit register
+  addressing, F01/F12 query+data bases, report parsing). No interrupts in the
+  first version — poll the IRQ/status register.
+  `sweettouch=0 sweetkeys=0` must stay out of the default cmdline until each
+  is proven.
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
