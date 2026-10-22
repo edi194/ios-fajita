@@ -54,12 +54,88 @@ BOOT_MANIFEST_HASH = hashlib.sha384(b'sweet boot manifest').digest()
 D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ipsw-x/d22ap.adt')
 
 
+# The /product identity of the iPhone X, straight from its real
+# DeviceTree.d22ap.im4p (the same 61 properties, 369 bytes, that the HackiOS
+# release publishes as xnuloader/identity.h). Used when the ADT itself is not
+# at hand. CoreUI/CoreThemeDefinition read graphics-featureset-class,
+# artwork-device-idiom, artwork-display-gamut, artwork-scale-factor and friends
+# to choose which compiled artwork to take out of an asset catalog; without a
+# /product node at all, UIKit's lookup of a device-specific bitmap can fail.
+D22_PRODUCT = [
+    ('sandman-support', b'\x01\x00\x00\x00'),
+    ('display-mirroring', b'\x01\x00\x00\x00'),
+    ('car-integration', b'\x01\x00\x00\x00'),
+    ('assistant', b'\x01\x00\x00\x00'),
+    ('lockdown-certtype', b'\x01\x00\x00\x00'),
+    ('ui-pip', b'\x01\x00\x00\x00'),
+    ('wifi-chipset', b'4357\x00'),
+    ('product-name', b'iPhone X\x00'),
+    ('hearingaid-audio-equalization', b'\x01\x00\x00\x00'),
+    ('RF-exposure-separation-distance', b'\x05\x00\x00\x00'),
+    ('mobiledevice-min-ver', b'1400\x00'),
+    ('product-id', b'\xfd\x07\x9b)\x81D\xa7\xde\xb4\xd7\xc8\x7f\xef>\xb4t\xd8\xf0\xe7\xeb'),
+    ('gps-capable', b'\x01\x00\x00\x00'),
+    ('product-description', b'iPhone X\x00'),
+    ('allow-32bit-apps', b'\x01\x00\x00\x00'),
+    ('low-power-wallet-mode', b'\x01\x00\x00\x00'),
+    ('builtin-mics', b'\x04\x00\x00\x00'),
+    ('has-boot-chime', b'\x00\x00\x00\x00'),
+    ('supports-burnin-mitigation', b'\x01\x00\x00\x00'),
+    ('compatible-device-fallback', b'iPhone9,2\x00'),
+    ('device-perf-memory-class', b'\x04\x00\x00\x00'),
+    ('artwork-scale-factor', b'\x03\x00\x00\x00'),
+    ('baseband-chipset', b'mav17\x00'),
+    ('hearingaid-low-energy-audio', b'\x01\x00\x00\x00'),
+    ('ui-background-quality', b'd\x00\x00\x00'),
+    ('supports-avatars', b''),
+    ('public-key-accelerator', b'\x01\x00\x00\x00'),
+    ('disable-globe-map', b''),
+    ('artwork-device-idiom', b'phone\x00'),
+    ('device-color-policy', b'\x00\x00\x00\x00'),
+    ('graphics-featureset-class', b'APPLE4\x00'),
+    ('siri-gesture', b'\x01\x00\x00\x00'),
+    ('supports-maps-optical-heading', b''),
+    ('compatible-app-variant', b'0\x00'),
+    ('artwork-dynamic-displaymode', b'0\x00'),
+    ('bluetooth-le', b'\x01\x00\x00\x00'),
+    ('watch-companion', b'\x01\x00\x00\x00'),
+    ('has-applelpm', b'\x00\x00\x00\x00'),
+    ('iap2-protocol-supported', b'\x01\x00\x00\x00'),
+    ('ephemeral-data-mode', b'\x00\x00\x00\x00'),
+    ('activation-protocol-version', b'\x02\x00\x00\x00'),
+    ('volume-up-button-location', b"x\xb0\t\x00\xff\x96\x14\x000\xe0\x03\x00\xca\x9d\x01\x00\x10'\x00\x00"),
+    ('ptp-large-files', b'\x01\x00\x00\x00'),
+    ('udid-version', b'\x01\x00\x00\x00'),
+    ('offline-dictation', b'\x01\x00\x00\x00'),
+    ('location-reminders', b'\x01\x00\x00\x00'),
+    ('ui-weather-quality', b'd\x00\x00\x00'),
+    ('graphics-featureset-fallbacks', b'APPLE3:APPLE3v1:APPLE2:APPLE1:GLES2,0\x00'),
+    ('dictation', b'\x01\x00\x00\x00'),
+    ('itunes-min-ver', b'\x03\x07\x0c\x00'),
+    ('artwork-display-gamut', b'P3\x00'),
+    ('front-cam-offset-from-center', b'\xd0\x01\x01\x00\x9e\x1d\x00\x00\xe8\x03\x00\x00\x00\x00\x00\x00'),
+    ('ui-reachability', b'\x01\x00\x00\x00'),
+    ('volume-down-button-location', b"x\xb0\t\x00\xff\x96\x14\x00H\xd0\x05\x00\xca\x9d\x01\x00\x10'\x00\x00"),
+    ('personal-hotspot', b'\x01\x00\x00\x00'),
+    ('single-stage-boot', b'\x01\x00\x00\x00'),
+    ('mobiledevice-beta-min-ver', b'1190.100.2\x00'),
+    ('oled-display', b'\x01\x00\x00\x00'),
+    ('thin-bezel', b'\x01\x00\x00\x00'),
+    ('artwork-device-subtype', b'\x84\t\x00\x00'),
+    ('side-button-location', b'u\xf3\x00\x00*\x0f\x02\x00\x00q\x00\x00\xea?\x00\x00\xe8\x03\x00\x00'),
+]
+
+
 def d22ap_product(path=D22AP_ADT):
     """/product properties of the real D22AP tree, without the syscfg
     placeholders iBoot would fill in (flag bit set) and the node bookkeeping."""
     if not os.path.exists(path):
-        print(f'warning: {path} missing, no /product node', file=sys.stderr)
-        return None
+        print(f'warning: {path} missing, using the built-in D22 identity table',
+              file=sys.stderr)
+        # The real iPhone X says P3; our framebuffer is sRGB 8-bit, so
+        # ADT_GAMUT=sRGB forces sRGB (ios-topaz does that for the same reason).
+        gamut = os.environ.get('ADT_GAMUT', 'P3').encode() + b'\0'
+        return [(k, gamut if k == 'artwork-display-gamut' else v) for k, v in D22_PRODUCT]
     root, _ = adt.parse(open(path, 'rb').read())
     for c in root.children:
         if dict((k, v) for k, f, v in c.props).get('name') == b'product\0':
