@@ -1,0 +1,343 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -29,6 +29,25 @@
+ #define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
++
++/*
++ * fajita (OnePlus 6T, SDM845): Synaptics RMI4 at I2C 0x20 on QUPv3 SE12
++ * (i2c@a90000, wrapper 1 SE4), ATTN gpio125 (TLMM NORTH), reset gpio99
++ * (NORTH), 1.8 V switch gpio88 (TLMM SOUTH), VDD on PM8998 ldoa28.
++ * Select with boot-arg sweetts=1; sweettouch=1 still enables the driver.
++ */
++#define FJ_GCC_PA        0x00100000u
++#define FJ_GCC_VOTE      0x5200cu
++#define FJ_GCC_CBCR      0x184d4u       /* WRAP1_S4 CBCR: bit31 = CLK_OFF */
++#define FJ_GCC_RCG       0x184d8u
++#define FJ_TLMM_NORTH    0x03900000u
++#define FJ_TLMM_SOUTH    0x03d00000u
++#define FJ_SE_PA         0x0a90000u
++#define FJ_TS_ADDR       0x20u
++#define FJ_GPIO_ATTN     125u
++#define FJ_GPIO_RESET    99u
++#define FJ_GPIO_VIO      88u
++#define FJ_VOTE_MASK     ((1u << 20) | (1u << 21) | (1u << 26))
+ #define TOUCH_MAX        10u
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
+@@ -72,7 +91,7 @@
+ #define SE_PACK1        0x000ffefeu
+ 
+ static struct {
+-	vm_offset_t se, gcc, gpio;
++	vm_offset_t se, gcc, gpio, gpio_s;     /* gpio_s: TLMM SOUTH (fajita) */
+ 	bool started, dead, probing;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+@@ -119,18 +138,25 @@
+ }
+ 
+ static void
+-touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++touch_gpio_at(vm_offset_t base, unsigned pin, unsigned mux, unsigned pull,
++    unsigned drive, bool out, bool high)
+ {
+ 	uint32_t off = TOUCH_GPIO_CFG(pin);
+-	uint32_t cfg = touch_rd(st.gpio, off);
++	uint32_t cfg = touch_rd(base, off);
+ 	if (out) {
+ 		/* Set the desired latch before enabling output (reset is active low). */
+-		touch_wr(st.gpio, TOUCH_GPIO_IO(pin),
+-		    (touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
++		touch_wr(base, TOUCH_GPIO_IO(pin),
++		    (touch_rd(base, TOUCH_GPIO_IO(pin)) & ~2u) | (high ? 2u : 0u));
+ 	}
+ 	cfg &= ~0x3ffu;
+ 	cfg |= (mux << 2) | pull | (drive << 6) | (out ? 0x200u : 0u);
+-	touch_wr(st.gpio, off, cfg);
++	touch_wr(base, off, cfg);
++}
++
++static void
++touch_gpio(unsigned pin, unsigned mux, unsigned pull, unsigned drive, bool out, bool high)
++{
++	touch_gpio_at(st.gpio, pin, mux, pull, drive, out, high);
+ }
+ 
+ static bool
+@@ -545,6 +571,259 @@
+ 	return true;
+ }
+ 
++/* ------------------------------------------------------------------ fajita */
++
++static uint8_t f01_query, f01_cmd, f01_ctrl, f01_data;
++static uint8_t f12_query, f12_ctrl, f12_data;
++static char ts_product[12];
++static int ts_xraw = 1080, ts_yraw = 2340, ts_max_x, ts_max_y;
++
++/* RMI4 page 0 over the 1-byte addressing this panel uses: register, repeated
++ * start, data. touch_msg() already knows how to hold the bus for the read. */
++static int
++rmi_read(uint8_t reg, uint8_t *buf, unsigned len)
++{
++	return touch_msg(FJ_TS_ADDR, &reg, 1, buf, len, true);
++}
++
++static int
++rmi_write(uint8_t reg, uint8_t val)
++{
++	uint8_t tx[2] = { reg, val };
++	return touch_msg(FJ_TS_ADDR, tx, 2, NULL, 0, false);
++}
++
++static bool
++fajita_clocks(void)
++{
++	touch_wr(st.gcc, FJ_GCC_VOTE, touch_rd(st.gcc, FJ_GCC_VOTE) | FJ_VOTE_MASK);
++	uint32_t cfg = touch_rd(st.gcc, FJ_GCC_RCG + 4u);
++	cfg = (cfg & ~(0x371fu | (1u << 20))) | 1u;   /* XO parent, divide by 1 */
++	touch_wr(st.gcc, FJ_GCC_RCG + 4u, cfg);
++	touch_wr(st.gcc, FJ_GCC_RCG, touch_rd(st.gcc, FJ_GCC_RCG) | 0x3u);
++	if (!touch_wait_clear(st.gcc, FJ_GCC_RCG, 1u)) {
++		printf("SWEET TS: RCG update timeout (rcg=%#x)\n", touch_rd(st.gcc, FJ_GCC_RCG));
++		return false;
++	}
++	for (unsigned i = 0; i < 200; ++i) {
++		if (!(touch_rd(st.gcc, FJ_GCC_CBCR) & (1u << 31))) {
++			printf("SWEET TS: gcc vote=%#x cbcr=%#x\n",
++			    touch_rd(st.gcc, FJ_GCC_VOTE), touch_rd(st.gcc, FJ_GCC_CBCR));
++			return true;
++		}
++		touch_wait(1);
++	}
++	printf("SWEET TS: SE clock still halted (cbcr=%#x)\n", touch_rd(st.gcc, FJ_GCC_CBCR));
++	return false;
++}
++
++/* The PDT is a chain of 6-byte entries descending from 0xE9; the function
++ * number is the last byte and 0 ends the list. This panel answers with
++ * F34 (0xE9), F01 (0xE3), F12 (0xDD). */
++static bool
++rmi_pdt(void)
++{
++	uint8_t buf[6];
++
++	f01_query = f01_cmd = f01_ctrl = f01_data = 0;
++	f12_query = f12_ctrl = f12_data = 0;
++	for (int a = 0x00e9; a > 6; a -= 6) {
++		if (rmi_read((uint8_t)a, buf, sizeof(buf)) != 0) {
++			printf("SWEET TS: PDT read %#x failed (irq=%#x)\n", a, st.irq_status);
++			return false;
++		}
++		printf("SWEET TS: PDT %#x fn=%#x q=%#x c=%#x ct=%#x d=%#x irq=%#x\n",
++		    a, buf[5], buf[0], buf[1], buf[2], buf[3], buf[4]);
++		if (buf[5] == 0x00) {
++			break;
++		}
++		if (buf[5] == 0x01) {
++			f01_query = buf[0];
++			f01_cmd = buf[1];
++			f01_ctrl = buf[2];
++			f01_data = buf[3];
++		} else if (buf[5] == 0x12) {
++			f12_query = buf[0];
++			f12_ctrl = buf[2];
++			f12_data = buf[3];
++		}
++	}
++	if (f01_data == 0 || f12_data == 0) {
++		printf("SWEET TS: no F01/F12 in the PDT (f01=%#x f12=%#x)\n", f01_data, f12_data);
++		return false;
++	}
++	return true;
++}
++
++static bool
++rmi_f01_init(void)
++{
++	uint8_t id[11] = {0};
++
++	if (rmi_write(f01_cmd, 0x01) == 0) {          /* reset */
++		touch_wait(100);
++	}
++	if (rmi_read((uint8_t)(f01_query + 0x10u), id, 10) == 0) {
++		for (unsigned k = 0; k < 10; ++k) {
++			ts_product[k] = (char)id[k];
++		}
++		ts_product[10] = 0;
++		for (int i = 9; i >= 0 && ts_product[i] == ' '; --i) {
++			ts_product[i] = 0;
++		}
++		printf("SWEET TS: product id \"%s\"\n", ts_product);
++	} else {
++		printf("SWEET TS: product id read failed\n");
++	}
++	if (rmi_write(f01_ctrl, 0x84) != 0 || rmi_write((uint8_t)(f01_ctrl + 1u), 0x7f) != 0) {
++		printf("SWEET TS: F01 control write failed\n");
++		return false;
++	}
++	uint8_t status[2] = {0};
++	if (rmi_read(f01_data, status, sizeof(status)) == 0) {
++		printf("SWEET TS: F01 status=%#x irq=%#x\n", status[0], status[1]);
++	}
++	return true;
++}
++
++/* One F12 2D report: 10 objects of 8 bytes, object +0 is the finger status
++ * (0 = no finger), +1/+2 and +3/+4 are 12-bit x/y, +5 is pressure. */
++static bool
++rmi_frame(void)
++{
++	uint8_t d[88];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++
++	if (rmi_read(f12_data, d, sizeof(d)) != 0) {
++		return false;
++	}
++	for (unsigned i = 0; i < TOUCH_MAX; ++i) {
++		const uint8_t *o = d + i * 8u;
++		if (o[0] == 0) {
++			continue;
++		}
++		int rx = o[1] | ((o[2] & 0x0fu) << 8);
++		int ry = o[3] | ((o[4] & 0x0fu) << 8);
++		int px = (int)((int64_t)rx * 1080 / ts_xraw);
++		int py = (int)((int64_t)ry * 2340 / ts_yraw);
++		if (px < 0) {
++			px = 0;
++		}
++		if (px > 1079) {
++			px = 1079;
++		}
++		if (py < 0) {
++			py = 0;
++		}
++		if (py > 2339) {
++			py = 2339;
++		}
++		x[i] = px;
++		y[i] = py;
++		mask |= 1u << i;
++		if (rx > ts_max_x) {
++			ts_max_x = rx;
++		}
++		if (ry > ts_max_y) {
++			ts_max_y = ry;
++		}
++	}
++	touch_report(mask, x, y);
++	return true;
++}
++
++static void
++touch_fajita_thread(__unused void *arg, __unused wait_result_t result)
++{
++	unsigned delay_s = 20;
++
++	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
++	(void)PE_parse_boot_argn("sweetts_xraw", &ts_xraw, sizeof(ts_xraw));
++	(void)PE_parse_boot_argn("sweetts_yraw", &ts_yraw, sizeof(ts_yraw));
++	if (ts_xraw <= 0 || ts_yraw <= 0) {
++		ts_xraw = 1080;
++		ts_yraw = 2340;
++	}
++	printf("SWEET TS: fajita RMI4, starting in %u s (raw %dx%d)\n", delay_s, ts_xraw, ts_yraw);
++	touch_wait(delay_s * 1000u);
++
++	st.gcc = ml_io_map(FJ_GCC_PA, 0x60000);
++	st.gpio = ml_io_map(FJ_TLMM_NORTH, 0x5b000);
++	st.gpio_s = ml_io_map(FJ_TLMM_SOUTH, 0x5b000);
++	st.se = ml_io_map(FJ_SE_PA, 0x4000);
++	if (!st.gcc || !st.gpio || !st.gpio_s || !st.se) {
++		printf("SWEET TS: MMIO mapping failed\n");
++		goto out;
++	}
++	/* VDD on PM8998 ldoa28 (3.008 V), VIO 1.8 V through the gpio88 switch. */
++	int perr = sweet_rpmh_vreg_enable("ldoa28", 3008);
++	printf("SWEET TS: ldoa28 vote -> %d\n", perr);
++	touch_gpio_at(st.gpio_s, FJ_GPIO_VIO, 0, 0, 1, true, true);
++	touch_wait(10);
++	touch_gpio_at(st.gpio, FJ_GPIO_ATTN, 0, 3, 3, false, false);   /* input, pull-up */
++	touch_gpio_at(st.gpio, FJ_GPIO_RESET, 0, 3, 2, true, true);
++	touch_wait(10);
++	touch_gpio_at(st.gpio, FJ_GPIO_RESET, 0, 3, 2, true, false);   /* reset low */
++	touch_wait(10);
++	touch_gpio_at(st.gpio, FJ_GPIO_RESET, 0, 3, 2, true, true);
++	touch_wait(200);
++	if (!fajita_clocks()) {
++		goto out;
++	}
++	if (!touch_se_init()) {
++		goto out;
++	}
++	st.probing = true;
++	bool ok = rmi_pdt() && rmi_f01_init();
++	st.probing = false;
++	if (!ok) {
++		goto out;
++	}
++	printf("SWEET TS: F01 q=%#x d=%#x | F12 q=%#x c=%#x d=%#x\n",
++	    f01_query, f01_data, f12_query, f12_ctrl, f12_data);
++	uint8_t q[32] = {0};
++	if (rmi_read(f12_query, q, sizeof(q)) == 0) {
++		printf("SWEET TS: F12 query %02x %02x %02x %02x %02x %02x %02x %02x\n",
++		    q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
++	}
++	unsigned errors = 0, ticks = 0;
++	while (!st.dead) {
++		uint8_t status[2] = {0};
++		if (rmi_read(f01_data, status, sizeof(status)) != 0) {
++			if (++errors == 20) {
++				printf("SWEET TS: F01 read keeps failing (irq=%#x)\n", st.irq_status);
++			}
++			if (errors > 200) {
++				printf("SWEET TS: giving up on the controller\n");
++				break;
++			}
++			touch_wait(10);
++			continue;
++		}
++		errors = 0;
++		if (status[0] & 0x80) {
++			printf("SWEET TS: controller unconfigured, re-initialising\n");
++			(void)rmi_f01_init();
++		}
++		if (status[1] & 0x04) {
++			if (!rmi_frame()) {
++				printf("SWEET TS: F12 report read failed\n");
++			}
++		} else if (status[1] & 0x01) {
++			touch_report(0, st.x, st.y);
++		}
++		if ((++ticks % 300u) == 0) {
++			printf("SWEET TS: raw max x=%d y=%d irq=%#x\n", ts_max_x, ts_max_y, status[1]);
++		}
++		touch_wait(10);
++	}
++	touch_report(0, st.x, st.y);
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ touch_thread(void *arg, wait_result_t result)
+ {
+@@ -650,7 +929,13 @@
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+ 	}
+-	kern_return_t kr = kernel_thread_start(touch_thread, NULL, &thread);
++	int fajita = 0;
++	(void)PE_parse_boot_argn("sweetts", &fajita, sizeof(fajita));
++	if (fajita) {
++		printf("SWEET TS: fajita RMI4 selected (sweetts=1)\n");
++	}
++	kern_return_t kr = kernel_thread_start(fajita ? touch_fajita_thread : touch_thread,
++	    NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
