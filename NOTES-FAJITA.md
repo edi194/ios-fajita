@@ -534,6 +534,56 @@ Observations, all from the live unit (serial intentionally not recorded here):
   1080×2340 layer tree on the CPU (4×A55), while `present()` memcpys a whole
   10 MB frame at `sweetfb_hz` (30 Hz ≈ 300 MB/s) with no vsync and with UFS
   polled I/O competing — 10 Hz is the sensible bring-up rate.
+- **Console log over adb WORKS (2026-10-22) — no more filming.** Patch 0047
+  writes the whole console stream into the last 4100 KiB of `userdata`;
+  `tools/sweet-log-pull.sh` (+ `tools/sweet-log.py`) read those 1025 blocks from
+  a recovery with adb and decode the `SWEETLOG` header/ring. Working recipe:
+  `fastboot boot <orange-fox-r12-fajita.img>`
+  (OrangeFox R12.0 unofficial V7 for fajita, 50,008,064 B, SHA256
+  `61eb9f7a…3d34`; TWRP 3.7.0 for fajita did **not** boot) → `adb
+  wait-for-device` → pull → `adb reboot bootloader`. First pull: 489,641 bytes
+  / 6977 lines. The recovery image is kept outside git.
+- **What the first full log says (console12)**: `backboardd` opens AppleCLCD,
+  gets `display on`, creates two 1125×2436 BGRA surfaces
+  (`SWEET SURF: backboardd create id 2/3 … size 11239424 keys 11`) and swaps
+  them (`SWEET FB: swap 2/3 …`), so presenting works and `IOAcceleratorES`
+  (0087) is found. The blocker is userland: SpringBoard aborts in
+  `-[_UIScreenComplexBoundingPathUtilities _loadBitmapForScreen:type:]`
+  (`_UIScreenComplexBoundingPathUtilities.m:326`) with
+  `NSInternalInconsistencyException: Failed to load bounding path bitmap data
+  from the asset manager for asset name:
+  BoundingPathBitmap-1125x2436-375x812-3.00x`, then relaunches forever
+  (pids 235, 239, 242, 245 …). `PosterBoard` then SIGTRAPs too.
+- **The asset is present**: `UIKitCore.framework/BoundingPathData.bundle/`
+  `Assets.car` is 101,768 B, starts with `BOMStore` (uncompressed) and contains
+  exactly that rendition name (checked on the mounted image). So this is not a
+  missing file — the *selection* fails.
+- **No `/product` node**: the log shows `IOKIT SpringBoard: path
+  IODeviceTree:/product -> none`; `research/ipsw-x/d22ap.adt` is not in this
+  tree, so mkadt emitted no `/product` at all. CoreUI/CoreThemeDefinition pick
+  compiled artwork from a catalog by exactly those properties. `tools/mkadt.py`
+  now falls back to the full 61-property **D22 identity** published by the
+  HackiOS release (`xnuloader/identity.h`, generated from the real
+  `DeviceTree.d22ap.im4p`): `graphics-featureset-class APPLE4`,
+  `graphics-featureset-fallbacks APPLE3:APPLE3v1:APPLE2:APPLE1:GLES2,0`,
+  `artwork-device-idiom phone`, `artwork-scale-factor 3`,
+  `artwork-display-gamut P3`, `artwork-device-subtype 0x984`,
+  `oled-display`, `thin-bezel`, `ui-background-quality 100`, `product-name
+  "iPhone X"`. `ADT_GAMUT=P3|sRGB` selects the gamut (the real phone says P3;
+  our framebuffer is sRGB 8-bit, so sRGB is the fallback).
+- **Reference repos (hackios-xnu-kernel / -userland, snapshot 2026-10-22)**:
+  POCO X5 Pro (`redwood`, SM7325) + QEMU, XNU `xnu-8796.121.2` built on Linux
+  with clang+theos, iOS 16.5 (20F66) iPhone X userland, same D22 identity
+  (`xnuloader/mkidentity.py`). They never hit the bounding-path abort, but two
+  of our suspects are exonerated by their code: their Sandbox stand-in has **no
+  vnode/file hooks at all** (nothing can block a framework reading another
+  bundle) and their SpringBoard reaches lock screen and home screen with the
+  Metal device array deliberately emptied in backboardd. Their general lesson
+  matches our case: Apple's code aborts when a file it expects is absent, and
+  CoreUI selects artwork by device capability, not just by size.
+- **SMP raised to all eight cores**: `cpus=8 sweetsmp=1` (A55 MPIDR
+  0x000–0x300 + A75 0x400–0x700); `console14.img` (SHA256 `ad9efb57…369c`) and
+  the sRGB twin `console15-srgb.img` (`d08a5c87…4973`) are built.
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
