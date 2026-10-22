@@ -1,0 +1,113 @@
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -112,7 +112,13 @@
+ void
+ sweet_early_panic(const char *fmt, va_list *args)
+ {
+-	if (early_disabled || early_panicking) {
++	/*
++	 * A panic always reaches the panel. The early console is switched off when
++	 * serial_init() reports a UART, and with sweetecon=1 the normal console
++	 * path is routed away from the panel, so without this a panic drew nothing.
++	 */
++	early_disabled = 0;
++	if (early_panicking) {
+ 		return;
+ 	}
+ 	early_panicking = 1;
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -683,6 +683,7 @@
+ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
++static bool sweet_log_started;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
+ 
+ /* Called for all console output, any context: never blocks. */
+@@ -786,6 +787,57 @@
+ 	}
+ }
+ 
++/*
++ * Panic-time flush: write the ring one last time so the panic text survives the
++ * reset. ufs_cmd() spins (delay) instead of sleeping whenever interrupts are
++ * off, so this cannot block on a scheduler that has stopped, and the lock is
++ * only tried because the log thread may be the thread that panicked.
++ * seq 0xffffffff in the header marks such a flush.
++ */
++void
++sweet_log_panic_flush(void)
++{
++	uint64_t base, total, pos;
++	void *bounce;
++	int error = 0;
++
++	if (!sweet_log_started || !su.ready || !su.writable ||
++	    su.nblocks < 2 * SWEET_LOG_BLOCKS) {
++		return;
++	}
++	if (!lck_mtx_try_lock(&sweet_ufs_lock)) {
++		return;
++	}
++	base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	total = os_atomic_load(&sweet_log_total, relaxed);
++	pos = total > SWEET_LOG_SIZE ? total - SWEET_LOG_SIZE : 0;
++	bounce = (void *)(su.dma + DMA_BOUNCE);
++	while (pos < total && !error) {
++		uint32_t off = (uint32_t)(pos % SWEET_LOG_SIZE);
++		uint32_t blk = off / UFS_BLOCK;
++		uint64_t need = ((uint64_t)off % UFS_BLOCK + (total - pos) + UFS_BLOCK - 1) / UFS_BLOCK;
++		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
++		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
++		memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
++		error = ufs_write_blocks(base + 1 + blk, n);
++		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
++	}
++	if (!error) {
++		struct sweet_log_header h = {
++			.magic = { 'S', 'W', 'E', 'E', 'T', 'L', 'O', 'G' },
++			.version = 1, .size = SWEET_LOG_SIZE, .total = total, .seq = 0xffffffffu,
++		};
++		bzero(bounce, UFS_BLOCK);
++		memcpy(bounce, &h, sizeof(h));
++		error = ufs_write_blocks(base, 1);
++		if (!error) {
++			(void)ufs_sync_cache();
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	printf("SWEET LOG: panic flush %llu bytes -> %d\n", total, error);
++}
++
+ static void
+ sweet_log_start(void)
+ {
+@@ -802,6 +854,7 @@
+ 	}
+ 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
++		sweet_log_started = true;
+ 	}
+ }
+ 
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1087,6 +1087,17 @@
+ 	/* call machine-layer panic handler */
+ 	ml_panic_trap_to_debugger(panic_format_str, panic_args, reason, ctx, panic_options_mask, panic_caller);
+ 
++#if defined(SWEET)
++	/*
++	 * The panic text is in the console ring now; write the ring to disk before
++	 * the reset so the next recovery can read why this boot died.
++	 */
++	{
++		extern void sweet_log_panic_flush(void);
++		sweet_log_panic_flush();
++	}
++#endif
++
+ 	/* track depth of debugger/panic entry */
+ 	CPUDEBUGGERCOUNT++;
+ 
