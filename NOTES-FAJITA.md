@@ -620,6 +620,22 @@ Observations, all from the live unit (serial intentionally not recorded here):
   to 1080×2340 with `sweetts_xraw`/`sweetts_yraw` overrides and raw maxima in
   the log. The research behind the numbers is in
   `docs/fajita-touch-rmi4-spec.md`.
+- **First touch boot froze the SoC (console20-input, 2026-10-22)**: the phone
+  went to a crashdump 25 s in, exactly when the touch thread woke
+  (`SWEET TS: fajita RMI4, starting in 25 s` is the last touch line, the ring
+  ends on a key event and holds a single flush, so the freeze was hard). Two
+  real bugs, both fixed by **patch 0093**:
+  * the RPMh helper hard-codes sweet's apps RSC `0x18220000` / TCS `0x18220d00`;
+    SDM845 has `0x179e0000` / `0x179e0d00` (vendor dts `mailbox@179e0000`), so
+    the rail vote addressed a wrong TCS. Now boot args `rpmhrsc=`/`rpmhtcs=`;
+  * sweet maps `0x5b000` of TLMM (pins up to 90), but fajita's reset is gpio99
+    (offset `0x63000`) and ATTN gpio125 (`0x7d000`) — outside that mapping.
+    The fajita path now maps `0x80000` of TLMM NORTH and SOUTH.
+  `sweetts_norail=1` skips the rail vote, used for the first isolated test.
+- **Keys confirmed on hardware**: `SWEET KEYS: fajita layout, vol-up apid=190
+  vol-down apid=189`, `fajita keys ready`, and a volume-down press produced
+  `SWEET HID: key 0xea down/up` (the HID service had no client yet that early,
+  which is expected).
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
