@@ -1,0 +1,116 @@
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -26,6 +26,8 @@
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
++static uint16_t keys_gpio2_apid = KEYS_NO_APID;   /* fajita: second volume key */
++static bool keys_fajita;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+@@ -98,23 +100,44 @@
+ 	(void)arg;
+ 	(void)result;
+ 	for (;;) {
+-		uint8_t pon = 0, gpio = 0;
++		uint8_t pon = 0, gpio = 0, gpio2 = 0;
+ 		bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 		bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-		int now[3] = {!!(pon & 1u), !(gpio & 1u), !!(pon & 2u)};
+-		if (!pok || !gok) {
++		bool g2ok = true;
++		int now[3];
++		/*
++		 * fajita: PM8998 GPIO5 = volume down (PPID 0x00c4) and GPIO6 =
++		 * volume up (0x00c5), both active low and enabled as inputs by the
++		 * bootloader. sweet instead reads one PM6150L GPIO block and takes
++		 * the second key from PON RESIN.
++		 */
++		if (keys_fajita) {
++			g2ok = keys_read(keys_gpio2_apid, KEYS_GPIO_RT, &gpio2);
++			now[0] = !!(pon & 1u);
++			now[1] = !(gpio2 & 1u);
++			now[2] = !(gpio & 1u);
++		} else {
++			now[0] = !!(pon & 1u);
++			now[1] = !(gpio & 1u);
++			now[2] = !!(pon & 2u);
++		}
++		if (!pok || !gok || !g2ok) {
+ 			if ((errors++ % 250u) == 0) {
+-				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d arb-status=%#x\n",
+-				    pok, gok, keys_last_status);
++				printf("SWEET KEYS: read error pon-ok=%d gpio-ok=%d gpio2-ok=%d arb-status=%#x\n",
++				    pok, gok, g2ok, keys_last_status);
+ 			}
+ 		} else {
+ 			errors = 0;
+ 		}
+ 		for (int k = 0; k < 3; ++k) {
+-			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
++			bool valid = (k == 0) ? pok : (k == 1 ? g2ok : gok);
++			if (!keys_fajita && k == 2) {
++				valid = pok;
++			}
++			if (valid && now[k] != state[k]) {
+ 				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
+-				    k, state[k], pon, gpio);
++				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio=%#x gpio2=%#x\n",
++				    k, state[k], pon, gpio, gpio2);
+ 				sweet_hid_key(k, state[k]);
+ 			}
+ 		}
+@@ -152,7 +175,18 @@
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	uint16_t vol_up = keys_find_apid(0x0c5, count);
++	uint16_t vol_down = keys_find_apid(0x0c4, count);
++	if (vol_up != KEYS_NO_APID && vol_down != KEYS_NO_APID) {
++		/* fajita (PM8998): volume up = GPIO6, volume down = GPIO5. */
++		keys_gpio2_apid = vol_up;
++		keys_gpio_apid = vol_down;
++		keys_fajita = true;
++		printf("SWEET KEYS: fajita layout, vol-up apid=%u vol-down apid=%u\n",
++		    vol_up, vol_down);
++	} else {
++		keys_gpio_apid = keys_find_apid(0x4c1, count);
++	}
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+@@ -166,12 +200,30 @@
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+ 	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
++		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume keys withheld, PMIC unchanged\n");
+ 		keys_gpio_apid = KEYS_NO_APID;
++		keys_gpio2_apid = KEYS_NO_APID;
++	} else if (keys_fajita) {
++		/* Confirm the second volume GPIO the same way. */
++		uint8_t mode2 = 0, en2 = 0, subtype2 = 0;
++		bool m2 = keys_read(keys_gpio2_apid, 0xc140, &mode2);
++		bool e2 = keys_read(keys_gpio2_apid, 0xc146, &en2);
++		bool s2 = keys_read(keys_gpio2_apid, 0xc105, &subtype2);
++		unsigned dir2 = subtype2 >= 0x10u && subtype2 <= 0x13u ?
++		    mode2 & 3u : (mode2 >> 4) & 7u;
++		printf("SWEET KEYS: second gpio subtype=%#x/%d en=%#x/%d mode=%#x/%d\n",
++		    subtype2, s2, en2, e2, mode2, m2);
++		if (!e2 || !m2 || !s2 || !(en2 & 0x80u) || (dir2 != 0 && dir2 != 2)) {
++			printf("SWEET KEYS: volume-up GPIO not confirmed; withholding it\n");
++			keys_gpio2_apid = KEYS_NO_APID;
++		}
+ 	}
+ 	if (!pok && !gok) {
+ 		printf("SWEET KEYS: no readable keys; polling retained for recovery\n");
+ 	}
++	if (keys_fajita) {
++		printf("SWEET KEYS: fajita keys ready (power, vol-up, vol-down)\n");
++	}
+ 	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
+ 	if (kr == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
