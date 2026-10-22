@@ -601,18 +601,25 @@ Observations, all from the live unit (serial intentionally not recorded here):
   scans slave 0–4 × GPIO peripherals 0xc0–0xd6 read-only, prints every
   candidate that answers (status/subtype/enable/mode) and then logs status
   changes, so one boot with the volume keys pressed names the register.
-- **Touch: not ported yet.** `bsd/dev/sweet_touch.c` is a sweet-specific
-  SE7 FIFO I2C driver for Goodix GT9896 / FocalTech 54:52
-  (`TOUCH_SE_PA 0xa84000`, TLMM at `0x3900000`, `ldoc11` rail). Fajita has a
-  **Synaptics RMI4** controller at I2C 0x20 on the GENI/QUPv3 SE at
-  `0xa90000` (vendor dts `i2c@a90000`, interrupt 0x165), with IRQ GPIO 125,
-  reset GPIO 99, VIO GPIO 88 and VDD on LDO28 (per `tools/fajita.env`), so a
-  fajita branch needs: the right SE/wrapper clock registers for that SE,
-  SDM845 TLMM (0x03400000), the LDO vote, and RMI4 (16-bit register
-  addressing, F01/F12 query+data bases, report parsing). No interrupts in the
-  first version — poll the IRQ/status register.
-  `sweettouch=0 sweetkeys=0` must stay out of the default cmdline until each
-  is proven.
+- **Volume keys resolved (probe boot, 2026-10-22)**: `sweetkeysprobe=1` answered
+  `ppid=0x0c4` and `ppid=0x0c5` (slave 0, peripherals 0xc4/0xc5 = PM8998
+  GPIO5/GPIO6), both `subtype=0x10 en=0x80 mode=0` (input, enabled) and
+  `status=0x1` released / `0` pressed. So **GPIO5 = volume down, GPIO6 =
+  volume up**. **Patch 0091** detects that pair and uses the fajita layout
+  (power = PON bit0, volume up = 0x00c5 bit0, volume down = 0x00c4 bit0) while
+  leaving the sweet path alone; HID usages 0/1/2 already existed.
+- **Touch port written (patch 0090)**: a fajita branch in `sweet_touch.c`
+  (`sweetts=1`, still gated by `sweettouch=1`): GCC vote `0x5200c`
+  bits 20/21/26, RCG `0x184d8` (XO/1), CBCR `0x184d4` poll, a gpio helper with
+  an explicit TLMM block (NORTH `0x03900000` for ATTN 125 / reset 99, SOUTH
+  `0x03d00000` for the gpio88 1.8 V switch — sweet only knew NORTH), RPMh
+  `ldoa28` at 3.008 V, reset pulse + 200 ms settle, then RMI4 over the existing
+  GENI transport: 1-byte page-0 addressing with a repeated start, PDT scan down
+  from `0xE9` (F34/F01/F12), F01 reset + `0x84` + product id, a 10 ms poll of
+  the F01 IRQ byte and an 88-byte F12 2D report (10 objects × 8 bytes) mapped
+  to 1080×2340 with `sweetts_xraw`/`sweetts_yraw` overrides and raw maxima in
+  the log. The research behind the numbers is in
+  `docs/fajita-touch-rmi4-spec.md`.
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
