@@ -636,6 +636,16 @@ Observations, all from the live unit (serial intentionally not recorded here):
   vol-down apid=189`, `fajita keys ready`, and a volume-down press produced
   `SWEET HID: key 0xea down/up` (the HID service had no client yet that early,
   which is expected).
+- **Touch hang bisected (2026-10-22)**: with `sweettouch=1` the SoC froze at
+  37–49 s with `flush #1` and no panic — a hard hang, not a panic. Isolating
+  the keys (`sweetkeys=0`, touch only) still hung, and **with
+  `sweettouchdelay=300` the same kernel survived** (2847 log lines, reached the
+  daemon loop). So the delay works and the hang is inside the touch hardware
+  bring-up, before its first post-delay printf (the MMIO mapping or the three
+  GPIO writes). Patch **0095** prints before/after every step and adds
+  `sweetts_nogpio=1`, `sweetts_noclk=1`, `sweetts_nose=1` so one kernel can
+  bisect with boot args. Patch **0094** (panic-visible + panic-time ring flush,
+  header seq `0xffffffff`) is in the same build for the next real panic.
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
