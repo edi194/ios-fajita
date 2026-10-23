@@ -1,0 +1,56 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -88,15 +88,11 @@
+ 	}
+ 	printf("SWEET GPU: read %s +%#x\n", what, off);
+ 	/*
+-	 * Persist the line before touching the register: a read of a block whose
+-	 * clock is off hangs the bus, and the log thread only flushes every
+-	 * ufslogsecs seconds (10 by default), which is longer than the time between
+-	 * this print and the reset.
++	 * No flush here: it is a polled UFS write and this runs before the UFS
++	 * driver exists. console47 panicked inside one of them, and the panic flush
++	 * then waited for the same lock, so the disk kept an older ring. The probe
++	 * flushes twice instead, around the reset.
+ 	 */
+-	{
+-		extern void sweet_log_panic_flush(void);
+-		sweet_log_panic_flush();
+-	}
+ 	v = *(volatile uint32_t *)(base + off);
+ 	__asm__ volatile("dmb oshld" ::: "memory");
+ 	printf("SWEET GPU: %s +%#x = %#x\n", what, off, v);
+@@ -181,10 +177,6 @@
+ gpu_probe_wr(const char *what, vm_offset_t base, uint32_t off, uint32_t val)
+ {
+ 	printf("SWEET GPU: write %s +%#x = %#x\n", what, off, val);
+-	{
+-		extern void sweet_log_panic_flush(void);
+-		sweet_log_panic_flush();
+-	}
+ 	*(volatile uint32_t *)(base + off) = val;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+@@ -502,7 +494,11 @@
+ 	gpu_probe_wr("gmu fence range", gmu, GPU_GMU_AHB_FENCE_RANGE, 0x80000000u | (0xau << 18) | 0xa0u);
+ 	gpu_probe_wr("gmu cm3 cfg", gmu, GPU_GMU_CM3_CFG, 0x4052);
+ 
+-	/* out of reset */
++	/* out of reset: the one place a flush is worth its risk */
++	{
++		extern void sweet_log_panic_flush(void);
++		sweet_log_panic_flush();
++	}
+ 	gpu_probe_wr("gmu fw_init", gmu, GPU_GMU_FW_INIT, 0);
+ 	gpu_probe_wr("gmu sysreset", gmu, GPU_GMU_SYSRESET, 1);
+ 	gpu_probe_wr("gmu log write ptr", gmu, GPU_GMU_PWR_COL_CP_RESP, 0);
+@@ -522,5 +518,9 @@
+ 	    *(volatile uint32_t *)(log + 0), *(volatile uint32_t *)(log + 4),
+ 	    *(volatile uint32_t *)(log + 8), *(volatile uint32_t *)(log + 12));
+ 	printf("SWEET GPU: stage 3d done\n");
++	{
++		extern void sweet_log_panic_flush(void);
++		sweet_log_panic_flush();
++	}
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
