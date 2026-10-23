@@ -1,0 +1,30 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -253,9 +253,26 @@
+ 	}
+ 	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
+ 	touch_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
+-	touch_wr(st.se, nr ? SE_RX_LEN : SE_TX_LEN, nr ? nr : nt);
++	/* Both lengths are programmed for every command (mainline geni_se does the
++	 * same); a write+repeated-start read needs TX_LEN even though it is a read. */
++	touch_wr(st.se, SE_TX_LEN, nt);
++	touch_wr(st.se, SE_RX_LEN, nr);
+ 	touch_wr(st.se, SE_CMD, ((nr ? 2u : 1u) << 27) |
+ 	    ((uint32_t)addr << 9) | (stretch ? 4u : 0u));
++	{
++		static unsigned dbg;
++		if (dbg < 6) {
++			dbg++;
++			printf("SWEET TS: se cmd=%#x addr=%#x txlen=%#x rxlen=%#x status=%#x "
++			    "irq=%#x irqen=%#x out=%#x cgc=%#x dma=%#x
++",
++			    touch_rd(st.se, SE_CMD), addr, touch_rd(st.se, SE_TX_LEN),
++			    touch_rd(st.se, SE_RX_LEN), touch_rd(st.se, SE_STATUS),
++			    touch_rd(st.se, SE_IRQ), touch_rd(st.se, SE_IRQ_EN),
++			    touch_rd(st.se, 0x24), touch_rd(st.se, 0x28),
++			    touch_rd(st.se, SE_DMA));
++		}
++	}
+ 	int err = ETIMEDOUT;
+ 	for (unsigned i = 0; i < 20000; ++i) {
+ 		uint32_t irq = touch_irq();
