@@ -1110,3 +1110,55 @@ AHB fence range `0x80000000|(0xa<<18)|0xa0`, `CM3_CFG 0x4052`), releases the res
 `0xbabeface`. The RPMh interface (`RPMH_CTRL 0xf11`) is left disabled on purpose:
 without the PDC/RSCC handshake first the firmware could wait forever for votes
 nobody answers.
+
+### GPU, 2026-10-23 evening: what is settled and what is not
+
+**Diagnostics that matter**
+
+* The panel console keeps the whole boot's text; the ring in userdata does not.
+  After a crash, photograph the panel: in several boots the ring on disk was
+  older than the panel because the panic happened *during* a ring flush (the
+  panic flush then waits for the same lock). `tools/sweet-log-pull.sh` is still
+  the way to get the ring, but the photo is authoritative.
+* OrangeFox is also a Linux with the real memory map: `cat /proc/iomem` there
+  says System RAM is `80000000-856fffff`, `85d00000-85dfffff`,
+  `85f00000-85fbffff`, `8c417000-8c4fffff` and **`97d00000-27c89ffff`** - one
+  contiguous range across the 4 GB boundary. Battery and thermal were checked
+  too (100%, 4.38 V, GPU 35 C) and are not the problem.
+
+**Settled**
+
+* Stage 2a (CX GDSC) is required: without it the GMU block reads 0 and hangs
+  (`adreno=8` proved it).
+* The GMU takes the firmware: 32 KB through the ITCM window, read back word for
+  word in console40 and sampled in later boots (`0 of 3 words differ`).
+* The GPU's SMMU is the hypervisor's: `qcom,hyp_secure_alloc`, `sCR0` bit 21,
+  S2CR writes dropped and the fifth access froze the phone. **Never write
+  SMR/S2CR** (0112). Its registers cannot even be read reliably (0113): the
+  device tree marks it `qcom,retention`.
+* SDM845 has no `hub_clk_src`, `cb`, `hub_aon` or `hub_cx_int` (those are a660
+  clocks; HackiOS' driver is for an a660). Writing those gpucc offsets is what
+  0116 stopped.
+* GMU registers are word-indexed from the GMU base: byte offset = 4 x the
+  vendor's number (HackiOS' `GMU_WORD`). The newer Linux xml adds `0x1a800`
+  because it counts from the GPU base.
+* The low bank at `0xb0000000` is readable from XNU (console50) but a read of it
+  *after* the GPU power-on and firmware load froze the boot (console49), so the
+  scratch is prepared first now (0120).
+* Log flushes from the GPU probe are gone (0117): they were polled UFS writes in
+  the first second of boot, and one of them is where console47 died.
+
+**Not settled / next**
+
+* `adreno=7` now: 2a power, 2b/2c clocks (valid ones only), 3a firmware,
+  3d HFI table + reset. The last run died right after the stage 3d banner, which
+  turned out to be the scratch access, not the reset. With 0120 the reset
+  sequence should finally run: `GENERAL_7=1`, HFI SFR/QTBL, log address, caches,
+  boot config, fence range, `CM3_CFG 0x4052`, then `SYSRESET 1`,
+  `PWR_COL_CP_RESP 0`, `SYSRESET 0` and a poll for `FW_INIT_RESULT ==
+  0xbabeface`.
+* If the firmware does not start, the two candidates are the RPMh interface
+  (`RPMH_CTRL 0xf11`, deliberately still off) and the SMMU (the GMU's stream 4
+  has no match and every S2CR is FAULT, so its own memory accesses may be
+  refused). The latter would need the hypervisor's cooperation - the vendor's
+  kgsl goes through SCM - and there is no known call for it here.
