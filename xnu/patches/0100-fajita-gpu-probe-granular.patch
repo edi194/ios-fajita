@@ -1,0 +1,88 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -34,13 +34,18 @@
+ #define GPU_CMD_DB      0x85fe0000u
+ 
+ static uint32_t
+-gpu_rd(vm_offset_t base, uint32_t off)
++gpu_probe_rd(const char *what, vm_offset_t base, uint32_t off)
+ {
++	uint32_t v;
++
+ 	if (base == 0) {
++		printf("SWEET GPU: %s +%#x: no mapping\n", what, off);
+ 		return 0;
+ 	}
+-	uint32_t v = *(volatile uint32_t *)(base + off);
++	printf("SWEET GPU: read %s +%#x\n", what, off);
++	v = *(volatile uint32_t *)(base + off);
+ 	__asm__ volatile("dmb oshld" ::: "memory");
++	printf("SWEET GPU: %s +%#x = %#x\n", what, off, v);
+ 	return v;
+ }
+ 
+@@ -67,41 +72,29 @@
+ 	printf("SWEET GPU: level %d, maps gcc=%p cc=%p dbgc=%p misc=%p gmu=%p smmu=%p gpu=%p qf=%p db=%p\n",
+ 	    level, (void *)gcc, (void *)cc, (void *)dbgc, (void *)misc, (void *)gmu,
+ 	    (void *)smmu, (void *)gpu, (void *)qf, (void *)db);
+-
+-	printf("SWEET GPU: reading gcc\n");
+-	printf("SWEET GPU: gcc pll-vote=%#x\n", gpu_rd(gcc, 0x52000));
+-
+-	printf("SWEET GPU: reading qfprom\n");
+-	printf("SWEET GPU: qfprom 0x1e0=%#x 0x1e4=%#x 0x1e8=%#x 0x1ec=%#x 0x1f0=%#x 0x1f4=%#x 0x1f8=%#x\n",
+-	    gpu_rd(qf, 0x1e0), gpu_rd(qf, 0x1e4), gpu_rd(qf, 0x1e8), gpu_rd(qf, 0x1ec),
+-	    gpu_rd(qf, 0x1f0), gpu_rd(qf, 0x1f4), gpu_rd(qf, 0x1f8));
+-
+-	printf("SWEET GPU: reading cmd-db\n");
+-	printf("SWEET GPU: cmd-db version=%#x magic=%#x\n", gpu_rd(db, 0x00), gpu_rd(db, 0x04));
+-
+-	printf("SWEET GPU: reading gpucc\n");
+-	printf("SWEET GPU: gpucc gx-sw-reset=%#x gx-gdscr=%#x gx-gmu-cbcr=%#x cx-gdscr=%#x ahb=%#x\n",
+-	    gpu_rd(cc, 0x1008), gpu_rd(cc, 0x100c), gpu_rd(cc, 0x1064), gpu_rd(cc, 0x106c),
+-	    gpu_rd(cc, 0x1078));
+-	printf("SWEET GPU: gpucc cx-gmu=%#x cxo=%#x gmu-rcgr=%#x cb=%#x hub=%#x/%#x/%#x cx-hw-ctrl=%#x\n",
+-	    gpu_rd(cc, 0x1098), gpu_rd(cc, 0x109c), gpu_rd(cc, 0x1120), gpu_rd(cc, 0x1170),
+-	    gpu_rd(cc, 0x1178), gpu_rd(cc, 0x117c), gpu_rd(cc, 0x1204), gpu_rd(cc, 0x1540));
+-
+-	printf("SWEET GPU: reading smmu\n");
+-	printf("SWEET GPU: smmu idr0=%#x idr1=%#x idr2=%#x scr0=%#x sacr=%#x\n",
+-	    gpu_rd(smmu, 0x00), gpu_rd(smmu, 0x04), gpu_rd(smmu, 0x08),
+-	    gpu_rd(smmu, 0x30), gpu_rd(smmu, 0x40));
+-
+-	printf("SWEET GPU: reading gmu\n");
+-	printf("SWEET GPU: gmu fw-init=%#x cm3-sysreset=%#x itcm=%#x\n",
+-	    gpu_rd(gmu, 0x501c), gpu_rd(gmu, 0x5000), gpu_rd(gmu, 0x0c00));
+-
+-	printf("SWEET GPU: reading gpu core\n");
+-	printf("SWEET GPU: gpu 0x0000=%#x 0x0004=%#x 0x0010=%#x\n",
+-	    gpu_rd(gpu, 0x0000), gpu_rd(gpu, 0x0004), gpu_rd(gpu, 0x0010));
+-
+-	printf("SWEET GPU: reading cx dbgc/misc\n");
+-	printf("SWEET GPU: dbgc=%#x misc=%#x\n", gpu_rd(dbgc, 0x00), gpu_rd(misc, 0x00));
++	/*
++	 * Order matters: start with registers this port already touches, end with
++	 * the ones that may need a rail/clock voted first. 0x52000 is HackiOS's
++	 * PLL-vote offset on their SoC and hung the bus here - 0x5200c is the
++	 * register the touch driver already uses.
++	 */
++	(void)gpu_probe_rd("gcc", gcc, 0x5200c);
++	(void)gpu_probe_rd("qfprom", qf, 0x1e8);
++	(void)gpu_probe_rd("cmd-db", db, 0x04);
++	(void)gpu_probe_rd("gpucc", cc, 0x100c);        /* GX_GDSCR */
++	(void)gpu_probe_rd("gpucc", cc, 0x106c);        /* CX_GDSCR */
++	(void)gpu_probe_rd("gpucc", cc, 0x1098);        /* CX_GMU_CBCR */
++	(void)gpu_probe_rd("gpucc", cc, 0x1120);        /* GMU_RCGR */
++	(void)gpu_probe_rd("smmu", smmu, 0x00);         /* IDR0 */
++	(void)gpu_probe_rd("smmu", smmu, 0x04);         /* IDR1 */
++	(void)gpu_probe_rd("smmu", smmu, 0x08);         /* IDR2 */
++	(void)gpu_probe_rd("smmu", smmu, 0x30);         /* SCR0 */
++	(void)gpu_probe_rd("gmu", gmu, 0x501c);         /* FW_INIT_RESULT */
++	(void)gpu_probe_rd("gmu", gmu, 0x5000);         /* CM3_SYSRESET */
++	(void)gpu_probe_rd("gpu", gpu, 0x0000);
++	(void)gpu_probe_rd("dbgc", dbgc, 0x00);
++	(void)gpu_probe_rd("misc", misc, 0x00);
+ 	printf("SWEET GPU: probe done (nothing written)\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
++#endif /* ARM64_BOARD_CONFIG_SWEET */
