@@ -40,9 +40,15 @@ PAYLOAD=${PAYLOAD:-shim/out/payload.bin}
 # what makes the panel log survive whatever stalls the normal console path.
 # The persistent log (patch 0047, sweetlog, on by default) keeps the whole
 # console stream in a 4 MiB ring in the last 1025 blocks of userdata; read it
-# without filming: fastboot boot twrp.img -> adb wait-for-device ->
+# without filming: fastboot boot <recovery.img> -> adb wait-for-device ->
 # tools/sweet-log-pull.sh out.txt -> adb reboot bootloader.
-CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=1 sweetsmp=0 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=30 sweetfb_console=1 sweetecon=1 sweettouch=0 sweetkeys=0"}
+#
+# Defaults below are the usable configuration reached on 2026-10-23: eight
+# cores, the D22 identity, GUI on the panel (sweetfb_noconsole mutes the console
+# at the first swap), RMI4 touch and the PM8998 keys. Diagnostic switches for
+# the touch bring-up: sweetfb_console=1 (keep the console on the panel instead
+# of the GUI), sweetts_nogpio/noclk/nose/norail=1, sweettouchdelay=<s>.
+CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=8 sweetsmp=1 keepsyms=1 -noprogress nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1 wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1 sweetfb_hz=10 sweetecon=1 sweetfb_noconsole=1 sweetlog=1 sweettouch=1 sweetts=1 sweettouchdelay=20 sweetkeys=1 rpmhrsc=0x179e0000 rpmhtcs=0x179e0d00"}
 
 [[ -f "$XNU_KERNEL" ]] || { echo "missing XNU kernel: $XNU_KERNEL" >&2; exit 1; }
 [[ -f "$DTB" ]] || { echo "missing stock DTB: $DTB (unpack the OnePlus boot.img first)" >&2; exit 1; }

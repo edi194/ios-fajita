@@ -6,58 +6,59 @@ hardware table and the plan; this file is the short handoff.
 
 ## State
 
-### NEXT SESSION — start here (2026-10-22 night)
+### NEXT SESSION — start here (2026-10-23, after the input milestone)
 
-**iOS 16.7.16 (iPhone X, 20H392) boots to the LOCK SCREEN on the OnePlus 6T.**
-Power and volume keys work. Touch is the last missing input: the driver is
-written but hangs the SoC during its hardware bring-up, and a bisect is one
-boot away from naming the step.
+**iOS 16.7.16 (iPhone X, 20H392) runs on the OnePlus 6T with its GUI, working
+touch and working keys** — lock screen appears and responds, on all eight
+cores. Reached 2026-10-23 ~12:30.
 
-- **Flashed now**: `boot_a` = `console24-nogpio.img`
-  (SHA256 `49e782a0…388f`, kernel `a89d49ce…8fdd`, CI `39854431202`), cmdline
+- **Flashed now**: `boot_a` = `console28-gui.img` (SHA256 `9410d845…400f`),
+  kernel `bb2ee166…084b` (CI `39938029165`, patches 0090–0098), cmdline:
   `debug=0xc serial=3 cpus=8 sweetsmp=1 keepsyms=1 -noprogress
-  nointr_consio=1 rd=ufsroot0 … sweetfb_console=1 sweetecon=1 sweetlog=1
-  sweettouch=1 sweetts=1 sweetts_norail=1 sweetts_nogpio=1
-  sweettouchdelay=20 sweetkeys=0`. `userdata` = the iOS root image from
-  2026-10-20 (unchanged).
-- **First action**: boot it (it is probably already running/hung), let it sit
-  ~2 min, then read the log (recipe below) and look at the last `SWEET TS:`
-  line:
-  * reached `gpio writes skipped` and then `gcc vote=… cbcr=…` / `PDT …` →
-    the GPIO writes were the hang; the TLMM pin addresses are wrong. Verify
-    SDM845 tile bases and the per-pin offset against mainline
-    `pinctrl-sdm845.c` (pin 125 NORTH, pin 99 NORTH, pin 88 SOUTH) before
-    touching the driver again.
-  * hung right after `maps …` with no `gcc vote` → clocks: rebuild with
-    `sweetts_noclk=1` (and `sweetts_nogpio=1`) to confirm, then fix the GCC
-    vote/RCG numbers for wrapper 1 SE4.
-  * reached `PDT read 0xe9 failed` → the controller is unpowered or the SE is
-    not clocked; retry **with** the rail vote and the fajita RPMh bases
-    (`rpmhrsc=0x179e0000 rpmhtcs=0x179e0d00`, drop `sweetts_norail=1`).
-- **Reading the log without filming** (works, used all night): with the phone
-  in fastboot,
-  `fastboot boot <orange-fox-r12-fajita.img>` → `adb wait-for-device` (the
-  state is `recovery`, so plain `wait-for-device` may not fire; poll
-  `adb devices` instead) → `tools/sweet-log-pull.sh out.txt` (reads the last
+  nointr_consio=1 rd=ufsroot0 unentitled_ios_sim_launch=1 ignition_level=1
+  wdt_test=no_user_checkin ufsrw=1 rootrw=1 launchd_unsecure_cache=1 wdt=-1
+  sweetfb_hz=10 sweetecon=1 sweetfb_noconsole=1 sweetlog=1 sweettouch=1
+  sweetts=1 sweettouchdelay=20 sweetkeys=1 rpmhrsc=0x179e0000
+  rpmhtcs=0x179e0d00`. `tools/build-fajita.sh` now defaults to this.
+- **What works**: launchd + the daemon set, backboardd/SpringBoard, lock
+  screen and GUI on the panel (10 Hz), 8 cores via PSCI, RMI4 touch with panel
+  coordinates, PM8998 keys (power `0x30`, VOL+ `0xe9`, VOL− `0xea`), the
+  persistent log and the panic flush.
+- **Next candidates, in a sensible order**:
+  1. Unlock → home screen: swipe up and see whether SpringBoard renders it;
+     PosterBoard has no wallpaper provider on this root (ios-topaz records the
+     same), so expect a black wallpaper.
+  2. RTC/time: everything runs at `1969-12-31`, so any certificate check
+     (TLS, activation) sees an invalid date.
+  3. Wi-Fi: the only big feature the reference port has that we do not. It
+     needs the modem/WLFW work (ios-topaz patches 0113–0130) ported to SDM845.
+  4. GPU: only through HackiOS patches, which are not public yet; until then
+     CoreAnimation stays on the CPU (`sweetfb_hz=10` keeps it usable).
+  5. Polish: `product id ""` from F01 (the read offset is probably wrong),
+     touch edge calibration (raw maxima seen 1063/2326 vs 1080/2340),
+     `sweetfb_hz` tuning, drop the now-unused `sweetts_norail` path.
+- **Reading the log without filming** (used all night): with the phone in
+  fastboot, `fastboot boot <orange-fox-r12-fajita.img>` → poll `adb devices`
+  until the state is `recovery` → `tools/sweet-log-pull.sh out.txt` (the last
   1025 blocks of `userdata` = the 4 MiB ring, patch 0047) →
-  `adb reboot bootloader`. Recovery image (outside git): OrangeFox
-  R12.0 unofficial V7 for fajita, 50,008,064 B, SHA256 `61eb9f7a…3d34`.
+  `adb reboot bootloader`. Recovery image (outside git): OrangeFox R12.0
+  unofficial V7 for fajita, 50,008,064 B, SHA256 `61eb9f7a…3d34`.
   TWRP 3.7.0 for fajita does **not** boot on this unit.
 - **Kernel rebuild loop**: edit `xnu/patches/NNNN-*.patch` (generate them with
   the `mk-patch-00NN.py` helpers kept in the temp dir), `python3
   tools/check-hunk-counts.py`, push, `gh run watch`, then
   `ADT_GAMUT=P3 CMDLINE="…" tools/build-fajita.sh` and flash the image.
-  Cmdline-only changes need no CI.
-- **Patches 0087–0095 (all in this kernel)**: 0087 empty `IOAcceleratorES`;
+  Cmdline-only changes need no CI. GitHub occasionally throttles artifact
+  downloads ("Egress is over the account limit") — retry, or download
+  `xnu-kernel` by hand and unzip it into `xnu/out/`.
+- **Patches 0087–0098 (all in this kernel)**: 0087 empty `IOAcceleratorES`;
   0088 SweetSurface surfaces of client memory; 0089 `sweetkeysprobe`;
   0090 fajita RMI4 touch branch (`sweetts=1`); 0091 fajita key layout;
   0092 RPMh `ldoa28`; 0093 RPMh bases + TLMM map size + `sweetts_norail`;
   0094 panic visible + panic-time ring flush (`seq 0xffffffff`);
-  0095 per-step prints and `sweetts_nogpio/noclk/nose` switches.
-- **Do not lose**: `d22ap` `/product` identity (61 props, P3 gamut) is what
-  fixed SpringBoard's `BoundingPathBitmap` abort and gave the lock screen;
-  eight cores come up through PSCI (`cpus=8 sweetsmp=1`); the volume keys are
-  PM8998 GPIO5 (VOL_DOWN, PPID `0x00c4`) and GPIO6 (VOL_UP, `0x00c5`).
+  0095 per-step prints and `sweetts_nogpio/noclk/nose` switches;
+  0096 TLMM EAST tile for gpio88/125 + I2C pin mux; 0097 both GENI lengths +
+  sequencer dump; 0098 RMI4 reads as two transactions.
 
 - The Windows workspace is now the canonical git repo (local commit `460b7a5`,
   branch `main`, `core.autocrlf=false`). WSL builds it through the symlink
