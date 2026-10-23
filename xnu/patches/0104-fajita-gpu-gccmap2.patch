@@ -1,0 +1,16 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -70,9 +70,10 @@
+ 		printf("SWEET GPU: probe off (adreno=1 enables it)\n");
+ 		return;
+ 	}
+-	/* The PLL vote lives at +0x5200c, so the block needs 0x60000 (the touch
+-	 * driver maps the same range); 0x20000 left the read outside the mapping. */
+-	gcc = ml_io_map(GPU_GCC, 0x60000);
++	/* The PLL vote lives at +0x5200c and the GPU clocks at +0x71004, so the
++	 * block needs 0x80000; smaller maps left the reads outside the mapping and
++	 * froze the bus (0x20000 in 0099, 0x60000 in 0102). */
++	gcc = ml_io_map(GPU_GCC, 0x80000);
+ 	cc = ml_io_map(GPU_CC, 0x9000);
+ 	dbgc = ml_io_map(GPU_CX_DBGC, 0x800);
+ 	misc = ml_io_map(GPU_CX_MISC, 0x1000);
