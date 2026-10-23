@@ -1,0 +1,57 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -42,6 +42,10 @@
+ #define FJ_GCC_RCG       0x184d8u
+ #define FJ_TLMM_NORTH    0x03900000u
+ #define FJ_TLMM_SOUTH    0x03d00000u
++/* mainline pinctrl-sdm845 tiles: EAST 0x00100000, NORTH 0x00500000,
++ * SOUTH 0x00900000, register = tile + 0x1000 * pin. gpio88 (VIO) and gpio125
++ * (ATTN) are EAST; only gpio99 (reset) and the I2C pins 49/50 are NORTH. */
++#define FJ_TLMM_EAST     0x03500000u
+ #define FJ_SE_PA         0x0a90000u
+ #define FJ_TS_ADDR       0x20u
+ #define FJ_GPIO_ATTN     125u
+@@ -91,7 +95,7 @@
+ #define SE_PACK1        0x000ffefeu
+ 
+ static struct {
+-	vm_offset_t se, gcc, gpio, gpio_s;     /* gpio_s: TLMM SOUTH (fajita) */
++	vm_offset_t se, gcc, gpio, gpio_s, gpio_e;   /* north, south, east */
+ 	bool started, dead, probing;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+@@ -765,10 +769,12 @@
+ 	 */
+ 	st.gpio = ml_io_map(FJ_TLMM_NORTH, 0x80000);
+ 	st.gpio_s = ml_io_map(FJ_TLMM_SOUTH, 0x80000);
++	st.gpio_e = ml_io_map(FJ_TLMM_EAST, 0x80000);
+ 	st.se = ml_io_map(FJ_SE_PA, 0x4000);
+-	printf("SWEET TS: maps gcc=%p north=%p south=%p se=%p\n",
+-	    (void *)st.gcc, (void *)st.gpio, (void *)st.gpio_s, (void *)st.se);
+-	if (!st.gcc || !st.gpio || !st.gpio_s || !st.se) {
++	printf("SWEET TS: maps gcc=%p north=%p south=%p east=%p se=%p\n",
++	    (void *)st.gcc, (void *)st.gpio, (void *)st.gpio_s, (void *)st.gpio_e,
++	    (void *)st.se);
++	if (!st.gcc || !st.gpio || !st.gpio_s || !st.gpio_e || !st.se) {
+ 		printf("SWEET TS: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+@@ -779,11 +785,14 @@
+ 	if (nogpio) {
+ 		printf("SWEET TS: gpio writes skipped (sweetts_nogpio=1)\n");
+ 	} else {
+-		printf("SWEET TS: gpio88 high\n");
+-		touch_gpio_at(st.gpio_s, FJ_GPIO_VIO, 0, 0, 1, true, true);
++		printf("SWEET TS: gpio49/50 qup12 mux\n");
++		touch_gpio_at(st.gpio, 49, 1, 0, 0, false, false);
++		touch_gpio_at(st.gpio, 50, 1, 0, 0, false, false);
++		printf("SWEET TS: gpio88 high (EAST)\n");
++		touch_gpio_at(st.gpio_e, FJ_GPIO_VIO, 0, 0, 3, true, true);
+ 		touch_wait(10);
+-		printf("SWEET TS: gpio125 input\n");
+-		touch_gpio_at(st.gpio, FJ_GPIO_ATTN, 0, 3, 3, false, false);
++		printf("SWEET TS: gpio125 input (EAST)\n");
++		touch_gpio_at(st.gpio_e, FJ_GPIO_ATTN, 0, 3, 3, false, false);
+ 		printf("SWEET TS: gpio99 reset high\n");
+ 		touch_gpio_at(st.gpio, FJ_GPIO_RESET, 0, 3, 2, true, true);
+ 		touch_wait(10);
