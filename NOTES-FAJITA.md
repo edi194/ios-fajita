@@ -738,6 +738,16 @@ Observations, all from the live unit (serial intentionally not recorded here):
   read ran with a stale TX_LEN) and dumps M_CMD0, TX/RX_LEN, STATUS, IRQ,
   IRQ_EN, OUTPUT_CTRL, CGC and DMA_MODE around the first six commands.
   `console26-touch4` is that kernel with keys enabled again.
+- **console26-touch4 (2026-10-23): keys confirmed, touch reads were rejected
+  before any hardware access.** Keys deliver HID `0xe9` (VOL+), `0xea` (VOL−)
+  and `0x30` (power). The touch debug dump never printed, which pointed at
+  `touch_msg_run()`: it returns `EIO` for a **combined** transfer
+  (`(nt && nr)`), and `rmi_read()` issued the RMI4 register byte and the read
+  as one command — so every read failed with `err=5` and no register was ever
+  touched. **Patch 0098** reads in two transactions (write the register byte,
+  then read), which is what `touch_read()` does for sweet's controllers; RMI4
+  keeps the pointer between transactions.
+  `console27-touch5` is that kernel (keys on).
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
