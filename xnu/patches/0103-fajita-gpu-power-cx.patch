@@ -1,9 +1,12 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -59,6 +59,36 @@
+@@ -59,6 +59,39 @@
  	return v;
  }
  
++/* not exported through the headers this file may use */
++extern void delay(unsigned);
++
 +#define GPU_GCC_CFG_AHB     0x71004u    /* gcc_gpu_cfg_ahb_clk, CBCR */
 +#define GPU_GCC_MEMNOC_GFX  0x7100cu
 +#define GPU_GCC_SNOC_DVM    0x71018u
@@ -37,7 +40,7 @@
  void
  sweet_gpu_probe(void)
  {
-@@ -104,6 +134,49 @@
+@@ -104,6 +137,49 @@
  	(void)gpu_probe_rd("gpu", gpu, 0x0000);
  	(void)gpu_probe_rd("dbgc", dbgc, 0x00);
  	(void)gpu_probe_rd("misc", misc, 0x00);
