@@ -974,3 +974,22 @@ service. The GPU driver differs from `main` by 48 lines (renames), `HKGPU.cpp`
 by 140 (renames). Two new screenshots, `docs/adreno-springboard.png` and
 `docs/gpu-first-frame.png`, confirm their Adreno path reaches SpringBoard, so
 porting `redwood_adreno.c` to a630 is still the right approach.
+
+### GPU stage 2a WORKS on hardware (console36, 2026-10-23)
+
+The first write to the GPU block succeeded and the phone booted to SpringBoard:
+
+```
+SWEET GPU: gcc +0x71004 = 0x1                 (gpu_cfg_ahb already running)
+SWEET GPU: gpucc +0x106c = 0x222001           (gpu_cx_gdsc collapsed)
+SWEET GPU: gpucc +0x1540 = 0x5ff4             (cx_hw_ctrl)
+SWEET GPU: write gpucc +0x106c = 0x222000     (clear SW_COLLAPSE)
+SWEET GPU: cx_gdscr = 0xf8222000 cx_hw_ctrl = 0x80001fe0 -> ON
+```
+
+GX stayed collapsed (0x222001), as expected. `adreno=2` is therefore safe on
+this device and stage 2b (patch 0105, `adreno=3`) enables the clock branches:
+GCC `gpu_memnoc_gfx`/`gpu_snoc_dvm_gfx`/`ddrss_gpu_axi` and gpucc
+`cb`/`cxo`/`ahb`/`hub_aon`/`hub_cx_int`/`cx_gmu`/`smmu vote`, each read back
+with its halt bit. The PLL vote (`GCC+0x52000` froze the bus in 0099, so it
+needs the exact SDM845 register) and the GMU/hub RCGs are the next step.
