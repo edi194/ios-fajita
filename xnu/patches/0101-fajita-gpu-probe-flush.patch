@@ -1,0 +1,19 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -43,6 +43,16 @@
+ 		return 0;
+ 	}
+ 	printf("SWEET GPU: read %s +%#x\n", what, off);
++	/*
++	 * Persist the line before touching the register: a read of a block whose
++	 * clock is off hangs the bus, and the log thread only flushes every
++	 * ufslogsecs seconds (10 by default), which is longer than the time between
++	 * this print and the reset.
++	 */
++	{
++		extern void sweet_log_panic_flush(void);
++		sweet_log_panic_flush();
++	}
+ 	v = *(volatile uint32_t *)(base + off);
+ 	__asm__ volatile("dmb oshld" ::: "memory");
+ 	printf("SWEET GPU: %s +%#x = %#x\n", what, off, v);
