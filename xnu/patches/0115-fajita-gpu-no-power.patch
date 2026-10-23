@@ -1,0 +1,28 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -249,6 +249,17 @@
+ 		return;
+ 	}
+ 
++	/*
++	 * adreno=8 leaves the block's power and clocks alone: every access this
++	 * probe has made to them seems to make the next one less likely to answer,
++	 * so the firmware is tried with the block exactly as the boot loader left
++	 * it.
++	 */
++	if (level >= 8) {
++		printf("SWEET GPU: level %d: no power or clock writes, straight to the GMU\n", level);
++		goto gmu_only;
++	}
++
+ 	/* ---- stage 2a: the first writes ------------------------------------- */
+ 	printf("SWEET GPU: --- stage 2a: power\n");
+ 	uint32_t ahb = gpu_probe_rd("gcc", gcc, GPU_GCC_CFG_AHB);
+@@ -376,6 +387,7 @@
+ 		return;
+ 	}
+ 
++gmu_only:
+ 	/* ---- stage 3a: the GMU's memory and the firmware --------------------- */
+ 	printf("SWEET GPU: --- stage 3a: gmu memory and firmware\n");
+ 	(void)gpu_probe_rd("gmu sysreset", gmu, GPU_GMU_SYSRESET);
