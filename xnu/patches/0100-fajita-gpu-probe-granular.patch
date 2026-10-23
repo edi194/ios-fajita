@@ -21,7 +21,7 @@
  	return v;
  }
  
-@@ -67,41 +72,29 @@
+@@ -67,41 +72,28 @@
  	printf("SWEET GPU: level %d, maps gcc=%p cc=%p dbgc=%p misc=%p gmu=%p smmu=%p gpu=%p qf=%p db=%p\n",
  	    level, (void *)gcc, (void *)cc, (void *)dbgc, (void *)misc, (void *)gmu,
  	    (void *)smmu, (void *)gpu, (void *)qf, (void *)db);
@@ -85,4 +85,3 @@
  	printf("SWEET GPU: probe done (nothing written)\n");
  }
  #endif /* ARM64_BOARD_CONFIG_SWEET */
-+#endif /* ARM64_BOARD_CONFIG_SWEET */
