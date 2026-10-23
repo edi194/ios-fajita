@@ -877,3 +877,44 @@ Observations, all from the live unit (serial intentionally not recorded here):
   the iPhoneOS SDK, ~45 s) would make the rest of this work several times
   faster; Docker-OSX is not an option on this host (no `/dev/kvm` in WSL2,
   4.8 GiB RAM).
+
+### Local XNU build on Linux — state (2026-10-23)
+
+Attempted because every GPU iteration costs ~15 min through CI. Progress:
+
+- **Toolchain ready**: `apt` packages (clang 21.1.8, lld, make, flex/bison, m4,
+  autoconf, uuid-dev, fakeroot, rsync, zip, libxml2-dev, libtinfo6), **theos**
+  in `~/theos` with the Linux toolchain (`toolchain/linux/iphone/bin`: clang,
+  ld64, checksyms...) and `sdks/iPhoneOS16.5.sdk` (271 MB, sparse clone);
+  `THEOS=~/theos` is in `~/.bashrc`. The theos installer needed
+  `libxml2` → `libxml2-dev libxml2-utils` (Ubuntu 25.10 renamed the package).
+- **HackiOS harness fetched**: `~/hackios-xnu-kernel` (46 MB). Its
+  `xnu-deps/setup.sh --stage1` works after the theos install: builds `mig`
+  (bootstrap_cmds port), `unifdef`, `tcsh`, downloads the macOS 13.3 SDK for
+  the DriverKit headers and builds the `iPhoneOS16.5.xnu.sdk` overlay
+  (`xnu-deps/sdk`).
+- **Build-system port applied** to `~/xnu-local` (= `xnu-135` + patches
+  0082–0102) from `redwood.patch`: `Makefile` (sysctl → nproc),
+  `makedefs/MakeInc.cmd` (MEMORY_SIZE from /proc/meminfo), `MakeInc.top`,
+  `SETUP/config/doconf`, `bsd/conf/Makefile.arm64`,
+  `tools/lldbmacros/core/syntax_checker.py`. The only rejected hunk is their
+  BCM2837 `+pan` flag (SoC-specific, not needed).
+- **Build now reaches the `bsd` component** and stops on two things:
+  1. the staged source trees are missing — run
+     `xnu/patches/0019-stage-libpthread.sh`, `0020-stage-bearssl.sh`,
+     `0026-stage-hfs.sh` in the tree before building (the CI does this through
+     blacktop's `build.sh`);
+  2. clang 21.1.8 rejects `__builtin_xnu_types_compatible` (`__is_same`) from
+     their `xnu-deps/hostinc/xnu_clang_compat.h` as used by `IOLib.h` in C++
+     (their build was tested with clang 22.1) — needs either clang 22 or a
+     compat tweak.
+- Command used (from `~/hackios-xnu-kernel`):
+  `source ./xnu-env.sh; export XNU_SRC=~/xnu-local; cd $XNU_SRC; make -j6 -k
+  SDKROOT=iphoneos ARCH_CONFIGS=ARM64 MACHINE_CONFIGS=SWEET
+  KERNEL_CONFIGS=DEVELOPMENT ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64
+  BUILD_WERROR=0 BUILD_LTO=0 DO_CTFMERGE=0 HOST_CC="clang -include
+  $XNUDEPS/hostinc/hostcompat.h -I$XNUDEPS/hostinc ..." HOST_FLEX=flex
+  HOST_BISON=bison HOST_GM4=m4 CC=xnu-clang CXX=xnu-clang++ LOGCOLORS=n`.
+- Verdict: 2–4 focused hours from a working local kernel build. Until then CI
+  stays the build path, and the GPU work should be batched to make each CI run
+  count.
