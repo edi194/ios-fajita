@@ -951,3 +951,26 @@ assembler flags) while the main line continues on CI. Everything else about
 the local build works: theos + clang 22 + SDK overlays, the HackiOS harness
 (mig/unifdef/tcsh/iig), the build-system patches, and all 103 project patches
 applying to a clean xnu-8796.141.3.
+
+### Local build: compiles, does not boot (2026-10-23 evening)
+
+The Linux kernel builds in ~130 s with the hackios harness and identical
+`SFLAGS` (see `~/xnu-clean/LOCAL-LINUX-BUILD.md`), but on the phone it stops at
+the **`sweet early 5`** marker: the shim jumps in and the kernel dies inside the
+bootstrap console/VM setup, so the local binary is not usable as-is (likely the
+link layout: the local build is stripped, has the `libcc_kext` stand-in and the
+harness' firehose/pthread archives). Its size is 15,753,496 B vs the CI's
+~16.6 MB payload, another sign that the linking differs. **CI remains the build
+path**; fixing the local one is its own task (compare `__TEXT`/`__DATA` segment
+layout and the entry point against the CI kernel with `llvm-otool`/`nm`).
+
+### ios-topaz "metal" branch (checked 2026-10-23)
+
+`oosexgang/hackios-xnu-kernel` branch `metal` (kernel `c2ddff4`, userland
+`29eef72`) is **not** a new GPU path: 16 commits about one kernel for every
+phone with the same SoC blocks (`hackios.patch`, `HK*` instead of `Redwood*`),
+dual boot with a boot menu, a boot guard, bundles, an installer and the thermal
+service. The GPU driver differs from `main` by 48 lines (renames), `HKGPU.cpp`
+by 140 (renames). Two new screenshots, `docs/adreno-springboard.png` and
+`docs/gpu-first-frame.png`, confirm their Adreno path reaches SpringBoard, so
+porting `redwood_adreno.c` to a630 is still the right approach.
