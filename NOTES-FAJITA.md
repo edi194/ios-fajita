@@ -7,7 +7,6 @@ hardware table and the plan; this file is the short handoff.
 ## State
 
 ### NEXT SESSION — start here (2026-10-23, after the input milestone)
-
 **iOS 16.7.16 (iPhone X, 20H392) runs on the OnePlus 6T with its GUI, working
 touch and working keys** — lock screen appears and responds, on all eight
 cores. Reached 2026-10-23 ~12:30.
@@ -32,11 +31,28 @@ cores. Reached 2026-10-23 ~12:30.
      (TLS, activation) sees an invalid date.
   3. Wi-Fi: the only big feature the reference port has that we do not. It
      needs the modem/WLFW work (ios-topaz patches 0113–0130) ported to SDM845.
-  4. GPU: only through HackiOS patches, which are not public yet; until then
-     CoreAnimation stays on the CPU (`sweetfb_hz=10` keeps it usable).
+  4. GPU: the HackiOS sources are public since 2026-10-22. Their path is not
+     Metal: EAGLContext is replaced in-process (eagl.c), OSMesa/freedreno
+     draws through a libdrm shim whose ioctls are an IOKit user client, and an
+     IOSurface doubles as a dma-buf; the kernel still blits the final frame.
+     About 60% of their redwood_adreno.c is family-generic a6xx. For
+     SDM845/a630 the SoC-specific parts are: GMU in legacy mode (flat firmware,
+     dtcm 0x40000, SPTPRAC enable, HFI v1 payloads, rscc inside the GMU), SMMU
+     v2 with 32-bit IOVA, a630_* firmware with all zap segments, and the bases
+     GPU 0x5000000, GMU 0x506a000, SMMU 0x5040000, gpucc 0x5090000, cx_misc
+     0x509e000, cmd-db 0x85fe0000, zap 0x8c415000, chipid 0x6030001. The Mesa
+     patches are SoC-agnostic, but inject.c's dyld-cache addresses are iOS
+     16.5's and must be re-derived for 16.7.16. Estimate 3-6 weeks and SoC
+     resets on mistakes; the ladder is read-only probe, GMU out of reset, core
+     writes a magic word, 2D blit, userspace GL, backboardd GL.
   5. Polish: `product id ""` from F01 (the read offset is probably wrong),
      touch edge calibration (raw maxima seen 1063/2326 vs 1080/2340),
      `sweetfb_hz` tuning, drop the now-unused `sweetts_norail` path.
+- **GPU stage 1 is written (patch 0099)**: `bsd/dev/sweet_gpu.c`, boot-arg
+  `adreno=1`, maps and *reads* gcc/pll-vote, qfprom, cmd-db, gpucc, SMMU
+  IDR0/1/2 + SCR0 + SACR, GMU fw-init/CM3 reset/ITCM, the GPU's first words
+  and cx_dbgc/cx_misc. Nothing is written; every block is announced before it
+  is read so a hang names it. `console30-gpuprobe.img` carries it.
 - **Reading the log without filming** (used all night): with the phone in
   fastboot, `fastboot boot <orange-fox-r12-fajita.img>` → poll `adb devices`
   until the state is `recovery` → `tools/sweet-log-pull.sh out.txt` (the last
