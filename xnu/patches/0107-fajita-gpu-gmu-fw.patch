@@ -1,0 +1,131 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -33,6 +33,40 @@
+ #define GPU_QFPROM      0x00784000u
+ #define GPU_CMD_DB      0x85fe0000u
+ 
++/* "0x<pa>:0x<size>", the form tools/mkpayload.py --blob announces */
++static bool
++gpu_parse_range(const char *s, uint64_t *pa, uint64_t *size)
++{
++	uint64_t v[2] = { 0, 0 };
++	int n = 0;
++
++	for (; *s != '\0' && n < 2; s++) {
++		if (*s == '0' && (s[1] == 'x' || s[1] == 'X')) {
++			s++;
++			v[n] = 0;
++			while ((*s >= '0' && *s <= '9') || (*s >= 'a' && *s <= 'f') ||
++			    (*s >= 'A' && *s <= 'F')) {
++				uint32_t d = *s <= '9' ? (uint32_t)(*s - '0') :
++				    (uint32_t)((*s | 0x20) - 'a' + 10);
++				v[n] = (v[n] << 4) | d;
++				s++;
++			}
++			n++;
++			s--;
++		} else if (*s == ':') {
++			continue;
++		} else {
++			return false;
++		}
++	}
++	if (n != 2) {
++		return false;
++	}
++	*pa = v[0];
++	*size = v[1];
++	return true;
++}
++
+ static uint32_t
+ gpu_probe_rd(const char *what, vm_offset_t base, uint32_t off)
+ {
+@@ -82,6 +116,18 @@
+ #define GPU_RCG_SOURCE_MASK     0x371fu     /* [4:0] 2*divider-1, [10:8] source, [13:12] mode */
+ #define GPU_RCG_GPLL0_DIV(twice) (6u << 8 | ((twice) - 1))
+ 
++/* stage 3a: the GMU's registers are word indexed from the GMU base, so the byte
++ * offset is four times the vendor driver's number (GMU_WORD(n) = 4n). */
++#define GPU_GMU_ITCM          0x3000u   /* 0x0c00: 16 KB of code, then 16 KB of data */
++#define GPU_GMU_DTCM          0x7000u   /* 0x1c00: where the firmware keeps its data */
++#define GPU_GMU_VERSIONS      (GPU_GMU_DTCM + 0xff8u * 4u) /* core, power, HFI versions */
++#define GPU_GMU_SYSRESET      0x14000u  /* 0x5000 */
++#define GPU_GMU_BOOT_CONFIG   0x14004u  /* 0x5001 */
++#define GPU_GMU_FW_INIT       0x14070u  /* 0x501c: 0xbabeface once the firmware runs */
++#define GPU_GMU_SPTPRAC       0x14340u  /* 0x50d0 */
++#define GPU_GMU_HFI_STATUS    0x14600u  /* 0x5180 */
++#define GPU_GMU_FW_BYTES      0x8000u   /* a630_gmu.bin: 32 KB, code then data */
++
+ static void
+ gpu_probe_wr(const char *what, vm_offset_t base, uint32_t off, uint32_t val)
+ {
+@@ -277,5 +323,68 @@
+ 		    (v & CBCR_OFF) ? "halted" : ((v & 1u) ? "on" : "off"));
+ 	}
+ 	printf("SWEET GPU: stage 2c done\n");
++	if (level < 5) {
++		return;
++	}
++
++	/* ---- stage 3a: the GMU's memory and the firmware --------------------- */
++	printf("SWEET GPU: --- stage 3a: gmu memory and firmware\n");
++	(void)gpu_probe_rd("gmu sysreset", gmu, GPU_GMU_SYSRESET);
++	(void)gpu_probe_rd("gmu fw_init", gmu, GPU_GMU_FW_INIT);
++	(void)gpu_probe_rd("gmu sptprac", gmu, GPU_GMU_SPTPRAC);
++	(void)gpu_probe_rd("gmu hfi", gmu, GPU_GMU_HFI_STATUS);
++	uint32_t itcm_before = gpu_probe_rd("gmu itcm[0]", gmu, GPU_GMU_ITCM);
++	uint32_t dtcm_before = gpu_probe_rd("gmu dtcm[0]", gmu, GPU_GMU_DTCM);
++
++	char arg[64];
++	if (!PE_parse_boot_argn("sweetfw0", arg, sizeof(arg))) {
++		printf("SWEET GPU: no sweetfw0 boot argument: this boot image carries no GMU firmware\n");
++		return;
++	}
++	uint64_t fw_pa = 0, fw_size = 0;
++	if (!gpu_parse_range(arg, &fw_pa, &fw_size) || fw_size < GPU_GMU_FW_BYTES) {
++		printf("SWEET GPU: sweetfw0 \"%s\" is not a firmware blob of %#x bytes\n", arg, GPU_GMU_FW_BYTES);
++		return;
++	}
++	printf("SWEET GPU: firmware blob %#llx bytes at %#llx\n", fw_size, fw_pa);
++	vm_offset_t fw = ml_io_map((vm_offset_t)fw_pa, GPU_GMU_FW_BYTES);
++	if (fw == 0) {
++		printf("SWEET GPU: cannot map the firmware blob\n");
++		return;
++	}
++	uint32_t sum = 0, first[4];
++	for (uint32_t off = 0; off < GPU_GMU_FW_BYTES; off += 4) {
++		uint32_t w = *(volatile uint32_t *)(fw + off);
++		sum += w;
++		if (off < sizeof(first)) {
++			first[off / 4] = w;
++		}
++	}
++	printf("SWEET GPU: firmware sum %#x, first words %#x %#x %#x %#x\n", sum, first[0], first[1], first[2], first[3]);
++
++	/* The whole image goes through the GMU's code window: 16 KB of code and the
++	 * 16 KB of data that follows it (a6xx_gmu_fw_load's legacy path). */
++	for (uint32_t off = 0; off < GPU_GMU_FW_BYTES; off += 4) {
++		*(volatile uint32_t *)(gmu + GPU_GMU_ITCM + off) = *(volatile uint32_t *)(fw + off);
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++
++	uint32_t wrong = 0, wrong_at = 0;
++	for (uint32_t off = 0; off < GPU_GMU_FW_BYTES; off += 4) {
++		if (*(volatile uint32_t *)(gmu + GPU_GMU_ITCM + off) != *(volatile uint32_t *)(fw + off)) {
++			if (wrong++ == 0) {
++				wrong_at = off;
++			}
++		}
++	}
++	printf("SWEET GPU: itcm[0] %#x -> %#x, dtcm[0] %#x -> %#x\n", itcm_before,
++	    *(volatile uint32_t *)(gmu + GPU_GMU_ITCM), dtcm_before,
++	    *(volatile uint32_t *)(gmu + GPU_GMU_DTCM));
++	printf("SWEET GPU: %u of %u words differ%s%#x, versions %#x %#x %#x\n", wrong,
++	    GPU_GMU_FW_BYTES / 4, wrong ? " (first at " : "", wrong ? wrong_at : 0,
++	    *(volatile uint32_t *)(gmu + GPU_GMU_VERSIONS),
++	    *(volatile uint32_t *)(gmu + GPU_GMU_VERSIONS + 8),
++	    *(volatile uint32_t *)(gmu + GPU_GMU_VERSIONS + 16));
++	printf("SWEET GPU: stage 3a done\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

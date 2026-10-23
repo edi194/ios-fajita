@@ -55,7 +55,13 @@ CMDLINE=${CMDLINE:-"debug=0xc serial=3 cpus=8 sweetsmp=1 keepsyms=1 -noprogress 
 
 mkdir -p shim/out
 python3 tools/mkadt.py "$ADT" --highmem
-python3 tools/mkpayload.py "$XNU_KERNEL" "$ADT" "$PAYLOAD" --cmdline "$CMDLINE"
+# Firmware the drivers want before there is a root travels in the payload, not
+# in git: mkpayload.py --blob announces each file as sweetfwN=<pa>:<size>.
+BLOB_ARGS=()
+for f in ${GPU_FW:-$HOME/gpu-fw/a630_gmu.bin}; do
+	[[ -f "$f" ]] && BLOB_ARGS+=(--blob "$f")
+done
+python3 tools/mkpayload.py "$XNU_KERNEL" "$ADT" "$PAYLOAD" --cmdline "$CMDLINE" "${BLOB_ARGS[@]}"
 # shim/build.sh cds into shim/, so hand it absolute paths. SHIM_HDR=1 is the
 # stock fajita layout (header v1, gzipped Image.gz-dtb): a v2 header with a dtb
 # section and a raw Image does not boot on this ABL.
