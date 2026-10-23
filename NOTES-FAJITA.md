@@ -918,3 +918,36 @@ Attempted because every GPU iteration costs ~15 min through CI. Progress:
 - Verdict: 2–4 focused hours from a working local kernel build. Until then CI
   stays the build path, and the GPU work should be batched to make each CI run
   count.
+
+### GPU stage 2a written (patch 0103, 2026-10-23)
+
+Ports the first *writes* of HackiOS `bsd/dev/redwood_adreno.c`
+(`step_gpucc`/`step_cx_power`) using the addresses stage 1 confirmed:
+
+- `GCC+0x71004` (`gcc_gpu_cfg_ahb_clk`) enabled and polled for un-halt — the
+  same offset on SDM845 (checked against mainline `gcc-sdm845.c`: 0x71004,
+  memnoc 0x7100c, snoc_dvm 0x71018);
+- `gpu_cx_gdsc` (`gpucc+0x106c`): clear `SW_COLLAPSE`, poll `GDSC_POWER_ON`
+  unless the switch is under hardware control. Safe here because the CX rail
+  is up while the SoC runs; the GX half, the clocks and the GMU are next.
+- `adreno=2` = stage 1 reads + 2a; every write flushes the console ring first,
+  so a hang still names the step on disk. `console34-gpu2a.img` carries it.
+
+The rest of the ladder, from their driver (for the next patches):
+GX GDSC (`0x100c`) + gfx3d clock, GMU clock root (`0x1120`) and
+`CX_GMU_CBCR`/`GX_GMU_CBCR`/`AHB`/`CXO` ungating, GMU power-up with the flat
+`a630_gmu.bin` (legacy mode: ITCM at `GMU+0x0c00`, `dtcm 0x40000`), **SPTPRAC**
+enable, **HFI v1** tables, zap through SCM (`PAS_GPU 13`, all b0x segments),
+then CP/RBBM init with `a630_sqe.fw` and a 32 KiB ring.
+
+### Local build handed to a subagent (2026-10-23)
+
+Blocked on Apple-private headers that only Xcode's SDK has
+(`AppleKeyStore/AppleKeyStoreFSServices.h` for `bsd/sweet_hfs`, plus
+`cp_handle_vnop`/`io_params`/`CP_*_ACCESS`), and on the SHA-256 asm
+(`processor not supported`). A subagent continues in `/home/edi194/xnu-clean`
+(stub the private headers or compile the CONFIG_PROTECT paths out, fix the
+assembler flags) while the main line continues on CI. Everything else about
+the local build works: theos + clang 22 + SDK overlays, the HackiOS harness
+(mig/unifdef/tcsh/iig), the build-system patches, and all 103 project patches
+applying to a clean xnu-8796.141.3.
