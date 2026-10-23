@@ -1,0 +1,42 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -184,5 +184,39 @@
+ 	}
+ 	(void)gpu_probe_rd("gpucc", cc, GPUCC_GX_GDSCR);
+ 	printf("SWEET GPU: stage 2a done\n");
++	if (level < 3) {
++		return;
++	}
++
++	/* ---- stage 2b: clock branches (no PLL vote, no RCG reprogramming) ----- */
++	printf("SWEET GPU: --- stage 2b: clocks\n");
++	static const struct {
++		const char *what;
++		int gcc;                /* 1 = GCC block, 0 = gpucc */
++		uint32_t off;
++	} branches[] = {
++		{ "gcc gpu_memnoc_gfx",   1, GPU_GCC_MEMNOC_GFX },
++		{ "gcc gpu_snoc_dvm_gfx", 1, GPU_GCC_SNOC_DVM },
++		{ "gcc ddrss_gpu_axi",    1, 0x44038u },
++		{ "gpucc cb",             0, 0x1170u },
++		{ "gpucc cxo",            0, 0x109cu },
++		{ "gpucc ahb",            0, 0x1078u },
++		{ "gpucc hub_aon",        0, 0x1178u },
++		{ "gpucc hub_cx_int",     0, 0x1204u },
++		{ "gpucc cx_gmu",         0, 0x1098u },
++		{ "gpucc smmu vote",      0, 0x5000u },
++	};
++	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
++		vm_offset_t base = branches[i].gcc ? gcc : cc;
++		uint32_t off = branches[i].off;
++		uint32_t v = gpu_probe_rd(branches[i].what, base, off);
++		if ((v & CBCR_OFF) || !(v & 1u)) {
++			gpu_probe_wr(branches[i].what, base, off, (v & ~CBCR_OFF) | 1u);
++		}
++		uint32_t now = gpu_probe_rd(branches[i].what, base, off);
++		printf("SWEET GPU: %s = %#x%s\n", branches[i].what, now,
++		    (now & CBCR_OFF) ? " (halted)" : " (running)");
++	}
++	printf("SWEET GPU: stage 2b done\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
