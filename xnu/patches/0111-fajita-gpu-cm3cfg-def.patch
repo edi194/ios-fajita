@@ -1,0 +1,10 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -134,6 +134,7 @@
+ #define GPU_GMU_SYSRESET      0x14000u  /* 0x5000 */
+ #define GPU_GMU_BOOT_CONFIG   0x14004u  /* 0x5001 */
+ #define GPU_GMU_FW_INIT       0x14070u  /* 0x501c: 0xbabeface once the firmware runs */
++#define GPU_GMU_CM3_CFG       0x140b4u  /* 0x502d: 0x4052 keeps a snapshot out of the NMI handler */
+ #define GPU_GMU_SPTPRAC       0x14340u  /* 0x50d0 */
+ #define GPU_GMU_HFI_STATUS    0x14600u  /* 0x5180 */
+ #define GPU_GMU_FW_BYTES      0x8000u   /* a630_gmu.bin: 32 KB, code then data */
