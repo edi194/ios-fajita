@@ -1,0 +1,44 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -171,7 +171,7 @@
+  * whose reserved-memory carve-outs all end below 0xac800000. */
+ #define GPU_SCRATCH_PA         0x0b000000u
+ #define GPU_SCRATCH_HFI        0x0000u      /* table and two queues, 12 KB */
+-#define GPU_SCRATCH_LOG        0x8000u      /* four pages of firmware log */
++#define GPU_SCRATCH_LOG        0x3000u      /* one page of firmware log, inside the same 16 KB */
+ 
+ static void
+ gpu_probe_wr(const char *what, vm_offset_t base, uint32_t off, uint32_t val)
+@@ -217,7 +217,7 @@
+ gpu_scratch_prepare(void)
+ {
+ 	vm_offset_t hfi = ml_io_map(GPU_SCRATCH_PA + GPU_SCRATCH_HFI, 0x4000);
+-	vm_offset_t log = ml_io_map(GPU_SCRATCH_PA + GPU_SCRATCH_LOG, 0x4000);
++	vm_offset_t log = hfi == 0 ? 0 : hfi + GPU_SCRATCH_LOG;   /* inside the same mapping */
+ 
+ 	printf("SWEET GPU: scratch: hfi at %#x -> %#llx, log at %#x -> %#llx\n",
+ 	    GPU_SCRATCH_PA + GPU_SCRATCH_HFI, (uint64_t)hfi,
+@@ -226,12 +226,11 @@
+ 		printf("SWEET GPU: cannot map the GMU's scratch memory\n");
+ 		return;
+ 	}
+-	printf("SWEET GPU: scratch reads %#x %#x (what is there now)\n",
+-	    *(volatile uint32_t *)hfi, *(volatile uint32_t *)log);
++	printf("SWEET GPU: hfi scratch reads %#x\n", *(volatile uint32_t *)hfi);
++	printf("SWEET GPU: log scratch reads %#x\n", *(volatile uint32_t *)log);
+ 
+ 	for (uint32_t off = 0; off < 0x4000; off += 4) {
+ 		*(volatile uint32_t *)(hfi + off) = 0;
+-		*(volatile uint32_t *)(log + off) = 0;
+ 	}
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 
+@@ -527,7 +526,7 @@
+ 	gpu_probe_wr("gmu hfi sfr", gmu, GPU_GMU_HFI_SFR, GPU_GMU_CHIPID);
+ 	gpu_probe_wr("gmu hfi qtbl info", gmu, GPU_GMU_HFI_QTBL_INFO, 1);
+ 	gpu_probe_wr("gmu hfi qtbl addr", gmu, GPU_GMU_HFI_QTBL_ADDR, hfi_pa);
+-	gpu_probe_wr("gmu log address", gmu, GPU_GMU_PWR_COL_CP_MSG, log_pa | 3u);
++	gpu_probe_wr("gmu log address", gmu, GPU_GMU_PWR_COL_CP_MSG, log_pa);   /* one page: size - 1 = 0 */
+ 	gpu_probe_wr("gmu sys bus", gmu, GPU_GMU_SYS_BUS_CONFIG, 0x1);
+ 	gpu_probe_wr("gmu icache", gmu, GPU_GMU_ICACHE_CONFIG, 0x1);
+ 	gpu_probe_wr("gmu dcache", gmu, GPU_GMU_DCACHE_CONFIG, 0x1);
