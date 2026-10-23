@@ -1,0 +1,26 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -598,12 +598,20 @@
+ static char ts_product[12];
+ static int ts_xraw = 1080, ts_yraw = 2340, ts_max_x, ts_max_y;
+ 
+-/* RMI4 page 0 over the 1-byte addressing this panel uses: register, repeated
+- * start, data. touch_msg() already knows how to hold the bus for the read. */
++/*
++ * RMI4 over I2C: 1-byte page-0 addressing. touch_msg_run() refuses a combined
++ * write+read (it returns EIO for nt && nr), so latch the register pointer with
++ * one write and read in a second transaction - RMI4 keeps the pointer between
++ * transactions, and this is what touch_read() does for sweet's controllers.
++ */
+ static int
+ rmi_read(uint8_t reg, uint8_t *buf, unsigned len)
+ {
+-	return touch_msg(FJ_TS_ADDR, &reg, 1, buf, len, true);
++	int err = touch_msg(FJ_TS_ADDR, &reg, 1, NULL, 0, false);
++	if (err) {
++		return err;
++	}
++	return touch_msg(FJ_TS_ADDR, NULL, 0, buf, len, false);
+ }
+ 
+ static int
