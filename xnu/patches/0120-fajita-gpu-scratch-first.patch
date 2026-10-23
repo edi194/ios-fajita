@@ -1,0 +1,170 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -188,6 +188,82 @@
+ 	delay(ms * 1000u);
+ }
+ 
++/* ---- the GMU's own memory ------------------------------------------------- */
++
++/*
++ * The HFI table and the log the firmware uses. HFI_QTBL_ADDR is a 32-bit
++ * register and all of the kernel's memory is above 4 GB (the ADT starts at
++ * 0x100000000), so they go into the low bank: Linux reports
++ * 0x97d00000-0x27c89ffff as one System RAM range across the 4 GB boundary, and
++ * console50 read 0xb0000000 from XNU without trouble.
++ *
++ * It is all prepared here, before the GPU is powered: console49 read the same
++ * address after the power-on, the clock writes and the firmware load, and died
++ * on it.
++ */
++struct hfi_queue_header {
++	uint32_t status, iova, type, size, msg_size, dropped;
++	uint32_t rx_watermark, tx_watermark, rx_request, tx_request, read_index, write_index;
++};
++struct hfi_table_header {
++	uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
++};
++
++static uint32_t gpu_hfi_pa, gpu_log_pa;
++static bool gpu_scratch_ready;
++
++static void
++gpu_scratch_prepare(void)
++{
++	vm_offset_t hfi = ml_io_map(GPU_SCRATCH_PA + GPU_SCRATCH_HFI, 0x4000);
++	vm_offset_t log = ml_io_map(GPU_SCRATCH_PA + GPU_SCRATCH_LOG, 0x4000);
++
++	printf("SWEET GPU: scratch: hfi at %#x -> %#llx, log at %#x -> %#llx\n",
++	    GPU_SCRATCH_PA + GPU_SCRATCH_HFI, (uint64_t)hfi,
++	    GPU_SCRATCH_PA + GPU_SCRATCH_LOG, (uint64_t)log);
++	if (hfi == 0 || log == 0) {
++		printf("SWEET GPU: cannot map the GMU's scratch memory\n");
++		return;
++	}
++	printf("SWEET GPU: scratch reads %#x %#x (what is there now)\n",
++	    *(volatile uint32_t *)hfi, *(volatile uint32_t *)log);
++
++	for (uint32_t off = 0; off < 0x4000; off += 4) {
++		*(volatile uint32_t *)(hfi + off) = 0;
++		*(volatile uint32_t *)(log + off) = 0;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++
++	volatile struct hfi_table_header *const table = (volatile struct hfi_table_header *)hfi;
++	volatile struct hfi_queue_header *const queue =
++	    (volatile struct hfi_queue_header *)(hfi + sizeof(*table));
++
++	table->version = 0;
++	table->size = sizeof(*table) + 2 * sizeof(*queue);
++	table->qhdr0_offset = sizeof(*table) / 4;
++	table->qhdr_size = sizeof(*queue) / 4;
++	table->num_queues = 2;
++	table->active_queues = 2;
++	for (uint32_t i = 0; i < 2; i++) {
++		queue[i].status = 1;
++		queue[i].iova = GPU_SCRATCH_PA + GPU_SCRATCH_HFI + 0x1000 * (i + 1);
++		queue[i].type = (10u << 8) | (i == 0 ? 0u : 4u);   /* 4: a630's legacy response queue */
++		queue[i].size = 0x1000 / 4;
++		queue[i].rx_watermark = 1;
++		queue[i].tx_watermark = 1;
++		queue[i].rx_request = 1;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++	printf("SWEET GPU: hfi table at %#x: %#x %#x %#x %#x %#x %#x, queue0 %#x %#x %#x\n",
++	    GPU_SCRATCH_PA + GPU_SCRATCH_HFI, table->version, table->size, table->qhdr0_offset,
++	    table->qhdr_size, table->num_queues, table->active_queues, queue[0].status,
++	    queue[0].iova, queue[0].type);
++
++	gpu_hfi_pa = GPU_SCRATCH_PA + GPU_SCRATCH_HFI;
++	gpu_log_pa = GPU_SCRATCH_PA + GPU_SCRATCH_LOG;
++	gpu_scratch_ready = true;
++}
++
+ void
+ sweet_gpu_probe(void)
+ {
+@@ -237,6 +313,9 @@
+ 	(void)gpu_probe_rd("dbgc", dbgc, 0x00);
+ 	(void)gpu_probe_rd("misc", misc, 0x00);
+ 	printf("SWEET GPU: probe done\n");
++	if (level >= 5) {
++		gpu_scratch_prepare();
++	}
+ 	if (level < 2) {
+ 		return;
+ 	}
+@@ -435,70 +514,12 @@
+ 
+ 	/* ---- stage 3d: the HFI table, the log, and the reset ------------------ */
+ 	printf("SWEET GPU: --- stage 3d: hfi and reset\n");
+-	/* Which part of the low bank can this kernel reach at all? */
+-	{
+-		static const uint32_t low[] = { 0x80000000u, 0x97d00000u, 0xb0000000u };
+-		for (unsigned i = 0; i < sizeof(low) / sizeof(low[0]); i++) {
+-			printf("SWEET GPU: low %#x: mapping\n", low[i]);
+-			vm_offset_t va = ml_io_map(low[i], 0x1000);
+-			printf("SWEET GPU: low %#x: va %#llx, reading\n", low[i], (uint64_t)va);
+-			if (va != 0) {
+-				printf("SWEET GPU: low %#x = %#x\n", low[i], *(volatile uint32_t *)va);
+-			}
+-		}
+-		printf("SWEET GPU: low bank probe done, stopping here\n");
+-		return;
+-	}
+-
+-	printf("SWEET GPU: mapping the hfi scratch at %#x\n", GPU_SCRATCH_PA + GPU_SCRATCH_HFI);
+-	vm_offset_t hfi = ml_io_map(GPU_SCRATCH_PA + GPU_SCRATCH_HFI, 0x4000);
+-	printf("SWEET GPU: hfi mapped at %#llx\n", (uint64_t)hfi);
+-	vm_offset_t log = ml_io_map(GPU_SCRATCH_PA + GPU_SCRATCH_LOG, 0x4000);
+-	printf("SWEET GPU: log mapped at %#llx\n", (uint64_t)log);
+-	if (hfi == 0 || log == 0) {
+-		printf("SWEET GPU: cannot map the GMU's scratch memory\n");
++	if (!gpu_scratch_ready) {
++		printf("SWEET GPU: the GMU's scratch was not prepared\n");
+ 		return;
+ 	}
+-	printf("SWEET GPU: scratch reads %#x (the word there now)\n", *(volatile uint32_t *)hfi);
+-	uint32_t hfi_pa = GPU_SCRATCH_PA + GPU_SCRATCH_HFI;
+-	uint32_t log_pa = GPU_SCRATCH_PA + GPU_SCRATCH_LOG;
+-
+-	struct hfi_queue_header {
+-		uint32_t status, iova, type, size, msg_size, dropped;
+-		uint32_t rx_watermark, tx_watermark, rx_request, tx_request, read_index, write_index;
+-	};
+-	struct hfi_table_header {
+-		uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
+-	};
+-
+-	printf("SWEET GPU: clearing the scratch\n");
+-	for (uint32_t off = 0; off < 0x4000; off += 4) {
+-		*(volatile uint32_t *)(hfi + off) = 0;
+-		*(volatile uint32_t *)(log + off) = 0;
+-	}
+-	printf("SWEET GPU: scratch cleared\n");
+-	volatile struct hfi_table_header *const table = (volatile struct hfi_table_header *)hfi;
+-	volatile struct hfi_queue_header *const queue = (volatile struct hfi_queue_header *)(hfi + sizeof(*table));
+-
+-	table->version = 0;
+-	table->size = sizeof(*table) + 2 * sizeof(*queue);
+-	table->qhdr0_offset = sizeof(*table) / 4;
+-	table->qhdr_size = sizeof(*queue) / 4;
+-	table->num_queues = 2;
+-	table->active_queues = 2;
+-	for (uint32_t i = 0; i < 2; i++) {
+-		queue[i].status = 1;
+-		queue[i].iova = hfi_pa + 0x1000 * (i + 1);
+-		queue[i].type = (10u << 8) | (i == 0 ? 0u : 4u);   /* 4: a630's legacy response queue */
+-		queue[i].size = 0x1000 / 4;
+-		queue[i].rx_watermark = 1;
+-		queue[i].tx_watermark = 1;
+-		queue[i].rx_request = 1;
+-	}
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	printf("SWEET GPU: hfi table at %#x: %#x %#x %#x %#x %#x %#x, queue0 %#x %#x %#x\n", hfi_pa,
+-	    table->version, table->size, table->qhdr0_offset, table->qhdr_size, table->num_queues,
+-	    table->active_queues, queue[0].status, queue[0].iova, queue[0].type);
++	uint32_t hfi_pa = gpu_hfi_pa, log_pa = gpu_log_pa;
++	printf("SWEET GPU: hfi at %#x, log at %#x (prepared before the power-on)\n", hfi_pa, log_pa);
+ 
+ 	gpu_probe_wr("gmu tcm retention", gmu, GPU_GMU_GENERAL_7, 1);
+ 	gpu_probe_wr("gmu hfi sfr", gmu, GPU_GMU_HFI_SFR, GPU_GMU_CHIPID);
