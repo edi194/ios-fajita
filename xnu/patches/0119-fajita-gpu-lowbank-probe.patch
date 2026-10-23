@@ -1,0 +1,24 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -435,6 +435,21 @@
+ 
+ 	/* ---- stage 3d: the HFI table, the log, and the reset ------------------ */
+ 	printf("SWEET GPU: --- stage 3d: hfi and reset\n");
++	/* Which part of the low bank can this kernel reach at all? */
++	{
++		static const uint32_t low[] = { 0x80000000u, 0x97d00000u, 0xb0000000u };
++		for (unsigned i = 0; i < sizeof(low) / sizeof(low[0]); i++) {
++			printf("SWEET GPU: low %#x: mapping\n", low[i]);
++			vm_offset_t va = ml_io_map(low[i], 0x1000);
++			printf("SWEET GPU: low %#x: va %#llx, reading\n", low[i], (uint64_t)va);
++			if (va != 0) {
++				printf("SWEET GPU: low %#x = %#x\n", low[i], *(volatile uint32_t *)va);
++			}
++		}
++		printf("SWEET GPU: low bank probe done, stopping here\n");
++		return;
++	}
++
+ 	printf("SWEET GPU: mapping the hfi scratch at %#x\n", GPU_SCRATCH_PA + GPU_SCRATCH_HFI);
+ 	vm_offset_t hfi = ml_io_map(GPU_SCRATCH_PA + GPU_SCRATCH_HFI, 0x4000);
+ 	printf("SWEET GPU: hfi mapped at %#llx\n", (uint64_t)hfi);
