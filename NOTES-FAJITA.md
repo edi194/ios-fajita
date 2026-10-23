@@ -1055,3 +1055,58 @@ the boot image and never enters git (`tools/build-fajita.sh` passes
 `${GPU_FW:-$HOME/gpu-fw/a630_gmu.bin}`). Stage 3a (`adreno=5`) reads the GMU's
 registers with the offsets above, maps the blob, writes it into the ITCM window
 and reads it back word by word.
+
+### GPU stage 3a WORKS: the GMU takes the firmware (console40, 2026-10-23)
+
+```
+SWEET GPU: gmu sysreset +0x14000 = 0x1        (held in reset by the boot loader)
+SWEET GPU: gmu sptprac +0x14340 = 0xd4        (GX without power and clock)
+SWEET GPU: gmu itcm[0] +0x3000  = 0xa00414be  (code memory answers)
+SWEET GPU: firmware blob 0x8000 bytes at 0x1024d0000
+SWEET GPU: firmware sum 0xe19e48be, first words 0x43f80 0x9 0xf3804805 0x48058808
+SWEET GPU: 0 of 8192 words differ, versions 0 0 0
+```
+
+All 32 KB of `a630_gmu.bin` went through the GMU's ITCM window and read back word
+for word: the payload transport (`sweetfw0=<pa>:<size>`) and the write path work.
+The version block reads 0 because the firmware fills it once it runs, so
+`FW_INIT_RESULT` has to become `0xbabeface` (the old mask).
+
+### The GPU's SMMU: hypervisor-owned (console40/41, 2026-10-23)
+
+```
+scr0 0x200626 (bits 1,2,5,9,10,21)   idr0 0x48016605 (5 stream matches)
+idr1 0x20008005 (32 contexts)        smr[0..4] = 0     s2cr[0..4] = 0x200ff (FAULT)
+```
+
+Writing those S2CR entries to bypass **froze the phone** (0111): every write was
+dropped, the reads still said `0x200ff`, and the access after the fifth never
+came back. The vendor device tree has `qcom,hyp_secure_alloc` on the SMMU and
+`sCR0` bit 21 is QCOM's hypervisor bit, so the stream table is virtualised; the
+vendor's kgsl reaches it through SCM. **Do not write SMR/S2CR from this port**
+(patch 0112 leaves the SMMU alone).
+
+From the same device tree: the SMMU is `qcom,kgsl-smmu-v2` at `0x5040000` with
+`qcom,micro-mmu-control 0x6000`, context banks at `qcom,gpu-offset 0x48000` (not
+`0x8000`, so the earlier CB reads were of nothing), streams **0 = gfx3d_user,
+1/2 = gfx3d_secure, 4 = gmu_user**. The GMU's clocks are gpucc
+`gmu_clk`/`cxo_clk` plus gcc `axi_clk`/`memnoc_clk`.
+
+### Where the GMU's memory lives (patch 0110)
+
+`HFI_QTBL_ADDR` is a 32-bit register and every address the kernel has is above
+4 GB (the ADT starts at `0x100000000`), so the HFI table and the log go into the
+low bank: the live FDT has `/memory` at `0x80000000+0x100000000` with every
+reserved-memory carve-out below `0xac800000`, so `0xb0000000` is plain DRAM that
+XNU never declares. It is mapped with `ml_io_map`, so the GMU sees the writes
+without cache maintenance. HFI: table header (6 words) + two queue headers (12
+words each) at `+0`, queues at `+0x1000`/`+0x2000` (a630 legacy: 2 queues,
+response queue type 4). Log: `+0x8000`, four pages.
+
+0110 writes what `a6xx_gmu_fw_start`/`a6xx_gmu_power_config` write (HFI SFR chipid
+`0x06030100`, table info/address, log address, caches and bus, boot config `2`,
+AHB fence range `0x80000000|(0xa<<18)|0xa0`, `CM3_CFG 0x4052`), releases the reset
+(`SYSRESET 1`, `PWR_COL_CP_RESP 0`, `SYSRESET 0`) and polls `FW_INIT_RESULT` for
+`0xbabeface`. The RPMh interface (`RPMH_CTRL 0xf11`) is left disabled on purpose:
+without the PDC/RSCC handshake first the firmware could wait forever for votes
+nobody answers.
