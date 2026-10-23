@@ -699,6 +699,27 @@ Observations, all from the live unit (serial intentionally not recorded here):
   `sweetts_nogpio=1`, `sweetts_noclk=1`, `sweetts_nose=1` so one kernel can
   bisect with boot args. Patch **0094** (panic-visible + panic-time ring flush,
   header seq `0xffffffff`) is in the same build for the next real panic.
+- **Bisect result (2026-10-23 morning)**: `console24-nogpio` (GPIO writes
+  skipped) **survived** — 2835 log lines, flush #21, reached the daemon loop —
+  and the touch code ran all the way to the I2C probe: `maps …` →
+  `ldoa28 vote -> 0 (skipped)` → `gcc vote=0x5bc0000 cbcr=0x4220` →
+  `SWEET TOUCH: se7 fw=0x300 proto=3 status=0 tx=0x20102964 rx=0x20104900` →
+  packing ok → `probe xfer addr=0x20 read len=6 stretch=1 err=5 irq=0 seen=0
+  tx=0 rx=0 status=0`. The SE is clocked and reachable; the transfer never
+  starts because the pins were never muxed (the whole GPIO step had been
+  skipped, since it was the hang).
+- **Root cause of the GPIO hang**: mainline `pinctrl-sdm845.c` puts **gpio88
+  (VIO) and gpio125 (ATTN) in the EAST tile (0x03500000)**, and only gpio99
+  (reset) plus the I2C pins 49/50 (qup12) in NORTH; the register is
+  `tile + 0x1000*pin`. Writing pins 88/125 into the SOUTH/NORTH slots hit
+  unimplemented addresses and froze the SoC. Patch **0096** maps EAST, muxes
+  49/50 to qup12 and uses the right tiles: gpio88 `0x03558000`,
+  gpio125 `0x0357d000`, gpio99 `0x03963000`, gpio49 `0x03931000`,
+  gpio50 `0x03932000`.
+- **Next boot (`console25-touch3`)**: GPIO + I2C mux fixed and the rail voted
+  with the fajita RPMh bases (`rpmhrsc=0x179e0000 rpmhtcs=0x179e0d00`, no
+  `sweetts_norail`). Success looks like `PDT 0xe9 fn=0x34`, `PDT 0xe3 fn=0x1`,
+  `PDT 0xdd fn=0x12`, `product id "…"` and then `raw max x=… y=…`.
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
