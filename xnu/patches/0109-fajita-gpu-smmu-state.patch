@@ -1,0 +1,92 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -67,6 +67,16 @@
+ 	return true;
+ }
+ 
++/* A read that does not announce itself: for groups that are flushed once. */
++static uint32_t
++gpu_rd_quiet(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
+ static uint32_t
+ gpu_probe_rd(const char *what, vm_offset_t base, uint32_t off)
+ {
+@@ -128,6 +138,22 @@
+ #define GPU_GMU_HFI_STATUS    0x14600u  /* 0x5180 */
+ #define GPU_GMU_FW_BYTES      0x8000u   /* a630_gmu.bin: 32 KB, code then data */
+ 
++/* stage 3b: the GPU's SMMU (qcom,smmu-v2: GR0 at 0, the contexts a page later) */
++#define GPU_SMMU_SCR0         0x000u
++#define GPU_SMMU_IDR0         0x020u
++#define GPU_SMMU_IDR1         0x024u
++#define GPU_SMMU_IDR2         0x028u
++#define GPU_SMMU_IDR7         0x03cu
++#define GPU_SMMU_SGFSR        0x048u
++#define GPU_SMMU_SMR(n)       (0x800u + 4u * (n))
++#define GPU_SMMU_S2CR(n)      (0xc00u + 4u * (n))
++#define GPU_SMMU_PAGE         0x8000u   /* where context 0's own registers start */
++#define GPU_SMMU_CBAR(n)      (GPU_SMMU_PAGE + 4u * (n))
++#define GPU_SMMU_CB_SCTLR     0x000u
++#define GPU_SMMU_CB_TTBR0     0x020u
++#define GPU_SMMU_CB_TCR       0x030u
++#define GPU_SMMU_CB_FSR       0x058u
++
+ static void
+ gpu_probe_wr(const char *what, vm_offset_t base, uint32_t off, uint32_t val)
+ {
+@@ -386,5 +412,49 @@
+ 	    *(volatile uint32_t *)(gmu + GPU_GMU_VERSIONS + 8),
+ 	    *(volatile uint32_t *)(gmu + GPU_GMU_VERSIONS + 16));
+ 	printf("SWEET GPU: stage 3a done\n");
++	if (level < 6) {
++		return;
++	}
++
++	/* ---- stage 3b: the state of the GPU's SMMU --------------------------- */
++	printf("SWEET GPU: --- stage 3b: smmu state\n");
++	if (smmu == 0) {
++		printf("SWEET GPU: no SMMU mapping\n");
++		return;
++	}
++	{
++		extern void sweet_log_panic_flush(void);
++		sweet_log_panic_flush();
++	}
++	printf("SWEET GPU: smmu scr0 %#x idr0 %#x idr1 %#x idr2 %#x idr7 %#x sgfsr %#x\n",
++	    gpu_rd_quiet(smmu, GPU_SMMU_SCR0), gpu_rd_quiet(smmu, GPU_SMMU_IDR0),
++	    gpu_rd_quiet(smmu, GPU_SMMU_IDR1), gpu_rd_quiet(smmu, GPU_SMMU_IDR2),
++	    gpu_rd_quiet(smmu, GPU_SMMU_IDR7), gpu_rd_quiet(smmu, GPU_SMMU_SGFSR));
++
++	/* arm-smmu.h: IDR0 [7:0] = stream match registers, IDR1 [31:24] = contexts */
++	uint32_t matches = gpu_rd_quiet(smmu, GPU_SMMU_IDR0) & 0xff;
++	uint32_t contexts = (gpu_rd_quiet(smmu, GPU_SMMU_IDR1) >> 24) & 0xff;
++	printf("SWEET GPU: smmu reports %u stream matches and %u contexts\n", matches, contexts);
++
++	if (matches > 16) {
++		matches = 16;
++	}
++	for (uint32_t i = 0; i < matches; i++) {
++		printf("SWEET GPU: smmu smr[%u] %#x s2cr %#x\n", i, gpu_rd_quiet(smmu, GPU_SMMU_SMR(i)),
++		    gpu_rd_quiet(smmu, GPU_SMMU_S2CR(i)));
++	}
++	if (contexts > 8) {
++		contexts = 8;
++	}
++	for (uint32_t i = 0; i < contexts; i++) {
++		printf("SWEET GPU: smmu cbar[%u] %#x\n", i, gpu_rd_quiet(smmu, GPU_SMMU_CBAR(i)));
++	}
++	printf("SWEET GPU: smmu cb0 sctlr %#x ttbr0 %#x %#x tcr %#x fsr %#x\n",
++	    gpu_rd_quiet(smmu, GPU_SMMU_PAGE + GPU_SMMU_CB_SCTLR),
++	    gpu_rd_quiet(smmu, GPU_SMMU_PAGE + GPU_SMMU_CB_TTBR0),
++	    gpu_rd_quiet(smmu, GPU_SMMU_PAGE + GPU_SMMU_CB_TTBR0 + 4),
++	    gpu_rd_quiet(smmu, GPU_SMMU_PAGE + GPU_SMMU_CB_TCR),
++	    gpu_rd_quiet(smmu, GPU_SMMU_PAGE + GPU_SMMU_CB_FSR));
++	printf("SWEET GPU: stage 3b done\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
