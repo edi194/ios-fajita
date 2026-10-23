@@ -1,0 +1,32 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -435,12 +435,16 @@
+ 
+ 	/* ---- stage 3d: the HFI table, the log, and the reset ------------------ */
+ 	printf("SWEET GPU: --- stage 3d: hfi and reset\n");
++	printf("SWEET GPU: mapping the hfi scratch at %#x\n", GPU_SCRATCH_PA + GPU_SCRATCH_HFI);
+ 	vm_offset_t hfi = ml_io_map(GPU_SCRATCH_PA + GPU_SCRATCH_HFI, 0x4000);
++	printf("SWEET GPU: hfi mapped at %#llx\n", (uint64_t)hfi);
+ 	vm_offset_t log = ml_io_map(GPU_SCRATCH_PA + GPU_SCRATCH_LOG, 0x4000);
++	printf("SWEET GPU: log mapped at %#llx\n", (uint64_t)log);
+ 	if (hfi == 0 || log == 0) {
+ 		printf("SWEET GPU: cannot map the GMU's scratch memory\n");
+ 		return;
+ 	}
++	printf("SWEET GPU: scratch reads %#x (the word there now)\n", *(volatile uint32_t *)hfi);
+ 	uint32_t hfi_pa = GPU_SCRATCH_PA + GPU_SCRATCH_HFI;
+ 	uint32_t log_pa = GPU_SCRATCH_PA + GPU_SCRATCH_LOG;
+ 
+@@ -452,10 +456,12 @@
+ 		uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
+ 	};
+ 
++	printf("SWEET GPU: clearing the scratch\n");
+ 	for (uint32_t off = 0; off < 0x4000; off += 4) {
+ 		*(volatile uint32_t *)(hfi + off) = 0;
+ 		*(volatile uint32_t *)(log + off) = 0;
+ 	}
++	printf("SWEET GPU: scratch cleared\n");
+ 	volatile struct hfi_table_header *const table = (volatile struct hfi_table_header *)hfi;
+ 	volatile struct hfi_queue_header *const queue = (volatile struct hfi_queue_header *)(hfi + sizeof(*table));
+ 
