@@ -63,6 +63,12 @@ cores. Reached 2026-10-23 ~12:30.
   already touch (`gcc 0x5200c`, `qfprom`, `cmd-db`, `gpucc` GDSCRs/CBCR/RCGR,
   SMMU IDR0/1/2 + SCR0) to the ones that may need a rail/clock first (GMU
   fw-init/CM3, GPU core, cx dbgc/misc). `console31-gpuprobe2.img` carries it.
+- **The probe output was lost on the next boot (console31)**: the ring on disk
+  was byte-identical to the previous boot (`flush #39`, 4703 lines) — the crash
+  happened before the log thread's first flush (~10 s), so nothing of the probe
+  reached userdata. **Patch 0101** calls `sweet_log_panic_flush()` right after
+  announcing each read, so the last line on disk always names the register
+  being touched. `console32-gpuprobe3.img` carries it.
 - **Reading the log without filming** (used all night): with the phone in
   fastboot, `fastboot boot <orange-fox-r12-fajita.img>` → poll `adb devices`
   until the state is `recovery` → `tools/sweet-log-pull.sh out.txt` (the last
