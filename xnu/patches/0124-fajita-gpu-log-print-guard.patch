@@ -1,0 +1,14 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -562,9 +562,8 @@
+ 	}
+ 	printf("SWEET GPU: fw_init %#x %s\n", init,
+ 	    init == GPU_GMU_FW_RUNNING ? "(THE GMU FIRMWARE RUNS)" : "(the firmware did not start)");
+-	printf("SWEET GPU: log first words %#x %#x %#x %#x\n",
+-	    *(volatile uint32_t *)(gpu_log_va + 0), *(volatile uint32_t *)(gpu_log_va + 4),
+-	    *(volatile uint32_t *)(gpu_log_va + 8), *(volatile uint32_t *)(gpu_log_va + 12));
++	/* The log lives at GPU address 0x60300000 and has no kernel mapping until the
++	 * SMMU stage maps it: reading it here is what panicked console53. */
+ 	printf("SWEET GPU: stage 3d done\n");
+ 	{
+ 		extern void sweet_log_panic_flush(void);
