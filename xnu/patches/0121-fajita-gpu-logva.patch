@@ -1,0 +1,29 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -209,6 +209,7 @@
+ 	uint32_t version, size, qhdr0_offset, qhdr_size, num_queues, active_queues;
+ };
+ 
++static vm_offset_t gpu_log_va;
+ static uint32_t gpu_hfi_pa, gpu_log_pa;
+ static bool gpu_scratch_ready;
+ 
+@@ -259,6 +260,7 @@
+ 	    table->qhdr_size, table->num_queues, table->active_queues, queue[0].status,
+ 	    queue[0].iova, queue[0].type);
+ 
++	gpu_log_va = log;
+ 	gpu_hfi_pa = GPU_SCRATCH_PA + GPU_SCRATCH_HFI;
+ 	gpu_log_pa = GPU_SCRATCH_PA + GPU_SCRATCH_LOG;
+ 	gpu_scratch_ready = true;
+@@ -557,8 +559,8 @@
+ 	printf("SWEET GPU: fw_init %#x %s\n", init,
+ 	    init == GPU_GMU_FW_RUNNING ? "(THE GMU FIRMWARE RUNS)" : "(the firmware did not start)");
+ 	printf("SWEET GPU: log first words %#x %#x %#x %#x\n",
+-	    *(volatile uint32_t *)(log + 0), *(volatile uint32_t *)(log + 4),
+-	    *(volatile uint32_t *)(log + 8), *(volatile uint32_t *)(log + 12));
++	    *(volatile uint32_t *)(gpu_log_va + 0), *(volatile uint32_t *)(gpu_log_va + 4),
++	    *(volatile uint32_t *)(gpu_log_va + 8), *(volatile uint32_t *)(gpu_log_va + 12));
+ 	printf("SWEET GPU: stage 3d done\n");
+ 	{
+ 		extern void sweet_log_panic_flush(void);
