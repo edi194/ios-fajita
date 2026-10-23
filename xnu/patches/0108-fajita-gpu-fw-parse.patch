@@ -1,0 +1,11 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -42,7 +42,7 @@
+ 
+ 	for (; *s != '\0' && n < 2; s++) {
+ 		if (*s == '0' && (s[1] == 'x' || s[1] == 'X')) {
+-			s++;
++			s += 2;        /* both the '0' and the 'x' */
+ 			v[n] = 0;
+ 			while ((*s >= '0' && *s <= '9') || (*s >= 'a' && *s <= 'f') ||
+ 			    (*s >= 'A' && *s <= 'F')) {
