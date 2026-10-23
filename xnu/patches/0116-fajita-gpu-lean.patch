@@ -1,0 +1,83 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -313,13 +313,11 @@
+ 		{ "gcc gpu_memnoc_gfx",   1, GPU_GCC_MEMNOC_GFX },
+ 		{ "gcc gpu_snoc_dvm_gfx", 1, GPU_GCC_SNOC_DVM },
+ 		{ "gcc ddrss_gpu_axi",    1, 0x44038u },
+-		{ "gpucc cb",             0, 0x1170u },
++		/* Only what gpucc-sdm845.c has: cb/hub_aon/hub_cx_int/smmu vote are
++		 * a660 clocks, and their offsets on this chip are something else. */
+ 		{ "gpucc cxo",            0, 0x109cu },
+ 		{ "gpucc ahb",            0, 0x1078u },
+-		{ "gpucc hub_aon",        0, 0x1178u },
+-		{ "gpucc hub_cx_int",     0, 0x1204u },
+ 		{ "gpucc cx_gmu",         0, 0x1098u },
+-		{ "gpucc smmu vote",      0, 0x5000u },
+ 	};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); i++) {
+ 		vm_offset_t base = branches[i].gcc ? gcc : cc;
+@@ -364,24 +362,7 @@
+ 		(void)gpu_probe_rd(roots[i].what, cc, roots[i].rcgr + 4);
+ 	}
+ 
+-	/* the hub's branches, which had no root clock when stage 2b tried them */
+-	static const struct {
+-		const char *what;
+-		uint32_t off;
+-	} hub[] = {
+-		{ "gpucc cb again",        0x1170u },
+-		{ "gpucc hub_aon again",   0x1178u },
+-		{ "gpucc hub_cx_int again", 0x1204u },
+-	};
+-	for (unsigned i = 0; i < sizeof(hub) / sizeof(hub[0]); i++) {
+-		uint32_t v = gpu_probe_rd(hub[i].what, cc, hub[i].off);
+-		if (!(v & 1u)) {
+-			gpu_probe_wr(hub[i].what, cc, hub[i].off, (v & ~CBCR_OFF) | 1u);
+-			v = gpu_probe_rd(hub[i].what, cc, hub[i].off);
+-		}
+-		printf("SWEET GPU: %s -> %s\n", hub[i].what,
+-		    (v & CBCR_OFF) ? "halted" : ((v & 1u) ? "on" : "off"));
+-	}
++	/* No "hub" branches here: cb/hub_aon/hub_cx_int are a660 clocks. */
+ 	printf("SWEET GPU: stage 2c done\n");
+ 	if (level < 5) {
+ 		return;
+@@ -392,8 +373,6 @@
+ 	printf("SWEET GPU: --- stage 3a: gmu memory and firmware\n");
+ 	(void)gpu_probe_rd("gmu sysreset", gmu, GPU_GMU_SYSRESET);
+ 	(void)gpu_probe_rd("gmu fw_init", gmu, GPU_GMU_FW_INIT);
+-	(void)gpu_probe_rd("gmu sptprac", gmu, GPU_GMU_SPTPRAC);
+-	(void)gpu_probe_rd("gmu hfi", gmu, GPU_GMU_HFI_STATUS);
+ 	char arg[64];
+ 	if (!PE_parse_boot_argn("sweetfw0", arg, sizeof(arg))) {
+ 		printf("SWEET GPU: no sweetfw0 boot argument: this boot image carries no GMU firmware\n");
+@@ -429,7 +408,7 @@
+ 
+ 	/* Seven words across both halves: the window is not read more than it has
+ 	 * to be (a single read of it has frozen the SoC). */
+-	static const uint32_t probe_at[] = { 0x0, 0x4, 0x8, 0x2000, 0x4000, 0x4004, 0x7ffc };
++	static const uint32_t probe_at[] = { 0x0, 0x4000, 0x7ffc };
+ 	uint32_t wrong = 0, wrong_at = 0;
+ 	for (unsigned i = 0; i < sizeof(probe_at) / sizeof(probe_at[0]); i++) {
+ 		uint32_t off = probe_at[i];
+@@ -530,17 +509,15 @@
+ 	gpu_probe_wr("gmu sysreset", gmu, GPU_GMU_SYSRESET, 0);
+ 
+ 	uint32_t init = 0;
+-	for (int i = 0; i < 200; i++) {
++	for (int i = 0; i < 50; i++) {
+ 		init = gpu_rd_quiet(gmu, GPU_GMU_FW_INIT);
+ 		if (init == GPU_GMU_FW_RUNNING) {
+ 			break;
+ 		}
+ 		gpu_wait_ms(1);
+ 	}
+-	printf("SWEET GPU: fw_init %#x %s, hfi status %#x, sptprac %#x, itcm[0] %#x\n", init,
+-	    init == GPU_GMU_FW_RUNNING ? "(THE GMU FIRMWARE RUNS)" : "(the firmware did not start)",
+-	    gpu_rd_quiet(gmu, GPU_GMU_HFI_STATUS), gpu_rd_quiet(gmu, GPU_GMU_SPTPRAC),
+-	    gpu_rd_quiet(gmu, GPU_GMU_ITCM));
++	printf("SWEET GPU: fw_init %#x %s\n", init,
++	    init == GPU_GMU_FW_RUNNING ? "(THE GMU FIRMWARE RUNS)" : "(the firmware did not start)");
+ 	printf("SWEET GPU: log first words %#x %#x %#x %#x\n",
+ 	    *(volatile uint32_t *)(log + 0), *(volatile uint32_t *)(log + 4),
+ 	    *(volatile uint32_t *)(log + 8), *(volatile uint32_t *)(log + 12));
