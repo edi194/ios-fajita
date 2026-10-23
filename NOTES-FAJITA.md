@@ -856,3 +856,24 @@ Observations, all from the live unit (serial intentionally not recorded here):
   do re-check it if the unit is ever swapped for a different RAM SKU.
 - UFS 2.1 timing and the Synaptics chip variant (s3320 vs s3706b) need
   on-device confirmation.
+
+### GPU stage 2 — assets ready (2026-10-23)
+
+- **Firmware extracted** from the partition dump (`vendor_a.img`, ext4
+  `/firmware/`) into `~/gpu-fw/` on the build host: `a630_gmu.bin` 32,768 B,
+  `a630_sqe.fw` 32,136 B, `a630_zap.b00` 148 B, `.b01` 6,536 B, `.b02`
+  1,968 B, `.elf` 14,256 B, `.mdt` 6,684 B. Keep them out of git; a100 KB
+  total is small enough to embed in the kernel for bring-up (no VFS
+  dependency) if that is simpler than loading from the iOS root.
+- **Stage-2 order**: CX/GX rail votes, un-collapse the GDSCs (`SWEET GPU`
+  showed GX/CX `0x222001`) and ungate the GMU/gfx clocks (`0x80004220`,
+  `0x80000000`), then GMU **legacy** mode: flat image to `GMU+0x0c00` (no
+  block headers, `dtcm_base 0x40000`), **SPTPRAC enable**, **HFI v1**
+  payloads, then zap through SCM (`PAS_GPU 13`) with all b0x segments, then
+  the 3D core: CP/RBBM init, 32 KiB ring, `a630_sqe.fw`.
+- **Build loop decision**: every GPU step needs a kernel rebuild + flash +
+  log pull (~15 min through CI, plus GitHub's artifact egress limits). A
+  Linux-native clang build (HackiOS does xnu-8796 with stock clang + theos +
+  the iPhoneOS SDK, ~45 s) would make the rest of this work several times
+  faster; Docker-OSX is not an option on this host (no `/dev/kvm` in WSL2,
+  4.8 GiB RAM).
