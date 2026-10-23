@@ -1,0 +1,90 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -59,6 +59,36 @@
+ 	return v;
+ }
+ 
++#define GPU_GCC_CFG_AHB     0x71004u    /* gcc_gpu_cfg_ahb_clk, CBCR */
++#define GPU_GCC_MEMNOC_GFX  0x7100cu
++#define GPU_GCC_SNOC_DVM    0x71018u
++#define GPUCC_CX_GDSCR      0x106cu
++#define GPUCC_CX_HW_CTRL    0x1540u
++#define GPUCC_GX_GDSCR      0x100cu
++#define GDSC_SW_COLLAPSE    (1u << 0)
++#define GDSC_HW_CONTROL     (1u << 1)
++#define GDSC_POWER_ON       (1u << 31)
++#define CBCR_OFF            (1u << 31)
++
++static void
++gpu_probe_wr(const char *what, vm_offset_t base, uint32_t off, uint32_t val)
++{
++	printf("SWEET GPU: write %s +%#x = %#x\n", what, off, val);
++	{
++		extern void sweet_log_panic_flush(void);
++		sweet_log_panic_flush();
++	}
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++gpu_wait_ms(unsigned ms)
++{
++	/* short, bounded waits: busy delay, no scheduler involvement */
++	delay(ms * 1000u);
++}
++
+ void
+ sweet_gpu_probe(void)
+ {
+@@ -104,6 +134,49 @@
+ 	(void)gpu_probe_rd("gpu", gpu, 0x0000);
+ 	(void)gpu_probe_rd("dbgc", dbgc, 0x00);
+ 	(void)gpu_probe_rd("misc", misc, 0x00);
+-	printf("SWEET GPU: probe done (nothing written)\n");
++	printf("SWEET GPU: probe done\n");
++	if (level < 2) {
++		return;
++	}
++
++	/* ---- stage 2a: the first writes ------------------------------------- */
++	printf("SWEET GPU: --- stage 2a: power\n");
++	uint32_t ahb = gpu_probe_rd("gcc", gcc, GPU_GCC_CFG_AHB);
++	if (ahb & CBCR_OFF) {
++		gpu_probe_wr("gcc", gcc, GPU_GCC_CFG_AHB, ahb | 1u);
++		for (int i = 0; i < 50; i++) {
++			if (!(gpu_probe_rd("gcc", gcc, GPU_GCC_CFG_AHB) & CBCR_OFF)) {
++				break;
++			}
++			gpu_wait_ms(1);
++		}
++		printf("SWEET GPU: gpu_cfg_ahb = %#x%s\n",
++		    gpu_probe_rd("gcc", gcc, GPU_GCC_CFG_AHB),
++		    (gpu_probe_rd("gcc", gcc, GPU_GCC_CFG_AHB) & CBCR_OFF) ? " (still halted)" : "");
++	}
++
++	uint32_t cx = gpu_probe_rd("gpucc", cc, GPUCC_CX_GDSCR);
++	uint32_t hw = gpu_probe_rd("gpucc", cc, GPUCC_CX_HW_CTRL);
++	if (((cx | hw) & GDSC_POWER_ON) == 0) {
++		if (cx & GDSC_HW_CONTROL) {
++			printf("SWEET GPU: CX is under hardware control; not operating it\n");
++		} else {
++			gpu_probe_wr("gpucc", cc, GPUCC_CX_GDSCR, cx & ~GDSC_SW_COLLAPSE);
++			for (int i = 0; i < 500; i++) {
++				cx = *(volatile uint32_t *)(cc + GPUCC_CX_GDSCR);
++				hw = *(volatile uint32_t *)(cc + GPUCC_CX_HW_CTRL);
++				if ((cx | hw) & GDSC_POWER_ON) {
++					break;
++				}
++				gpu_wait_ms(1);
++			}
++			printf("SWEET GPU: cx_gdscr = %#x cx_hw_ctrl = %#x -> %s\n", cx, hw,
++			    ((cx | hw) & GDSC_POWER_ON) ? "ON" : "STILL OFF");
++		}
++	} else {
++		printf("SWEET GPU: CX was already on (%#x|%#x)\n", cx, hw);
++	}
++	(void)gpu_probe_rd("gpucc", cc, GPUCC_GX_GDSCR);
++	printf("SWEET GPU: stage 2a done\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
