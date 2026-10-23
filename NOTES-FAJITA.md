@@ -53,6 +53,16 @@ cores. Reached 2026-10-23 ~12:30.
   IDR0/1/2 + SCR0 + SACR, GMU fw-init/CM3 reset/ITCM, the GPU's first words
   and cx_dbgc/cx_misc. Nothing is written; every block is announced before it
   is read so a hang names it. `console30-gpuprobe.img` carries it.
+- **First GPU probe boot froze on its first read (console30, 2026-10-23)**: the
+  panel stopped on `SWEET GPU: reading gcc`, i.e. the read of **GCC+0x52000** —
+  HackiOS's PLL-vote offset on their SoC, not a register validated here (this
+  port already reads GCC+**0x5200c**, the touch driver's vote register, and
+  that works). So a read of an unimplemented/halted GCC register hangs the bus
+  on SDM845. **Patch 0100** makes the probe per-register: one line announcing
+  `read <block> +<offset>`, one line with the value, ordered from registers we
+  already touch (`gcc 0x5200c`, `qfprom`, `cmd-db`, `gpucc` GDSCRs/CBCR/RCGR,
+  SMMU IDR0/1/2 + SCR0) to the ones that may need a rail/clock first (GMU
+  fw-init/CM3, GPU core, cx dbgc/misc). `console31-gpuprobe2.img` carries it.
 - **Reading the log without filming** (used all night): with the phone in
   fastboot, `fastboot boot <orange-fox-r12-fajita.img>` → poll `adb devices`
   until the state is `recovery` → `tools/sweet-log-pull.sh out.txt` (the last
