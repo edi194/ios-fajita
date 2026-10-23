@@ -69,6 +69,26 @@ cores. Reached 2026-10-23 ~12:30.
   reached userdata. **Patch 0101** calls `sweet_log_panic_flush()` right after
   announcing each read, so the last line on disk always names the register
   being touched. `console32-gpuprobe3.img` carries it.
+- **GPU stage 1 DONE (console33, 2026-10-23)**: the probe ran to completion and
+  the readings are exactly what a powered-down GPU looks like, with every
+  address confirmed:
+  * `gcc +0x5200c = 0x1bc0000` (wrapper AHB/SE votes; bit 26 not yet set because
+    the touch driver votes it later);
+  * `qfprom +0x1e8 = 0xce000000` (the a660 speed-bin offset means nothing here;
+    take the clock ladder from the dts `qcom,gpu-pwrlevels`);
+  * `cmd-db +0x4 = 0xc0330db` — **cmd-db magic, so 0x85fe0000 is right**;
+  * `gpucc +0x100c = 0x222001` and `+0x106c = 0x222001` — GX and CX GDSCs are
+    collapsed (GPU off);
+  * `gpucc +0x1098 = 0x80004220` (CX_GMU CBCR bit31 = halted) and
+    `+0x1120 = 0x80000000` (GMU clock root off);
+  * `smmu +0x00 = 0x200626` (the SMMU answers), `+0x04/+0x08 = 0` (IDR1/IDR2
+    zero — the v2 register layout needs checking when the domain is on),
+    `+0x30 = 0x30060000` (SCR0);
+  * `gmu +0x501c/+0x5000 = 0` (GMU in reset), `gpu +0 = 0`, `dbgc`, `misc` = 0
+    (the core is unclocked: reads return zero instead of hanging).
+  So the block bases are right and stage 2 starts with **power**: CX/GX rail
+  votes, un-collapse the GDSCs, ungate the GMU/gfx clocks, then the GMU
+  legacy-mode bring-up (SPTPRAC, HFI v1, flat `a630_gmu.bin`).
 - **Reading the log without filming** (used all night): with the phone in
   fastboot, `fastboot boot <orange-fox-r12-fajita.img>` → poll `adb devices`
   until the state is `recovery` → `tools/sweet-log-pull.sh out.txt` (the last
