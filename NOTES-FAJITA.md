@@ -720,6 +720,24 @@ Observations, all from the live unit (serial intentionally not recorded here):
   with the fajita RPMh bases (`rpmhrsc=0x179e0000 rpmhtcs=0x179e0d00`, no
   `sweetts_norail`). Success looks like `PDT 0xe9 fn=0x34`, `PDT 0xe3 fn=0x1`,
   `PDT 0xdd fn=0x12`, `product id "…"` and then `raw max x=… y=…`.
+- **console25-touch3 (2026-10-23): everything works except the transfer.**
+  The boot survived (2640 lines, SpringBoard running) and the log shows the
+  whole bring-up:
+  `SWEET RPMH: rsc=0x179e0000 tcs=0x179e0d00 … cmd-db … ldoa28 addr=0x42100
+  slave=4` → `TCS0 ACTIVE 3008 mV mode=7 enable=1` → `TCS0 done=1` →
+  `ldoa28 vote -> 0` (rail really voted), then
+  `gpio49/50 qup12 mux` → `gpio88 high (EAST)` → `gpio125 input (EAST)` →
+  `reset sequence done` (no hang, so the EAST addresses are right), then
+  `gcc vote=0x5bc0000 cbcr=0x4220` and
+  `SWEET TOUCH: se7 fw=0x300 proto=3 tx=0x20102964 rx=0x20104900 ios=0x3`
+  (the SE sees the bus), but
+  `probe xfer addr=0x20 read len=6 stretch=1 err=5 irq=0 seen=0 tx=0 rx=0
+  status=0` — the command never starts.
+  **Patch 0097** writes both `SE_I2C_TX_TRANS_LEN` and `SE_I2C_RX_TRANS_LEN`
+  for every command (mainline does; ours wrote only one, so the first RMI4
+  read ran with a stale TX_LEN) and dumps M_CMD0, TX/RX_LEN, STATUS, IRQ,
+  IRQ_EN, OUTPUT_CTRL, CGC and DMA_MODE around the first six commands.
+  `console26-touch4` is that kernel with keys enabled again.
 - **iOS root image built (2026-10-20)**: `~/ipsw-x/ios16-root-20H392.img`
   17,179,869,184 B (16 GiB, case-sensitive journaled HFS+, 12 GiB used,
   SHA256 `4d424a63…643b`) and `.simg` 12,145,480,060 B (flash this one with
