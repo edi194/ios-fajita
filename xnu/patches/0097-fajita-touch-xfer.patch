@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -253,9 +253,26 @@
+@@ -253,9 +253,25 @@
  	}
  	touch_wr(st.se, SE_IRQ_CLR, 0xffffffffu);
  	touch_wr(st.se, SE_TX_WM, nt ? 1u : 0u);
@@ -16,8 +16,7 @@
 +		if (dbg < 6) {
 +			dbg++;
 +			printf("SWEET TS: se cmd=%#x addr=%#x txlen=%#x rxlen=%#x status=%#x "
-+			    "irq=%#x irqen=%#x out=%#x cgc=%#x dma=%#x
-+",
++			    "irq=%#x irqen=%#x out=%#x cgc=%#x dma=%#x\n",
 +			    touch_rd(st.se, SE_CMD), addr, touch_rd(st.se, SE_TX_LEN),
 +			    touch_rd(st.se, SE_RX_LEN), touch_rd(st.se, SE_STATUS),
 +			    touch_rd(st.se, SE_IRQ), touch_rd(st.se, SE_IRQ_EN),
