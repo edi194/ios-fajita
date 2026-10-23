@@ -1,0 +1,40 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -482,17 +482,16 @@
+ 		return;
+ 	}
+ 
+-	/* ---- stage 3c: bypass for the GPU's streams -------------------------- */
+-	printf("SWEET GPU: --- stage 3c: smmu bypass\n");
+-	for (uint32_t i = 0; i < 5; i++) {
+-		uint32_t v = gpu_rd_quiet(smmu, GPU_SMMU_S2CR(i));
+-		if (((v >> 16) & 3u) != 1u) {
+-			gpu_probe_wr("smmu s2cr", smmu, GPU_SMMU_S2CR(i), (v & ~(3u << 16)) | GPU_SMMU_S2CR_BYPASS);
+-			v = gpu_rd_quiet(smmu, GPU_SMMU_S2CR(i));
+-		}
+-		printf("SWEET GPU: smmu s2cr[%u] %#x (%s)\n", i, v, ((v >> 16) & 3u) == 1u ? "bypass" : "not bypassed");
+-	}
+-	printf("SWEET GPU: stage 3c done\n");
++	/* ---- stage 3c: the SMMU is left alone -------------------------------- */
++	/*
++	 * Writing the stream table froze the phone in 0111: every write was
++	 * dropped (the reads still said 0x200ff) and the fifth access never
++	 * returned. The device tree says why - "qcom,hyp_secure_alloc", and sCR0
++	 * bit 21 is QCOM's hypervisor bit, so SMR/S2CR belong to the hypervisor
++	 * and the vendor's driver reaches them through SCM. Nothing is written
++	 * here; the GMU is tried against the SMMU as the boot loader left it.
++	 */
++	printf("SWEET GPU: --- stage 3c: smmu left alone (hypervisor's stream table)\n");
+ 
+ 	/* ---- stage 3d: the HFI table, the log, and the reset ------------------ */
+ 	printf("SWEET GPU: --- stage 3d: hfi and reset\n");
+@@ -572,6 +571,9 @@
+ 	    init == GPU_GMU_FW_RUNNING ? "(THE GMU FIRMWARE RUNS)" : "(the firmware did not start)",
+ 	    gpu_rd_quiet(gmu, GPU_GMU_HFI_STATUS), gpu_rd_quiet(gmu, GPU_GMU_SPTPRAC),
+ 	    gpu_rd_quiet(gmu, GPU_GMU_ITCM));
++	/* Did the GMU's own accesses fault? (sGFSR, sGFSYNR0/1: read-only) */
++	printf("SWEET GPU: smmu global fault %#x at %#x%08x\n",
++	    gpu_rd_quiet(smmu, GPU_SMMU_SGFSR), gpu_rd_quiet(smmu, 0x54u), gpu_rd_quiet(smmu, 0x50u));
+ 	printf("SWEET GPU: log first words %#x %#x %#x %#x\n",
+ 	    *(volatile uint32_t *)(log + 0), *(volatile uint32_t *)(log + 4),
+ 	    *(volatile uint32_t *)(log + 8), *(volatile uint32_t *)(log + 12));
