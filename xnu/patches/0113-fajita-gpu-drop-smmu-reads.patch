@@ -1,0 +1,63 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -434,50 +434,6 @@
+ 	    *(volatile uint32_t *)(gmu + GPU_GMU_VERSIONS + 8),
+ 	    *(volatile uint32_t *)(gmu + GPU_GMU_VERSIONS + 16));
+ 	printf("SWEET GPU: stage 3a done\n");
+-	if (level < 6) {
+-		return;
+-	}
+-
+-	/* ---- stage 3b: the state of the GPU's SMMU --------------------------- */
+-	printf("SWEET GPU: --- stage 3b: smmu state\n");
+-	if (smmu == 0) {
+-		printf("SWEET GPU: no SMMU mapping\n");
+-		return;
+-	}
+-	{
+-		extern void sweet_log_panic_flush(void);
+-		sweet_log_panic_flush();
+-	}
+-	printf("SWEET GPU: smmu scr0 %#x idr0 %#x idr1 %#x idr2 %#x idr7 %#x sgfsr %#x\n",
+-	    gpu_rd_quiet(smmu, GPU_SMMU_SCR0), gpu_rd_quiet(smmu, GPU_SMMU_IDR0),
+-	    gpu_rd_quiet(smmu, GPU_SMMU_IDR1), gpu_rd_quiet(smmu, GPU_SMMU_IDR2),
+-	    gpu_rd_quiet(smmu, GPU_SMMU_IDR7), gpu_rd_quiet(smmu, GPU_SMMU_SGFSR));
+-
+-	/* arm-smmu.h: IDR0 [7:0] = stream match registers, IDR1 [31:24] = contexts */
+-	uint32_t matches = gpu_rd_quiet(smmu, GPU_SMMU_IDR0) & 0xff;
+-	uint32_t contexts = (gpu_rd_quiet(smmu, GPU_SMMU_IDR1) >> 24) & 0xff;
+-	printf("SWEET GPU: smmu reports %u stream matches and %u contexts\n", matches, contexts);
+-
+-	if (matches > 16) {
+-		matches = 16;
+-	}
+-	for (uint32_t i = 0; i < matches; i++) {
+-		printf("SWEET GPU: smmu smr[%u] %#x s2cr %#x\n", i, gpu_rd_quiet(smmu, GPU_SMMU_SMR(i)),
+-		    gpu_rd_quiet(smmu, GPU_SMMU_S2CR(i)));
+-	}
+-	if (contexts > 8) {
+-		contexts = 8;
+-	}
+-	for (uint32_t i = 0; i < contexts; i++) {
+-		printf("SWEET GPU: smmu cbar[%u] %#x\n", i, gpu_rd_quiet(smmu, GPU_SMMU_CBAR(i)));
+-	}
+-	printf("SWEET GPU: smmu cb0 sctlr %#x ttbr0 %#x %#x tcr %#x fsr %#x\n",
+-	    gpu_rd_quiet(smmu, GPU_SMMU_PAGE + GPU_SMMU_CB_SCTLR),
+-	    gpu_rd_quiet(smmu, GPU_SMMU_PAGE + GPU_SMMU_CB_TTBR0),
+-	    gpu_rd_quiet(smmu, GPU_SMMU_PAGE + GPU_SMMU_CB_TTBR0 + 4),
+-	    gpu_rd_quiet(smmu, GPU_SMMU_PAGE + GPU_SMMU_CB_TCR),
+-	    gpu_rd_quiet(smmu, GPU_SMMU_PAGE + GPU_SMMU_CB_FSR));
+-	printf("SWEET GPU: stage 3b done\n");
+ 	if (level < 7) {
+ 		return;
+ 	}
+@@ -571,9 +527,6 @@
+ 	    init == GPU_GMU_FW_RUNNING ? "(THE GMU FIRMWARE RUNS)" : "(the firmware did not start)",
+ 	    gpu_rd_quiet(gmu, GPU_GMU_HFI_STATUS), gpu_rd_quiet(gmu, GPU_GMU_SPTPRAC),
+ 	    gpu_rd_quiet(gmu, GPU_GMU_ITCM));
+-	/* Did the GMU's own accesses fault? (sGFSR, sGFSYNR0/1: read-only) */
+-	printf("SWEET GPU: smmu global fault %#x at %#x%08x\n",
+-	    gpu_rd_quiet(smmu, GPU_SMMU_SGFSR), gpu_rd_quiet(smmu, 0x54u), gpu_rd_quiet(smmu, 0x50u));
+ 	printf("SWEET GPU: log first words %#x %#x %#x %#x\n",
+ 	    *(volatile uint32_t *)(log + 0), *(volatile uint32_t *)(log + 4),
+ 	    *(volatile uint32_t *)(log + 8), *(volatile uint32_t *)(log + 12));
