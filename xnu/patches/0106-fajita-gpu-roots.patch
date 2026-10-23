@@ -1,0 +1,74 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -73,6 +73,15 @@
+ #define GDSC_POWER_ON       (1u << 31)
+ #define CBCR_OFF            (1u << 31)
+ 
++/* stage 2c: the PLL tap and the two clock roots */
++#define GPU_GCC_PLL_VOTE        0x52000u
++#define GPU_GCC_PLL_VOTE_GPU_DIV (1u << 16) /* the 300 MHz tap of the 600 MHz PLL */
++#define GPUCC_GMU_RCGR          0x1120u     /* gpu_cc_gmu_clk_src: +0 command, +4 source/divider */
++#define GPUCC_HUB_RCGR          0x117cu     /* gpu_cc_hub_clk_src */
++#define GPU_RCG_UPDATE          (1u << 0)
++#define GPU_RCG_SOURCE_MASK     0x371fu     /* [4:0] 2*divider-1, [10:8] source, [13:12] mode */
++#define GPU_RCG_GPLL0_DIV(twice) (6u << 8 | ((twice) - 1))
++
+ static void
+ gpu_probe_wr(const char *what, vm_offset_t base, uint32_t off, uint32_t val)
+ {
+@@ -218,5 +227,55 @@
+ 		    (now & CBCR_OFF) ? " (halted)" : " (running)");
+ 	}
+ 	printf("SWEET GPU: stage 2b done\n");
++	if (level < 4) {
++		return;
++	}
++
++	/* ---- stage 2c: the PLL tap and the two clock roots -------------------- */
++	printf("SWEET GPU: --- stage 2c: clock roots\n");
++	uint32_t vote = gpu_probe_rd("gcc pll vote", gcc, GPU_GCC_PLL_VOTE);
++	if (!(vote & GPU_GCC_PLL_VOTE_GPU_DIV)) {
++		gpu_probe_wr("gcc pll vote", gcc, GPU_GCC_PLL_VOTE,
++		    (vote & ~CBCR_OFF) | GPU_GCC_PLL_VOTE_GPU_DIV);
++		(void)gpu_probe_rd("gcc pll vote", gcc, GPU_GCC_PLL_VOTE);
++	}
++	static const struct {
++		const char *what;
++		uint32_t rcgr;
++		uint32_t sel;
++	} roots[] = {
++		{ "gmu_clk_src", GPUCC_GMU_RCGR, GPU_RCG_GPLL0_DIV(3) },   /* 300 MHz / 1.5 */
++		{ "hub_clk_src", GPUCC_HUB_RCGR, GPU_RCG_GPLL0_DIV(4) },   /* 300 MHz / 2 */
++	};
++	for (unsigned i = 0; i < sizeof(roots) / sizeof(roots[0]); i++) {
++		uint32_t was = gpu_probe_rd(roots[i].what, cc, roots[i].rcgr + 4);
++		if ((was & GPU_RCG_SOURCE_MASK) != roots[i].sel) {
++			gpu_probe_wr(roots[i].what, cc, roots[i].rcgr + 4,
++			    (was & ~GPU_RCG_SOURCE_MASK) | roots[i].sel);
++			gpu_probe_wr(roots[i].what, cc, roots[i].rcgr,
++			    gpu_probe_rd(roots[i].what, cc, roots[i].rcgr) | GPU_RCG_UPDATE);
++		}
++		(void)gpu_probe_rd(roots[i].what, cc, roots[i].rcgr + 4);
++	}
++
++	/* the hub's branches, which had no root clock when stage 2b tried them */
++	static const struct {
++		const char *what;
++		uint32_t off;
++	} hub[] = {
++		{ "gpucc cb again",        0x1170u },
++		{ "gpucc hub_aon again",   0x1178u },
++		{ "gpucc hub_cx_int again", 0x1204u },
++	};
++	for (unsigned i = 0; i < sizeof(hub) / sizeof(hub[0]); i++) {
++		uint32_t v = gpu_probe_rd(hub[i].what, cc, hub[i].off);
++		if (!(v & 1u)) {
++			gpu_probe_wr(hub[i].what, cc, hub[i].off, (v & ~CBCR_OFF) | 1u);
++			v = gpu_probe_rd(hub[i].what, cc, hub[i].off);
++		}
++		printf("SWEET GPU: %s -> %s\n", hub[i].what,
++		    (v & CBCR_OFF) ? "halted" : ((v & 1u) ? "on" : "off"));
++	}
++	printf("SWEET GPU: stage 2c done\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
