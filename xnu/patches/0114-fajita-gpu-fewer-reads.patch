@@ -1,0 +1,57 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -157,6 +157,7 @@
+ #define GPU_SMMU_S2CR_BYPASS   (1u << 16)   /* [17:16]: 0 translate, 1 bypass, 2 fault */
+ 
+ /* stage 3d: what the GMU firmware needs (all GMU_WORD(n) = 4n from the GMU base) */
++#define GPU_GMU_GENERAL_7     0x14730u      /* 0x51cc: 1 turns on the TCM's retention */
+ #define GPU_GMU_HFI_SFR       0x14608u      /* 0x5182: which GPU this is */
+ #define GPU_GMU_HFI_QTBL_INFO 0x14610u      /* 0x5184 */
+ #define GPU_GMU_HFI_QTBL_ADDR 0x14614u      /* 0x5185: the HFI table, 32 bits */
+@@ -381,9 +382,6 @@
+ 	(void)gpu_probe_rd("gmu fw_init", gmu, GPU_GMU_FW_INIT);
+ 	(void)gpu_probe_rd("gmu sptprac", gmu, GPU_GMU_SPTPRAC);
+ 	(void)gpu_probe_rd("gmu hfi", gmu, GPU_GMU_HFI_STATUS);
+-	uint32_t itcm_before = gpu_probe_rd("gmu itcm[0]", gmu, GPU_GMU_ITCM);
+-	uint32_t dtcm_before = gpu_probe_rd("gmu dtcm[0]", gmu, GPU_GMU_DTCM);
+-
+ 	char arg[64];
+ 	if (!PE_parse_boot_argn("sweetfw0", arg, sizeof(arg))) {
+ 		printf("SWEET GPU: no sweetfw0 boot argument: this boot image carries no GMU firmware\n");
+@@ -417,19 +415,22 @@
+ 	}
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+ 
++	/* Seven words across both halves: the window is not read more than it has
++	 * to be (a single read of it has frozen the SoC). */
++	static const uint32_t probe_at[] = { 0x0, 0x4, 0x8, 0x2000, 0x4000, 0x4004, 0x7ffc };
+ 	uint32_t wrong = 0, wrong_at = 0;
+-	for (uint32_t off = 0; off < GPU_GMU_FW_BYTES; off += 4) {
++	for (unsigned i = 0; i < sizeof(probe_at) / sizeof(probe_at[0]); i++) {
++		uint32_t off = probe_at[i];
+ 		if (*(volatile uint32_t *)(gmu + GPU_GMU_ITCM + off) != *(volatile uint32_t *)(fw + off)) {
+ 			if (wrong++ == 0) {
+ 				wrong_at = off;
+ 			}
+ 		}
+ 	}
+-	printf("SWEET GPU: itcm[0] %#x -> %#x, dtcm[0] %#x -> %#x\n", itcm_before,
+-	    *(volatile uint32_t *)(gmu + GPU_GMU_ITCM), dtcm_before,
+-	    *(volatile uint32_t *)(gmu + GPU_GMU_DTCM));
+-	printf("SWEET GPU: %u of %u words differ%s%#x, versions %#x %#x %#x\n", wrong,
+-	    GPU_GMU_FW_BYTES / 4, wrong ? " (first at " : "", wrong ? wrong_at : 0,
++	printf("SWEET GPU: itcm[0] %#x dtcm[0] %#x (sampled %u of %u words differ%s%#x), versions %#x %#x %#x\n",
++	    *(volatile uint32_t *)(gmu + GPU_GMU_ITCM), *(volatile uint32_t *)(gmu + GPU_GMU_DTCM),
++	    wrong, (uint32_t)(sizeof(probe_at) / sizeof(probe_at[0])), wrong ? " (first at " : "",
++	    wrong ? wrong_at : 0,
+ 	    *(volatile uint32_t *)(gmu + GPU_GMU_VERSIONS),
+ 	    *(volatile uint32_t *)(gmu + GPU_GMU_VERSIONS + 8),
+ 	    *(volatile uint32_t *)(gmu + GPU_GMU_VERSIONS + 16));
+@@ -495,6 +496,7 @@
+ 	    table->version, table->size, table->qhdr0_offset, table->qhdr_size, table->num_queues,
+ 	    table->active_queues, queue[0].status, queue[0].iova, queue[0].type);
+ 
++	gpu_probe_wr("gmu tcm retention", gmu, GPU_GMU_GENERAL_7, 1);
+ 	gpu_probe_wr("gmu hfi sfr", gmu, GPU_GMU_HFI_SFR, GPU_GMU_CHIPID);
+ 	gpu_probe_wr("gmu hfi qtbl info", gmu, GPU_GMU_HFI_QTBL_INFO, 1);
+ 	gpu_probe_wr("gmu hfi qtbl addr", gmu, GPU_GMU_HFI_QTBL_ADDR, hfi_pa);
