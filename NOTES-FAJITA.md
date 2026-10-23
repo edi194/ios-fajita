@@ -993,3 +993,65 @@ GCC `gpu_memnoc_gfx`/`gpu_snoc_dvm_gfx`/`ddrss_gpu_axi` and gpucc
 `cb`/`cxo`/`ahb`/`hub_aon`/`hub_cx_int`/`cx_gmu`/`smmu vote`, each read back
 with its halt bit. The PLL vote (`GCC+0x52000` froze the bus in 0099, so it
 needs the exact SDM845 register) and the GMU/hub RCGs are the next step.
+
+### GPU stage 2c: what SDM845 actually has (console38, 2026-10-23)
+
+```
+SWEET GPU: gcc pll vote +0x52000 = 0x11          (GPLL0 bit 0 and GPLL4 bit 4: already on)
+SWEET GPU: gmu_clk_src +0x1124 = 0x602           (source 6 = GPLL0/1.5 -> 200 MHz: taken)
+SWEET GPU: hub_clk_src +0x1180 = 0               (not taken: the register does not exist here)
+SWEET GPU: gpucc cb / hub_aon / hub_cx_int = 0   (same: no such branches on this chip)
+```
+
+**HackiOS' driver is for an a660 (SM8250), not SDM845.** `gpucc-sdm845.c` has
+only `gpu_cc_cxo_clk`, `gpu_cc_cx_gmu_clk`, `gpu_cc_gmu_clk_src` and
+`gpu_cc_pll1`; there is no `hub_clk_src`, `cb`, `hub_aon` or `hub_cx_int`, which
+is why those reads stay 0 and why `GCC+0x52000` bit 16 does nothing (there the
+register enables GPLL0 in bit 0 and GPLL4 in bit 4, and reads `0x11` = both
+already on). For a630 the clock work is done: CX GDSC on, `gmu_clk_src` 200 MHz
+from GPLL0/1.5, `cx_gmu`/`cxo`/`ahb` and the GCC memory clocks on. The GMU
+answered the read at `gmu+0x501c` before any of this, so its AHB was already up.
+
+Also: the four SpringBoard crashes seen in console37 did not come back in
+console38 (0 crashes, same userland), so they were a startup race, not the GPU
+clocks.
+
+### GMU register offsets: settled (2026-10-23)
+
+The GMU's registers are indexed in **words from the GMU base** `0x506a000`, so
+the byte offset is `4 * n` - exactly HackiOS' `GMU_WORD(n)`, and it is right for
+a630 too. Proof: the older generated Linux header
+(`WSL2-Linux-Kernel/drivers/gpu/drm/msm/adreno/a6xx_gmu.xml.h`) has ITCM
+`0x0c00`, DTCM `0x1c00`, SYSRESET `0x5000`, FW_INIT_RESULT `0x501c`,
+HFI_CTRL_STATUS `0x5180`, and every entry of the newer
+`registers/adreno/a6xx_gmu.xml` is that number plus `0x1a800` - the newer file
+counts from the GPU base (`0x5000000`) instead of the GMU base. Byte offsets
+used from now on: ITCM `0x3000`, DTCM `0x7000` (versions at `0xafe0`),
+SYSRESET `0x14000`, BOOT_CONFIG `0x14004`, FW_INIT_RESULT `0x14070`,
+SPTPRAC status `0x14340`, HFI status `0x14600`, HFI init `0x14618`,
+HOST2GMU_INTR_SET `0x14650`, AHB_FENCE_CTRL `0x24c40`.
+
+### a630 GMU: what Linux does (for the next steps)
+
+`a6xx_gmu.c` marks a630 `gmu->legacy = true` ("manual SPTPRAC control"). The
+firmware is **flat** and the legacy path writes all 32 KB with one bulk write at
+`GMU_CM3_ITCM_START` (16 KB of code, then the 16 KB of data that follows it -
+DTCM `0x7000` lies inside that window). Start sequence: read
+`DTCM_START + 0xff8` (firmware version; ours reads 0, so the mask is
+`0xffffffff` and the expected `FW_INIT_RESULT` is **`0xbabeface`**),
+`SYSRESET=1`, `PWR_COL_CP_RESP=0`, `SYSRESET=0`, then poll `FW_INIT_RESULT`.
+Before that `a6xx_gmu_fw_start` needs `a6xx_rpmh_start` (the GMU's RSCC/RPMh
+interface; the GMU also has the `gmu_pdc` block at `0xb280000`), the HFI table
+iova, the log iova and `AHB_FENCE_RANGE_0`, `CM3_CFG=0x4052`, the chipid at
+`HFI_SFR_ADDR` and the log at `PWR_COL_CP_MSG`. Those buffers need an address
+space the GMU can reach - the GPU SMMU (bypass or a context) or physical
+addresses.
+
+### Firmware transport (patch 0107)
+
+`tools/mkpayload.py --blob FILE` appends files as extra payload segments and
+appends `sweetfwN=<pa>:<size>` to the command line, so `a630_gmu.bin` travels in
+the boot image and never enters git (`tools/build-fajita.sh` passes
+`${GPU_FW:-$HOME/gpu-fw/a630_gmu.bin}`). Stage 3a (`adreno=5`) reads the GMU's
+registers with the offsets above, maps the blob, writes it into the ITCM window
+and reads it back word by word.
