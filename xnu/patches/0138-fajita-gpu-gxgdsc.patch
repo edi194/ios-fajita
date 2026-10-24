@@ -1,0 +1,30 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1364,8 +1364,25 @@
+ 		{
+ 			bool rail = gpu_gx_rail_on(gmu);
+ 			printf("SWEET GPU: gx rail %s\n", rail ? "on" : "NOT on");
+-			if (rail) {
+-				(void)gpu_sptprac_on(gmu);
++			if (rail && gpu_sptprac_on(gmu)) {
++				/* The GX domain itself: the same collapse bit as CX, at 0x100c. */
++				uint32_t gx = gpu_probe_rd("gpucc gx gdscr", cc, GPUCC_GX_GDSCR);
++				if (gx & GDSC_POWER_ON) {
++					printf("SWEET GPU: gx gdscr already on %#x\n", gx);
++				} else {
++					gpu_probe_wr("gpucc gx gdscr on", cc, GPUCC_GX_GDSCR,
++					    (gx & ~GDSC_SW_COLLAPSE) & ~GDSC_HW_CONTROL);
++					uint32_t now = 0;
++					for (int i = 0; i < 100; i++) {
++						now = gpu_rd_quiet(cc, GPUCC_GX_GDSCR);
++						if (now & GDSC_POWER_ON) {
++							break;
++						}
++						gpu_wait_ms(1);
++					}
++					printf("SWEET GPU: gx gdscr %#x -> %#x -> %s\n", gx, now,
++					    (now & GDSC_POWER_ON) ? "GX ON" : "GX STILL OFF");
++				}
+ 			}
+ 		}
+ 	}
