@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Runs the GPU test tool once at boot and sends its output to the console, so the
+  result lands in the persistent kernel log (and on the panel) without a shell.
+
+  The tool needs the GPU bring-up to have run, which happens at UFS attach, so this
+  only works on the real root - not with rd=md0.
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.sweet.gputest</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/sweetgputest</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+	<key>KeepAlive</key>
+	<false/>
+	<key>ThrottleInterval</key>
+	<integer>0</integer>
+</dict>
+</plist>
