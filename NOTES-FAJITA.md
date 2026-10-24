@@ -2138,3 +2138,52 @@ interfaces against our tree.
 layer, with `IOConnectMapMemory64` backed by the arena pages; then their `sweet_drm.c`
 unchanged as the userspace side; then the `/dev/sweetgpu` test tool stays as the
 kernel-side smoke test.
+
+### Port plan for 0182 (the IOKit user client), read from their patch
+
+Their `0182-beryllium-gpu-adreno-iokit-user-client.patch` is 1208 lines and adds exactly
+three things:
+
+| file | size | note |
+| --- | --- | --- |
+| `iokit/Kernel/arm/SweetAdreno.cpp` | 950 lines, new | `SweetAdreno630 : IOService`, `SweetAdrenoUserClient : IOUserClient`, `AGXDeviceUserClient` subclass, `SweetAdrenoPublish()` |
+| `iokit/Kernel/arm/SweetAdrenoABI.h` | new | all the msm structs + the `SWEET_GPU_SEL_*` numbers |
+| `iokit/conf/files.arm64` | one line | `iokit/Kernel/arm/SweetAdreno.cpp   optional iokitcpp` |
+
+**That conf line slots in unchanged**: our tree has the same neighbours (SweetKeyStore,
+SweetWatchdog, SweetSurface, SweetFramebuffer, SweetNetwork, SweetBattery, hid/SweetHID) -
+the port descends from the same work.
+
+Their C++ calls sixteen C functions from the kernel driver. What we have and what is
+missing:
+
+| their call | us |
+| --- | --- |
+| `sweet_gpu_submit` | have: `gpu_cp_submit` (ring + IB + CACHE_FLUSH_TS) |
+| `sweet_gpu_fence_done/last` | have: `gpu_cp_wait_fence` / `gpu_client_wait` (poll) |
+| `sweet_gpu_iova_alloc/reserve/free` | **missing**: our allocator is a bump with no reuse and no reserve |
+| `sweet_gpu_vm_map/unmap` | **partial**: `gpu_pt_map` covers only the first 2 MiB (one L3) |
+| `sweet_gpu_ready`, `sweet_gpu_selector` | **missing** (trivial) |
+| `sweet_gpu_param` | **missing**: the msm GET_PARAM answers (GPU_ID 630, CHIP_ID, GMEM, VA range...) |
+| `sweet_gpu_surface_bo` | **missing**: IOSurface import - the drawable path, needs our tree's IOSurface internals |
+| `sweet_gpu_bo_sync`, `sweet_gpu_cache_sync` | **missing**: `dc civac` over a BO range (`flush_dcache64` by PA works) |
+| `sweet_gpu_mark_lost/report` | **missing** (a flag plus a log) |
+
+Suggested split, one boot each:
+
+1. **0156 - the C side**: `sweet_gpu_ready/selector/param/fence_done/fence_last`,
+   `bo_sync`/`cache_sync` (flush_dcache64 by PA), `mark_lost/report`, a real first-fit
+   allocator with an L3 pool (drop the 2 MiB limit), and `vm_map/unmap` over it.
+   Testable in the boot log like the rest.
+2. **0157 - `SweetAdrenoABI.h` + `SweetAdreno.cpp` + the conf line + publish** when the
+   GPU was kept up. Check Bergamota's licence first: their earlier kernel work said
+   "no code copied, all rewritten", and Chlorophyll is MIT; if the C++ is not clearly
+   MIT, adapt it rather than copy verbatim.
+3. **0158 - `surface_bo`** (IOSurface pages into the GPU address space) - the one that
+   needs our own IOSurface internals, and the reason not to blind-port their 0157/0159.
+4. **Userspace**: their `gpu/freedreno-sweet/sweet_drm.c` is the libdrm stand-in; build
+   it for our iOS arm64 (it only needs IOKit and the ABI), and it then serves Mesa and
+   Chlorophyll unchanged.
+
+The chardev (`/dev/sweetgpu`) stays as the kernel-side smoke test; it is not the path
+the graphics stack takes.
