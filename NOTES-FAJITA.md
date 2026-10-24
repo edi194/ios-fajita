@@ -1697,3 +1697,31 @@ Next: the CP. Ring (32 KiB at GPU VA 0x40000000), SQE (read-only, 0x10000 at
 0x40010000), scratch (0x40020000) in a new 128 KiB block, `CP_ME_INIT` with the
 hw_init writes, the zap through SCM PAS 13, `CP_SET_SECURE_MODE 0`, then
 NOP + `CP_MEM_WRITE` + `CP_EVENT_WRITE(CACHE_FLUSH_TS)` with RPTR polling.
+
+### console73: the CP's memory is mapped (2026-10-24)
+
+```
+SWEET GPU: cp memory: ring 0x40000000 (32 KiB) sqe 0x40010000 (32 KiB, read-only)
+           scratch 0x40020000; l2[0]=0x1024ee003 l3[0]=0x1024f0e43
+```
+
+The payload's second blob is 144 KiB now (the GMU keeps the first 64 KiB, the CP
+block the next 128 KiB carved from +0x10000): L1 shared with the GMU (0x40000000
+and 0x60000000 both have VA[31:30] = 1), a new L2 entry at index 0 pointing at the
+CP's L3, the ring's 8 pages at 0x40000000, the SQE's 8 read-only pages at
+0x40010000 and the scratch page at 0x40020000. Everything else on the ladder is
+unchanged and iOS still boots.
+
+### What the CP stage needs next (all in Bergamota's 0103)
+
+1. `CP_ME_INIT` plus the ~25 `hw_init` writes in Linux's order: the 64-bit address
+   modes, VBIF, UCHE, ROQ, and the ring/SQE base registers pointing at
+   `0x40000000` / `0x40010000` through CB1.
+2. The zap: `SCM_PAS_INIT_IMAGE` then `SCM_PAS_AUTH_AND_RESET` (PAS id 13, the
+   SMC64 convention with the continuation token; the files are in
+   `~/gpu-fw/a630_zap.{mdt,b00,b01,b02,elf}`).
+3. `CP_SET_SECURE_MODE 0`.
+4. The test: a NOP, a `CP_MEM_WRITE` to the scratch page and a
+   `CP_EVENT_WRITE(CACHE_FLUSH_TS)`, then poll RPTR and read both values back
+   (`0xc0ffee` style) - the first PM4 packet this kernel would ever submit.
+5. Leave `gpu_gx_slumber` in place afterwards so the rail is returned.
