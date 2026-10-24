@@ -1,0 +1,221 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -19,6 +19,11 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++/* stage 8: buffer allocation and cache attributes (the same calls sweet_ufs.c
++ * already uses on this port) */
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <arm/memory_types.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ void sweet_gpu_probe(void);
+@@ -341,6 +346,144 @@
+ #define GPU_CP_INDIRECT_BUFFER_PFE 0x3fu
+ #define GPU_CP_SCRATCH_FENCE   0x200u   /* CACHE_FLUSH_TS puts the sequence here */
+ #define GPU_VA_CLIENT_IB       (GPU_VA_CLIENT_TEST + 0x1000u)
++/* stage 8d: buffers (BOs) in the client address range */
++#define GPU_BO_MAX             8u
++#define GPU_VA_BASE            0x80020000u   /* after the 0149/0150 test pages */
++#define GPU_BO_MAX_BYTES       0x100000u
++
++struct gpu_bo {
++	vm_offset_t kva;        /* the kernel alias, write-combined */
++	uint64_t pa;
++	vm_size_t size;
++	uint32_t va;            /* the GPU address */
++	bool used;
++};
++
++static struct gpu_bo gpu_bos[GPU_BO_MAX];
++static uint32_t gpu_va_next;         /* bump allocator, one guard page, no reuse */
++static vm_offset_t gpu_pt_blob;      /* where the page tables live */
++
++static void
++gpu_bo_init(vm_offset_t blob)
++{
++	gpu_pt_blob = blob;
++	gpu_va_next = GPU_VA_BASE;
++	for (unsigned i = 0; i < GPU_BO_MAX; i++) {
++		gpu_bos[i].used = false;
++	}
++}
++
++/*
++ * Map [va, va+size) to [pa, pa+size) in the client range. Only the first 2 MiB are
++ * covered: that is the single L3 the payload provides (0149), and a pool comes
++ * with the ABI patch.
++ */
++static bool
++gpu_pt_map(uint32_t va, uint64_t pa, vm_size_t size)
++{
++	volatile uint64_t *l1 = (volatile uint64_t *)(gpu_pt_blob + GPU_GMEM_L1);
++	volatile uint64_t *l2 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L2);
++	volatile uint64_t *l3 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L3);
++	uint32_t l1i = (va >> 30) & 0x1ff;
++	uint32_t l2i = (va >> 21) & 0x1ff;
++
++	if (l2i != 0) {
++		printf("SWEET GPU: bo va %#x is past the first 2 MiB of the client range\n", va);
++		return false;
++	}
++	if ((l1[l1i] & 3) != GPU_PTE_TABLE) {
++		printf("SWEET GPU: bo va %#x: L1[%u] is not a table\n", va, l1i);
++		return false;
++	}
++	if ((l2[l2i] & 3) != GPU_PTE_TABLE) {
++		printf("SWEET GPU: bo va %#x: L2[%u] is not a table\n", va, l2i);
++		return false;
++	}
++	for (vm_size_t o = 0; o < size; o += 0x1000) {
++		l3[((va + o) >> 12) & 0x1ff] = (pa + o) | GPU_PTE_PAGE;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	return true;
++}
++
++static struct gpu_bo *
++gpu_bo_alloc(vm_size_t size)
++{
++	struct gpu_bo *bo = NULL;
++
++	size = round_page(size);
++	if (size == 0 || size > GPU_BO_MAX_BYTES) {
++		return NULL;
++	}
++	for (unsigned i = 0; i < GPU_BO_MAX; i++) {
++		if (!gpu_bos[i].used) {
++			bo = &gpu_bos[i];
++			break;
++		}
++	}
++	if (bo == NULL) {
++		printf("SWEET GPU: bo: out of descriptors\n");
++		return NULL;
++	}
++
++	vm_offset_t kva = 0;
++	if (kmem_alloc_contig(kernel_map, &kva, size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("SWEET GPU: bo: %lu bytes, contiguous allocation failed\n",
++		    (unsigned long)size);
++		return NULL;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	if (pn == 0) {
++		kmem_free(kernel_map, kva, size);
++		return NULL;
++	}
++	for (vm_size_t o = 0; o < size; o += 0x1000) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(kva + o)) != pn + o / 0x1000) {
++			printf("SWEET GPU: bo: %lu bytes not physically contiguous\n",
++			    (unsigned long)size);
++			kmem_free(kernel_map, kva, size);
++			return NULL;
++		}
++		/* The GPU's PTEs are non-cacheable: a cacheable alias would go
++		 * invisible to the CP and stale lines would overwrite its writes. */
++		pmap_set_cache_attributes(pn + o / 0x1000, VM_WIMG_WCOMB);
++	}
++
++	bo->kva = kva;
++	bo->pa = (uint64_t)pn << PAGE_SHIFT;
++	bo->size = size;
++	bo->va = gpu_va_next;
++	bo->used = true;
++	gpu_va_next += size + 0x1000;   /* one unmapped guard page between buffers */
++
++	if (!gpu_pt_map(bo->va, bo->pa, size)) {
++		bo->used = false;
++		kmem_free(kernel_map, kva, size);
++		return NULL;
++	}
++	printf("SWEET GPU: bo: %lu bytes pa %#llx va %#x kva %#lx\n", (unsigned long)size,
++	    (unsigned long long)bo->pa, bo->va, (unsigned long)kva);
++	return bo;
++}
++
++static void
++gpu_bo_free(struct gpu_bo *bo)
++{
++	if (bo == NULL || !bo->used) {
++		return;
++	}
++	volatile uint64_t *l3 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L3);
++
++	for (vm_size_t o = 0; o < bo->size; o += 0x1000) {
++		l3[((bo->va + o) >> 12) & 0x1ff] = 0;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	kmem_free(kernel_map, bo->kva, bo->size);
++	printf("SWEET GPU: bo: freed va %#x (%lu bytes)\n", bo->va, (unsigned long)bo->size);
++	bo->used = false;
++}
++
+ /* stage 7c: the zap shader through SCM (PAS id 13) */
+ #define GPU_ZAP_BASE           0x25000u   /* offset inside the blob */
+ #define GPU_ZAP_BYTES          0x3000u    /* .mdt 0x25000, b02 segment 0x27000 */
+@@ -1049,6 +1192,51 @@
+ 	return ok;
+ }
+ 
++/* Allocate, map, submit into, fence, verify, free - the whole buffer path. */
++static bool
++gpu_bo_test(vm_offset_t core, vm_offset_t blob)
++{
++	static const uint32_t v[3] = { 0xb0010001u, 0xb0010002u, 0xb0010003u };
++	unsigned n = 0;
++
++	gpu_bo_init(blob);
++	struct gpu_bo *cmd = gpu_bo_alloc(0x4000);
++	struct gpu_bo *dst = gpu_bo_alloc(0x1000);
++	if (cmd == NULL || dst == NULL) {
++		printf("SWEET GPU: bo test: allocation failed\n");
++		gpu_bo_free(dst);
++		gpu_bo_free(cmd);
++		return false;
++	}
++
++	volatile uint32_t *ib = (volatile uint32_t *)cmd->kva;
++	volatile uint32_t *out = (volatile uint32_t *)dst->kva;
++	for (unsigned i = 0; i < 3; i++) {
++		ib[n++] = gpu_pkt7(GPU_CP_MEM_WRITE, 3);
++		ib[n++] = dst->va + 0x10u * (i + 1);
++		ib[n++] = 0;
++		ib[n++] = v[i];
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	bool idle = gpu_cp_submit(core, blob, cmd->va, n);
++	uint32_t seq = gpu_cp_seq;
++	bool fenced = gpu_cp_wait_fence(blob, seq, 5000);
++	bool match = out[4] == v[0] && out[8] == v[1] && out[12] == v[2];
++
++	printf("SWEET GPU: bo test: %u dwords from va %#x, ring %s, fence %u %s, got %#x/%#x/%#x "
++	    "(want %#x/%#x/%#x)\n", n, cmd->va, idle ? "drained" : "STUCK", seq,
++	    fenced ? "retired" : "TIMED OUT", out[4], out[8], out[12], v[0], v[1], v[2]);
++
++	bool ok = idle && fenced && match;
++	printf("SWEET GPU: bo test: %s\n", ok ?
++	    "PASSED - allocate, map, submit, fence, verify, free" : "FAILED");
++
++	gpu_bo_free(dst);
++	gpu_bo_free(cmd);
++	return ok;
++}
++
+ /* ---- stage 7c: the zap shader through SCM/PAS -------------------------- */
+ 
+ static bool gpu_zap_started;    /* AUTH_AND_RESET returned 0: SHUTDOWN is owed */
+@@ -2259,6 +2447,9 @@
+ 									if (ok) {
+ 										ok = gpu_cp_ib_test(gpu, g, gmem_pa);
+ 									}
++									if (ok) {
++										ok = gpu_bo_test(gpu, g);
++									}
+ 								}
+ 								int hold = 0;
+ 								(void)PE_parse_boot_argn("gpuhold", &hold, sizeof(hold));
