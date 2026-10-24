@@ -1222,3 +1222,81 @@ addresses `0x60000000`/`0x60100000`/`0x60200000`/`0x60300000`.
 Their finding that matters: **masked SMRs do not stick, exact ones do** (from the
 A618 work, patch 0083), and `smmu_write_sme` writes S2CR first, then SMR, then
 reads both back with `sGFSR`.
+
+### Bergamota: what its repo and its A618 ancestor say (checked 2026-10-24)
+
+**Nothing new on the kernel side.** Their last twenty commits are userspace work -
+"Metal Mercury" (`bgmtl`, a Metal device dylib linked into
+`MercuryPosterExtension`, installed by default since `aed199a7`), the charger and
+wallpapers. The kernel GPU series is from 2026-10-23: `0103` (bring-up, stages
+1-7), `0180-0186` (firmware dirs, keepalive API, IOKit user client, SQE max,
+debug selector, 4 KiB page fault check, DCVS/recovery), `0187-0188`
+(IOSurface import, governor), `0210-0212` (stats, scan-out, GPU cache policy).
+That they are now writing a Metal backend is the useful part: **their GPU path
+(stages 4-8) is proven end to end on beryllium.**
+
+**Why our SMR/S2CR writes looked "dropped".** From their A618 ancestor
+(`mxtpasontop/ios-sweet`, branch `gpu`, patches 0083-0085):
+
+* `0083`: a VALID SMR with a non-zero mask (id 4, mask 1) **reads back 0**;
+  their guess at the time: "the GMU's first RAM accesses as unmatched streams";
+  the phone reset without a panic.
+* `0084`: all five SMRs keep the ID/MASK values written **without** VALID, and
+  `MICRO_MMU_CTRL` reads `0x2378`, `sCR0` `0x00200626` after resume - so the
+  register block is writable.
+* `0085`: **exact SMRs (mask 0) stick** (`SMR0 0x80000005`, `SMR1 0x80000004`,
+  `S2CR 0x300`, sGFSR 0 before and after).
+
+Their `smmu_write_sme(idx, s2cr, smr)` writes **S2CR first, then SMR**, and
+checks both plus `sGFSR`. Our 3e test wrote S2CR0 while SMR0 was invalid, which is
+why it read back unchanged: **an S2CR entry has no effect until the SMR beside it
+is VALID**. The next attempt must write the pair.
+
+**GMU reset hygiene.** Their `gpu_gmu_boot()` refuses to load unless
+`CM3_SYSRESET == 1` ("GMU core not held in reset; not booted") and every stage
+except the "keep up" one ends with `gpu_gmu_reset()` - `SYSRESET = 1`, 10 ms. Our
+console54 left the GMU running, console55 then found `SYSRESET` 0, loaded the
+firmware into a running core (fw_init 0), and in console56 the write of
+`SYSRESET = 1` did not take either. **A cold boot is needed to get a clean GMU**,
+and our probe should put it back into reset when it is done.
+
+**Their stage 4 recipe (for the HFI step), verbatim facts**
+
+* Memory: 64 KiB from `kmem_alloc_contig(kernel_map, &kva, size, PAGE_MASK, 0, 0,
+  KMA_DATA|KMA_ZERO|KMA_PERMANENT, VM_KERN_MEMORY_IOKIT)`, checked physically
+  contiguous with `pmap_find_phys`, then every page switched to
+  `VM_WIMG_WCOMB` with `pmap_set_cache_attributes` (and `dc civac` before and
+  after). Their note: **`ml_io_map` on managed RAM panics**
+  (`pmap_panic_dev_wimg_on_managed`), "device memory types on managed RAM are
+  refused by the pmap".
+* Layout: `L1 0x0000`, `L2 0x1000`, `L3A 0x2000` (0x60000000-0x601fffff),
+  `L3B 0x3000` (0x60200000-0x603fffff), `dummy 0x4000`, `HFI 0x5000`
+  (0x5000 bytes), `dump 0xa000` (0x4000), `log 0xe000`. GPU addresses:
+  dummy 0x60000000, HFI 0x60100000, dump 0x60200000, log 0x60300000 (KGSL's
+  uncached kernel slots, one 1 MiB each).
+* Tables: 4 KiB granule, 512-entry tables of 8-byte descriptors, levels indexed
+  by VA[31:30], VA[29:21], VA[20:12]; `PTE_TABLE = 3`, page descriptor
+  `0xE43 | pa` (AF, SH_OS, AP unpriv, nG, MAIR attr 0 = non-cacheable, and
+  `1<<7` for the read-only SQE page); `TCR = (2<<12)|(1<<23)|32`,
+  `TCR2 = 1|(7<<15)|(1<<4)`, `MAIR0 = 0x0004ff44`, `ACTLR = 0x70000000`,
+  `SCTLR = 0x00c01067`, `CBAR = (1<<16)|(3<<8)|(0xf<<12)` stage 1 with stage 2
+  bypassed, `CBA2R = 1` (64-bit TTBR0).
+* Stream table: `SMR0 = VALID | 5` (gmu_kernel), `SMR1 = VALID | 4` (gmu_user),
+  `S2CR = (3<<8) | cb` (translation, context `cb`); CP later gets `SMR2 =
+  VALID | 0` and context 1. After the pairs: `TLBIALLNSNH`, `sTLBGSYNC`,
+  poll `sTLBGSTATUS`. It refuses to boot the GMU if the SMRs do not read back.
+* HFI table: header 6 dwords `{0, 54, 6, 12, 4, 4}` (size = 6 + 4*12 dwords,
+  qhdr0_offset 6, queue header 12 dwords, four queues), then four queue headers
+  with `start_addr = HFI_VA + 0xe0 + 0x1000*i`, `size = 1024` dwords, rx/tx
+  watermark 1, rx_request 1; queues CMD (idx 0, pri 10, status 1), MSG
+  (idx 4), DBG (idx 5), DSP (idx 1, disabled). Legacy v1 ids.
+* Handshake: `HFI_QTBL_ADDR = 0x60100000`, `HFI_QTBL_INFO = 1` **before**
+  releasing `SYSRESET`; after the boot `HFI_CTRL_INIT = 1`, poll
+  `HFI_CTRL_STATUS` for 1 (100 ms), read `HFI_VERSION_INFO` and reject
+  `(ver >> 28) >= 2` (that would be HFI v2); then `H2F_MSG_INIT` (5 dwords:
+  header, 0, dump VA 0x60200000, dump size 0x4000, `GMU_COLD_BOOT` = 1),
+  `H2F_MSG_FW_VER` (1, wants 1.10 = `0x100a0000`), `H2F_MSG_PERF_TBL` (4),
+  `H2F_MSG_BW_VOTE_TBL` (3), `H2F_MSG_TEST` (5). Send = dwords at the queue's
+  write index, bump `QH_WRITE_INDEX`, then `HOST2GMU_INTR_SET = 1`; receive =
+  poll `GMU2HOST_INTR_INFO & 1`, clear it, read the MSG queue; ACK is
+  `MSG_TYPE == 2`, `ack[2]` must be 0.
