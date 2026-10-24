@@ -1,0 +1,146 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -275,6 +275,46 @@
+ #define GPU_VA_CP_RING        0x40000000u
+ #define GPU_VA_CP_SQE         0x40010000u
+ #define GPU_VA_CP_SCRATCH     0x40020000u
++/* stage 7: the CP's registers (dword indexes, byte = 4 * N), from a6xx.xml */
++#define A6XX_RBBM_VBIF_CLIENT_QOS_CNTL 0x0010u
++#define A6XX_RBBM_INTERFACE_HANG_INT_CNTL 0x001fu
++#define A6XX_RBBM_PERFCTR_GPU_BUSY_MASKED 0x050bu
++#define A6XX_CP_RB_BASE        0x0800u
++#define A6XX_CP_RB_CNTL        0x0802u
++#define A6XX_CP_RB_RPTR_ADDR   0x0804u
++#define A6XX_CP_RB_RPTR        0x0806u
++#define A6XX_CP_RB_WPTR        0x0807u
++#define A6XX_CP_SQE_CNTL       0x0808u
++#define A6XX_CP_HW_FAULT       0x0821u
++#define A6XX_CP_INTERRUPT_STATUS 0x0823u
++#define A6XX_CP_STATUS_1       0x0825u
++#define A6XX_CP_SQE_INSTR_BASE 0x0830u
++#define A6XX_CP_ADDR_MODE_CNTL 0x0842u
++#define A6XX_CP_ROQ_THRESHOLDS_1 0x08c1u
++#define A6XX_CP_ROQ_THRESHOLDS_2 0x08c2u
++#define A6XX_CP_MEM_POOL_SIZE  0x08c3u
++#define A6XX_CP_AHB_CNTL       0x098du
++#define A6XX_UCHE_ADDR_MODE_CNTL 0x0e00u
++#define A6XX_UCHE_WRITE_RANGE_MAX 0x0e05u
++#define A6XX_UCHE_WRITE_THRU_BASE 0x0e07u
++#define A6XX_UCHE_TRAP_BASE    0x0e09u
++#define A6XX_UCHE_GMEM_RANGE_MIN 0x0e0bu
++#define A6XX_UCHE_GMEM_RANGE_MAX 0x0e0du
++#define A6XX_UCHE_CACHE_WAYS   0x0e17u
++#define A6XX_UCHE_FILTER_CNTL  0x0e18u
++#define A6XX_UCHE_CLIENT_PF    0x0e19u
++#define A6XX_VSC_ADDR_MODE_CNTL 0x0c01u
++#define A6XX_GRAS_ADDR_MODE_CNTL 0x8601u
++#define A6XX_RB_ADDR_MODE_CNTL 0x8e05u
++#define A6XX_PC_DBG_ECO_CNTL   0x9e00u
++#define A6XX_PC_ADDR_MODE_CNTL 0x9e01u
++#define A6XX_VPC_ADDR_MODE_CNTL 0x9601u
++#define A6XX_VFD_ADDR_MODE_CNTL 0xa601u
++#define A6XX_SP_ADDR_MODE_CNTL 0xae01u
++#define A6XX_TPL1_ADDR_MODE_CNTL 0xb601u
++#define A6XX_HLSQ_ADDR_MODE_CNTL 0xbe05u
++#define A6XX_VBIF_GATE_OFF_WRREQ_EN 0x302au
++#define CP_RB_CNTL_VALUE       ((1u << 27) | (2u << 8) | 12u)
+ #define GPU_GMU_SPTPRAC_STATUS 0x14340u  /* 0x50d0 */
+ #define GPU_GMU_BOOT_SLUMBER  0x8fe0u   /* 0x23f8 */
+ #define GPU_GMU_GX_VOTE_IDX   0x8fe4u   /* 0x23f9 */
+@@ -579,6 +619,85 @@
+ 	    gpu_rd_quiet(gmu, GPU_GMU_RSCC_ACK), gpu_rd_quiet(gmu, GPU_RSCC(GPU_RSCC_SEQ_BUSY)));
+ }
+ 
++/* ---- stage 7: the CP's hardware initialisation ------------------------- */
++
++static uint32_t
++gpu_cp_rd(vm_offset_t core, uint32_t dword)
++{
++	return gpu_rd_quiet(core, 4u * dword);
++}
++
++static void
++gpu_cp_wr(vm_offset_t core, uint32_t dword, uint32_t val)
++{
++	gpu_wr_quiet(core, 4u * dword, val);
++}
++
++static void
++gpu_cp_wr64(vm_offset_t core, uint32_t dword, uint64_t val)
++{
++	gpu_cp_wr(core, dword, (uint32_t)val);
++	gpu_cp_wr(core, dword + 1, (uint32_t)(val >> 32));
++}
++
++/* The subset of Linux's a6xx hw_init a NOP test needs (Bergamota's version). */
++static bool
++gpu_cp_hw_init(vm_offset_t core)
++{
++	static const uint32_t addr_mode[] = {
++		A6XX_CP_ADDR_MODE_CNTL, A6XX_VSC_ADDR_MODE_CNTL, A6XX_GRAS_ADDR_MODE_CNTL,
++		A6XX_RB_ADDR_MODE_CNTL, A6XX_PC_ADDR_MODE_CNTL, A6XX_HLSQ_ADDR_MODE_CNTL,
++		A6XX_VFD_ADDR_MODE_CNTL, A6XX_VPC_ADDR_MODE_CNTL, A6XX_UCHE_ADDR_MODE_CNTL,
++		A6XX_SP_ADDR_MODE_CNTL, A6XX_TPL1_ADDR_MODE_CNTL,
++	};
++
++	printf("SWEET GPU: cp: before configuration: sqe_cntl %#x hw_fault %#x irq %#x rptr %#x wptr %#x\n",
++	    gpu_cp_rd(core, A6XX_CP_SQE_CNTL), gpu_cp_rd(core, A6XX_CP_HW_FAULT),
++	    gpu_cp_rd(core, A6XX_CP_INTERRUPT_STATUS), gpu_cp_rd(core, A6XX_CP_RB_RPTR),
++	    gpu_cp_rd(core, A6XX_CP_RB_WPTR));
++
++	for (unsigned i = 0; i < sizeof(addr_mode) / sizeof(addr_mode[0]); i++) {
++		gpu_cp_wr(core, addr_mode[i], 1);            /* 64-bit addressing */
++	}
++	gpu_cp_wr(core, A6XX_RBBM_VBIF_CLIENT_QOS_CNTL, 3);
++	gpu_cp_wr(core, A6XX_VBIF_GATE_OFF_WRREQ_EN, 9);          /* a630 only */
++	gpu_cp_wr(core, A6XX_RBBM_PERFCTR_GPU_BUSY_MASKED, 0xffffffffu);
++	gpu_cp_wr64(core, A6XX_UCHE_WRITE_RANGE_MAX, 0x0001ffffffffffc0ull);
++	gpu_cp_wr64(core, A6XX_UCHE_TRAP_BASE, 0x0001fffffffff000ull);
++	gpu_cp_wr64(core, A6XX_UCHE_WRITE_THRU_BASE, 0x0001fffffffff000ull);
++	gpu_cp_wr64(core, A6XX_UCHE_GMEM_RANGE_MIN, 0x100000u);
++	gpu_cp_wr64(core, A6XX_UCHE_GMEM_RANGE_MAX, 0x100000u + 0x100000u - 1u);
++	gpu_cp_wr(core, A6XX_UCHE_FILTER_CNTL, 0x804);
++	gpu_cp_wr(core, A6XX_UCHE_CACHE_WAYS, 0x4);
++	gpu_cp_wr(core, A6XX_CP_ROQ_THRESHOLDS_2, 0x010000c0);
++	gpu_cp_wr(core, A6XX_CP_ROQ_THRESHOLDS_1, 0x8040362c);
++	gpu_cp_wr(core, A6XX_CP_MEM_POOL_SIZE, 128);
++	gpu_cp_wr(core, A6XX_PC_DBG_ECO_CNTL, 0x00180000);
++	gpu_cp_wr(core, A6XX_CP_AHB_CNTL, 1);
++	gpu_cp_wr(core, A6XX_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0x1fffffu);
++	gpu_cp_wr(core, A6XX_UCHE_CLIENT_PF, (1u << 7) | 1u);
++	/* The ring and the SQE through context CB1; completion is polled (INT mask 0). */
++	gpu_cp_wr64(core, A6XX_CP_SQE_INSTR_BASE, GPU_VA_CP_SQE);
++	gpu_cp_wr64(core, A6XX_CP_RB_BASE, GPU_VA_CP_RING);
++	gpu_cp_wr(core, A6XX_CP_RB_CNTL, CP_RB_CNTL_VALUE);
++	gpu_cp_wr64(core, A6XX_CP_RB_RPTR_ADDR, GPU_VA_CP_SCRATCH);
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	uint32_t cntl = gpu_cp_rd(core, A6XX_CP_RB_CNTL);
++	uint32_t sqe = gpu_cp_rd(core, A6XX_CP_SQE_INSTR_BASE);
++	uint32_t rb = gpu_cp_rd(core, A6XX_CP_RB_BASE);
++	uint32_t roq = gpu_cp_rd(core, A6XX_CP_ROQ_THRESHOLDS_2);
++	uint32_t amode = gpu_cp_rd(core, A6XX_CP_ADDR_MODE_CNTL);
++	printf("SWEET GPU: cp configured: rb_cntl %#x sqe_base %#x rb_base %#x roq2 %#x addr_mode %#x\n",
++	    cntl, sqe, rb, roq, amode);
++	if (cntl != CP_RB_CNTL_VALUE || sqe != (uint32_t)GPU_VA_CP_SQE ||
++	    rb != (uint32_t)GPU_VA_CP_RING || roq != 0x010000c0) {
++		printf("SWEET GPU: CP configuration readback mismatch\n");
++		return false;
++	}
++	return true;
++}
++
+ /* ---- stage 5: the GX rail through the GMU's OOB interface ------------- */
+ 
+ /* HOST2GMU_INTR_SET / GMU2HOST_INTR_INFO are the ones stage 4 already uses. */
+@@ -1508,6 +1627,10 @@
+ 					printf("SWEET GPU: GPU ANSWERS: rbbm_status %#x, cp_status1 %#x, GMU counter %#x -> %#x (%s)\n",
+ 					    rbbm, cp1, c0, c1, c0 != c1 ? "ticking" : "still");
+ 
++					/* ---- stage 7a: the CP's hardware initialisation ---- */
++					printf("SWEET GPU: --- stage 7a: cp hw_init\n");
++					(void)gpu_cp_hw_init(gpu);
++
+ 					/* a6xx_gmu_notify_slumber: give the rail back. */
+ 					gpu_probe_wr("gmu power counter off", gmu, GPU_GMU_POWER_COUNTER, 0);
+ 					gpu_probe_wr("gmu sptprac off", gmu, GPU_GMU_GX_SPTPRAC_POWER, 0x778001u);
