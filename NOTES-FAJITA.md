@@ -1495,3 +1495,42 @@ If the GX rail later refuses to come up, this ack is the first suspect.
 Everything up to here is repeatable: `adreno=9` runs CX, clocks, cmd-db + PDC/RSC,
 firmware load, GMU boot, SMMU context and streams, HFI INIT/FW_VER/TEST, and puts
 the GMU back into reset.
+
+### *** GPU STAGE 5 WORKS: the GX rail is voted and SPTPRAC is on (console67, 2026-10-24) ***
+
+```
+SWEET GPU: ARC levels: gfx 10 (0 16 48 64 128 192 256 320 384 416 ) mx 5 (0 16 16 256 384 ) cx 8
+SWEET GPU: GX rail at 257 MHz (VLVL 64): gfx ARC 3, mx ARC 3
+SWEET GPU: write gmu boot slumber opt +0x8fe0 = 0
+SWEET GPU: write gmu gx vote idx +0x8fe4 = 0x3
+SWEET GPU: write gmu mx vote idx +0x8fe8 = 0x3
+SWEET GPU: write gmu oob boot slumber +0x14650 = 0x400000
+SWEET GPU: OOB boot_slumber: acknowledged (INTR_INFO 0x40000000, RPMH_POWER_STATE 0xf, SPTPRAC 0x28)
+SWEET GPU: gx rail on
+SWEET GPU: write gmu sptprac ctrl +0x204 = 0x778000
+SWEET GPU: SPTPRAC power on: ok (status 0x28)
+```
+
+Our phone's ARC tables from the command DB: **gfx 10 levels** (0, 16, 48, 64,
+128, 192, 256, 320, 384, 416), **mx 5** (0, 16, 16, 256, 384), **cx 8**. At the boot
+level (257 MHz, VLVL 64) both indices are **3**. The boot OOB is acknowledged
+(`INTR_INFO` bit 30) and SPTPRAC reports `0x28`, i.e. the 3D core's power domain is
+on. Nothing crashed and the rest of the probe (HFI, reset, iOS boot) is unchanged.
+
+`RPMH_POWER_STATE` reads `0xf` right after the OOB - that is `GPU_HW_SLUMBER`, the
+value their slumber path *checks for* after powering down, so it may just be the
+state the register reports until the GMU's first vote lands. Worth a second look
+if the core later refuses to answer.
+
+### Next: the GX GDSC and the first core registers
+
+* GX GDSC (`gpucc 0x100c`) with its `core_root_clk` (`clocks = <&gpucc 2>` in the
+  DT, `qcom,force-enable-root-clk`): clear SW_COLLAPSE, wait for POWER_ON, and
+  note that the DT also gives it `sw-reset` and `domain-addr`.
+* Only then read `RBBM_STATUS` and `CP_ALWAYS_ON` (a read of a gated core hangs
+  the bus - Bergamota's rule), then `gpu_gx_slumber` to give the rail back:
+  `GMU_POWER_COUNTER_EN = 0`, SPTPRAC off (`0x778001`, bit 2),
+  `BOOT_SLUMBER_OPTION = 1`, OOB set/clear, `RPMH_POWER_STATE == 0xf`, then
+  `GMU_AO_AHB_FENCE_CTRL = 0`.
+* After that: the CP (ring + SQE in a second SMMU context for SID 0, the zap
+  through SCM PAS 13, a NOP + `CACHE_FLUSH_TS` test).
