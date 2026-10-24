@@ -1,0 +1,58 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -253,6 +253,9 @@
+ #define GPU_GMU_RSCC_ACK      0x24c20u   /* 0x9308 */
+ #define GPU_GMU_GX_SPTPRAC_POWER 0x204u  /* 0x0081 */
+ #define GPU_GMU_RPMH_POWER_STATE 0x143b0u /* 0x50ec */
++#define GPU_GMU_POWER_COUNTER  0x14100u  /* 0x5040 */
++#define GPU_GMU_AO_AHB_FENCE   0x24c40u  /* 0x9310 */
++#define GPU_HW_SLUMBER         0xfu
+ #define GPU_GMU_AO_COUNTER_L  0x14220u   /* 0x5088: counts the 19.2 MHz crystal */
+ #define GPU_CORE_RBBM_STATUS  0x840u     /* a6xx 0x0210 off the GPU base */
+ #define GPU_CORE_CP_STATUS_1  0x20d4u    /* a6xx 0x0825 */
+@@ -1461,6 +1464,45 @@
+ 					uint32_t c1 = gpu_rd_quiet(gmu, GPU_GMU_AO_COUNTER_L);
+ 					printf("SWEET GPU: GPU ANSWERS: rbbm_status %#x, cp_status1 %#x, GMU counter %#x -> %#x (%s)\n",
+ 					    rbbm, cp1, c0, c1, c0 != c1 ? "ticking" : "still");
++
++					/* a6xx_gmu_notify_slumber: give the rail back. */
++					gpu_probe_wr("gmu power counter off", gmu, GPU_GMU_POWER_COUNTER, 0);
++					gpu_probe_wr("gmu sptprac off", gmu, GPU_GMU_GX_SPTPRAC_POWER, 0x778001u);
++					{
++						uint32_t st = 0;
++						bool off = false;
++						for (int i = 0; i < 100; i++) {
++							st = gpu_rd_quiet(gmu, GPU_GMU_SPTPRAC_STATUS);
++							if (st & 0x4u) {
++								off = true;
++								break;
++							}
++							gpu_wait_ms(1);
++						}
++						printf("SWEET GPU: SPTPRAC off: %s (status %#x)\n", off ? "ok" : "TIMED OUT", st);
++					}
++					gpu_probe_wr("gmu slumber option", gmu, GPU_GMU_BOOT_SLUMBER, 1);
++					gpu_probe_wr("gmu oob slumber", gmu, GPU_GMU_HOST2GMU_SET,
++					    1u << (GPU_OOB_BOOT_SLUMBER + 16));
++					{
++						uint32_t info2 = 0;
++						bool ack = false;
++						for (int i = 0; i < 100; i++) {
++							info2 = gpu_rd_quiet(gmu, GPU_GMU_GMU2HOST_INFO);
++							if (info2 & (1u << (GPU_OOB_BOOT_SLUMBER + 24))) {
++								ack = true;
++								break;
++							}
++							gpu_wait_ms(1);
++						}
++						gpu_wr_quiet(gmu, GPU_GMU_GMU2HOST_CLR,
++						    1u << (GPU_OOB_BOOT_SLUMBER + 24));
++						uint32_t ps = gpu_rd_quiet(gmu, GPU_GMU_RPMH_POWER_STATE);
++						printf("SWEET GPU: slumber %s: RPMH_POWER_STATE %#x%s\n",
++						    ack ? "acknowledged" : "not acknowledged", ps,
++						    ps == GPU_HW_SLUMBER ? " (slumber)" : " (not slumber)");
++					}
++					gpu_probe_wr("gmu ahb fence allow", gmu, GPU_GMU_AO_AHB_FENCE, 0);
+ 				}
+ 			}
+ 		}
