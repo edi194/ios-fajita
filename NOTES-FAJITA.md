@@ -2086,3 +2086,55 @@ Order I would follow: clone Chlorophyll + Bergamota with submodules, read
 `gpu/freedreno-sweet` (their kernel ABI), `plugin/`, `inject/`, then port in this order:
 IOAcceleratorES naming + plugin bundle, libdrm stand-in against our ABI, `air/` built for
 arm64 iOS 16.7.16, the inject for backboardd, then CoreAnimation's own passes.
+
+### Analysis of Bergamota + Chlorophyll (cloned 2026-10-24, /home/edi194/ref)
+
+**The decisive fact: their userspace speaks IOKit, not a chardev.**
+`gpu/freedreno-sweet/sweet_drm.c` (the libdrm stand-in every Mesa/Chlorophyll path goes
+through) does `IOServiceOpen("SweetAdreno630", task, 0, &conn)`, then
+`IOConnectCallStructMethod(conn, selector, in, out)` with selector = msm request number,
+and `IOConnectMapMemory64(conn, handle, ...)` with the BO handle as memoryType for
+zero-copy CPU access - textures and IOSurfaces included. Our `0152`/`0154` is a
+character device with read/write copies, which cannot serve that (perf and shape).
+
+**Verdict**: implement their IOKit user client. Keep the chardev as the kernel-side test
+path (`abi test`), but the ABI the userspace stack needs is:
+
+- `xnu/gpu-abi/sweet_adreno_abi.h` (291 lines): all the msm structs - `msm_param`,
+  `gem_new`, `gem_info`, `gem_cpu_prep/fini`, `gem_submit` (bos/cmds/relocs),
+  `wait_fence`, `madvise`, `submitqueue`, `gem_close` - plus `sweet_gpu_info`,
+  `surface_bo` (IOSurface import), `bo_sync`, `debug`.
+- selectors = `DRM_COMMAND_BASE (0x40) + DRM_MSM_*`, so `drmIoctl` forwards 1:1.
+
+**Their kernel GPU series (xnu/patches-11215) is the map for everything after:**
+
+| patch | what we lack |
+| --- | --- |
+| 0103 bringup | we have our own equivalent (0099-0142) |
+| 0181 keepalive + kernel API | buffers/submit/fence - we have a first version (0151-0155) |
+| **0182 IOKit user client** | **the next thing to port** |
+| 0183 SQE max | small |
+| 0185 4K GPU pages + fault check | we use 4 KiB already, no fault check |
+| **0187 IOSurface import** | `SURFACE_BO`, needed for CA drawables |
+| 0214/0217 SBO writable/any surface | follow-up to 0187 |
+| 0212 fb GPU cache policy, 0229 fb GPU gate | present integration |
+| 0186/0188/0189 power/DCVS/metrics | later |
+
+**Chlorophyll side** (from its README/commits): `Chlorophyll.bundle` in
+`/System/Library/Extensions`, loaded by Metal **because the kernel's IOAcceleratorES
+names it** (`MetalPluginName`); `inject/` gives backboardd a compositor profile and a
+watchdog; `air/` translates AIR -> NIR and Mesa's ir3 compiles for a630. Their commits
+from 2026-10-24 say the wallpaper now draws ("a refused draw or clear is skipped and
+logged instead of failing the command buffer ... A/B: wallpaper fine with readback off"),
+which is our PosterBoard question answered upstream.
+
+**Version gap to expect**: they are on iOS 18 (xnu-11215). Their patches 0157/0159 fix
+iOS 18's IOSurface limits and result layout, and 0160 the IOMFB swap record - i.e. the
+same areas where our 16.7.16 port has its own patches (0046-era IOSurface/IOMFB work).
+Do not blind-port those; take 0182/0187 (self-contained) and check the IOSurface
+interfaces against our tree.
+
+**Order from here**: 0182 (IOKit user client + `sweet_adreno_abi.h`) on top of our BO
+layer, with `IOConnectMapMemory64` backed by the arena pages; then their `sweet_drm.c`
+unchanged as the userspace side; then the `/dev/sweetgpu` test tool stays as the
+kernel-side smoke test.
