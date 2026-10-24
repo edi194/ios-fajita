@@ -1814,3 +1814,46 @@ copy all worked first time. iOS booted normally afterwards.
 
 Next: `CP_SET_SECURE_MODE 0`, then NOP + CP_MEM_WRITE + CACHE_FLUSH_TS with RPTR
 polling and read-back (0147, `zap=1`), then PAS SHUTDOWN.
+
+### console76: STAGE 7 COMPLETE - the CP runs our packets (2026-10-24)
+
+```
+cp CP_ME_INIT: ring idle (RPTR=WPTR=9) rbbm_status 0x1
+scm pas INIT_IMAGE / MEM_SETUP / AUTH_AND_RESET: status 0 result 0
+zap authenticated and started (PAS 13 quiesced into reset)
+cp CP_SET_SECURE_MODE 0: ring idle (RPTR=WPTR=11) rbbm_status 0x1
+cp NOP submission: ring idle (RPTR=WPTR=22) rbbm_status 0x1
+cp NOP test: mem_write 0x5ee70001 (want 0x5ee70001),
+             cache_flush_ts 0x600d0001 (want 0x600d0001), rbbm_int_0_status 0
+cp after NOP: cp_status1 0x1000000 hw_fault 0 irq 0 rptr 22
+CP NOP TEST PASSED: the CP fetched, executed and wrote back through the GPU SMMU
+zap shutdown (PAS 13)
+```
+
+This is the line Bergamota's port prints, and the whole ladder underneath is
+unchanged: SPTPRAC off, `RPMH_POWER_STATE` 0xf, `gmu sysreset 0x1`, iOS up
+(SpringBoard and backboardd running, 452 processes, no GPU fault anywhere).
+
+What is now proven, end to end, on this device: CX power and clocks, pmodel/ARC,
+PDC/RSC, the GMU's legacy firmware and HFI v1, two SMMU contexts (CB0 for the GMU,
+CB1 for the CP), the GX rail and SPTPRAC, the signed zap through TrustZone, the SQE
+microcode, PM4 encoding with its parity bits, the ring in CB1, secure-mode exit, and
+a submission whose effects are read back from memory.
+
+`cp_status1` after the test is `0x1000000` - down from `0x81004000` right after
+CP_ME_INIT, i.e. bit 31 and bit 14 clear once the CP has left secure mode. HW_FAULT
+and CP_INTERRUPT_STATUS stay 0 throughout, so nothing was rejected.
+
+### What stage 8 needs
+
+1. More than one submission: two `CP_MEM_WRITE`s and a `CP_INDIRECT_BUFFER`, i.e. the
+   ring used as a ring (WPTR wrapping the 32 KiB, RPTR tracking it).
+2. A real fence: `CP_EVENT_WRITE` into a timestamp buffer instead of polling RPTR.
+3. A render target in GPU memory and a solid-colour full-screen triangle through
+   SP/TPL1/RB, read back with `CP_MEM_WRITE`/`CP_EVENT_WRITE` or a PFP read - the
+   "2D by way of the 3D pipe" test.
+4. Then shaders, textures, UBWC and the userspace backend (bgmtl's shape), which is
+   the multi-week part.
+
+Optional cleanup on the way: flip the default so the ladder runs without `zap=1`,
+add CP_PROTECT, interrupts/fences for real waits, and per-process page tables.
