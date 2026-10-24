@@ -1725,3 +1725,41 @@ unchanged and iOS still boots.
    `CP_EVENT_WRITE(CACHE_FLUSH_TS)`, then poll RPTR and read both values back
    (`0xc0ffee` style) - the first PM4 packet this kernel would ever submit.
 5. Leave `gpu_gx_slumber` in place afterwards so the rail is returned.
+
+### console74: stage 7a accepted by hardware (2026-10-24)
+
+```
+cp: before configuration: sqe_cntl 0 hw_fault 0 irq 0 rptr 0 wptr 0
+cp configured: rb_cntl 0x800020c sqe_base 0x40010000 rb_base 0x40000000
+               roq2 0x10000c0 addr_mode 0x1
+```
+
+Every write landed and every readback matched, and the CP's state before the writes
+was zero - nothing was inherited from the Android boot, so the GMU really does hold
+the CP in reset until the KMD configures it. The rest of the ladder (HFI, GX rail,
+RBBM_STATUS 0x1, ticking GMU counter, SPTPRAC off, slumber 0xf, GMU reset) and iOS
+are unchanged.
+
+### Two layout facts established while laying out stage 7b
+
+- **The scratch page was one page past the blob.** 0143 put it at blob +0x24000 and
+  the blob was 0x24000 bytes, so its PTE pointed outside the payload. Nothing wrote
+  there (the CP had not run), but the blob is 148 KiB since 0145 and 160 KiB once
+  the zap payload joins it.
+- **The zap carve-out on fajita is wherever the DT says**: `gpu_region@0x8c415000`,
+  `no-map`, `0x2000` bytes (phandle 0x2a9 behind the `qcom,kgsl-hyp` node with
+  `qcom,pas-id = <0x0d>`). It is reserved, so iOS cannot allocate it. This happens
+  to equal the value Bergamota's port uses, but it is now verified from our own
+  `dtb/fajita0.dts` rather than copied.
+- **a630_zap.mdt has exactly one loadable segment**: phdr 2 (`paddr 0x5000`,
+  1968 bytes, `QCOM_MDT_RELOCATABLE`), i.e. `a630_zap.b02`. The other files are hash
+  and signature blocks (`QCOM_MDT_TYPE_HASH`) that never reach memory, so only the
+  .mdt and b02 have to travel in the payload.
+
+### The SQE has to have its microcode
+
+`CP_SQE_INSTR_BASE` points at instruction RAM: without `a630_sqe.fw` the SQE cannot
+fetch a single packet. It now rides inside the payload blob at +0x1c000 (32132
+bytes, header stripped like Linux does) and the boot prints its first three words,
+because a missing firmware otherwise looks like a ring that silently refuses to
+drain. `build-fajita.sh` rebuilds the blob on every image so it cannot go stale.
