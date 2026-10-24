@@ -1997,3 +1997,44 @@ attribute changes, and a later mmap can hand out physical pages trivially.
 
 The ladder up to and including `cp ib test: PASSED` in that boot was unaffected; the
 panic came afterwards, inside the buffer test, before its first print.
+
+### console81: STAGE 8 CLOSED - buffers, submission and the ABI all work (2026-10-24)
+
+```
+buffer arena 1024 KiB at 0x102510000 -> 0xfffffe50f1018000
+bo: 16384 bytes arena+0 pa 0x102510000 va 0x80020000 handle 1
+bo: 16384 bytes arena+0x4000 pa 0x102514000 va 0x80025000 handle 2
+bo test: 12 dwords from va 0x80020000, ring drained, fence 2 retired,
+         got 0xb0010001/0xb0010002/0xb0010003
+bo test: PASSED - allocate, map, submit, fence, verify, free
+GPU KEPT UP: GMU live, OOB gpu held, zap authenticated, ring live at wptr 300
+abi test: INFO abi 1 chip 0x6030001 va 0x80020000+0x200000;
+          GEM_NEW 0x3/0x8002a000 0x4/0x8002f000; SUBMIT 10 dwords fence 3 wait 0;
+          GET_IOVA 0x8002f000; got 0xc0de0001/0xc0de0002
+abi test: close 0/0, closed handle refused yes, bad handle refused yes
+abi test: PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE
+/dev/sweetgpu major 19 ready
+```
+
+iOS booted normally (468 processes, SpringBoard up) with the GPU held for the whole
+boot. So the kernel half of the bring-up is done: power, clocks, pmodel/ARC, PDC/RSC,
+GMU legacy firmware, HFI v1, two SMMU contexts, the GX rail, the signed zap, the SQE,
+the ring, PM4, buffers in a client VA range, fences - and an ABI a client can call.
+
+### What is still missing before a real userspace submission
+
+1. **mmap** of a buffer (`d_mmap` returning `gpu_arena_pa + offset`); everything else
+   in the ABI is already exercised in the boot log.
+2. **A userspace binary** and a way to run it: the root image is already flashed, so
+   either a test tool goes into a rebuilt root image (a userdata flash) or it rides in
+   the boot payload. That decision is the gate to B'.
+3. Optional: a real allocator (first-fit with reuse) and an L3 pool, so buffers are
+   not confined to the first 2 MiB / one 1 MiB arena.
+
+### Then B': the Metal probe
+
+Publish an `IOAcceleratorES` service with the `MetalPluginName` property, whose
+bundle's principal class subclasses `_MTLDevice`; `MTLCreateSystemDefaultDevice` then
+returns a device and QuartzCore picks `MetalContext` instead of `SWContext`. Even a
+stub that only logs the selectors answers the important question - how far CoreAnimation
+gets before it needs a shader - without risking anything.
