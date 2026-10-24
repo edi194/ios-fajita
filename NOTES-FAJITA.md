@@ -1598,3 +1598,41 @@ GMU back into reset -> iOS boots.
   and a read-back of both values.
 * `gpu_gx_slumber` when done, so the rail is given back on the boots that only
   probe.
+
+### console70: the gpucc clocks (2026-10-24)
+
+```
+gpucc cx_apb      0x80000000 -> 0x80000000 (halted)
+gpucc cx_snoc_dvm 0          -> 0          (running)
+gpucc gx_cxo      already 0x1
+gpucc gx_gmu      0x80000000 -> 0x1        (running)
+gpucc gx_gfx3d    already 0x4221           (it came up with GX)
+GPU ANSWERS: rbbm_status 0x1, cp_status1 0xffffffff, GMU counter 0x31e536 -> 0x32af21 (ticking)
+```
+
+`gx_gfx3d` (0x1054) was already running - the GX domain brings it up - and `gx_gmu`
+(0x1064) starts when written. `cx_apb` (0x1088) stays halted even with its enable
+bit written, and `cx_snoc_dvm` (0x108c) reads 0; both probably need a parent that
+nothing here votes for, and neither is needed for what follows.
+
+`CP_STATUS_1` still reads all ones **because the CP is not initialised**: it only
+becomes meaningful after `CP_ME_INIT`, the ring and the SQE (Bergamota's stage 7).
+`RBBM_STATUS = 1` (idle) and the ticking GMU counter already say the block is
+healthy.
+
+### Where the port stands (end of 2026-10-24)
+
+Everything below works on every boot with `adreno=9` and iOS boots on top:
+CX GDSC -> clocks -> cmd-db/PDC/RSC -> firmware -> GMU boot -> SMMU context and
+streams (SID 5/4) -> HFI v1 (INIT, FW_VER 1.7, TEST) -> GX rail (ARC 3, 257 MHz)
+-> SPTPRAC -> GX GDSC on -> RBBM_STATUS 0x1 with a ticking GMU counter -> GMU back
+in reset.
+
+The next piece is Bergamota's stage 7, the CP: `CP_ME_INIT` and the ~25 hw_init
+writes in Linux's order, the ring and the SQE in a **second** SMMU context
+(CP_CB 1, SID 0, SQE mapped read-only), the zap through **SCM PAS id 13**
+(`SCM_PAS_INIT_IMAGE`, `SCM_PAS_AUTH_AND_RESET` with the continuation-token
+convention), `CP_SET_SECURE_MODE 0`, then a NOP + `CP_MEM_WRITE` +
+`CP_EVENT_WRITE(CACHE_FLUSH_TS)` with RPTR polling and a read-back of both values
+from the scratch buffer. Their 0103 has all of it for this chip, and the zap
+files are already extracted in `~/gpu-fw/`.
