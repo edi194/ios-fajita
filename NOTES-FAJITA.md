@@ -2271,3 +2271,24 @@ Then the userspace side: their `gpu/freedreno-sweet/sweet_drm.c` (IOServiceOpen
 "SweetAdreno630" + IOConnectCallStructMethod + IOConnectMapMemory64) built for our iOS
 arm64, which is what Mesa and Chlorophyll sit on. The `/dev/sweetgpu` chardev stays as
 the kernel-side smoke test.
+
+### Process trap that cost a CI run (2026-10-24)
+
+`0158` was rejected with `patch failed: iokit/Kernel/arm/SweetSurface.h:40`, and **one
+failed hunk skips the whole patch**, new files included - so nothing was added.
+
+Cause: this local base (`~/xnu-135`) already has the pre-0099 patches *baked in*, but it
+does **not** have them as patch files, and at least one of them (`0088`, the SweetSurface
+client-memory work) rewrites `SweetSurface.h`. A hunk generated against the local file
+therefore cannot match the CI tree, where the same patch is applied before ours.
+
+Rules that follow:
+
+- **Never anchor a hunk on a file that patches 0001-0098 touch** (SweetSurface.h,
+  IOMFB/IOSurface internals, files.arm64 additions, and anything the early series
+  rewrites). Either avoid the file, or clone the full series locally and build the hunk
+  against a tree that also applied 0001-0098.
+- Files created by our own series (`bsd/dev/sweet_gpu.c` from 0099) are safe.
+- Prefer editing *our* files or the ported upstream file over touching shared kernel
+  headers - here the fix was to drop the `s->wrapped` test in their .cpp instead of
+  adding a field to our class.
