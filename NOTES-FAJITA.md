@@ -1559,3 +1559,42 @@ and `CP_ALWAYS_ON` while GX stays on (Bergamota's stage 5 tail reads them, then
 slumbers with `gpu_gx_slumber`: power counter off, SPTPRAC off,
 `BOOT_SLUMBER_OPTION = 1`, OOB set/clear, `RPMH_POWER_STATE == 0xf`,
 `AO_AHB_FENCE_CTRL = 0`).
+
+### *** THE GPU ANSWERS AS A PROCESSOR (console69, adreno=9, 2026-10-24) ***
+
+```
+SWEET GPU: gpucc gx gdscr +0x100c = 0xf8222000            (GX ON)
+SWEET GPU: gpu core rbbm status +0x840 = 0x1              (bit 0: CP idle)
+SWEET GPU: gpu core cp status1 +0x20d4 = 0xffffffff       (the CP has no clock yet)
+SWEET GPU: GPU ANSWERS: rbbm_status 0x1, cp_status1 0xffffffff,
+           GMU counter 0x2af50e -> 0x2bbee5 (ticking)
+```
+
+`RBBM_STATUS = 0x1` is the idle bit, and the GMU's always-on counter moved ~52k
+ticks in the 2 ms between the two reads (~26 MHz, i.e. the 19.2 MHz crystal plus
+the read overhead). The core is powered, answers reads and its clock runs - the
+first time this port has read the GPU as anything but a block of clock registers.
+
+`CP_STATUS_1` reading all ones is expected at this point: the CP's own clock
+(`gx_gfx3d` / the CP root) has not been enabled - the clocks brought up so far are
+gcc memnoc/snoc/ddrss, gpucc cxo/ahb/cx_gmu and the GMU root.
+
+### The whole working ladder (console69)
+
+`adreno=9` on every boot: CX GDSC -> GCC/gpucc clocks -> cmd-db + PDC/RSC ->
+firmware 32 KB into ITCM/DTCM (SYSRESET verified) -> GMU boot (`0xbabeface`) ->
+SMMU impl-defs + CB0 + 4 KiB tables -> SIDs 5/4 through context 0 -> HFI v1
+(INIT / FW_VER 1.7 / TEST, all ACKed) -> GX rail (ARC 3, 257 MHz, OOB acked) ->
+SPTPRAC `0x28` -> GX GDSC on by itself -> RBBM_STATUS + ticking counter ->
+GMU back into reset -> iOS boots.
+
+### Next: the CP (Bergamota's stages 6-7)
+
+* the CP's clocks: `gx_gfx3d` (via the GX GDSC's `core_root_clk`, gpucc id 2) and
+  the CP root; `CP_STATUS_1` should stop reading all ones.
+* `CP_ME_INIT`, the ring and the SQE in a second SMMU context (CP_CB 1, SID 0,
+  SQE read-only), then the zap through SCM PAS id 13, `CP_SET_SECURE_MODE 0`, and
+  a NOP + `CP_MEM_WRITE` + `CP_EVENT_WRITE(CACHE_FLUSH_TS)` test with RPTR polling
+  and a read-back of both values.
+* `gpu_gx_slumber` when done, so the rail is given back on the boots that only
+  probe.
