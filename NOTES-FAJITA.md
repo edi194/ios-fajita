@@ -2234,3 +2234,40 @@ Two things still block a *working* client whatever the signatures say: buffers m
 real kernel-wired pages the client can also map (`clientMemoryForType`), and
 `sweet_gpu_surface_bo` must import an IOSurface. Those are the arena-to-descriptor step
 and the IOSurface step, in that order.
+
+### 0157 verified on hardware (console85), and what 0158 needs
+
+```
+capi test: ready 1 selector 1; param gpu 630 chip 0x6030001 gmem 0x100000;
+           iova reuse yes; vm_map/unmap yes; fence 3 done yes
+report after the capi test: live 1 lost 0 ring wptr 309 fence 3
+abi test: PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C contract
+```
+
+`vm_map/unmap yes` reads the L3 entry back, so their page-by-page mapping contract is
+proven. iOS booted normally (441 processes, no fault).
+
+`0158` = their two files plus one conf line plus publishing. Concrete steps, with what
+was already checked:
+
+1. `iokit/Kernel/arm/SweetAdrenoABI.h` - take `/home/edi194/ref/berg-0182/SweetAdrenoABI.h`
+   (235 lines) verbatim.
+2. `iokit/Kernel/arm/SweetAdreno.cpp` - take `/home/edi194/ref/berg-0182/SweetAdreno.cpp`
+   (949 lines). It includes `<pexpert/arm64/board_config.h>`, `IOKit/*`, `kern/clock.h`,
+   `sys/proc.h` and **"SweetSurface.h" - which our tree already has** in
+   `iokit/Kernel/arm/SweetSurface.h`, so the include resolves.
+3. Add `iokit/Kernel/arm/SweetAdreno.cpp   optional iokitcpp` to `iokit/conf/files.arm64`
+   next to the other Sweet*.cpp entries (the extracted `files.arm64` fragment shows the
+   exact line and its neighbours).
+4. Re-add `sweet_gpu_bo_sync` to the C side if their BO_SYNC selector calls it (0157
+   replaced it with `sweet_gpu_cache_sync`), and check at the use sites whether
+   `sweet_gpu_info` / `sweet_gpu_surface_bo` are called - grep the .cpp for the call
+   rather than the prototype: the first pass found the names but not `name(` patterns, so
+   they may only be declared. `surface_bo` can start as `kIOReturnUnsupported`.
+5. Call `SweetAdrenoPublish()` from `sweet_gpu_probe()` after the keep-up block, guarded
+   by `gpu_live`, and set the service's `MetalPluginName` when the Metal step comes.
+
+Then the userspace side: their `gpu/freedreno-sweet/sweet_drm.c` (IOServiceOpen
+"SweetAdreno630" + IOConnectCallStructMethod + IOConnectMapMemory64) built for our iOS
+arm64, which is what Mesa and Chlorophyll sit on. The `/dev/sweetgpu` chardev stays as
+the kernel-side smoke test.
