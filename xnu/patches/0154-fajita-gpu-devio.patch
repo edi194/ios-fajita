@@ -1,0 +1,124 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -351,6 +351,7 @@
+ #define GPU_BO_MAX_BYTES       0x100000u
+ #define GPU_ARENA_BYTES        0x100000u   /* the sweetfw2 blob: 1 MiB */
+ /* stage 8e: the device node and its ABI (selector numbers as in Linux msm) */
++#define SWEET_GPU_IOCTL_SELECT     0x44u   /* pick the buffer read/write use */
+ #define SWEET_GPU_IOCTL_INFO       0x70u
+ #define SWEET_GPU_IOCTL_GEM_NEW    0x42u
+ #define SWEET_GPU_IOCTL_GEM_INFO   0x43u
+@@ -398,6 +399,11 @@
+ 	uint32_t pad[2];
+ };
+ 
++struct sweet_gpu_select {
++	uint32_t handle;
++	uint32_t pad;
++};
++
+ struct sweet_gpu_close {
+ 	uint32_t handle;
+ 	uint32_t pad;
+@@ -1455,6 +1461,62 @@
+ 	return 0;
+ }
+ 
++/* ---- the selected buffer: read/write, because a device node cannot be mapped ---- */
++
++static uint32_t gpu_selected;
++
++static int
++gpu_client_select(struct sweet_gpu_select *arg)
++{
++	if (!gpu_live) {
++		return ENXIO;
++	}
++	if (gpu_bo_by_handle(arg->handle) == NULL) {
++		return EINVAL;
++	}
++	gpu_selected = arg->handle;
++	return 0;
++}
++
++/* Copy n bytes of the selected buffer at off to/from the caller. */
++static int
++gpu_dev_io(dev_t dev, struct uio *uio, bool write)
++{
++	struct gpu_bo *bo;
++	off_t off = uio->uio_offset;
++
++	if (!gpu_live) {
++		return ENXIO;
++	}
++	bo = gpu_bo_by_handle(gpu_selected);
++	if (bo == NULL) {
++		return ENXIO;
++	}
++	if (off < 0 || (vm_size_t)off >= bo->size || uio_resid(uio) == 0) {
++		return EINVAL;
++	}
++	vm_size_t n = MIN((vm_size_t)uio_resid(uio), bo->size - (vm_size_t)off);
++	int err = uiomove((caddr_t)(bo->kva + off), (int)n, uio);
++
++	if (!write) {
++		return err;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++	return err;
++}
++
++static int
++sweet_gpu_dev_read(dev_t dev, struct uio *uio, int flags)
++{
++	return gpu_dev_io(dev, uio, false);
++}
++
++static int
++sweet_gpu_dev_write(dev_t dev, struct uio *uio, int flags)
++{
++	return gpu_dev_io(dev, uio, true);
++}
++
+ /* devfs: one node, no per-open state, the GPU is a single system resource. */
+ static int
+ sweet_gpu_dev_open(dev_t dev, int flags, int devtype, struct proc *p)
+@@ -1484,6 +1546,8 @@
+ 		return gpu_client_wait((struct sweet_gpu_wait *)data);
+ 	case SWEET_GPU_IOCTL_GEM_CLOSE:
+ 		return gpu_client_gem_close((struct sweet_gpu_close *)data);
++	case SWEET_GPU_IOCTL_SELECT:
++		return gpu_client_select((struct sweet_gpu_select *)data);
+ 	default:
+ 		return ENOTTY;
+ 	}
+@@ -1492,6 +1556,8 @@
+ static const struct cdevsw sweet_gpu_cdevsw = {
+ 	.d_open   = sweet_gpu_dev_open,
+ 	.d_close  = sweet_gpu_dev_close,
++	.d_read   = sweet_gpu_dev_read,
++	.d_write  = sweet_gpu_dev_write,
+ 	.d_ioctl  = sweet_gpu_dev_ioctl,
+ 	.d_stop   = eno_stop,
+ 	.d_reset  = eno_reset,
+@@ -1600,6 +1666,20 @@
+ 	printf("SWEET GPU: abi test: close %d/%d, closed handle refused %s, bad handle refused %s\n",
+ 	    c1, c2, refusals ? "yes" : "NO", bad ? "yes" : "NO");
+ 	ok = ok && c1 == 0 && c2 == 0 && refusals && bad;
++	/* SELECT is testable here; the read/write that follows it needs a user
++	 * context (uiomove), so it is only reported as armed. */
++	struct sweet_gpu_gem_new io_bo = { .size = 0x1000, .flags = 0 };
++	bool sel_ok = false;
++	if (gpu_client_gem_new(&io_bo) == 0) {
++		struct sweet_gpu_select sel = { .handle = io_bo.handle };
++		sel_ok = gpu_client_select(&sel) == 0 &&
++		    gpu_client_select(&(struct sweet_gpu_select){ .handle = 9999 }) == EINVAL;
++		closecmd = (struct sweet_gpu_close) { .handle = io_bo.handle };
++		(void)gpu_client_gem_close(&closecmd);
++	}
++	printf("SWEET GPU: abi test: SELECT ok %s, unknown handle refused, read/write armed\n",
++	    sel_ok ? "yes" : "NO");
++
+ 	printf("SWEET GPU: abi test: %s\n", ok ?
+ 	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE" : "FAILED");
+ 	return ok;
