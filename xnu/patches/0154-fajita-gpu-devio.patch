@@ -1,6 +1,14 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -351,6 +351,7 @@
+@@ -21,6 +21,7 @@
+ #include <pexpert/pexpert.h>
+ /* stage 8: buffer allocation and cache attributes */
+ #include <sys/conf.h>
++#include <sys/uio.h>   /* struct uio for the read/write path */
+ #include <sys/ioccom.h>
+ #include <miscfs/devfs/devfs.h>
+ 
+@@ -351,6 +352,7 @@
  #define GPU_BO_MAX_BYTES       0x100000u
  #define GPU_ARENA_BYTES        0x100000u   /* the sweetfw2 blob: 1 MiB */
  /* stage 8e: the device node and its ABI (selector numbers as in Linux msm) */
@@ -8,7 +16,7 @@
  #define SWEET_GPU_IOCTL_INFO       0x70u
  #define SWEET_GPU_IOCTL_GEM_NEW    0x42u
  #define SWEET_GPU_IOCTL_GEM_INFO   0x43u
-@@ -398,6 +399,11 @@
+@@ -398,6 +400,11 @@
  	uint32_t pad[2];
  };
  
@@ -20,7 +28,7 @@
  struct sweet_gpu_close {
  	uint32_t handle;
  	uint32_t pad;
-@@ -1455,6 +1461,62 @@
+@@ -1455,6 +1462,62 @@
  	return 0;
  }
  
@@ -83,7 +91,7 @@
  /* devfs: one node, no per-open state, the GPU is a single system resource. */
  static int
  sweet_gpu_dev_open(dev_t dev, int flags, int devtype, struct proc *p)
-@@ -1484,6 +1546,8 @@
+@@ -1484,6 +1547,8 @@
  		return gpu_client_wait((struct sweet_gpu_wait *)data);
  	case SWEET_GPU_IOCTL_GEM_CLOSE:
  		return gpu_client_gem_close((struct sweet_gpu_close *)data);
@@ -92,7 +100,7 @@
  	default:
  		return ENOTTY;
  	}
-@@ -1492,6 +1556,8 @@
+@@ -1492,6 +1557,8 @@
  static const struct cdevsw sweet_gpu_cdevsw = {
  	.d_open   = sweet_gpu_dev_open,
  	.d_close  = sweet_gpu_dev_close,
@@ -101,7 +109,7 @@
  	.d_ioctl  = sweet_gpu_dev_ioctl,
  	.d_stop   = eno_stop,
  	.d_reset  = eno_reset,
-@@ -1600,6 +1666,20 @@
+@@ -1600,6 +1667,20 @@
  	printf("SWEET GPU: abi test: close %d/%d, closed handle refused %s, bad handle refused %s\n",
  	    c1, c2, refusals ? "yes" : "NO", bad ? "yes" : "NO");
  	ok = ok && c1 == 0 && c2 == 0 && refusals && bad;
