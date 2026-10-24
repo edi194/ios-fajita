@@ -1,0 +1,348 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1356,31 +1356,31 @@
+ 	return ok;
+ }
+ 
+-/* ---- stage 8f: the surface the user client will call ------------------- */
++/* ---- stage 8f: the surface the IOKit user client calls ----------------- */
+ 
++/* Prototypes exactly as their SweetAdreno.cpp declares them. */
+ static bool gpu_lost;
+ static struct gpu_extent gpu_free_ext[GPU_EXTENT_MAX];
+ 
+-static bool
++bool
+ sweet_gpu_ready(void)
+ {
+ 	return gpu_live && !gpu_lost;
+ }
+ 
+-static uint32_t
++uint32_t
+ sweet_gpu_selector(void)
+ {
+ 	return gpu_live ? 1u : 0u;
+ }
+ 
+-/* The msm answers a winsys asks for before it does anything else. */
+-static bool
+-sweet_gpu_param(uint32_t param, uint64_t *value)
++bool
++sweet_gpu_param(uint32_t which, uint64_t *value)
+ {
+ 	if (!gpu_live) {
+ 		return false;
+ 	}
+-	switch (param) {
++	switch (which) {
+ 	case GPU_PARAM_GPU_ID:
+ 		*value = 630;
+ 		break;
+@@ -1394,7 +1394,6 @@
+ 		*value = 710000000u;
+ 		break;
+ 	case GPU_PARAM_TIMESTAMP:
+-		/* the CP's last CACHE_FLUSH_TS value: monotonic across submissions */
+ 		*value = *(volatile uint32_t *)(gpu_blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE);
+ 		break;
+ 	case GPU_PARAM_GMEM_BASE:
+@@ -1412,22 +1411,23 @@
+ 	return true;
+ }
+ 
++/* A GPU address is GPU_VA_BASE + an arena offset, and both are 64-bit. */
+ static bool
+-sweet_gpu_fence_done(uint32_t fence)
++gpu_iova_to_off(uint64_t iova, uint64_t size, uint32_t *off)
+ {
+-	if (!gpu_live || fence == 0) {
++	uint64_t o;
++
++	if (iova < GPU_VA_BASE) {
+ 		return false;
+ 	}
+-	return *(volatile uint32_t *)(gpu_blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE) >= fence;
+-}
+-
+-static uint32_t
+-sweet_gpu_fence_last(void)
+-{
+-	return gpu_last_fence;
++	o = iova - GPU_VA_BASE;
++	if (o + size > gpu_arena_size) {
++		return false;
++	}
++	*off = (uint32_t)o;
++	return true;
+ }
+ 
+-/* Arena space comes back so a client can allocate all day. */
+ static uint32_t
+ gpu_extent_alloc(uint32_t size)
+ {
+@@ -1436,13 +1436,10 @@
+ 			uint32_t off = gpu_free_ext[i].off;
+ 			gpu_free_ext[i].off += size;
+ 			gpu_free_ext[i].size -= size;
+-			if (gpu_free_ext[i].size == 0) {
+-				gpu_free_ext[i].size = 0;
+-			}
+ 			return off;
+ 		}
+ 	}
+-	return gpu_arena_used;   /* fresh space, or past the end and refused by the caller */
++	return gpu_arena_used;
+ }
+ 
+ static void
+@@ -1457,85 +1454,150 @@
+ 	}
+ }
+ 
+-static bool
+-sweet_gpu_iova_alloc(uint32_t size, uint32_t *off)
++bool
++sweet_gpu_iova_alloc(uint64_t size, uint64_t *iova, uint64_t *taken)
+ {
+-	if (!gpu_live || size == 0 || (size & 0xfffu) || size > gpu_arena_size) {
++	uint64_t sz;
++	uint32_t off;
++
++	if (!gpu_live || size == 0 || size > gpu_arena_size) {
+ 		return false;
+ 	}
+-	uint32_t o = gpu_extent_alloc(size);
+-	if (o + size > gpu_arena_size) {
++	sz = (size + 0xfff) & ~0xfffull;
++	off = gpu_extent_alloc((uint32_t)sz);
++	if ((uint64_t)off + sz > gpu_arena_size) {
+ 		return false;
+ 	}
+-	if (o == gpu_arena_used) {
+-		gpu_arena_used += size;
++	if (off == gpu_arena_used) {
++		gpu_arena_used += (uint32_t)sz;
++	}
++	*iova = GPU_VA_BASE + off;
++	if (taken != NULL) {
++		*taken = sz;
+ 	}
+-	*off = o;
+ 	return true;
+ }
+ 
+-static void
+-sweet_gpu_iova_free(uint32_t off, uint32_t size)
++/* msm SET_IOVA: the client picked an address; refuse it if it is not ours to give. */
++bool
++sweet_gpu_iova_reserve(uint64_t iova, uint64_t size)
+ {
+-	if (size) {
+-		gpu_extent_free(off, size);
+-	}
++	uint32_t off;
++
++	return gpu_live && gpu_iova_to_off(iova, size, &off);
+ }
+ 
+-static bool
+-sweet_gpu_vm_map(uint32_t off, uint32_t size)
++void
++sweet_gpu_iova_free(uint64_t iova, uint64_t size)
+ {
+-	if (!gpu_live || off + size > gpu_arena_size) {
+-		return false;
++	uint32_t off;
++
++	if (gpu_iova_to_off(iova, size, &off)) {
++		gpu_extent_free(off, (uint32_t)size);
+ 	}
+-	return gpu_pt_map(GPU_VA_BASE + off, gpu_arena_pa + off, size);
+ }
+ 
+-static void
+-sweet_gpu_vm_unmap(uint32_t off, uint32_t size)
++bool
++sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly)
+ {
+ 	volatile uint64_t *l3 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L3);
+-	uint32_t va = GPU_VA_BASE + off;
++	uint32_t l2i;
+ 
+-	for (uint32_t o = 0; o < size; o += 0x1000) {
+-		l3[((va + o) >> 12) & 0x1ff] = 0;
++	if (!gpu_live) {
++		return false;
+ 	}
++	l2i = (uint32_t)((iova >> 21) & 0x1ff);
++	if (l2i != 0) {
++		printf("SWEET GPU: vm_map %#llx is past the first 2 MiB (L2[%u])\n",
++		    (unsigned long long)iova, l2i);
++		return false;
++	}
++	l3[(iova >> 12) & 0x1ff] = (pa & ~0xfffull) | GPU_PTE_PAGE |
++	    (readonly ? (1ull << 7) : 0ull);
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	return true;
+ }
+ 
+-/*
+- * The arena is mapped uncached through ml_io_map and the GPU's PTEs are non-cacheable,
+- * so there is nothing to write back here. The call exists because a client must be able
+- * to ask, and because the day a buffer comes from cacheable memory this is where the
+- * flush goes.
+- */
+-static void
+-sweet_gpu_bo_sync(uint32_t off, uint32_t size)
++void
++sweet_gpu_vm_unmap(uint64_t iova, uint64_t size)
+ {
+-	if (!gpu_live || off + size > gpu_arena_size) {
++	volatile uint64_t *l3 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L3);
++
++	if (!gpu_live) {
+ 		return;
+ 	}
++	for (uint64_t o = 0; o < size; o += 0x1000) {
++		l3[((iova + o) >> 12) & 0x1ff] = 0;
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+-static void
+-sweet_gpu_cache_sync(void)
++/* Their buffers are cacheable IOBufferMemoryDescriptors and this is dc civac over the
++ * kernel alias; ours are uncached, so the barrier is the whole story - but keep the
++ * prototype they call. */
++void
++sweet_gpu_cache_sync(void *va, size_t len)
+ {
++	(void)va;
++	(void)len;
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
+-static void
+-sweet_gpu_mark_lost(const char *why)
++/* One CP_INDIRECT_BUFFER per command buffer, then the CACHE_FLUSH_TS fence - Linux's
++ * a6xx_submit tail, which is what their submit path hands us. */
++uint32_t
++sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count)
++{
++	if (!gpu_live || ib_iova == NULL || ib_dwords == NULL || count == 0) {
++		return 0;
++	}
++	for (unsigned i = 0; i < count; i++) {
++		gpu_ring_emit(gpu_blob + GPU_CP_RING, gpu_pkt7(GPU_CP_INDIRECT_BUFFER_PFE, 3));
++		gpu_ring_emit(gpu_blob + GPU_CP_RING, (uint32_t)ib_iova[i]);
++		gpu_ring_emit(gpu_blob + GPU_CP_RING, (uint32_t)(ib_iova[i] >> 32));
++		gpu_ring_emit(gpu_blob + GPU_CP_RING, ib_dwords[i]);
++	}
++	gpu_ring_emit(gpu_blob + GPU_CP_RING, gpu_pkt7(GPU_CP_EVENT_WRITE, 4));
++	gpu_ring_emit(gpu_blob + GPU_CP_RING, GPU_CP_CACHE_FLUSH_TS);
++	gpu_ring_emit(gpu_blob + GPU_CP_RING,
++	    (uint32_t)(GPU_VA_CP_SCRATCH + GPU_CP_SCRATCH_FENCE));
++	gpu_ring_emit(gpu_blob + GPU_CP_RING, 0);
++	gpu_ring_emit(gpu_blob + GPU_CP_RING, ++gpu_cp_seq);
++	gpu_ring_flush(gpu_core, gpu_cp_wptr);
++
++	if (!gpu_ring_wait_idle(gpu_core, "submit")) {
++		return 0;
++	}
++	return gpu_cp_seq;
++}
++
++bool
++sweet_gpu_fence_done(uint32_t fence)
++{
++	if (!gpu_live || fence == 0) {
++		return false;
++	}
++	return *(volatile uint32_t *)(gpu_blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE) >= fence;
++}
++
++uint32_t
++sweet_gpu_fence_last(void)
++{
++	return gpu_cp_seq;
++}
++
++void
++sweet_gpu_mark_lost(void)
+ {
+ 	gpu_lost = true;
+-	printf("SWEET GPU: marked lost: %s\n", why ? why : "unspecified");
+ }
+ 
+-static void
+-sweet_gpu_report(void)
++void
++sweet_gpu_report(const char *why)
+ {
+-	printf("SWEET GPU: report: live %d lost %d ring wptr %u fence %u\n",
+-	    gpu_live ? 1 : 0, gpu_lost ? 1 : 0, gpu_cp_wptr, gpu_last_fence);
++	printf("SWEET GPU: report%s%s: live %d lost %d ring wptr %u fence %u\n",
++	    why ? " " : "", why ? why : "", gpu_live ? 1 : 0, gpu_lost ? 1 : 0,
++	    gpu_cp_wptr, gpu_cp_seq);
+ }
+ 
+ /* ---- stage 8e: the ABI the device node exposes ------------------------- */
+@@ -1894,31 +1956,44 @@
+ 	printf("SWEET GPU: abi test: SELECT ok %s, unknown handle refused, read/write armed\n",
+ 	    sel_ok ? "yes" : "NO");
+ 
+-	/* the surface the IOKit user client will call */
++	/* the surface the IOKit user client calls, with their prototypes */
+ 	uint64_t capv = 0;
+ 	bool param_ok = sweet_gpu_param(GPU_PARAM_GPU_ID, &capv) && capv == 630;
+ 	param_ok = param_ok && sweet_gpu_param(GPU_PARAM_CHIP_ID, &capv) && capv == 0x06030001u;
+ 	param_ok = param_ok && sweet_gpu_param(GPU_PARAM_GMEM_SIZE, &capv) && capv == 0x100000u;
+ 	param_ok = param_ok && !sweet_gpu_param(999, &capv);
+ 
+-	uint32_t cap_a = 0, cap_b = 0, cap_c = 0;
+-	bool reuse = false;
+-	if (sweet_gpu_iova_alloc(0x1000, &cap_a) && sweet_gpu_iova_alloc(0x1000, &cap_b)) {
+-		sweet_gpu_iova_free(cap_a, 0x1000);
+-		reuse = sweet_gpu_iova_alloc(0x1000, &cap_c) && cap_c == cap_a;
+-		sweet_gpu_iova_free(cap_b, 0x1000);
+-		sweet_gpu_iova_free(cap_c, 0x1000);
++	uint64_t iova_a = 0, iova_b = 0, iova_c = 0, taken = 0;
++	bool reuse = false, map_ok = false;
++	if (sweet_gpu_iova_alloc(0x1000, &iova_a, &taken) &&
++	    sweet_gpu_iova_alloc(0x1000, &iova_b, &taken)) {
++		uint32_t off = 0;
++		if (gpu_iova_to_off(iova_b, 0x1000, &off) &&
++		    sweet_gpu_vm_map(iova_b, gpu_arena_pa + off, false)) {
++			volatile uint64_t *l3 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L3);
++			map_ok = l3[(iova_b >> 12) & 0x1ff] ==
++			    ((gpu_arena_pa + off) | GPU_PTE_PAGE);
++			sweet_gpu_vm_unmap(iova_b, 0x1000);
++			map_ok = map_ok && l3[(iova_b >> 12) & 0x1ff] == 0;
++		}
++		sweet_gpu_iova_free(iova_a, 0x1000);
++		reuse = sweet_gpu_iova_alloc(0x1000, &iova_c, &taken) && iova_c == iova_a;
++		sweet_gpu_iova_free(iova_b, 0x1000);
++		sweet_gpu_iova_free(iova_c, 0x1000);
+ 	}
++	sweet_gpu_cache_sync((void *)gpu_arena, 0x1000);
+ 
+-	bool sync_ok = sweet_gpu_fence_done(sweet_gpu_fence_last());
+ 	printf("SWEET GPU: capi test: ready %d selector %u; param gpu %llu chip %#llx gmem %#llx; "
+-	    "iova reuse %s; fence %u done %s; bo_sync+cache_sync called; lost still %d\n",
++	    "iova reuse %s; vm_map/unmap %s; fence %u done %s\n",
+ 	    sweet_gpu_ready(), sweet_gpu_selector(), (unsigned long long)630,
+ 	    (unsigned long long)0x06030001ull, (unsigned long long)0x100000ull,
+-	    reuse ? "yes" : "NO", sweet_gpu_fence_last(), sync_ok ? "yes" : "NO", gpu_lost ? 1 : 0);
+-	sweet_gpu_report();
++	    reuse ? "yes" : "NO", map_ok ? "yes" : "NO", sweet_gpu_fence_last(),
++	    sweet_gpu_fence_done(sweet_gpu_fence_last()) ? "yes" : "NO");
++	sweet_gpu_report("after the capi test");
+ 
+-	ok = ok && param_ok && reuse && sync_ok;
++	ok = ok && param_ok && reuse && map_ok;
++	printf("SWEET GPU: abi test: %s\n", ok ?
++	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C contract" : "FAILED");
+ 	printf("SWEET GPU: abi test: %s\n", ok ?
+ 	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C surface" : "FAILED");
+ 	return ok;
