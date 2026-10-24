@@ -1,0 +1,111 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -329,6 +329,8 @@
+ #define A6XX_CP_PROTECT_STATUS  0x0824u
+ #define GPU_CP_SCRATCH_MEMWR   0x100u   /* the value CP_MEM_WRITE leaves behind */
+ #define GPU_CP_SCRATCH_TS      0x110u   /* CACHE_FLUSH_TS writes the sequence here */
++#define GPU_CP_SCRATCH_FILL    0x200u   /* the 256-byte fill self-test lands here */
++#define GPU_CP_FILL_BYTES      0x100u
+ /* stage 7c: the zap shader through SCM (PAS id 13) */
+ #define GPU_ZAP_BASE           0x25000u   /* offset inside the blob */
+ #define GPU_ZAP_BYTES          0x3000u    /* .mdt 0x25000, b02 segment 0x27000 */
+@@ -421,6 +423,7 @@
+ static vm_offset_t gpu_log_va;
+ static uint32_t gpu_hfi_pa, gpu_log_pa;
+ static bool gpu_scratch_ready;
++static bool gpu_kept_up;        /* stage 8: leave the GPU powered and the ring live */
+ 
+ static void
+ gpu_scratch_prepare(void)
+@@ -864,6 +867,43 @@
+ 	return false;
+ }
+ 
++/* A 256-byte fill through the CP: 64 CP_MEM_WRITEs, the primitive a real buffer
++ * write needs, and the check that every word arrived. */
++static bool
++gpu_cp_fill_test(vm_offset_t core, vm_offset_t blob)
++{
++	vm_offset_t ring = blob + GPU_CP_RING;
++	volatile uint32_t *dst = (volatile uint32_t *)(blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FILL);
++	const uint32_t val = 0x5a5a5a5au;
++	const unsigned words = GPU_CP_FILL_BYTES / 4;
++
++	for (unsigned i = 0; i < words; i++) {
++		dst[i] = 0;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	for (unsigned i = 0; i < words; i++) {
++		gpu_ring_emit(ring, gpu_pkt7(GPU_CP_MEM_WRITE, 3));
++		gpu_ring_emit(ring, (uint32_t)(GPU_VA_CP_SCRATCH + GPU_CP_SCRATCH_FILL + 4u * i));
++		gpu_ring_emit(ring, 0);
++		gpu_ring_emit(ring, val);
++	}
++	gpu_ring_flush(core, gpu_cp_wptr);
++	if (!gpu_ring_wait_idle(core, "fill submission")) {
++		return false;
++	}
++
++	unsigned differ = 0;
++	for (unsigned i = 0; i < words; i++) {
++		if (dst[i] != val) {
++			differ++;
++		}
++	}
++	printf("SWEET GPU: cp fill test: %u of %u words differ (%s)\n", differ, words,
++	    differ ? "FAILED" : "ok");
++	return differ == 0;
++}
++
+ /* ---- stage 7c: the zap shader through SCM/PAS -------------------------- */
+ 
+ static bool gpu_zap_started;    /* AUTH_AND_RESET returned 0: SHUTDOWN is owed */
+@@ -2057,21 +2097,45 @@
+ 						if (cp_zap) {
+ 							printf("SWEET GPU: --- stage 7c: the zap shader\n");
+ 							if (gpu_zap_load(g, gmem_pa)) {
++								bool ok = false;
+ 								printf("SWEET GPU: --- stage 7d: out of secure mode, the first submission\n");
+ 								gpu_ring_emit(g + GPU_CP_RING,
+ 								    gpu_pkt7(GPU_CP_SET_SECURE_MODE, 1));
+ 								gpu_ring_emit(g + GPU_CP_RING, 0);
+ 								gpu_ring_flush(gpu, gpu_cp_wptr);
+ 								if (gpu_ring_wait_idle(gpu, "CP_SET_SECURE_MODE 0")) {
+-									(void)gpu_cp_nop_test(gpu, g);
++									ok = gpu_cp_nop_test(gpu, g);
++									if (ok) {
++										ok = gpu_cp_fill_test(gpu, g);
++									}
++								}
++								int hold = 0;
++								(void)PE_parse_boot_argn("gpuhold", &hold, sizeof(hold));
++								if (ok && hold) {
++									/* Stage 8: keep everything live so the CP's
++									 * state survives the boot. */
++									gpu_kept_up = true;
++									printf("SWEET GPU: GPU KEPT UP: GMU live, OOB gpu held, "
++									    "zap authenticated, ring live at wptr %u\n",
++									    gpu_cp_wptr);
++								} else {
++									gpu_zap_shutdown();
+ 								}
+-								gpu_zap_shutdown();
+ 							}
+ 						}
+ 					} else {
+ 						printf("SWEET GPU: CP bring-up stopped before the NOP test\n");
+ 					}
+ 
++					if (gpu_kept_up) {
++						/* Stage 8: everything the ladder built has to
++						 * survive the boot, so stop here - the slumber
++						 * below and the GMU reset at the end of the
++						 * function would both take it away. */
++						printf("SWEET GPU: stage 8: GPU kept up, slumber and GMU reset skipped\n");
++						return;
++					}
++
+ 					/* a6xx_gmu_notify_slumber: give the rail back. */
+ 					gpu_probe_wr("gmu power counter off", gmu, GPU_GMU_POWER_COUNTER, 0);
+ 					gpu_probe_wr("gmu sptprac off", gmu, GPU_GMU_GX_SPTPRAC_POWER, 0x778001u);
