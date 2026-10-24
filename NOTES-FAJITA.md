@@ -1763,3 +1763,25 @@ fetch a single packet. It now rides inside the payload blob at +0x1c000 (32132
 bytes, header stripped like Linux does) and the boot prints its first three words,
 because a missing firmware otherwise looks like a ring that silently refuses to
 drain. `build-fajita.sh` rebuilds the blob on every image so it cannot go stale.
+
+### console75: the CP executes its first packet (2026-10-24)
+
+```
+sqe microcode at +0x1c000: 0x16ee19a 0x1001ee1 0x1190001 (loaded)
+cp: SQE enabled, cp_status1 0x81004000
+cp CP_ME_INIT: ring idle (RPTR=WPTR=9) rbbm_status 0x1
+```
+
+`CP_SQE_CNTL = 1` took the CP out of the reset the GMU had held it in (`cp_status1`
+went from `0xffffffff` to `0x81004000`), and the nine dword CP_ME_INIT packet was
+fetched through the SMMU context CB1, executed, and retired - RPTR caught up with
+WPTR. This is the same line and the same value (9) that Bergamota's port prints, so
+the packet encoding, the ring layout in CB1 and the SQE microcode placement are all
+right the first time.
+
+Ladder order follows Linux and Bergamota: hw_init -> CP_ME_INIT -> zap ->
+CP_SET_SECURE_MODE 0 -> NOP test. The zap is next and is the only step that enters
+the secure world, so it stays behind `zap=1` (`console75c-zap.img`).
+
+Note `cp_status1 0x81004000` is this driver's own diagnostic, not a value checked
+anywhere: bit 31 and bit 24 are set after CP_ME_INIT on this chip.
