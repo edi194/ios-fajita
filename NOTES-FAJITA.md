@@ -1413,3 +1413,21 @@ Next: `PERF_TBL` and `BW_VOTE_TBL` need the DCVS table from the cmd-db and
 Linux's fixed a630 bandwidth table; then the GX rail (`gfx_rail_on` + SPTPRAC)
 and the first GPU-core register reads; then the CP (ring, SQE in a second SMMU
 context for SID 0, the zap through SCM PAS 13, a NOP + CACHE_FLUSH_TS test).
+
+### console64: the whole GPU probe runs on every boot (2026-10-24)
+
+```
+hfi ctrl status 0x1 (THE HFI QUEUES ARE UP), version info 0
+hfi fw version: reply 0x12047e, request 0x1, error 0, data 0x10070000
+hfi firmware version exchange ok
+hfi test: reply 0x22047e, request 0x5, error 0
+hfi test ok
+gmu sysreset at the end 0x1
+```
+
+(The line prints "firmware 16.7" because it shifts `0x10070000` byte-wise; the
+value is the HFI version 1.7. Cosmetic, one line to fix when convenient.)
+
+iOS boots normally afterwards with the full probe: CX GDSC, clocks, firmware,
+GMU boot, SMMU context and streams, HFI INIT/FW_VER/TEST, GMU back in reset. This
+is the state to build on - `adreno=9` is the switch.
