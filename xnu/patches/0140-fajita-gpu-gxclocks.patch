@@ -1,0 +1,35 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1387,6 +1387,32 @@
+ 					    (now & GDSC_POWER_ON) ? "GX ON" : "GX STILL OFF");
+ 				}
+ 
++				/* The five clocks still off here (Bergamota's gpucc table). */
++				{
++					static const struct { const char *what; uint32_t off; } clk[] = {
++						{ "gpucc cx_apb",      0x1088u },
++						{ "gpucc cx_snoc_dvm", 0x108cu },
++						{ "gpucc gx_cxo",      0x1060u },
++						{ "gpucc gx_gmu",      0x1064u },
++						{ "gpucc gx_gfx3d",    0x1054u },
++					};
++					for (unsigned i = 0; i < sizeof(clk) / sizeof(clk[0]); i++) {
++						uint32_t v = gpu_rd_quiet(cc, clk[i].off);
++						if ((v & 1u) && !(v & CBCR_OFF)) {
++							printf("SWEET GPU: %s already %#x\n", clk[i].what, v);
++							continue;
++						}
++						gpu_probe_wr(clk[i].what, cc, clk[i].off, (v & ~CBCR_OFF) | 1u);
++						uint32_t now = gpu_rd_quiet(cc, clk[i].off);
++						for (int k = 0; k < 20 && (now & CBCR_OFF); k++) {
++							gpu_wait_ms(1);
++							now = gpu_rd_quiet(cc, clk[i].off);
++						}
++						printf("SWEET GPU: %s %#x -> %#x %s\n", clk[i].what, v, now,
++						    (now & CBCR_OFF) ? "(halted)" : "(running)");
++					}
++				}
++
+ 				/* The core, at last: reads are safe only with GX powered. */
+ 				if (gpu_rd_quiet(cc, GPUCC_GX_GDSCR) & GDSC_POWER_ON) {
+ 					uint32_t c0 = gpu_rd_quiet(gmu, GPU_GMU_AO_COUNTER_L);
