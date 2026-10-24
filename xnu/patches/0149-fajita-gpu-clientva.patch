@@ -1,0 +1,89 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -261,7 +261,7 @@
+ #define GPU_CORE_CP_STATUS_1  0x20d4u    /* a6xx 0x0825 */
+ 
+ /* stage 7: the CP's memory, carved out of the blob after the GMU's 64 KiB */
+-#define GPU_BLOB_BYTES        0x28000u
++#define GPU_BLOB_BYTES        0x34000u
+ #define GPU_CP_BASE           0x10000u   /* offset inside the blob */
+ #define GPU_CP_L1             (GPU_CP_BASE + 0x0000u)
+ #define GPU_CP_L2             (GPU_CP_BASE + 0x1000u)
+@@ -331,6 +331,12 @@
+ #define GPU_CP_SCRATCH_TS      0x110u   /* CACHE_FLUSH_TS writes the sequence here */
+ #define GPU_CP_SCRATCH_FILL    0x200u   /* the 256-byte fill self-test lands here */
+ #define GPU_CP_FILL_BYTES      0x100u
++/* stage 8b: the client's address range, one L1 slot above the CP's own */
++#define GPU_ARENA_L2           0x28000u   /* offset inside the blob, right after the zap */
++#define GPU_ARENA_L3           0x29000u
++#define GPU_ARENA_DATA         0x2a000u
++#define GPU_ARENA_PAGES        8u
++#define GPU_VA_CLIENT_TEST     0x80000000u   /* L1[2], L2[0], L3[0] */
+ /* stage 7c: the zap shader through SCM (PAS id 13) */
+ #define GPU_ZAP_BASE           0x25000u   /* offset inside the blob */
+ #define GPU_ZAP_BYTES          0x3000u    /* .mdt 0x25000, b02 segment 0x27000 */
+@@ -904,6 +910,54 @@
+ 	return differ == 0;
+ }
+ 
++/* ---- stage 8b: a client-address mapping the CP has never seen ---------- */
++
++/*
++ * Build L1[2] -> a fresh L2 -> a fresh L3 -> a fresh data page for
++ * GPU_VA_CLIENT_TEST, then have the CP write through it. The value is read back
++ * through the blob's own mapping of the same physical page, so a match means the
++ * CP resolved the new VA through the new tables.
++ */
++static bool
++gpu_client_va_test(vm_offset_t core, vm_offset_t blob, uint64_t blob_pa)
++{
++	volatile uint64_t *l1 = (volatile uint64_t *)(blob + GPU_GMEM_L1);
++	volatile uint64_t *l2 = (volatile uint64_t *)(blob + GPU_ARENA_L2);
++	volatile uint64_t *l3 = (volatile uint64_t *)(blob + GPU_ARENA_L3);
++	volatile uint32_t *page = (volatile uint32_t *)(blob + GPU_ARENA_DATA);
++	vm_offset_t ring = blob + GPU_CP_RING;
++	const uint32_t magic = 0xfeed0001u;
++	const uint32_t l1i = (GPU_VA_CLIENT_TEST >> 30) & 0x1ff;
++	const uint32_t l2i = (GPU_VA_CLIENT_TEST >> 21) & 0x1ff;
++	const uint32_t l3i = (GPU_VA_CLIENT_TEST >> 12) & 0x1ff;
++
++	for (unsigned i = 0; i < GPU_ARENA_PAGES * 1024; i++) {
++		page[i] = 0;
++	}
++	l1[l1i] = (uint64_t)(blob_pa + GPU_ARENA_L2) | GPU_PTE_TABLE;
++	l2[l2i] = (uint64_t)(blob_pa + GPU_ARENA_L3) | GPU_PTE_TABLE;
++	l3[l3i] = (uint64_t)(blob_pa + GPU_ARENA_DATA) | GPU_PTE_PAGE;
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET GPU: client va %#x: l1[%u]=%#llx l2[%u]=%#llx l3[%u]=%#llx (data pa %#llx)\n",
++	    GPU_VA_CLIENT_TEST, l1i, (unsigned long long)l1[l1i],
++	    l2i, (unsigned long long)l2[l2i], l3i, (unsigned long long)l3[l3i],
++	    (unsigned long long)(blob_pa + GPU_ARENA_DATA));
++
++	gpu_ring_emit(ring, gpu_pkt7(GPU_CP_MEM_WRITE, 3));
++	gpu_ring_emit(ring, GPU_VA_CLIENT_TEST);
++	gpu_ring_emit(ring, 0);
++	gpu_ring_emit(ring, magic);
++	gpu_ring_flush(core, gpu_cp_wptr);
++	if (!gpu_ring_wait_idle(core, "client va submission")) {
++		return false;
++	}
++
++	bool ok = page[0] == magic;
++	printf("SWEET GPU: client va write: %#x (want %#x) %s\n", page[0], magic,
++	    ok ? "- the CP resolved a new L1 slot" : "- MISMATCH");
++	return ok;
++}
++
+ /* ---- stage 7c: the zap shader through SCM/PAS -------------------------- */
+ 
+ static bool gpu_zap_started;    /* AUTH_AND_RESET returned 0: SHUTDOWN is owed */
+@@ -2108,6 +2162,9 @@
+ 									if (ok) {
+ 										ok = gpu_cp_fill_test(gpu, g);
+ 									}
++									if (ok) {
++										ok = gpu_client_va_test(gpu, g, gmem_pa);
++									}
+ 								}
+ 								int hold = 0;
+ 								(void)PE_parse_boot_argn("gpuhold", &hold, sizeof(hold));

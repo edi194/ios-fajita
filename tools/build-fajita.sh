@@ -72,7 +72,7 @@ ZAP_SEG=${ZAP_SEG:-$HOME/gpu-fw/a630_zap.b02}
 #   +0x10000 CP block: L1, L2, L3, ring (0x14000), SQE (0x1c000), scratch (0x24000)
 #   +0x25000 zap metadata (.mdt), +0x27000 its loadable segment (b02)
 mkdir -p "$(dirname "$GMEM_BLOB")"
-dd if=/dev/zero of="$GMEM_BLOB" bs=1024 count=160 status=none
+dd if=/dev/zero of="$GMEM_BLOB" bs=1024 count=208 status=none
 # The SQE microcode, without its four-byte header (Linux loads from byte 4).
 if [[ -f "$SQE_FW" ]]; then
 	tail -c +5 "$SQE_FW" | dd of="$GMEM_BLOB" bs=1024 seek=112 conv=notrunc status=none
