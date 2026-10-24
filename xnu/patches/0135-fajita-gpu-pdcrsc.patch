@@ -1,0 +1,235 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -227,6 +227,35 @@
+ #define GPU_GMU_GMU2HOST_INFO 0x14648u   /* 0x5192 */
+ #define GPU_GMU_HOST2GMU_SET  0x14650u   /* 0x5194 */
+ 
++/* stage 5, first half: the command DB, the PDC and the RSC (Bergamota 0103) */
++#define GPU_CMDDB_PA          0x85fe0000u
++#define GPU_CMDDB_BYTES       0x20000u
++#define GPU_CMDDB_MAGIC       0x0c0330dbu
++#define GPU_CMDDB_HEADER      144u
++#define GPU_CMDDB_ENTRY       24u
++#define GPU_CMDDB_SLAVE_ARC   3u
++#define GPU_PDC_CFG_PA        0x0b280000u
++#define GPU_PDC_SEQ_PA        0x0b480000u
++#define GPU_PDC_BYTES         0x10000u
++#define GPU_PDC_CMD_OFFSET    4u
++#define GPU_RSC_CMD_OFFSET    2u
++#define GPU_RSCC_RSC_STATUS0  0x0004u
++#define GPU_RSCC_PDC_SEQ_START 0x0008u
++#define GPU_RSCC_MATCH_LO     0x0009u
++#define GPU_RSCC_MATCH_HI     0x000au
++#define GPU_RSCC_PDC_SLAVE_ID 0x000bu
++#define GPU_RSCC_HIDDEN_ADDR  0x000du
++#define GPU_RSCC_HIDDEN_DATA  0x000eu
++#define GPU_RSCC_OVERRIDE     0x0100u
++#define GPU_RSCC_SEQ_BUSY     0x0101u
++#define GPU_RSCC_SEQ_MEM      0x0180u
++#define GPU_GMU_RSCC_REQ      0x24c1cu   /* 0x9307 */
++#define GPU_GMU_RSCC_ACK      0x24c20u   /* 0x9308 */
++#define GPU_GMU_GX_SPTPRAC_POWER 0x204u  /* 0x0081 */
++#define GPU_GMU_SPTPRAC_STATUS 0x14340u  /* 0x50d0 */
++#define GPU_RSCC(off)         (0x23000u + 4u * (off))
++#define GPU_PDCR(off)         (4u * (off))
++
+ #define GPU_SMMU_MICRO_MMU_CTRL 0x6000u
+ #define GPU_SMMU_MICRO_HALT     (1u << 2)
+ #define GPU_SMMU_MICRO_IDLE     (1u << 3)
+@@ -341,6 +370,187 @@
+ 	gpu_scratch_ready = true;
+ }
+ 
++/* ---- stage 5 prep: the command DB, the PDC and the RSC ---------------- */
++
++static vm_offset_t gpu_cmddb;
++
++static uint32_t
++gpu_db32(uint32_t off)
++{
++	return gpu_rd_quiet(gpu_cmddb, off & ~3u);
++}
++
++static uint16_t
++gpu_db16(uint32_t off)
++{
++	return (uint16_t)(gpu_db32(off) >> (8u * (off & 3u)));
++}
++
++static bool
++gpu_db_range(uint32_t off, uint32_t size)
++{
++	return off <= GPU_CMDDB_BYTES && size <= GPU_CMDDB_BYTES - off;
++}
++
++/*
++ * Find a resource in the command DB. Returns its slave type (3 ARC) or -1 and
++ * writes the ARC address plus its u16 level table.
++ */
++static int
++gpu_cmddb_lookup(const char *res, uint32_t *address, uint16_t *vals, unsigned max)
++{
++	uint32_t key[2] = { 0, 0 };
++	unsigned matches = 0, kind = 0;
++
++	if (gpu_cmddb == 0) {
++		gpu_cmddb = ml_io_map(GPU_CMDDB_PA, GPU_CMDDB_BYTES);
++		if (gpu_cmddb == 0) {
++			printf("SWEET GPU: cannot map the command DB\n");
++			return -1;
++		}
++		if (gpu_db32(4) != GPU_CMDDB_MAGIC || gpu_db32(0) != 1) {
++			printf("SWEET GPU: command DB at %#x: version %#x magic %#x not usable\n",
++			    GPU_CMDDB_PA, gpu_db32(0), gpu_db32(4));
++			return -1;
++		}
++	}
++	for (unsigned i = 0; i < 8 && res[i]; i++) {
++		key[i / 4] |= (uint32_t)(uint8_t)res[i] << (8u * (i % 4));
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		uint32_t h = 8u + 16u * i;
++		unsigned slave = gpu_db16(h);
++		if (!slave) {
++			break;
++		}
++		uint32_t entries = GPU_CMDDB_HEADER + gpu_db16(h + 2);
++		uint32_t aux = GPU_CMDDB_HEADER + gpu_db16(h + 4);
++		unsigned count = gpu_db16(h + 6);
++		if (slave < 3 || slave > 5 || (entries & 3u) ||
++		    !gpu_db_range(entries, count * GPU_CMDDB_ENTRY)) {
++			printf("SWEET GPU: command DB: malformed slave header %u\n", i);
++			return -1;
++		}
++		for (unsigned j = 0; j < count; j++) {
++			uint32_t e = entries + GPU_CMDDB_ENTRY * j;
++			if (gpu_db32(e) != key[0] || gpu_db32(e + 4) != key[1]) {
++				continue;
++			}
++			uint32_t addr = gpu_db32(e + 16), off = aux + gpu_db16(e + 22);
++			uint32_t len = gpu_db16(e + 20);
++			if (!gpu_db_range(off, len)) {
++				return -1;
++			}
++			if (slave == GPU_CMDDB_SLAVE_ARC && vals) {
++				for (unsigned k = 0; k < max; k++) {
++					vals[k] = k < len / 2 ? gpu_db16(off + 2 * k) : 0;
++				}
++			}
++			*address = addr;
++			kind = slave;
++			matches++;
++		}
++	}
++	return matches == 1 ? (int)kind : -1;
++}
++
++/* a PDC TCS command: message id 0x10108, the ARC address, the trigger. */
++static void
++gpu_pdc_tcs_cmd(vm_offset_t cfg, uint32_t msgid0, unsigned n, uint32_t addr, uint32_t data)
++{
++	uint32_t r = msgid0 + n * GPU_PDC_CMD_OFFSET;
++	gpu_wr_quiet(cfg, GPU_PDCR(r), 0x10108u);
++	gpu_wr_quiet(cfg, GPU_PDCR(r + 1), addr);
++	gpu_wr_quiet(cfg, GPU_PDCR(r + 2), data);
++}
++
++/* a6xx_gmu_rpmh_init for a630: RSC handshake and sequencer, PDC and its TCSes. */
++static bool
++gpu_rpmh_ucode(vm_offset_t gmu)
++{
++	static const uint32_t rsc_seq[5] = { 0xa7a506a0u, 0xa1e6a6e7u, 0xa2e081e1u, 0xe9a982e2u, 0x0020e8a8u };
++	static const uint32_t pdc_seq[5] = { 0xfebea1e1u, 0xa5a4a3a2u, 0x8382a6e0u, 0xbce3e284u, 0x002081fcu };
++	uint32_t mx = 0x30010u, cx = 0x30000u, gfx = 0x30080u, a = 0;
++	uint16_t lv[16];
++	vm_offset_t cfg = ml_io_map(GPU_PDC_CFG_PA, GPU_PDC_BYTES);
++	vm_offset_t seq = ml_io_map(GPU_PDC_SEQ_PA, GPU_PDC_BYTES);
++
++	if (cfg == 0 || seq == 0) {
++		printf("SWEET GPU: cannot map the PDC\n");
++		return false;
++	}
++	static const struct { const char *name; uint32_t *addr; uint32_t linux; } arcs[] = {
++		{ "mx.lvl", &mx, 0x30010u }, { "cx.lvl", &cx, 0x30000u }, { "gfx.lvl", &gfx, 0x30080u },
++	};
++	for (unsigned i = 0; i < 3; i++) {
++		if (gpu_cmddb_lookup(arcs[i].name, &a, lv, 16) == (int)GPU_CMDDB_SLAVE_ARC && a) {
++			*arcs[i].addr = a;
++		}
++		printf("SWEET GPU: pdc %s address %#x%s\n", arcs[i].name, *arcs[i].addr,
++		    *arcs[i].addr == arcs[i].linux ? " (as Linux a630)" : " (cmd-db)");
++	}
++
++	gpu_wr_quiet(gmu, GPU_RSCC(GPU_RSCC_RSC_STATUS0), 1u << 24);   /* no SDE clock gating */
++	gpu_wr_quiet(gmu, GPU_RSCC(GPU_RSCC_PDC_SLAVE_ID), 1);
++	for (unsigned i = 0; i < 3; i++) {
++		gpu_wr_quiet(gmu, GPU_RSCC(GPU_RSCC_HIDDEN_DATA + i * GPU_RSC_CMD_OFFSET),
++		    i == 2 ? 0x80000000u : 0u);
++		gpu_wr_quiet(gmu, GPU_RSCC(GPU_RSCC_HIDDEN_ADDR + i * GPU_RSC_CMD_OFFSET), 0);
++	}
++	gpu_wr_quiet(gmu, GPU_RSCC(GPU_RSCC_OVERRIDE), 0);
++	gpu_wr_quiet(gmu, GPU_RSCC(GPU_RSCC_PDC_SEQ_START), 0x4520u);
++	gpu_wr_quiet(gmu, GPU_RSCC(GPU_RSCC_MATCH_LO), 0x4510u);
++	gpu_wr_quiet(gmu, GPU_RSCC(GPU_RSCC_MATCH_HI), 0x4514u);
++	for (unsigned i = 0; i < 5; i++) {
++		gpu_wr_quiet(gmu, GPU_RSCC(GPU_RSCC_SEQ_MEM + i), rsc_seq[i]);
++	}
++	for (unsigned i = 0; i < 5; i++) {
++		gpu_wr_quiet(seq, GPU_PDCR(i), pdc_seq[i]);
++	}
++	gpu_wr_quiet(cfg, GPU_PDCR(0x1573u), 7);            /* TCS1 enable bank */
++	gpu_wr_quiet(cfg, GPU_PDCR(0x1574u), 0);
++	gpu_wr_quiet(cfg, GPU_PDCR(0x1572u), 0);
++	gpu_pdc_tcs_cmd(cfg, 0x1575u, 0, mx, 1);
++	gpu_pdc_tcs_cmd(cfg, 0x1575u, 1, cx, 0);
++	gpu_pdc_tcs_cmd(cfg, 0x1575u, 2, gfx, 0);
++	gpu_wr_quiet(cfg, GPU_PDCR(0x15d7u), 7);            /* TCS3 enable bank */
++	gpu_wr_quiet(cfg, GPU_PDCR(0x15d8u), 0);
++	gpu_wr_quiet(cfg, GPU_PDCR(0x15d6u), 0);
++	gpu_pdc_tcs_cmd(cfg, 0x15d9u, 0, mx, 2);
++	gpu_pdc_tcs_cmd(cfg, 0x15d9u, 1, cx, 3);
++	gpu_pdc_tcs_cmd(cfg, 0x15d9u, 2, gfx, 3);
++	gpu_wr_quiet(cfg, GPU_PDCR(0x1148u), 0);
++	gpu_wr_quiet(cfg, GPU_PDCR(0x1140u), 0x80000001u);
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET GPU: pdc and rsc microcode written (mx %#x, cx %#x, gfx %#x)\n", mx, cx, gfx);
++	return true;
++}
++
++/* a6xx_rpmh_start: wake the GPU's RSC; a failure is logged, not fatal. */
++static void
++gpu_rpmh_start(vm_offset_t gmu)
++{
++	gpu_wr_quiet(gmu, GPU_GMU_RSCC_REQ, 1u << 1);
++	bool ack = false, idle = false;
++	for (int i = 0; i < 100; i++) {
++		if (gpu_rd_quiet(gmu, GPU_GMU_RSCC_ACK) & (1u << 1)) {
++			ack = true;
++			break;
++		}
++		gpu_wait_ms(1);
++	}
++	for (int i = 0; i < 100; i++) {
++		if ((gpu_rd_quiet(gmu, GPU_RSCC(GPU_RSCC_SEQ_BUSY)) & 0xffffffffu) == 0) {
++			idle = true;
++			break;
++		}
++		gpu_wait_ms(1);
++	}
++	gpu_wr_quiet(gmu, GPU_GMU_RSCC_REQ, 0);
++	printf("SWEET GPU: rsc wake: ack=%d sequencer idle=%d (ack %#x busy %#x)\n", ack, idle,
++	    gpu_rd_quiet(gmu, GPU_GMU_RSCC_ACK), gpu_rd_quiet(gmu, GPU_RSCC(GPU_RSCC_SEQ_BUSY)));
++}
++
+ /* ---- the HFI queues, once stage 4 has them running --------------------- */
+ 
+ static vm_offset_t hfi_gmu;
+@@ -709,6 +919,8 @@
+ 
+ 	/* ---- stage 3d: the HFI table, the log, and the reset ------------------ */
+ 	printf("SWEET GPU: --- stage 3d: hfi and reset\n");
++	(void)gpu_rpmh_ucode(gmu);
++	gpu_rpmh_start(gmu);
+ 	/*
+ 	 * The firmware does not touch RAM while it boots, so these are the GPU
+ 	 * addresses KGSL's allocator gives the buffers (Bergamota, a630 stage 3),
