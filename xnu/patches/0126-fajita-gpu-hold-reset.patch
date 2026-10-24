@@ -1,0 +1,47 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -458,6 +458,16 @@
+ 	printf("SWEET GPU: --- stage 3a: gmu memory and firmware\n");
+ 	(void)gpu_probe_rd("gmu sysreset", gmu, GPU_GMU_SYSRESET);
+ 	(void)gpu_probe_rd("gmu fw_init", gmu, GPU_GMU_FW_INIT);
++	/*
++	 * The processor must be held in reset while its memory is written, and a
++	 * previous boot of this kernel may have left it running (console55: SYSRESET
++	 * read 0 and the firmware went into a running core, so it never started).
++	 */
++	if (gpu_rd_quiet(gmu, GPU_GMU_SYSRESET) != 1) {
++		gpu_probe_wr("gmu sysreset hold", gmu, GPU_GMU_SYSRESET, 1);
++		gpu_wait_ms(1);
++		printf("SWEET GPU: gmu sysreset now %#x\n", gpu_rd_quiet(gmu, GPU_GMU_SYSRESET));
++	}
+ 	char arg[64];
+ 	if (!PE_parse_boot_argn("sweetfw0", arg, sizeof(arg))) {
+ 		printf("SWEET GPU: no sweetfw0 boot argument: this boot image carries no GMU firmware\n");
+@@ -622,17 +632,19 @@
+ 		    gpu_rd_quiet(smmu, GPU_SMMU_MICRO_MMU_CTRL), gpu_rd_quiet(smmu, GPU_SMMU_SCR0));
+ 	}
+ 
+-	/* A no-op write: the values SMR0/S2CR0 already hold. If they read back the
+-	 * same, the stream table takes writes now. */
+-	uint32_t smr0 = gpu_rd_quiet(smmu, GPU_SMMU_SMR(0));
++	/* A real write: S2CR0 to bypass, read back, then back to what it was. Before
++	 * the impl-defs these writes were dropped; now they should stick. */
+ 	uint32_t s2cr0 = gpu_rd_quiet(smmu, GPU_SMMU_S2CR(0));
+-	printf("SWEET GPU: smmu smr0 %#x s2cr0 %#x before\n", smr0, s2cr0);
+-	gpu_wr_quiet(smmu, GPU_SMMU_S2CR(0), s2cr0);
+-	gpu_wr_quiet(smmu, GPU_SMMU_SMR(0), smr0);
++	printf("SWEET GPU: smmu s2cr0 %#x before, writing bypass\n", s2cr0);
++	gpu_wr_quiet(smmu, GPU_SMMU_S2CR(0), (s2cr0 & ~(3u << 16)) | GPU_SMMU_S2CR_BYPASS);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	printf("SWEET GPU: smmu smr0 %#x s2cr0 %#x after, sgfsr %#x\n",
+-	    gpu_rd_quiet(smmu, GPU_SMMU_SMR(0)), gpu_rd_quiet(smmu, GPU_SMMU_S2CR(0)),
++	uint32_t now = gpu_rd_quiet(smmu, GPU_SMMU_S2CR(0));
++	printf("SWEET GPU: smmu s2cr0 %#x after: %s, sgfsr %#x\n", now,
++	    ((now >> 16) & 3u) == 1u ? "BYPASS STUCK (the stream table is writable)" : "still dropped",
+ 	    gpu_rd_quiet(smmu, GPU_SMMU_SGFSR));
++	gpu_wr_quiet(smmu, GPU_SMMU_S2CR(0), s2cr0);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	printf("SWEET GPU: smmu s2cr0 restored to %#x\n", gpu_rd_quiet(smmu, GPU_SMMU_S2CR(0)));
+ 	printf("SWEET GPU: stage 3e done\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
