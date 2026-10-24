@@ -1911,3 +1911,18 @@ Suggested order for us, one boot per step:
 3. a sysctl-triggered kernel test that does 1 + 2 from a thread while iOS runs (the
    GPU is kept up, so no reboot is needed to submit again);
 4. only then the IOKit user client and the msm ABI.
+
+### console78: the client address range works (2026-10-24)
+
+```
+client va 0x80000000: l1[2]=0x102504003 l2[0]=0x102505003 l3[0]=0x102506e43 (data pa 0x102506000)
+cp client va submission: ring idle (RPTR=WPTR=282) rbbm_status 0x1
+client va write: 0xfeed0001 (want 0xfeed0001) - the CP resolved a new L1 slot
+```
+
+A VA in L1[2] - nothing else in this driver lives there (the CP's buffers and the
+GMU's are both under L1[1]) - resolved through a fresh L2, a fresh L3 and a fresh
+page, and the CP wrote to it. That is the walk every client buffer will take; the
+pages come from the blob only until buffers have to be handed to userspace.
+
+The blob is 208 KiB now: L2 +0x28000, L3 +0x29000, eight data pages +0x2a000.
