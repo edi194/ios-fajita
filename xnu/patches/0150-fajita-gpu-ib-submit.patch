@@ -1,0 +1,117 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -337,6 +337,10 @@
+ #define GPU_ARENA_DATA         0x2a000u
+ #define GPU_ARENA_PAGES        8u
+ #define GPU_VA_CLIENT_TEST     0x80000000u   /* L1[2], L2[0], L3[0] */
++/* stage 8c: submissions as buffer + fence */
++#define GPU_CP_INDIRECT_BUFFER_PFE 0x3fu
++#define GPU_CP_SCRATCH_FENCE   0x200u   /* CACHE_FLUSH_TS puts the sequence here */
++#define GPU_VA_CLIENT_IB       (GPU_VA_CLIENT_TEST + 0x1000u)
+ /* stage 7c: the zap shader through SCM (PAS id 13) */
+ #define GPU_ZAP_BASE           0x25000u   /* offset inside the blob */
+ #define GPU_ZAP_BYTES          0x3000u    /* .mdt 0x25000, b02 segment 0x27000 */
+@@ -958,6 +962,93 @@
+ 	return ok;
+ }
+ 
++/* ---- stage 8c: a submission as a command buffer plus a fence ----------- */
++
++static uint32_t gpu_cp_seq;    /* the fence sequence, as Linux's ring->seqno */
++
++/*
++ * The Linux a6xx_submit tail: one indirect buffer in the ring, then a
++ * CACHE_FLUSH_TS carrying the sequence number as the fence.
++ */
++static bool
++gpu_cp_submit(vm_offset_t core, vm_offset_t blob, uint32_t ib_va, uint32_t ib_dwords)
++{
++	gpu_ring_emit(blob + GPU_CP_RING, gpu_pkt7(GPU_CP_INDIRECT_BUFFER_PFE, 3));
++	gpu_ring_emit(blob + GPU_CP_RING, ib_va);
++	gpu_ring_emit(blob + GPU_CP_RING, 0);
++	gpu_ring_emit(blob + GPU_CP_RING, ib_dwords);
++	gpu_ring_emit(blob + GPU_CP_RING, gpu_pkt7(GPU_CP_EVENT_WRITE, 4));
++	gpu_ring_emit(blob + GPU_CP_RING, GPU_CP_CACHE_FLUSH_TS);
++	gpu_ring_emit(blob + GPU_CP_RING, (uint32_t)(GPU_VA_CP_SCRATCH + GPU_CP_SCRATCH_FENCE));
++	gpu_ring_emit(blob + GPU_CP_RING, 0);
++	gpu_ring_emit(blob + GPU_CP_RING, ++gpu_cp_seq);
++	gpu_ring_flush(core, gpu_cp_wptr);
++	return gpu_ring_wait_idle(core, "indirect submission");
++}
++
++/* Wait for the fence the CP stores: the sequence number in the timestamp slot. */
++static bool
++gpu_cp_wait_fence(vm_offset_t blob, uint32_t seq, unsigned ms)
++{
++	volatile uint32_t *ts = (volatile uint32_t *)(blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE);
++
++	for (unsigned i = 0; i < ms; i++) {
++		if (*ts == seq) {
++			return true;
++		}
++		gpu_wait_ms(1);
++	}
++	return false;
++}
++
++/* The first submission shaped like a userspace one: commands in a buffer, a
++ * fence at the end, both verified. */
++static bool
++gpu_cp_ib_test(vm_offset_t core, vm_offset_t blob, uint64_t blob_pa)
++{
++	volatile uint32_t *ib = (volatile uint32_t *)(blob + GPU_ARENA_DATA + 0x1000);
++	volatile uint32_t *out1 = (volatile uint32_t *)(blob + GPU_ARENA_DATA + 0x40);
++	volatile uint32_t *out2 = (volatile uint32_t *)(blob + GPU_ARENA_DATA + 0x80);
++	volatile uint64_t *l3 = (volatile uint64_t *)(blob + GPU_ARENA_L3);
++	const uint32_t v1 = 0x1b000001u, v2 = 0x1b000002u;
++	unsigned n = 0;
++
++	*out1 = 0;
++	*out2 = 0;
++	*(volatile uint32_t *)(blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE) = 0;
++	/* The command buffer lives one page above the mapped client page. */
++	l3[(GPU_VA_CLIENT_IB >> 12) & 0x1ff] =
++	    (uint64_t)(blob_pa + GPU_ARENA_DATA + 0x1000) | GPU_PTE_PAGE;
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	/* The command buffer: NOP, two writes, NOP. */
++	ib[n++] = gpu_pkt7(GPU_CP_NOP, 1);
++	ib[n++] = 0;
++	ib[n++] = gpu_pkt7(GPU_CP_MEM_WRITE, 3);
++	ib[n++] = GPU_VA_CLIENT_TEST + 0x40;
++	ib[n++] = 0;
++	ib[n++] = v1;
++	ib[n++] = gpu_pkt7(GPU_CP_MEM_WRITE, 3);
++	ib[n++] = GPU_VA_CLIENT_TEST + 0x80;
++	ib[n++] = 0;
++	ib[n++] = v2;
++	ib[n++] = gpu_pkt7(GPU_CP_NOP, 1);
++	ib[n++] = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	bool idle = gpu_cp_submit(core, blob, GPU_VA_CLIENT_IB, n);
++	uint32_t seq = gpu_cp_seq;
++	bool fenced = gpu_cp_wait_fence(blob, seq, 5000);
++	printf("SWEET GPU: cp ib test: %u dwords at %#x, ring %s, fence %u %s, writes %#x %#x (want %#x %#x)\n",
++	    n, GPU_VA_CLIENT_IB, idle ? "drained" : "STUCK", seq,
++	    fenced ? "retired" : "TIMED OUT", *out1, *out2, v1, v2);
++
++	bool ok = idle && fenced && *out1 == v1 && *out2 == v2;
++	printf("SWEET GPU: cp ib test: %s\n", ok ? "PASSED - a command buffer plus a fence, "
++	    "the shape userspace will use" : "FAILED");
++	return ok;
++}
++
+ /* ---- stage 7c: the zap shader through SCM/PAS -------------------------- */
+ 
+ static bool gpu_zap_started;    /* AUTH_AND_RESET returned 0: SHUTDOWN is owed */
+@@ -2165,6 +2256,9 @@
+ 									if (ok) {
+ 										ok = gpu_client_va_test(gpu, g, gmem_pa);
+ 									}
++									if (ok) {
++										ok = gpu_cp_ib_test(gpu, g, gmem_pa);
++									}
+ 								}
+ 								int hold = 0;
+ 								(void)PE_parse_boot_argn("gpuhold", &hold, sizeof(hold));
