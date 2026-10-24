@@ -1,0 +1,13 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1026,6 +1026,10 @@
+ 		hfi_msg_qh = (volatile uint32_t *)(g + GPU_GMEM_HFI + 4 * (HFI_QTBL_HDR_DW + HFI_QHDR_DW));
+ 		hfi_cmd_data = (volatile uint32_t *)(g + GPU_GMEM_HFI + 0xe0);
+ 		hfi_msg_data = (volatile uint32_t *)(g + GPU_GMEM_HFI + 0x10e0);
++		/* The INIT acknowledgement above was read by hand and is four dwords:
++		 * the read index has to start after it, or the sender reads it again. */
++		hfi_msg_qh[10] = 4u;
++		__asm__ volatile("dmb oshst" ::: "memory");
+ 
+ 		/* H2F_MSG_FW_VER: one dword, the version we speak (1.10). */
+ 		{
