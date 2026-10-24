@@ -1,0 +1,134 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -252,7 +252,12 @@
+ #define GPU_GMU_RSCC_REQ      0x24c1cu   /* 0x9307 */
+ #define GPU_GMU_RSCC_ACK      0x24c20u   /* 0x9308 */
+ #define GPU_GMU_GX_SPTPRAC_POWER 0x204u  /* 0x0081 */
++#define GPU_GMU_RPMH_POWER_STATE 0x143b0u /* 0x50ec */
+ #define GPU_GMU_SPTPRAC_STATUS 0x14340u  /* 0x50d0 */
++#define GPU_GMU_BOOT_SLUMBER  0x8fe0u   /* 0x23f8 */
++#define GPU_GMU_GX_VOTE_IDX   0x8fe4u   /* 0x23f9 */
++#define GPU_GMU_MX_VOTE_IDX   0x8fe8u   /* 0x23fa */
++#define GPU_OOB_BOOT_SLUMBER  6u        /* set bit 22, ack bit 30 */
+ #define GPU_RSCC(off)         (0x23000u + 4u * (off))
+ #define GPU_PDCR(off)         (4u * (off))
+ 
+@@ -552,6 +557,101 @@
+ 	    gpu_rd_quiet(gmu, GPU_GMU_RSCC_ACK), gpu_rd_quiet(gmu, GPU_RSCC(GPU_RSCC_SEQ_BUSY)));
+ }
+ 
++/* ---- stage 5: the GX rail through the GMU's OOB interface ------------- */
++
++/* HOST2GMU_INTR_SET / GMU2HOST_INTR_INFO are the ones stage 4 already uses. */
++
++/* a6xx_gmu_gfx_rail_on: vote the boot level's ARC indices, then the boot OOB. */
++static bool
++gpu_gx_rail_on(vm_offset_t gmu)
++{
++	/* gpu_levels[] for a630: MHz and the VLVL Linux sends for each. */
++	static const struct { uint32_t mhz, vlvl; } levels[] = {
++		{ 0, 0 }, { 257, 64 }, { 342, 128 }, { 414, 192 },
++		{ 520, 256 }, { 596, 320 }, { 675, 384 }, { 710, 416 },
++	};
++	uint16_t gfx[16], mx[16], cx[16];
++	uint32_t a = 0;
++	unsigned ngfx = 0, nmx = 0, ncx = 0;
++	const uint32_t boot_vlvl = 64;            /* 257 MHz, initial-pwrlevel 6 */
++	unsigned gi = 0, mi = 0;
++
++	if (gpu_cmddb_lookup("gfx.lvl", &a, gfx, 16) != (int)GPU_CMDDB_SLAVE_ARC ||
++	    gpu_cmddb_lookup("mx.lvl", &a, mx, 16) != (int)GPU_CMDDB_SLAVE_ARC) {
++		printf("SWEET GPU: no gfx.lvl/mx.lvl in the command DB; GX rail not voted\n");
++		return false;
++	}
++	(void)gpu_cmddb_lookup("cx.lvl", &a, cx, 16);
++	for (ngfx = 1; ngfx < 16 && !(gfx[ngfx - 1] && !gfx[ngfx]); ngfx++) {
++	}
++	for (nmx = 1; nmx < 16 && !(mx[nmx - 1] && !mx[nmx]); nmx++) {
++	}
++	for (ncx = 1; ncx < 16 && !(cx[ncx - 1] && !cx[ncx]); ncx++) {
++	}
++	printf("SWEET GPU: ARC levels: gfx %u (", ngfx);
++	for (unsigned i = 0; i < ngfx; i++) {
++		printf("%u ", gfx[i]);
++	}
++	printf(") mx %u (", nmx);
++	for (unsigned i = 0; i < nmx; i++) {
++		printf("%u ", mx[i]);
++	}
++	printf(") cx %u\n", ncx);
++	while (gi < ngfx && gfx[gi] < boot_vlvl) {
++		gi++;
++	}
++	while (mi < nmx && mx[mi] < boot_vlvl) {
++		mi++;
++	}
++	if (gi >= ngfx || mi >= nmx) {
++		printf("SWEET GPU: no ARC level covers VLVL %u (gfx %u/%u, mx %u/%u)\n",
++		    boot_vlvl, gi, ngfx, mi, nmx);
++		return false;
++	}
++	printf("SWEET GPU: GX rail at 257 MHz (VLVL %u): gfx ARC %u, mx ARC %u\n", boot_vlvl, gi, mi);
++	(void)levels;
++
++	gpu_probe_wr("gmu boot slumber opt", gmu, GPU_GMU_BOOT_SLUMBER, 0);
++	gpu_probe_wr("gmu gx vote idx", gmu, GPU_GMU_GX_VOTE_IDX, gi);
++	gpu_probe_wr("gmu mx vote idx", gmu, GPU_GMU_MX_VOTE_IDX, mi);
++	gpu_probe_wr("gmu oob boot slumber", gmu, GPU_GMU_HOST2GMU_SET, 1u << (GPU_OOB_BOOT_SLUMBER + 16));
++
++	bool ok = false;
++	uint32_t info = 0;
++	for (int i = 0; i < 100; i++) {
++		info = gpu_rd_quiet(gmu, GPU_GMU_GMU2HOST_INFO);
++		if (info & (1u << (GPU_OOB_BOOT_SLUMBER + 24))) {
++			ok = true;
++			break;
++		}
++		gpu_wait_ms(1);
++	}
++	printf("SWEET GPU: OOB boot_slumber: %s (INTR_INFO %#x, RPMH_POWER_STATE %#x, SPTPRAC %#x)\n",
++	    ok ? "acknowledged" : "TIMED OUT", info, gpu_rd_quiet(gmu, 0x143b0u),
++	    gpu_rd_quiet(gmu, GPU_GMU_SPTPRAC_STATUS));
++	gpu_wr_quiet(gmu, GPU_GMU_GMU2HOST_CLR, 1u << (GPU_OOB_BOOT_SLUMBER + 24));
++	return ok;
++}
++
++/* a6xx_sptprac_enable: legacy GMUs leave the 3D core's power to the CPU. */
++static bool
++gpu_sptprac_on(vm_offset_t gmu)
++{
++	gpu_probe_wr("gmu sptprac ctrl", gmu, GPU_GMU_GX_SPTPRAC_POWER, 0x778000u);
++	bool ok = false;
++	uint32_t st = 0;
++	for (int i = 0; i < 100; i++) {
++		st = gpu_rd_quiet(gmu, GPU_GMU_SPTPRAC_STATUS);
++		if ((st & 0x38u) == 0x28u) {
++			ok = true;
++			break;
++		}
++		gpu_wait_ms(1);
++	}
++	printf("SWEET GPU: SPTPRAC power on: %s (status %#x)\n", ok ? "ok" : "TIMED OUT", st);
++	return ok;
++}
++
+ /* ---- the HFI queues, once stage 4 has them running --------------------- */
+ 
+ static vm_offset_t hfi_gmu;
+@@ -1258,6 +1358,16 @@
+ 			int id = gpu_hfi_send(test, 4, "test");
+ 			printf("SWEET GPU: hfi test %s\n", id == 5 ? "ok" : "failed");
+ 		}
++
++		/* ---- stage 5: the GX rail and SPTPRAC ---- */
++		printf("SWEET GPU: --- stage 5: gx rail\n");
++		{
++			bool rail = gpu_gx_rail_on(gmu);
++			printf("SWEET GPU: gx rail %s\n", rail ? "on" : "NOT on");
++			if (rail) {
++				(void)gpu_sptprac_on(gmu);
++			}
++		}
+ 	}
+ 	printf("SWEET GPU: stage 3e done\n");
+ 
