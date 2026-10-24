@@ -918,7 +918,7 @@
 +	if (s == NULL) {
 +		return kIOReturnNotFound;
 +	}
-+	if (s->memory == NULL || s->wrapped) {
++	if (s->memory == NULL) {   /* no wrapped surfaces on this port */
 +		s->release();
 +		return kIOReturnUnsupported;       /* wrapped client memory is pageable: never entered into the GPU */
 +	}
@@ -1188,20 +1188,6 @@
 +}
 +
 +#endif /* SWEET */
---- a/iokit/Kernel/arm/SweetSurface.h
-+++ b/iokit/Kernel/arm/SweetSurface.h
-@@ -40,7 +40,10 @@
- 	IOBufferMemoryDescriptor *state;        /* shared state page, read-only for users */
- 	IOMemoryMap              *kernelMap;    /* lazily created for kernel copies */
- 
--	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
-+	/* Client memory that was wrapped instead of copied: the GPU never sees it. */
-+	bool wrapped;
-+
-+	bool init() APPLE_KEXT_OVERRIDE { wrapped = false; return OSObject::init(); }
- 	void free() APPLE_KEXT_OVERRIDE;
- 
- 	/* Kernel address of the pixels (mapped on first use), or 0. */
 --- a/iokit/conf/files.arm64
 +++ b/iokit/conf/files.arm64
 @@ -15,6 +15,7 @@
