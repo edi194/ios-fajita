@@ -2292,3 +2292,51 @@ Rules that follow:
 - Prefer editing *our* files or the ported upstream file over touching shared kernel
   headers - here the fix was to drop the `s->wrapped` test in their .cpp instead of
   adding a field to our class.
+
+### console86: STAGE 8 COMPLETE - the IOKit user client is in the kernel (2026-10-24)
+
+```
+CP NOP TEST PASSED / cp ib test PASSED / bo test PASSED
+abi test: SELECT ok yes, unknown handle refused, read/write armed
+capi test: ready 1 selector 1; param gpu 630 chip 0x6030001 gmem 0x100000;
+           iova reuse yes; vm_map/unmap yes; fence 3 done yes
+abi test: PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C contract
+/dev/sweetgpu major 19 ready
+iOS up, 438 processes, no fault
+```
+
+Bergamota's 949-line `SweetAdreno.cpp` compiled into our kernel untouched except for
+one dropped `s->wrapped` test, and `SweetAdrenoPublish()` runs from `sweet_gpu_probe()`
+without any log line of its own - the service is there, quietly, like theirs.
+
+**This is the kernel-side finish line of the ABI**: the exact interface their
+`gpu/freedreno-sweet/sweet_drm.c` opens (`IOServiceOpen("SweetAdreno630")`,
+`IOConnectCallStructMethod` with msm selectors, `IOConnectMapMemory64`) now exists here.
+The `/dev/sweetgpu` chardev stays as the in-kernel smoke test.
+
+### The userspace blocker, identified before starting it
+
+`gpu/freedreno-sweet/sweet_drm.c` is C that includes **userland** IOKit headers
+(`<IOKit/IOKitLib.h>`, CoreFoundation) - those are not in the kernel tree, so they cannot
+be compiled with what is installed here. There is no iOS SDK on this machine (the
+`~/swift` toolchain from earlier sessions is gone too), and `build-ios.sh` in Chlorophyll
+expects `GPU_EAGL_CROSS=/path/to/ios-hw.cross`, i.e. a real SDK cross file.
+
+Two ways out, in order of cost:
+
+1. **No-SDK route**: write the shim against our own declarations of the handful of
+   userland IOKit functions (`IOServiceMatching`, `IOServiceOpen`,
+   `IOConnectCallStructMethod`, `IOConnectMapMemory64`, `IOObjectRelease`,
+   `mach_task_self`), and resolve them at run time with `dlsym(RTLD_DEFAULT, ...)` - they
+   are all in IOKit.framework on the device. Then `mkinit.py` can wrap the object into a
+   static Mach-O the way it does for `sweet-gputest.S`. This keeps the "no SDK" property
+   the port already has.
+2. **SDK route**: get an iOS SDK (Xcode/xtool) and build their tree with the cross file
+   they expect. More faithful for Mesa/Chlorophyll later, but a bigger prerequisite and a
+   licensing/`gh` question.
+
+Either way the first milestone is the same: a userspace program that opens
+`SweetAdreno630`, asks `INFO`/`GET_PARAM`, allocates a buffer with `GEM_NEW`, maps it
+with `IOConnectMapMemory64`, writes PM4 into it, submits and waits - i.e. what
+`tools/sweet-gputest.S` already does over the chardev, but through IOKit. That proves the
+ABI end to end from userspace, which is the last item of stage 8.
