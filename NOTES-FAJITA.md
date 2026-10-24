@@ -1389,3 +1389,27 @@ normally. `adreno=9` is the level.
    shader through SCM PAS id 13, then a NOP + CACHE_FLUSH_TS test.
 4. Only then the 3D pipeline (shaders, UBWC, RBBM_SECVID) and a Metal/OpenGL
    backend - Bergamota is at that point now (bgmtl).
+
+### HFI works in both directions (console63, 2026-10-24)
+
+```
+hfi ctrl status 0x1 (THE HFI QUEUES ARE UP), version info 0
+hfi fw version: reply 0x12047e (id 126, 4 words, type 2), request 0x1, error 0, data 0x10070000
+hfi test:       reply 0x22047e (id 126, 4 words, type 2), request 0x5, error 0, data 0xe550e55
+gmu sysreset at the end 0x1
+```
+
+**The GMU firmware is 1.7** and speaks HFI v1 (`0x10070000`; the driver asked for
+1.10). Both the version exchange and the TEST message came back ACKed with the
+right echoed request id and `error 0`, so the queue mechanics (write index, read
+index, HOST2GMU/GMU2HOST interrupts) work in both directions.
+
+Gotcha for the next messages: the ACK's own id is 126; the message it answers is
+in `ack[1] & 0xff`, and the ACK is four dwords, so the read index has to start at
+4 after the hand-read INIT acknowledgement (0133). The verdict must compare the
+echoed request id, not the reply id (0134).
+
+Next: `PERF_TBL` and `BW_VOTE_TBL` need the DCVS table from the cmd-db and
+Linux's fixed a630 bandwidth table; then the GX rail (`gfx_rail_on` + SPTPRAC)
+and the first GPU-core register reads; then the CP (ring, SQE in a second SMMU
+context for SID 0, the zap through SCM PAS 13, a NOP + CACHE_FLUSH_TS test).
