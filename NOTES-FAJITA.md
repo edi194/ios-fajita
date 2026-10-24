@@ -1162,3 +1162,63 @@ nobody answers.
   has no match and every S2CR is FAULT, so its own memory accesses may be
   refused). The latter would need the hypervisor's cooperation - the vendor's
   kgsl goes through SCM - and there is no known call for it here.
+
+### *** GPU STAGE 3 WORKS: the GMU firmware runs on fajita (console54, 2026-10-24) ***
+
+```
+SWEET GPU: hfi address 0x60100000, log address 0x60300000 (unmapped until the SMMU stage)
+SWEET GPU: write gmu tcm retention +0x14730 = 0x1
+SWEET GPU: write gmu hfi sfr +0x14608 = 0x6030100
+SWEET GPU: write gmu hfi qtbl info +0x14610 = 0x1
+SWEET GPU: write gmu hfi qtbl addr +0x14614 = 0x60100000
+SWEET GPU: write gmu log address +0x14400 = 0x60300000
+SWEET GPU: write gmu inter-frame ctrl +0x14300 = 0x9c40400
+SWEET GPU: write gmu rpmh ctrl +0x143a0 = 0xf11
+SWEET GPU: write gmu fence range +0x24c44 = 0x802800a0
+SWEET GPU: write gmu cm3 cfg +0x140b4 = 0x4052
+SWEET GPU: write gmu wfi config +0x14008 = 0
+SWEET GPU: write gmu sysreset +0x14000 = 0x1
+SWEET GPU: write gmu sysreset +0x14000 = 0
+SWEET GPU: fw_init 0xbabeface (THE GMU FIRMWARE RUNS)
+SWEET GPU: stage 3d done
+```
+
+The phone booted to SpringBoard afterwards (3114 log lines, touch and keys fine),
+so the GMU runs beside iOS with no side effects. `adreno=7` is the level.
+
+**What made it work: Bergamota.** `ry-diffusion/Bergamota` is iOS 18 on the Poco
+F1 - the same SDM845 and the same Adreno 630 - and its `docs/GPU_A630_BRINGUP.md`
+plus `xnu/patches-11215/0103-beryllium-gpu-a630-bringup.patch` are the same
+ladder done for this exact chip. Their stage 3 boots the firmware **with the SMMU
+untouched**: the firmware does not touch RAM while it boots, so `HFI_QTBL_ADDR`
+and the log address are the GPU addresses KGSL hands out (`0x60100000`,
+`0x60300000`) that nothing maps yet - and `FW_INIT_RESULT` still comes back
+`0xbabeface`. That removes the low-bank scratch question from this stage
+entirely (the scratch attempts in 0110-0122 are history).
+
+The three registers that were missing here, from their sequence:
+`GMU_CX_GMU_WFI_CONFIG` (0x5002 -> byte 0x14008) = 0, `PWR_COL_INTER_FRAME_CTRL`
+(0x50c0 -> 0x14300) = `0x9c40400`, and `RPMH_CTRL` (0x50e8 -> 0x143a0) |= `0xf11`
+(interface + LLC/DDR/MX/CX/GFX votes).
+
+### Next: the SMMU + HFI stage (Bergamota's stage 4)
+
+Their `smmu_impl_init()` is the piece our 0111/0112 were missing: the GPU's SMMU
+needs **qsmmuv2_device_reset** before anything sticks - the DT's
+`attach-impl-defs` written while the micro-MMU is halted (`0x6000`, HALT_REQ bit
+2, IDLE bit 3). Our `dtb/fajita2.dts` has the same twelve pairs as theirs
+(`0x6000 0x2378`, `0x6060 0x1055`, `0x678c 0x8`, `0x6794 0x28`, `0x6800 0x6`,
+`0x6900 0x3ff`, `0x6924 0x204`, `0x6928 0x11000`, `0x6930 0x800`,
+`0x6960 0xffffffff`, `0x6b64 0x1a5551`, `0x6b68 0x9a82a382`), plus
+`qcom,disable-atos` and `qcom,use-3-lvl-tables`.
+
+Then, in their order: context bank 0 at `0x8000` (CBAR/CBA2R in GR1 = 0x800,
+`CBAR_S1_BYPASS_S2`, TCR/TCR2/MAIR0 `0x0004ff44`/ACTLR `0x70000000`/SCTLR
+`0x00c01067`), **exact SMRs (mask 0)** for stream IDs 5 (gmu_kernel) and 4
+(gmu_user), and a 64 KiB non-cacheable block holding the 4 KiB page tables, the
+dummy page, the HFI table (0x5000 bytes), the dump and the log, mapped at GPU
+addresses `0x60000000`/`0x60100000`/`0x60200000`/`0x60300000`.
+
+Their finding that matters: **masked SMRs do not stick, exact ones do** (from the
+A618 work, patch 0083), and `smmu_write_sme` writes S2CR first, then SMR, then
+reads both back with `sGFSR`.
