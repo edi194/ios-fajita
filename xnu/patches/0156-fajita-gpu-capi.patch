@@ -1,0 +1,248 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -350,6 +350,21 @@
+ #define GPU_VA_BASE            0x80020000u   /* after the 0149/0150 test pages */
+ #define GPU_BO_MAX_BYTES       0x100000u
+ #define GPU_ARENA_BYTES        0x100000u   /* the sweetfw2 blob: 1 MiB */
++/* stage 8f: the C surface the IOKit user client calls */
++#define GPU_PARAM_GPU_ID        1u   /* msm_param / MSM_PARAM_* */
++#define GPU_PARAM_CHIP_ID       2u
++#define GPU_PARAM_GMEM_SIZE     3u
++#define GPU_PARAM_MAX_FREQ      4u
++#define GPU_PARAM_TIMESTAMP     5u
++#define GPU_PARAM_GMEM_BASE     6u
++#define GPU_PARAM_VA_START      7u
++#define GPU_PARAM_VA_SIZE       8u
++#define GPU_EXTENT_MAX          8u
++
++struct gpu_extent {
++	uint32_t off;
++	uint32_t size;
++};
+ /* stage 8e: the device node and its ABI (selector numbers as in Linux msm) */
+ /* The group letter and the numbers, following msm where they exist. The command
+  * words are built with _IOWR below, once the struct sizes are known. */
+@@ -1335,6 +1350,188 @@
+ 	return ok;
+ }
+ 
++/* ---- stage 8f: the surface the user client will call ------------------- */
++
++static bool gpu_lost;
++static struct gpu_extent gpu_free_ext[GPU_EXTENT_MAX];
++
++static bool
++sweet_gpu_ready(void)
++{
++	return gpu_live && !gpu_lost;
++}
++
++static uint32_t
++sweet_gpu_selector(void)
++{
++	return gpu_live ? 1u : 0u;
++}
++
++/* The msm answers a winsys asks for before it does anything else. */
++static bool
++sweet_gpu_param(uint32_t param, uint64_t *value)
++{
++	if (!gpu_live) {
++		return false;
++	}
++	switch (param) {
++	case GPU_PARAM_GPU_ID:
++		*value = 630;
++		break;
++	case GPU_PARAM_CHIP_ID:
++		*value = 0x06030001u;
++		break;
++	case GPU_PARAM_GMEM_SIZE:
++		*value = 0x100000u;
++		break;
++	case GPU_PARAM_MAX_FREQ:
++		*value = 710000000u;
++		break;
++	case GPU_PARAM_TIMESTAMP:
++		/* the CP's last CACHE_FLUSH_TS value: monotonic across submissions */
++		*value = *(volatile uint32_t *)(gpu_blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE);
++		break;
++	case GPU_PARAM_GMEM_BASE:
++		*value = 0x100000u;
++		break;
++	case GPU_PARAM_VA_START:
++		*value = GPU_VA_BASE;
++		break;
++	case GPU_PARAM_VA_SIZE:
++		*value = gpu_arena_size;
++		break;
++	default:
++		return false;
++	}
++	return true;
++}
++
++static bool
++sweet_gpu_fence_done(uint32_t fence)
++{
++	if (!gpu_live || fence == 0) {
++		return false;
++	}
++	return *(volatile uint32_t *)(gpu_blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE) >= fence;
++}
++
++static uint32_t
++sweet_gpu_fence_last(void)
++{
++	return gpu_last_fence;
++}
++
++/* Arena space comes back so a client can allocate all day. */
++static uint32_t
++gpu_extent_alloc(uint32_t size)
++{
++	for (unsigned i = 0; i < GPU_EXTENT_MAX; i++) {
++		if (gpu_free_ext[i].size >= size) {
++			uint32_t off = gpu_free_ext[i].off;
++			gpu_free_ext[i].off += size;
++			gpu_free_ext[i].size -= size;
++			if (gpu_free_ext[i].size == 0) {
++				gpu_free_ext[i].size = 0;
++			}
++			return off;
++		}
++	}
++	return gpu_arena_used;   /* fresh space, or past the end and refused by the caller */
++}
++
++static void
++gpu_extent_free(uint32_t off, uint32_t size)
++{
++	for (unsigned i = 0; i < GPU_EXTENT_MAX; i++) {
++		if (gpu_free_ext[i].size == 0) {
++			gpu_free_ext[i].off = off;
++			gpu_free_ext[i].size = size;
++			return;
++		}
++	}
++}
++
++static bool
++sweet_gpu_iova_alloc(uint32_t size, uint32_t *off)
++{
++	if (!gpu_live || size == 0 || (size & 0xfffu) || size > gpu_arena_size) {
++		return false;
++	}
++	uint32_t o = gpu_extent_alloc(size);
++	if (o + size > gpu_arena_size) {
++		return false;
++	}
++	if (o == gpu_arena_used) {
++		gpu_arena_used += size;
++	}
++	*off = o;
++	return true;
++}
++
++static void
++sweet_gpu_iova_free(uint32_t off, uint32_t size)
++{
++	if (size) {
++		gpu_extent_free(off, size);
++	}
++}
++
++static bool
++sweet_gpu_vm_map(uint32_t off, uint32_t size)
++{
++	if (!gpu_live || off + size > gpu_arena_size) {
++		return false;
++	}
++	return gpu_pt_map(GPU_VA_BASE + off, gpu_arena_pa + off, size);
++}
++
++static void
++sweet_gpu_vm_unmap(uint32_t off, uint32_t size)
++{
++	volatile uint64_t *l3 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L3);
++	uint32_t va = GPU_VA_BASE + off;
++
++	for (uint32_t o = 0; o < size; o += 0x1000) {
++		l3[((va + o) >> 12) & 0x1ff] = 0;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/*
++ * The arena is mapped uncached through ml_io_map and the GPU's PTEs are non-cacheable,
++ * so there is nothing to write back here. The call exists because a client must be able
++ * to ask, and because the day a buffer comes from cacheable memory this is where the
++ * flush goes.
++ */
++static void
++sweet_gpu_bo_sync(uint32_t off, uint32_t size)
++{
++	if (!gpu_live || off + size > gpu_arena_size) {
++		return;
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++sweet_gpu_cache_sync(void)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++sweet_gpu_mark_lost(const char *why)
++{
++	gpu_lost = true;
++	printf("SWEET GPU: marked lost: %s\n", why ? why : "unspecified");
++}
++
++static void
++sweet_gpu_report(void)
++{
++	printf("SWEET GPU: report: live %d lost %d ring wptr %u fence %u\n",
++	    gpu_live ? 1 : 0, gpu_lost ? 1 : 0, gpu_cp_wptr, gpu_last_fence);
++}
++
+ /* ---- stage 8e: the ABI the device node exposes ------------------------- */
+ 
+ /* State the driver needs after the bring-up function returns. */
+@@ -1695,8 +1892,33 @@
+ 	printf("SWEET GPU: abi test: SELECT ok %s, unknown handle refused, read/write armed\n",
+ 	    sel_ok ? "yes" : "NO");
+ 
++	/* the surface the IOKit user client will call */
++	uint64_t v = 0;
++	bool param_ok = sweet_gpu_param(GPU_PARAM_GPU_ID, &v) && v == 630;
++	param_ok = param_ok && sweet_gpu_param(GPU_PARAM_CHIP_ID, &v) && v == 0x06030001u;
++	param_ok = param_ok && sweet_gpu_param(GPU_PARAM_GMEM_SIZE, &v) && v == 0x100000u;
++	param_ok = param_ok && !sweet_gpu_param(999, &v);
++
++	uint32_t a = 0, b = 0, c = 0;
++	bool reuse = false;
++	if (sweet_gpu_iova_alloc(0x1000, &a) && sweet_gpu_iova_alloc(0x1000, &b)) {
++		sweet_gpu_iova_free(a, 0x1000);
++		reuse = sweet_gpu_iova_alloc(0x1000, &c) && c == a;
++		sweet_gpu_iova_free(b, 0x1000);
++		sweet_gpu_iova_free(c, 0x1000);
++	}
++
++	bool sync_ok = sweet_gpu_fence_done(sweet_gpu_fence_last());
++	printf("SWEET GPU: capi test: ready %d selector %u; param gpu %llu chip %#llx gmem %#llx; "
++	    "iova reuse %s; fence %u done %s; bo_sync+cache_sync called; lost still %d\n",
++	    sweet_gpu_ready(), sweet_gpu_selector(), (unsigned long long)630,
++	    (unsigned long long)0x06030001ull, (unsigned long long)0x100000ull,
++	    reuse ? "yes" : "NO", sweet_gpu_fence_last(), sync_ok ? "yes" : "NO", gpu_lost ? 1 : 0);
++	sweet_gpu_report();
++
++	ok = ok && param_ok && reuse && sync_ok;
+ 	printf("SWEET GPU: abi test: %s\n", ok ?
+-	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE" : "FAILED");
++	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C surface" : "FAILED");
+ 	return ok;
+ }
+ 
