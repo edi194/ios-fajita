@@ -2187,3 +2187,50 @@ Suggested split, one boot each:
 
 The chardev (`/dev/sweetgpu`) stays as the kernel-side smoke test; it is not the path
 the graphics stack takes.
+
+### The exact C contract their user client expects (read from their file)
+
+`/home/edi194/ref/berg-0182/SweetAdreno.cpp` declares the sixteen functions it calls at
+the top of the file. Copy these signatures rather than inventing ones - then the 949-line
+C++ needs almost no change:
+
+```c
+bool     sweet_gpu_ready(void);
+bool     sweet_gpu_param(uint32_t which, uint64_t *value);
+bool     sweet_gpu_iova_alloc(uint64_t size, uint64_t *iova, uint64_t *taken);
+bool     sweet_gpu_iova_reserve(uint64_t iova, uint64_t size);
+void     sweet_gpu_iova_free(uint64_t iova, uint64_t size);
+bool     sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly);
+void     sweet_gpu_vm_unmap(uint64_t iova, uint64_t size);
+void     sweet_gpu_cache_sync(void *va, size_t len);
+uint32_t sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count);
+bool     sweet_gpu_fence_done(uint32_t fence);
+uint32_t sweet_gpu_fence_last(void);
+void     sweet_gpu_mark_lost(void);
+void     sweet_gpu_report(const char *why);
+/* plus surface_bo/info/selector used by the extra selectors */
+```
+
+What this says about their kernel shapes, and where our 0156 differs:
+
+- **addresses are 64-bit** and `vm_map` takes `(iova, pa, readonly)` - *one page at a
+  time*, from kernel-wired buffer pages. Ours is a 32-bit arena offset with a range map.
+- **`cache_sync` takes a kernel VA** (`void *va, len`) - theirs is `dc civac` over the
+  BO's kernel alias, because their buffers are cacheable `IOBufferMemoryDescriptor`s.
+  Ours are uncached, so it is a `dsb`, but the signature should match.
+- **`submit` takes arrays**: `(const uint64_t *ib_iova, const uint32_t *ib_dwords,
+  unsigned count)` - one `CP_INDIRECT_BUFFER` per entry plus the fence tail. Ours takes a
+  single buffer.
+- `iova_alloc` returns both the address and how much was actually taken (for alignment
+  padding), and `iova_reserve` pins a client-chosen address (msm `SET_IOVA`).
+
+So the correct next patch replaces the 0156 signatures with these, keeping the
+mechanisms: the extent allocator becomes 64-bit VA-with-PA, `vm_map` writes PTEs for one
+page with an optional read-only bit, `submit` loops over IB entries, `cache_sync` keeps
+the VA argument. The built-in test then exercises the real contract - and the port of
+`SweetAdreno.cpp` + `SweetAdrenoABI.h` + the conf line becomes mostly mechanical.
+
+Two things still block a *working* client whatever the signatures say: buffers must be
+real kernel-wired pages the client can also map (`clientMemoryForType`), and
+`sweet_gpu_surface_bo` must import an IOSurface. Those are the arena-to-descriptor step
+and the IOSurface step, in that order.
