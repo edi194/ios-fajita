@@ -1,0 +1,405 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -23,6 +23,9 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <arm/memory_types.h>
++#include <sys/conf.h>
++#include <sys/ioccom.h>
++#include <miscfs/devfs/devfs.h>
+ /* The arm pmap is not exported to the BSD layer on this port (sweet_ufs.c
+  * declares pmap_find_phys the same way). */
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+@@ -353,17 +356,71 @@
+ #define GPU_BO_MAX             8u
+ #define GPU_VA_BASE            0x80020000u   /* after the 0149/0150 test pages */
+ #define GPU_BO_MAX_BYTES       0x100000u
++/* stage 8e: the device node and its ABI (selector numbers as in Linux msm) */
++#define SWEET_GPU_IOCTL_INFO       0x70u
++#define SWEET_GPU_IOCTL_GEM_NEW    0x42u
++#define SWEET_GPU_IOCTL_GEM_INFO   0x43u
++#define SWEET_GPU_IOCTL_GEM_SUBMIT 0x46u
++#define SWEET_GPU_IOCTL_WAIT_FENCE 0x47u
++#define SWEET_GPU_IOCTL_GEM_CLOSE  0x09u
++
++#define SWEET_GPU_INFO_GET_IOVA    1u
++#define SWEET_GPU_INFO_GET_SIZE    2u
++#define SWEET_GPU_INFO_GET_OFFSET  3u
++
++struct sweet_gpu_info {
++	uint32_t abi_version;
++	uint32_t flags;                 /* bit0 live */
++	uint32_t chip_id;
++	uint32_t va_start;
++	uint32_t va_size;
++	uint32_t last_fence;
++};
++
++struct sweet_gpu_gem_new {
++	uint32_t size;
++	uint32_t flags;
++	uint32_t handle;                /* out */
++	uint32_t iova;                  /* out */
++};
++
++struct sweet_gpu_gem_info {
++	uint32_t handle;
++	uint32_t op;
++	uint32_t value;                 /* out */
++	uint32_t pad;
++};
++
++struct sweet_gpu_gem_submit {
++	uint32_t handle;                /* the command buffer BO */
++	uint32_t offset;
++	uint32_t dwords;
++	uint32_t fence;                 /* out */
++};
++
++struct sweet_gpu_wait {
++	uint32_t fence;
++	uint32_t timeout_ms;
++	uint32_t pad[2];
++};
++
++struct sweet_gpu_close {
++	uint32_t handle;
++	uint32_t pad;
++};
+ 
+ struct gpu_bo {
+ 	vm_offset_t kva;        /* the kernel alias, write-combined */
+ 	uint64_t pa;
+ 	vm_size_t size;
+ 	uint32_t va;            /* the GPU address */
++	uint32_t handle;        /* what the ABI returns to the client */
+ 	bool used;
+ };
+ 
+ static struct gpu_bo gpu_bos[GPU_BO_MAX];
+ static uint32_t gpu_va_next;         /* bump allocator, one guard page, no reuse */
++static uint32_t next_handle = 1;
+ static vm_offset_t gpu_pt_blob;      /* where the page tables live */
+ 
+ static void
+@@ -457,6 +514,7 @@
+ 	bo->pa = (uint64_t)pn << PAGE_SHIFT;
+ 	bo->size = size;
+ 	bo->va = gpu_va_next;
++	bo->handle = next_handle++;
+ 	bo->used = true;
+ 	gpu_va_next += size + 0x1000;   /* one unmapped guard page between buffers */
+ 
+@@ -1240,6 +1298,297 @@
+ 	return ok;
+ }
+ 
++/* ---- stage 8e: the ABI the device node exposes ------------------------- */
++
++/* State the driver needs after the bring-up function returns. */
++static vm_offset_t gpu_blob;
++static vm_offset_t gpu_core;
++static bool gpu_live;
++static uint32_t gpu_last_fence;
++
++static struct gpu_bo *
++gpu_bo_by_handle(uint32_t handle)
++{
++	for (unsigned i = 0; i < GPU_BO_MAX; i++) {
++		if (gpu_bos[i].used && gpu_bos[i].handle == handle) {
++			return &gpu_bos[i];
++		}
++	}
++	return NULL;
++}
++
++static int
++gpu_client_info(struct sweet_gpu_info *out)
++{
++	if (!gpu_live) {
++		return ENXIO;
++	}
++	out->abi_version = 1;
++	out->flags = 1;                 /* live */
++	out->chip_id = 0x06030001u;
++	out->va_start = GPU_VA_BASE;
++	out->va_size = 0x00200000u;     /* the mapped window, one L3 */
++	out->last_fence = gpu_last_fence;
++	return 0;
++}
++
++static int
++gpu_client_gem_new(struct sweet_gpu_gem_new *arg)
++{
++	if (!gpu_live) {
++		return ENXIO;
++	}
++	if (arg->size == 0 || arg->size > GPU_BO_MAX_BYTES) {
++		return EINVAL;
++	}
++	struct gpu_bo *bo = gpu_bo_alloc(arg->size);
++	if (bo == NULL) {
++		return ENOMEM;
++	}
++	arg->handle = bo->handle;
++	arg->iova = bo->va;
++	return 0;
++}
++
++static int
++gpu_client_gem_info(struct sweet_gpu_gem_info *arg)
++{
++	if (!gpu_live) {
++		return ENXIO;
++	}
++	struct gpu_bo *bo = gpu_bo_by_handle(arg->handle);
++	if (bo == NULL) {
++		return EINVAL;
++	}
++	switch (arg->op) {
++	case SWEET_GPU_INFO_GET_IOVA:
++		arg->value = bo->va;
++		break;
++	case SWEET_GPU_INFO_GET_SIZE:
++		arg->value = (uint32_t)bo->size;
++		break;
++	case SWEET_GPU_INFO_GET_OFFSET:
++		arg->value = arg->handle;       /* the mmap offset in this port */
++		break;
++	default:
++		return EINVAL;
++	}
++	return 0;
++}
++
++static int
++gpu_client_gem_submit(struct sweet_gpu_gem_submit *arg)
++{
++	if (!gpu_live) {
++		return ENXIO;
++	}
++	struct gpu_bo *bo = gpu_bo_by_handle(arg->handle);
++	if (bo == NULL) {
++		return EINVAL;
++	}
++	if ((arg->offset & 3u) || arg->dwords == 0) {
++		return EINVAL;
++	}
++	if (arg->offset >= bo->size || arg->dwords * 4u > bo->size - arg->offset) {
++		return EINVAL;
++	}
++	if (!gpu_cp_submit(gpu_core, gpu_blob, bo->va + arg->offset, arg->dwords)) {
++		return EIO;
++	}
++	gpu_last_fence = gpu_cp_seq;
++	arg->fence = gpu_last_fence;
++	return 0;
++}
++
++static int
++gpu_client_wait(struct sweet_gpu_wait *arg)
++{
++	volatile uint32_t *ts;
++	unsigned ms;
++
++	if (!gpu_live) {
++		return ENXIO;
++	}
++	if (arg->fence == 0 || arg->fence > gpu_last_fence) {
++		return EINVAL;
++	}
++	/* The CP keeps only the latest timestamp, so "done" means "reached at
++	 * least this fence". */
++	ts = (volatile uint32_t *)(gpu_blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE);
++	ms = arg->timeout_ms ? arg->timeout_ms : 1000;
++	for (unsigned i = 0; i < ms; i++) {
++		if (*ts >= arg->fence) {
++			return 0;
++		}
++		gpu_wait_ms(1);
++	}
++	return ETIMEDOUT;
++}
++
++static int
++gpu_client_gem_close(struct sweet_gpu_close *arg)
++{
++	if (!gpu_live) {
++		return ENXIO;
++	}
++	struct gpu_bo *bo = gpu_bo_by_handle(arg->handle);
++	if (bo == NULL) {
++		return EINVAL;
++	}
++	gpu_bo_free(bo);
++	return 0;
++}
++
++/* devfs: one node, no per-open state, the GPU is a single system resource. */
++static int
++sweet_gpu_dev_open(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	return gpu_live ? 0 : ENXIO;
++}
++
++static int
++sweet_gpu_dev_close(dev_t dev, int flags, int devtype, struct proc *p)
++{
++	return 0;
++}
++
++static int
++sweet_gpu_dev_ioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
++{
++	switch (cmd) {
++	case SWEET_GPU_IOCTL_INFO:
++		return gpu_client_info((struct sweet_gpu_info *)data);
++	case SWEET_GPU_IOCTL_GEM_NEW:
++		return gpu_client_gem_new((struct sweet_gpu_gem_new *)data);
++	case SWEET_GPU_IOCTL_GEM_INFO:
++		return gpu_client_gem_info((struct sweet_gpu_gem_info *)data);
++	case SWEET_GPU_IOCTL_GEM_SUBMIT:
++		return gpu_client_gem_submit((struct sweet_gpu_gem_submit *)data);
++	case SWEET_GPU_IOCTL_WAIT_FENCE:
++		return gpu_client_wait((struct sweet_gpu_wait *)data);
++	case SWEET_GPU_IOCTL_GEM_CLOSE:
++		return gpu_client_gem_close((struct sweet_gpu_close *)data);
++	default:
++		return ENOTTY;
++	}
++}
++
++static const struct cdevsw sweet_gpu_cdevsw = {
++	.d_open   = sweet_gpu_dev_open,
++	.d_close  = sweet_gpu_dev_close,
++	.d_ioctl  = sweet_gpu_dev_ioctl,
++	.d_stop   = eno_stop,
++	.d_reset  = eno_reset,
++	.d_select = eno_select,
++	.d_mmap   = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_reserved_1 = eno_getc,
++	.d_reserved_2 = eno_putc,
++	.d_type   = 0,
++};
++
++static void
++gpu_dev_register(void)
++{
++	int major = cdevsw_add(-1, &sweet_gpu_cdevsw);
++
++	if (major < 0) {
++		printf("SWEET GPU: cannot add the device node (%d)\n", major);
++		return;
++	}
++	void *node = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT,
++	    GID_WHEEL, 0666, "sweetgpu");
++	printf("SWEET GPU: /dev/sweetgpu major %d %s\n", major,
++	    node ? "ready" : "NOT created");
++}
++
++/* The same calls the ioctl makes, driven from the kernel so the ABI is exercised
++ * before any userspace tool exists. */
++static bool
++gpu_abi_test(void)
++{
++	struct sweet_gpu_info info = { 0 };
++	struct sweet_gpu_gem_new newcmd;
++	struct sweet_gpu_gem_info geminfo;
++	struct sweet_gpu_gem_submit submit;
++	struct sweet_gpu_wait wait;
++	struct sweet_gpu_close closecmd;
++	static const uint32_t v[2] = { 0xc0de0001u, 0xc0de0002u };
++
++	if (gpu_client_info(&info) != 0) {
++		printf("SWEET GPU: abi test: INFO failed\n");
++		return false;
++	}
++
++	newcmd = (struct sweet_gpu_gem_new) { .size = 0x2000, .flags = 0 };
++	if (gpu_client_gem_new(&newcmd) != 0) {
++		printf("SWEET GPU: abi test: GEM_NEW failed\n");
++		return false;
++	}
++	struct sweet_gpu_gem_new dst = { .size = 0x1000, .flags = 0 };
++	if (gpu_client_gem_new(&dst) != 0) {
++		printf("SWEET GPU: abi test: GEM_NEW failed\n");
++		return false;
++	}
++	struct gpu_bo *cmd_bo = gpu_bo_by_handle(newcmd.handle);
++	struct gpu_bo *dst_bo = gpu_bo_by_handle(dst.handle);
++	if (cmd_bo == NULL || dst_bo == NULL) {
++		printf("SWEET GPU: abi test: handles do not resolve\n");
++		return false;
++	}
++
++	/* The client writes its packets through the mapped buffer. */
++	volatile uint32_t *ib = (volatile uint32_t *)cmd_bo->kva;
++	unsigned n = 0;
++	ib[n++] = gpu_pkt7(GPU_CP_NOP, 1);
++	ib[n++] = 0;
++	for (unsigned i = 0; i < 2; i++) {
++		ib[n++] = gpu_pkt7(GPU_CP_MEM_WRITE, 3);
++		ib[n++] = dst_bo->va + 0x10u * (i + 1);
++		ib[n++] = 0;
++		ib[n++] = v[i];
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	submit = (struct sweet_gpu_gem_submit) { .handle = newcmd.handle, .offset = 0, .dwords = n };
++	if (gpu_client_gem_submit(&submit) != 0) {
++		printf("SWEET GPU: abi test: GEM_SUBMIT failed\n");
++		return false;
++	}
++	wait = (struct sweet_gpu_wait) { .fence = submit.fence, .timeout_ms = 2000 };
++	int w = gpu_client_wait(&wait);
++
++	geminfo = (struct sweet_gpu_gem_info) { .handle = dst.handle, .op = SWEET_GPU_INFO_GET_IOVA };
++	int g = gpu_client_gem_info(&geminfo);
++
++	volatile uint32_t *out = (volatile uint32_t *)dst_bo->kva;
++	bool ok = w == 0 && g == 0 && geminfo.value == dst_bo->va &&
++	    out[4] == v[0] && out[8] == v[1];
++	printf("SWEET GPU: abi test: INFO abi %u chip %#x va %#x+%#x; GEM_NEW 0x%x/0x%x 0x%x/0x%x; "
++	    "SUBMIT %u dwords fence %u wait %d; GET_IOVA %#x; got %#x/%#x (want %#x/%#x)\n",
++	    info.abi_version, info.chip_id, info.va_start, info.va_size,
++	    newcmd.handle, newcmd.iova, dst.handle, dst.iova, submit.dwords, submit.fence, w,
++	    geminfo.value, out[4], out[8], v[0], v[1]);
++
++	closecmd = (struct sweet_gpu_close) { .handle = dst.handle };
++	int c1 = gpu_client_gem_close(&closecmd);
++	closecmd = (struct sweet_gpu_close) { .handle = newcmd.handle };
++	int c2 = gpu_client_gem_close(&closecmd);
++
++	/* A closed handle must be refused, not trusted. */
++	geminfo = (struct sweet_gpu_gem_info) { .handle = dst.handle, .op = SWEET_GPU_INFO_GET_IOVA };
++	int refusals = gpu_client_gem_info(&geminfo) == EINVAL;
++	bool bad = gpu_client_gem_submit(&(struct sweet_gpu_gem_submit){ .handle = 9999,
++		.dwords = 1 }) == EINVAL;
++
++	printf("SWEET GPU: abi test: close %d/%d, closed handle refused %s, bad handle refused %s\n",
++	    c1, c2, refusals ? "yes" : "NO", bad ? "yes" : "NO");
++	ok = ok && c1 == 0 && c2 == 0 && refusals && bad;
++	printf("SWEET GPU: abi test: %s\n", ok ?
++	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE" : "FAILED");
++	return ok;
++}
++
+ /* ---- stage 7c: the zap shader through SCM/PAS -------------------------- */
+ 
+ static bool gpu_zap_started;    /* AUTH_AND_RESET returned 0: SHUTDOWN is owed */
+@@ -2460,9 +2809,14 @@
+ 									/* Stage 8: keep everything live so the CP's
+ 									 * state survives the boot. */
+ 									gpu_kept_up = true;
++									gpu_blob = g;
++									gpu_core = gpu;
++									gpu_live = true;
+ 									printf("SWEET GPU: GPU KEPT UP: GMU live, OOB gpu held, "
+ 									    "zap authenticated, ring live at wptr %u\n",
+ 									    gpu_cp_wptr);
++									(void)gpu_abi_test();
++									gpu_dev_register();
+ 								} else {
+ 									gpu_zap_shutdown();
+ 								}
