@@ -4,7 +4,7 @@
  #include <pexpert/pexpert.h>
  /* stage 8: buffer allocation and cache attributes */
  #include <sys/conf.h>
-+#include <sys/uio.h>   /* struct uio for the read/write path */
++#include <sys/uio_internal.h>   /* struct uio lives here, not in sys/uio.h */
  #include <sys/ioccom.h>
  #include <miscfs/devfs/devfs.h>
  
