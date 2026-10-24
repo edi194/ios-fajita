@@ -1,0 +1,104 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -221,6 +221,7 @@
+ #define HFI_MSG_ACK           2u
+ #define HFI_H2F_INIT          0u
+ #define HFI_H2F_FW_VER        1u
++#define HFI_H2F_TEST          5u
+ #define GPU_GMU_HFI_CTRL_INIT 0x14618u   /* 0x5186 */
+ #define GPU_GMU_GMU2HOST_CLR  0x14644u   /* 0x5191 */
+ #define GPU_GMU_GMU2HOST_INFO 0x14648u   /* 0x5192 */
+@@ -340,6 +341,66 @@
+ 	gpu_scratch_ready = true;
+ }
+ 
++/* ---- the HFI queues, once stage 4 has them running --------------------- */
++
++static vm_offset_t hfi_gmu;
++static volatile uint32_t *hfi_cmd_qh, *hfi_msg_qh, *hfi_cmd_data, *hfi_msg_data;
++
++/*
++ * Send one message and wait for its answer. Returns the reply's id, or -1.
++ * The reply is read at the MSG queue's read index and that index is advanced by
++ * the reply's own dword count, so several messages can follow each other.
++ */
++static int
++gpu_hfi_send(const uint32_t *msg, unsigned n, const char *what)
++{
++	if (hfi_cmd_qh == NULL || hfi_msg_qh == NULL) {
++		return -1;
++	}
++	uint32_t w = hfi_cmd_qh[11] % 1024u;
++	for (unsigned i = 0; i < n; i++) {
++		hfi_cmd_data[(w + i) % 1024u] = msg[i];
++	}
++	hfi_cmd_qh[11] = (w + n) % 1024u;
++	__asm__ volatile("dmb oshst" ::: "memory");
++	gpu_wr_quiet(hfi_gmu, GPU_GMU_HOST2GMU_SET, 1);
++
++	uint32_t info = 0;
++	for (int i = 0; i < 200; i++) {
++		info = gpu_rd_quiet(hfi_gmu, GPU_GMU_GMU2HOST_INFO);
++		if (info & 1u) {
++			break;
++		}
++		gpu_wait_ms(1);
++	}
++	if (!(info & 1u)) {
++		printf("SWEET GPU: hfi %s: no answer from the GMU\n", what);
++		return -1;
++	}
++	gpu_wr_quiet(hfi_gmu, GPU_GMU_GMU2HOST_CLR, 1);
++
++	uint32_t r = hfi_msg_qh[10] % 1024u;
++	uint32_t hdr = hfi_msg_data[r];
++	uint32_t dw = (hdr >> 8) & 0xffu;
++	uint32_t ack_hdr = hfi_msg_data[(r + 1) % 1024u];
++	uint32_t error = hfi_msg_data[(r + 2) % 1024u];
++	uint32_t data = hfi_msg_data[(r + 3) % 1024u];
++	hfi_msg_qh[10] = (r + (dw ? dw : 4u)) % 1024u;
++	__asm__ volatile("dmb oshst" ::: "memory");
++
++	printf("SWEET GPU: hfi %s: reply %#x (id %u, %u words, type %u), request %#x, error %#x, data %#x\n",
++	    what, hdr, hdr & 0xffu, dw, (hdr >> 16) & 0xfu, ack_hdr, error, data);
++	if (((hdr >> 16) & 0xfu) != 2u) {                 /* HFI_V1_MSG_ACK */
++		printf("SWEET GPU: hfi %s: that is not an ACK\n", what);
++		return -1;
++	}
++	if (error) {
++		printf("SWEET GPU: hfi %s: the GMU refused it (error %u)\n", what, error);
++		return -1;
++	}
++	return (int)(hdr & 0xffu);
++}
++
+ void
+ sweet_gpu_probe(void)
+ {
+@@ -958,6 +1019,26 @@
+ 			}
+ 			printf("SWEET GPU: hfi reply id %u type %u (2 = ACK)\n", r & 0xffu, (r >> 16) & 0xfu);
+ 		}
++
++		/* keep the queues for the messages that follow */
++		hfi_gmu = gmu;
++		hfi_cmd_qh = qh;
++		hfi_msg_qh = (volatile uint32_t *)(g + GPU_GMEM_HFI + 4 * (HFI_QTBL_HDR_DW + HFI_QHDR_DW));
++		hfi_cmd_data = (volatile uint32_t *)(g + GPU_GMEM_HFI + 0xe0);
++		hfi_msg_data = (volatile uint32_t *)(g + GPU_GMEM_HFI + 0x10e0);
++
++		/* H2F_MSG_FW_VER: one dword, the version we speak (1.10). */
++		{
++			uint32_t fwver[2] = { HFI_QMARK_HDR(HFI_H2F_FW_VER, 2, 0), 0x100a0000u };
++			int id = gpu_hfi_send(fwver, 2, "fw version");
++			printf("SWEET GPU: hfi firmware version exchange %s\n", id == 1 ? "ok" : "failed");
++		}
++		/* H2F_MSG_TEST: two dwords, the numbers the GMU echoes back. */
++		{
++			uint32_t test[4] = { HFI_QMARK_HDR(5, 4, 0), 0x12345678u, 0x9abcdef0u, 0 };
++			int id = gpu_hfi_send(test, 4, "test");
++			printf("SWEET GPU: hfi test %s\n", id == 5 ? "ok" : "failed");
++		}
+ 	}
+ 	printf("SWEET GPU: stage 3e done\n");
+ 
