@@ -1636,3 +1636,36 @@ convention), `CP_SET_SECURE_MODE 0`, then a NOP + `CP_MEM_WRITE` +
 `CP_EVENT_WRITE(CACHE_FLUSH_TS)` with RPTR polling and a read-back of both values
 from the scratch buffer. Their 0103 has all of it for this chip, and the zap
 files are already extracted in `~/gpu-fw/`.
+
+### console71: the CP's SMMU context (2026-10-24)
+
+```
+SWEET GPU: cb1 sctlr 0xc01067 ttbr0 0x20001024dc000 | smr2 sid 0:
+           wrote 0x301/0x80000000 read 0x301/0x80000000 sGFSR 0
+SWEET GPU: cp context took
+```
+
+Context bank 1 with ASID 2, SMR2 = VALID | 0 (stream ID 0, gfx3d_user) and
+S2CR = 0x301 (translation to context 1); every value reads back as written and
+sGFSR stays 0. Together with CB0 (SIDs 5 and 4 for the GMU) both address spaces the
+a630 driver needs are now in place.
+
+Note the blob's physical address moves with the kernel size (this boot:
+0x1024dc000 instead of 0x1024d8000) - it is whatever `sweetfw1` announces, which
+is why nothing may hardcode it.
+
+### What stage 7 still needs
+
+1. Memory for the CP in that context: the ring (32 KiB at GPU VA 0x40000000), the
+   SQE (read-only, 0x10000 at 0x40010000) and a scratch buffer for the flush test
+   (0x40020000) - Bergamota's `CP_MEMORY_SIZE 0x20000` block with its own
+   L1/L2/L3 tables. Our payload currently carries 64 KiB for the GMU; the CP
+   block needs another 128 KiB (a third blob, or grow `sweetfw1` to 0x30000 and
+   carve it at +0x10000).
+2. `CP_ME_INIT` and the ~25 `hw_init` writes in Linux's order (64-bit address
+   modes, VBIF, UCHE, ROQ, ring/SQE base).
+3. The zap through SCM PAS id 13 (`SCM_PAS_INIT_IMAGE`, then
+   `SCM_PAS_AUTH_AND_RESET` with the continuation-token convention) - the files are
+   in `~/gpu-fw/a630_zap.*`.
+4. `CP_SET_SECURE_MODE 0`, then NOP + `CP_MEM_WRITE` + `CP_EVENT_WRITE`
+   (CACHE_FLUSH_TS) with RPTR polling and a read-back of both values.
