@@ -1,0 +1,14 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -340,7 +340,10 @@
+ 	 * so the firmware is tried with the block exactly as the boot loader left
+ 	 * it.
+ 	 */
+-	if (level >= 8) {
++	if (level == 8) {
++		/* Exactly 8: the diagnostic that leaves the block as the boot loader left
++		 * it. 9 and above need the power-on (0115 wrote >= 8, which quietly kept
++		 * the block off in every adreno=9 boot up to console58). */
+ 		printf("SWEET GPU: level %d: no power or clock writes, straight to the GMU\n", level);
+ 		goto gmu_only;
+ 	}
