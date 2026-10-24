@@ -1345,3 +1345,47 @@ RAM**), L1/L2/L3A/L3B 4 KiB tables, `TCR = (2<<12)|(1<<23)|32`,
 `0x60100000`, `HFI_CTRL_INIT = 1`, poll `HFI_CTRL_STATUS == 1`, reject
 `HFI_VERSION_INFO >> 28 >= 2`, then `H2F_MSG_INIT` (dump VA 0x60200000, size
 0x4000, GMU_COLD_BOOT), `FW_VER` (wants 1.10), `PERF_TBL`, `BW_VOTE_TBL`, `TEST`.
+
+### *** GPU STAGE 4 WORKS: the GMU talks HFI through our SMMU (console61, 2026-10-24) ***
+
+```
+SWEET GPU: gmu memory at 0x1024d8000 -> 0xfffffe3ccbd68000
+SWEET GPU: tables at 0x1024d8000: l1[1]=0x1024d9003 l2[256]=0x1024da003 l2[257]=0x1024db003
+SWEET GPU: hfi table at 0x60100000: size 54 words, 4 queues at +0x601000e0/+0x601010e0
+SWEET GPU: smmu micro-mmu ctrl 0x2378, halting / idle=1 ctrl 0x237c / resumed: ctrl 0x2378 scr0 0x200626
+SWEET GPU: cb0 sctlr 0xc01067 tcr 0x802020 tcr2 0x38011 ttbr0 0x10001024d8000 mair0 0x4ff44
+SWEET GPU: smr0 sid 5: wrote 0x300/0x80000005 read 0x300/0x80000005 sGFSR 0
+SWEET GPU: smr1 sid 4: wrote 0x300/0x80000004 read 0x300/0x80000004 sGFSR 0
+SWEET GPU: smmu routes sid 5 and 4 through context 0 (sTLBGSTATUS 0)
+SWEET GPU: write gmu hfi ctrl init +0x14618 = 0x1
+SWEET GPU: hfi ctrl status 0x1 (THE HFI QUEUES ARE UP), version info 0
+SWEET GPU: write gmu host2gmu intr +0x14650 = 0x1
+SWEET GPU: gmu2host intr info 0x1 (the GMU answered)
+SWEET GPU: hfi reply[0] 0x2047e  (id 126, dw 4, type 2 = ACK), reply[2] 0 (error 0), reply[3] 0xe550e55
+```
+
+`0x0002047e` is the same INIT ACK Bergamota's A618 log shows. The GMU booted,
+read our HFI table **through the page tables we built** (stream IDs 5 and 4 ->
+context 0), and ACKed `H2F_MSG_INIT`. Then it was put back into reset and iOS booted
+normally. `adreno=9` is the level.
+
+**Two bugs of ours stood between console59 and this** (both visible in the logs):
+
+* `uint32_t gmem_pa = (uint32_t)gm_pa64` truncated the blob's address to 32 bits,
+  so every PTE and TTBR0 pointed at 0x24d8000 instead of 0x1024d8000 and the GMU's
+  first access reset the phone (0131: keep it 64-bit, the SMMU takes 40-bit
+  output addresses and a 64-bit TTBR0).
+* nothing else - CB0, the SMR/S2CR pairs and the HFI table all worked first time.
+
+### What is left (Bergamota's stages 5-8)
+
+1. The rest of the HFI messages: `H2F_MSG_FW_VER` (wants 1.10 = `0x100a0000`),
+   `PERF_TBL`, `BW_VOTE_TBL`, `TEST` - our queue code already sends one message;
+   each needs its ACK checked the same way.
+2. GX rail on: `a6xx_gmu_gfx_rail_on` (boot OOB at 257 MHz), SPTPRAC on, then the
+   GPU core registers become readable (RBBM_STATUS, CP_ALWAYS_ON). Requires the
+   `gx_gdsc` sequence and its `core_root_clk`.
+3. The CP: `CP_ME_INIT`, ring and SQE in a second SMMU context (SID 0), the zap
+   shader through SCM PAS id 13, then a NOP + CACHE_FLUSH_TS test.
+4. Only then the 3D pipeline (shaders, UBWC, RBBM_SECVID) and a Metal/OpenGL
+   backend - Bergamota is at that point now (bgmtl).
