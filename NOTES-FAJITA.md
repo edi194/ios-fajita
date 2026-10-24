@@ -2038,3 +2038,51 @@ bundle's principal class subclasses `_MTLDevice`; `MTLCreateSystemDefaultDevice`
 returns a device and QuartzCore picks `MetalContext` instead of `SWContext`. Even a
 stub that only logs the selectors answers the important question - how far CoreAnimation
 gets before it needs a shader - without risking anything.
+
+### 2026-10-24 evening: Chlorophyll exists - the Metal wall is gone
+
+`github.com/ry-diffusion/Chlorophyll`, pushed 2026-10-24 17:53 (MIT, C):
+
+> Metal driver for Bergamota: AIR -> NIR -> ir3 shader translator and Metal API over
+> Mesa freedreno (Adreno 630)
+
+| part | what |
+| --- | --- |
+| `air/` | AIR -> NIR: Apple bitcode reader, layout, intrinsics, `air2nir` |
+| `air/air_metal.c` | Metal API over freedreno Gallium (`libbgair.dylib`) |
+| `src/bgmtl.m` | `BGMTLDevice` and the Metal classes |
+| `plugin/chlorophyll_plugin.m` | `Chlorophyll.bundle` - the system Metal driver, loaded from `/System/Library/Extensions` **when the kernel's IOAcceleratorES names it** |
+| `inject/bgmtl_inject.m` | injection into processes: backboardd's compositor profile and watchdog |
+| `patches/` | Mesa/ir3 fixes plus the AIR frontend hook |
+| `results/all-system-metallibs-summary.json` | **every system metallib translated** |
+
+Their commits from that same day say the wallpaper works: "a refused draw or clear is
+skipped and logged instead of failing the command buffer (the rest of the frame used to
+stay undrawn: the real cause of the black/grey wallpaper...) A/B: wallpaper fine with
+readback off and batch reordering on", plus fixes for the poster's passes, SBRendererService
+and the SpringBoard crash loop.
+
+**What this changes for us**
+
+- The shader wall (CA's precompiled AGX metallibs) is solved, not researched: AIR ->
+  NIR -> ir3 with a corpus of all system metallibs. A "Metal probe" would be a waste;
+  the job is now **porting Chlorophyll**.
+- The discovery route is exactly what `berg-GPU_PHASE0_DISCOVERY.md` describes, and our
+  kernel **already publishes an IOAcceleratorES service** (patch 0087) which backboardd
+  finds in the boot log. What is missing is the `MetalPluginName` property naming a
+  bundle whose principal class subclasses `_MTLDevice`.
+- **A version gap to check first**: they run iOS 18, we are on 16.7.16, so the AIR and
+  metallib formats and Metal.framework internals differ. Their phase-0 notes for OUR
+  version are already in `berg-GPU_PHASE0_DISCOVERY.md`, so this is porting work.
+
+**The architectural question to settle before more code**: Chlorophyll's libdrm stand-in
+talks to their kernel through **IOKit** (msm selectors). Ours (`0152`/`0154`) is a
+**character device** with read/write and `_IOWR` ioctls. If their glue expects IOKit,
+the right move may be to expose the IOKit user client (and keep the chardev as a test
+path) rather than extend the chardev. Decide that after reading their `gpu/freedreno-sweet`
+and `libdrm` stand-in - not before.
+
+Order I would follow: clone Chlorophyll + Bergamota with submodules, read
+`gpu/freedreno-sweet` (their kernel ABI), `plugin/`, `inject/`, then port in this order:
+IOAcceleratorES naming + plugin bundle, libdrm stand-in against our ABI, `air/` built for
+arm64 iOS 16.7.16, the inject for backboardd, then CoreAnimation's own passes.
