@@ -1,0 +1,62 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -465,8 +465,17 @@
+ 	 */
+ 	if (gpu_rd_quiet(gmu, GPU_GMU_SYSRESET) != 1) {
+ 		gpu_probe_wr("gmu sysreset hold", gmu, GPU_GMU_SYSRESET, 1);
+-		gpu_wait_ms(1);
+-		printf("SWEET GPU: gmu sysreset now %#x\n", gpu_rd_quiet(gmu, GPU_GMU_SYSRESET));
++		gpu_wait_ms(5);
++		uint32_t held = gpu_rd_quiet(gmu, GPU_GMU_SYSRESET);
++		printf("SWEET GPU: gmu sysreset now %#x\n", held);
++		if (held != 1) {
++			/* A running GMU that will not go back into reset: writing its TCM
++			 * would corrupt a live processor, so nothing is written. A cold boot
++			 * clears this (0127; console55/56 saw it after console54 left the GMU
++			 * running). */
++			printf("SWEET GPU: the GMU will not hold in reset; firmware not loaded (cold boot to clear)\n");
++			return;
++		}
+ 	}
+ 	char arg[64];
+ 	if (!PE_parse_boot_argn("sweetfw0", arg, sizeof(arg))) {
+@@ -632,19 +641,30 @@
+ 		    gpu_rd_quiet(smmu, GPU_SMMU_MICRO_MMU_CTRL), gpu_rd_quiet(smmu, GPU_SMMU_SCR0));
+ 	}
+ 
+-	/* A real write: S2CR0 to bypass, read back, then back to what it was. Before
+-	 * the impl-defs these writes were dropped; now they should stick. */
++	/*
++	 * The pair, the way the A618 notes found it works: S2CR first, then an exact
++	 * SMR (VALID, mask 0) - and S2CR is only honoured once that SMR is VALID. The
++	 * S2CR keeps its FAULT value, so nothing can fault while the test runs.
++	 */
+ 	uint32_t s2cr0 = gpu_rd_quiet(smmu, GPU_SMMU_S2CR(0));
+-	printf("SWEET GPU: smmu s2cr0 %#x before, writing bypass\n", s2cr0);
+-	gpu_wr_quiet(smmu, GPU_SMMU_S2CR(0), (s2cr0 & ~(3u << 16)) | GPU_SMMU_S2CR_BYPASS);
++	uint32_t smr0 = gpu_rd_quiet(smmu, GPU_SMMU_SMR(0));
++	printf("SWEET GPU: smmu smr0 %#x s2cr0 %#x before\n", smr0, s2cr0);
++	gpu_wr_quiet(smmu, GPU_SMMU_S2CR(0), s2cr0);
++	gpu_wr_quiet(smmu, GPU_SMMU_SMR(0), (1u << 31) | 5u);      /* VALID | gmu_kernel SID 5 */
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	uint32_t now = gpu_rd_quiet(smmu, GPU_SMMU_S2CR(0));
+-	printf("SWEET GPU: smmu s2cr0 %#x after: %s, sgfsr %#x\n", now,
+-	    ((now >> 16) & 3u) == 1u ? "BYPASS STUCK (the stream table is writable)" : "still dropped",
++	uint32_t smr_now = gpu_rd_quiet(smmu, GPU_SMMU_SMR(0));
++	printf("SWEET GPU: smmu smr0 %#x after writing %#x: %s, sgfsr %#x\n", smr_now,
++	    (1u << 31) | 5u, smr_now == ((1u << 31) | 5u) ? "EXACT SMR STICKS (the stream table is writable)" : "dropped",
+ 	    gpu_rd_quiet(smmu, GPU_SMMU_SGFSR));
+-	gpu_wr_quiet(smmu, GPU_SMMU_S2CR(0), s2cr0);
++	gpu_wr_quiet(smmu, GPU_SMMU_SMR(0), smr0);
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+-	printf("SWEET GPU: smmu s2cr0 restored to %#x\n", gpu_rd_quiet(smmu, GPU_SMMU_S2CR(0)));
++	printf("SWEET GPU: smmu smr0 restored to %#x\n", gpu_rd_quiet(smmu, GPU_SMMU_SMR(0)));
+ 	printf("SWEET GPU: stage 3e done\n");
++
++	/* Leave the GMU as Bergamota leaves it: in reset, so the next boot starts
++	 * from the state the boot loader expects. */
++	gpu_probe_wr("gmu sysreset end", gmu, GPU_GMU_SYSRESET, 1);
++	gpu_wait_ms(10);
++	printf("SWEET GPU: gmu sysreset at the end %#x\n", gpu_rd_quiet(gmu, GPU_GMU_SYSRESET));
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
