@@ -1669,3 +1669,31 @@ is why nothing may hardcode it.
    in `~/gpu-fw/a630_zap.*`.
 4. `CP_SET_SECURE_MODE 0`, then NOP + `CP_MEM_WRITE` + `CP_EVENT_WRITE`
    (CACHE_FLUSH_TS) with RPTR polling and a read-back of both values.
+
+### console72: the rail is given back (stage 5 closed both ways)
+
+```
+GPU ANSWERS: rbbm_status 0x1, cp_status1 0xffffffff, GMU counter 0x320e2e -> 0x32d824 (ticking)
+SPTPRAC off: ok (status 0x14)
+slumber not acknowledged: RPMH_POWER_STATE 0xf (slumber)
+gmu ahb fence allow = 0
+```
+
+SPTPRAC goes off (status bit 2), `RPMH_POWER_STATE` reads `0xf` = `GPU_HW_SLUMBER`
+and the AHB fence returns to allow, so a probe boot leaves the GPU as it found it.
+The OOB acknowledgement bit does not come back for the slumber request (the boot
+one did); the state register says the slumber happened, so it is treated as
+cosmetic - the same pattern as `rsc wake: ack=0`.
+
+### State of the port at the end of 2026-10-24 (adreno=9, every boot)
+
+CX GDSC -> clocks -> cmd-db/PDC/RSC -> firmware -> GMU boot -> SMMU impl-defs,
+CB0 (SIDs 5/4) and CB1 (SID 0, read back) -> HFI v1 INIT/FW_VER 1.7/TEST -> GX
+rail (ARC 3, 257 MHz) -> SPTPRAC on -> GX GDSC on -> RBBM_STATUS 0x1 with a
+ticking GMU counter -> SPTPRAC off -> slumber (`RPMH_POWER_STATE 0xf`) -> AHB
+fence allow -> GMU back into reset -> iOS boots.
+
+Next: the CP. Ring (32 KiB at GPU VA 0x40000000), SQE (read-only, 0x10000 at
+0x40010000), scratch (0x40020000) in a new 128 KiB block, `CP_ME_INIT` with the
+hw_init writes, the zap through SCM PAS 13, `CP_SET_SECURE_MODE 0`, then
+NOP + `CP_MEM_WRITE` + `CP_EVENT_WRITE(CACHE_FLUSH_TS)` with RPTR polling.
