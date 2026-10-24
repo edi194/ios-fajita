@@ -1,0 +1,12 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -479,7 +479,8 @@
+ 		printf("SWEET GPU: cannot map the PDC\n");
+ 		return false;
+ 	}
+-	static const struct { const char *name; uint32_t *addr; uint32_t linux; } arcs[] = {
++	/* Not static: these entries hold the addresses of three locals. */
++	const struct { const char *name; uint32_t *addr; uint32_t linux; } arcs[] = {
+ 		{ "mx.lvl", &mx, 0x30010u }, { "cx.lvl", &cx, 0x30000u }, { "gfx.lvl", &gfx, 0x30080u },
+ 	};
+ 	for (unsigned i = 0; i < 3; i++) {
