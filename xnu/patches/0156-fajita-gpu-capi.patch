@@ -237,19 +237,19 @@
  	    sel_ok ? "yes" : "NO");
  
 +	/* the surface the IOKit user client will call */
-+	uint64_t v = 0;
-+	bool param_ok = sweet_gpu_param(GPU_PARAM_GPU_ID, &v) && v == 630;
-+	param_ok = param_ok && sweet_gpu_param(GPU_PARAM_CHIP_ID, &v) && v == 0x06030001u;
-+	param_ok = param_ok && sweet_gpu_param(GPU_PARAM_GMEM_SIZE, &v) && v == 0x100000u;
-+	param_ok = param_ok && !sweet_gpu_param(999, &v);
++	uint64_t capv = 0;
++	bool param_ok = sweet_gpu_param(GPU_PARAM_GPU_ID, &capv) && capv == 630;
++	param_ok = param_ok && sweet_gpu_param(GPU_PARAM_CHIP_ID, &capv) && capv == 0x06030001u;
++	param_ok = param_ok && sweet_gpu_param(GPU_PARAM_GMEM_SIZE, &capv) && capv == 0x100000u;
++	param_ok = param_ok && !sweet_gpu_param(999, &capv);
 +
-+	uint32_t a = 0, b = 0, c = 0;
++	uint32_t cap_a = 0, cap_b = 0, cap_c = 0;
 +	bool reuse = false;
-+	if (sweet_gpu_iova_alloc(0x1000, &a) && sweet_gpu_iova_alloc(0x1000, &b)) {
-+		sweet_gpu_iova_free(a, 0x1000);
-+		reuse = sweet_gpu_iova_alloc(0x1000, &c) && c == a;
-+		sweet_gpu_iova_free(b, 0x1000);
-+		sweet_gpu_iova_free(c, 0x1000);
++	if (sweet_gpu_iova_alloc(0x1000, &cap_a) && sweet_gpu_iova_alloc(0x1000, &cap_b)) {
++		sweet_gpu_iova_free(cap_a, 0x1000);
++		reuse = sweet_gpu_iova_alloc(0x1000, &cap_c) && cap_c == cap_a;
++		sweet_gpu_iova_free(cap_b, 0x1000);
++		sweet_gpu_iova_free(cap_c, 0x1000);
 +	}
 +
 +	bool sync_ok = sweet_gpu_fence_done(sweet_gpu_fence_last());
