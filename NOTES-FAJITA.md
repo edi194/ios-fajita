@@ -1785,3 +1785,32 @@ the secure world, so it stays behind `zap=1` (`console75c-zap.img`).
 
 Note `cp_status1 0x81004000` is this driver's own diagnostic, not a value checked
 anywhere: bit 31 and bit 24 are set after CP_ME_INIT on this chip.
+
+### console75c: TrustZone accepts the zap (2026-10-24)
+
+```
+scm pas INIT_IMAGE available: status 0 result 1
+scm pas MEM_SETUP available: status 0 result 1
+scm pas AUTH_AND_RESET available: status 0 result 1
+scm pas SHUTDOWN available: status 0 result 1
+zap metadata at +0x25000 (PA 0x102501000): magic 0x464c457f class 1 bits 32 phnum 3 phoff 52
+zap phdr 1: type 0 off 0x1000 paddr 0x6000 filesz 6536 memsz 8192 flags 0x2200000
+zap phdr 2: type 1 off 0x3000 paddr 0x5000 filesz 1968 memsz 1968 flags 0x8000007
+scm pas INIT_IMAGE fn=0x42000201 arginfo=0x82 args=0x102501000/0 -> status 0 result 0
+scm pas MEM_SETUP fn=0x42000202 arginfo=0x3 args=0x8c415000/0x1000 -> status 0 result 0
+zap segment 2: 1968 bytes -> carve-out +0
+scm pas AUTH_AND_RESET fn=0x42000205 arginfo=0x1 args=0/0 -> status 0 result 0
+zap authenticated and started (PAS 13 quiesced into reset)
+```
+
+All four PAS calls are available to the secure world on this boot chain - the biggest
+assumption in Bergamota's port holds on fajita too - and the signed zap verified and
+started, so the CP is no longer in secure mode. The carve-out at 0x8c415000, the
+blob-as-coherent-memory trick (metadata PA = blob + 0x25000) and the single-segment
+copy all worked first time. iOS booted normally afterwards.
+
+`phdr 1` (`flags 0x2200000`, i.e. QCOM_MDT_TYPE_HASH) is correctly skipped; only
+`phdr 2` is loaded, which is why b00/b01 never have to be in the blob.
+
+Next: `CP_SET_SECURE_MODE 0`, then NOP + CP_MEM_WRITE + CACHE_FLUSH_TS with RPTR
+polling and read-back (0147, `zap=1`), then PAS SHUTDOWN.
