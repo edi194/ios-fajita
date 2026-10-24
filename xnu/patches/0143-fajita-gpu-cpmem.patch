@@ -1,0 +1,84 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -259,6 +259,22 @@
+ #define GPU_GMU_AO_COUNTER_L  0x14220u   /* 0x5088: counts the 19.2 MHz crystal */
+ #define GPU_CORE_RBBM_STATUS  0x840u     /* a6xx 0x0210 off the GPU base */
+ #define GPU_CORE_CP_STATUS_1  0x20d4u    /* a6xx 0x0825 */
++
++/* stage 7: the CP's memory, carved out of the blob after the GMU's 64 KiB */
++#define GPU_BLOB_BYTES        0x24000u
++#define GPU_CP_BASE           0x10000u   /* offset inside the blob */
++#define GPU_CP_L1             (GPU_CP_BASE + 0x0000u)
++#define GPU_CP_L2             (GPU_CP_BASE + 0x1000u)
++#define GPU_CP_L3             (GPU_CP_BASE + 0x2000u)
++#define GPU_CP_RING           (GPU_CP_BASE + 0x4000u)
++#define GPU_CP_RING_BYTES     0x8000u
++#define GPU_CP_SQE            (GPU_CP_BASE + 0xc000u)
++#define GPU_CP_SQE_BYTES      0x8000u
++#define GPU_CP_SCRATCH        (GPU_CP_BASE + 0x14000u)
++#define GPU_CP_SCRATCH_BYTES  0x1000u
++#define GPU_VA_CP_RING        0x40000000u
++#define GPU_VA_CP_SQE         0x40010000u
++#define GPU_VA_CP_SCRATCH     0x40020000u
+ #define GPU_GMU_SPTPRAC_STATUS 0x14340u  /* 0x50d0 */
+ #define GPU_GMU_BOOT_SLUMBER  0x8fe0u   /* 0x23f8 */
+ #define GPU_GMU_GX_VOTE_IDX   0x8fe4u   /* 0x23f9 */
+@@ -1096,20 +1112,20 @@
+ 	char gmarg[64];
+ 	uint64_t gm_pa64 = 0, gm_size = 0;
+ 	if (!PE_parse_boot_argn("sweetfw1", gmarg, sizeof(gmarg)) ||
+-	    !gpu_parse_range(gmarg, &gm_pa64, &gm_size) || gm_size < GPU_GMEM_BYTES) {
+-		printf("SWEET GPU: no sweetfw1 blob of %#x bytes; stage 3e skipped\n", GPU_GMEM_BYTES);
++	    !gpu_parse_range(gmarg, &gm_pa64, &gm_size) || gm_size < GPU_BLOB_BYTES) {
++		printf("SWEET GPU: no sweetfw1 blob of %#x bytes; stage 3e skipped\n", GPU_BLOB_BYTES);
+ 		return;
+ 	}
+ 	/* 64 bits throughout: the payload sits above 4 GB, and the SMMU takes a
+ 	 * 40-bit output address in its descriptors and a 64-bit TTBR0. */
+ 	uint64_t gmem_pa = gm_pa64;
+-	vm_offset_t g = ml_io_map((vm_offset_t)gm_pa64, GPU_GMEM_BYTES);
++	vm_offset_t g = ml_io_map((vm_offset_t)gm_pa64, GPU_BLOB_BYTES);
+ 	if (g == 0) {
+ 		printf("SWEET GPU: cannot map the gmu memory blob\n");
+ 		return;
+ 	}
+ 	printf("SWEET GPU: gmu memory at %#llx -> %#llx\n", (unsigned long long)gmem_pa, (uint64_t)g);
+-	for (uint32_t off = 0; off < GPU_GMEM_BYTES; off += 4) {
++	for (uint32_t off = 0; off < GPU_BLOB_BYTES; off += 4) {
+ 		*(volatile uint32_t *)(g + off) = 0;
+ 	}
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+@@ -1142,6 +1158,33 @@
+ 		    (GPU_VA_DUMP >> 21) & 0x1ff, (unsigned long long)l2[(GPU_VA_DUMP >> 21) & 0x1ff]);
+ 	}
+ 
++	/* The CP's tables and its memory, in the blob after the GMU's 64 KiB. */
++	{
++		volatile uint64_t *l3cp = (volatile uint64_t *)(g + GPU_CP_L3);
++		/* L1[1] is shared with the GMU (both 0x4000_0000 and 0x6000_0000 have
++		 * VA[31:30] = 1); the CP needs its own L2 entry at index 0. */
++		volatile uint64_t *l2s = (volatile uint64_t *)(g + GPU_GMEM_L2);
++		l2s[(GPU_VA_CP_RING >> 21) & 0x1ff] = (uint64_t)(gmem_pa + GPU_CP_L3) | GPU_PTE_TABLE;
++
++		for (uint32_t i = 0; i < GPU_CP_RING_BYTES / 0x1000; i++) {
++			l3cp[((GPU_VA_CP_RING >> 12) & 0x1ff) + i] =
++			    (uint64_t)(gmem_pa + GPU_CP_RING + 0x1000 * i) | GPU_PTE_PAGE;
++		}
++		for (uint32_t i = 0; i < GPU_CP_SQE_BYTES / 0x1000; i++) {
++			l3cp[((GPU_VA_CP_SQE >> 12) & 0x1ff) + i] =
++			    (uint64_t)(gmem_pa + GPU_CP_SQE + 0x1000 * i) | GPU_PTE_PAGE | (1ull << 7);
++		}
++		l3cp[(GPU_VA_CP_SCRATCH >> 12) & 0x1ff] =
++		    (uint64_t)(gmem_pa + GPU_CP_SCRATCH) | GPU_PTE_PAGE;
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("SWEET GPU: cp memory: ring %#x (%u KiB) sqe %#x (%u KiB, read-only) scratch %#x; l2[%u]=%#llx l3[%u]=%#llx\n",
++		    GPU_VA_CP_RING, GPU_CP_RING_BYTES / 1024, GPU_VA_CP_SQE, GPU_CP_SQE_BYTES / 1024,
++		    GPU_VA_CP_SCRATCH, (GPU_VA_CP_RING >> 21) & 0x1ff,
++		    (unsigned long long)l2s[(GPU_VA_CP_RING >> 21) & 0x1ff],
++		    (GPU_VA_CP_RING >> 12) & 0x1ff,
++		    (unsigned long long)l3cp[(GPU_VA_CP_RING >> 12) & 0x1ff]);
++	}
++
+ 	/* The legacy HFI table: four queues, data at +0xe0 + 0x1000*i. */
+ 	{
+ 		volatile uint32_t *t = (volatile uint32_t *)(g + GPU_GMEM_HFI);

@@ -64,9 +64,9 @@ done
 # A second blob: 64 KiB of zeroes, the memory the GMU reaches through the GPU
 # SMMU (page tables, dummy, HFI, dump, log). Nothing of it is committed.
 GMEM_BLOB=${GMEM_BLOB:-$HOME/gpu-fw/gmem.bin}
-if [[ ! -f "$GMEM_BLOB" ]]; then
+if [[ ! -f "$GMEM_BLOB" || $(stat -c%s "$GMEM_BLOB" 2>/dev/null || echo 0) -lt 147456 ]]; then
 	mkdir -p "$(dirname "$GMEM_BLOB")"
-	dd if=/dev/zero of="$GMEM_BLOB" bs=65536 count=1 status=none
+	dd if=/dev/zero of="$GMEM_BLOB" bs=1024 count=144 status=none
 fi
 BLOB_ARGS+=(--blob "$GMEM_BLOB")
 python3 tools/mkpayload.py "$XNU_KERNEL" "$ADT" "$PAYLOAD" --cmdline "$CMDLINE" "${BLOB_ARGS[@]}"
