@@ -1,0 +1,39 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -719,13 +719,15 @@
+ 		printf("SWEET GPU: no sweetfw1 blob of %#x bytes; stage 3e skipped\n", GPU_GMEM_BYTES);
+ 		return;
+ 	}
+-	uint32_t gmem_pa = (uint32_t)gm_pa64;
++	/* 64 bits throughout: the payload sits above 4 GB, and the SMMU takes a
++	 * 40-bit output address in its descriptors and a 64-bit TTBR0. */
++	uint64_t gmem_pa = gm_pa64;
+ 	vm_offset_t g = ml_io_map((vm_offset_t)gm_pa64, GPU_GMEM_BYTES);
+ 	if (g == 0) {
+ 		printf("SWEET GPU: cannot map the gmu memory blob\n");
+ 		return;
+ 	}
+-	printf("SWEET GPU: gmu memory at %#x -> %#llx\n", gmem_pa, (uint64_t)g);
++	printf("SWEET GPU: gmu memory at %#llx -> %#llx\n", (unsigned long long)gmem_pa, (uint64_t)g);
+ 	for (uint32_t off = 0; off < GPU_GMEM_BYTES; off += 4) {
+ 		*(volatile uint32_t *)(g + off) = 0;
+ 	}
+@@ -752,7 +754,8 @@
+ 		}
+ 		l3b[(GPU_VA_LOG >> 12) & 0x1ff] = (uint64_t)(gmem_pa + GPU_GMEM_LOG) | GPU_PTE_PAGE;
+ 		__asm__ volatile("dsb sy" ::: "memory");
+-		printf("SWEET GPU: tables at %#x: l1[%u]=%#llx l2[%u]=%#llx l2[%u]=%#llx\n", gmem_pa,
++		printf("SWEET GPU: tables at %#llx: l1[%u]=%#llx l2[%u]=%#llx l2[%u]=%#llx\n",
++		    (unsigned long long)gmem_pa,
+ 		    (GPU_VA_HFI >> 30) & 0x1ff, (unsigned long long)l1[(GPU_VA_HFI >> 30) & 0x1ff],
+ 		    (GPU_VA_DUMMY >> 21) & 0x1ff, (unsigned long long)l2[(GPU_VA_DUMMY >> 21) & 0x1ff],
+ 		    (GPU_VA_DUMP >> 21) & 0x1ff, (unsigned long long)l2[(GPU_VA_DUMP >> 21) & 0x1ff]);
+@@ -840,7 +843,7 @@
+ 	/* ---- context bank 0 with those tables ---- */
+ 	{
+ 		vm_offset_t b = smmu + GPU_SMMU_CB(0);
+-		uint64_t ttbr = (uint64_t)(gmem_pa + GPU_GMEM_L1) | ((uint64_t)1 << 48);
++		uint64_t ttbr = (gmem_pa + GPU_GMEM_L1) | ((uint64_t)1 << 48);
+ 
+ 		gpu_wr_quiet(smmu, GPU_SMMU_GR1 + GPU_SMMU_CBA2R(0), 1u);
+ 		gpu_wr_quiet(smmu, GPU_SMMU_GR1 + GPU_SMMU_CBAR(0), GPU_CBAR_S1);
