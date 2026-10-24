@@ -1471,3 +1471,27 @@ What stage 5 needs, from Bergamota's `0103` (function names there):
 The GX GDSC (gpucc `0x100c`) also needs its `core_root_clk` (the DT says
 `clocks = <&gpucc 2>` with `qcom,force-enable-root-clk`), and it has `sw-reset`
 and `domain-addr` properties - read them from the DT before writing the GDSCR.
+
+### console66: the PDC/RSC step, and the cmd-db earns its keep
+
+```
+pdc mx.lvl address 0x30010 (as Linux a630)
+pdc cx.lvl address 0x30000 (as Linux a630)
+pdc gfx.lvl address 0x30050 (cmd-db)
+pdc and rsc microcode written (mx 0x30010, cx 0x30000, gfx 0x30050)
+rsc wake: ack=0 sequencer idle=1 (ack 0 busy 0)
+```
+
+**The command DB matters on this phone**: `gfx.lvl` is `0x30050`, not the
+`0x30080` Linux hardcodes for a630 - the same kind of per-device difference
+Bergamota's note mentions for a618. The PDC now uses the value the bootloader's
+cmd-db gives (mx and cx match Linux).
+
+`rsc wake: ack=0` - the RSCC_CONTROL_ACK bit never came, while the sequencer
+reports idle; their code logs that and carries on, and everything after it still
+works (HFI up, firmware 1.7, TEST ACKed, GMU back in reset, SpringBoard boots).
+If the GX rail later refuses to come up, this ack is the first suspect.
+
+Everything up to here is repeatable: `adreno=9` runs CX, clocks, cmd-db + PDC/RSC,
+firmware load, GMU boot, SMMU context and streams, HFI INIT/FW_VER/TEST, and puts
+the GMU back into reset.
