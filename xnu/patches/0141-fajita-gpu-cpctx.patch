@@ -1,0 +1,48 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1265,6 +1265,45 @@
+ 			    want_s2, want_smr, got_s2, got_smr, gpu_rd_quiet(smmu, GPU_SMMU_SGFSR));
+ 			routed &= (got_s2 == want_s2) && (got_smr == want_smr);
+ 		}
++		/* The CP's own stream (SID 0, gfx3d_user) in context 1, same tables. */
++		{
++			vm_offset_t b1 = smmu + GPU_SMMU_CB(1);
++			uint64_t ttbr = (gmem_pa + GPU_GMEM_L1) | ((uint64_t)2 << 48);
++
++			gpu_wr_quiet(smmu, GPU_SMMU_GR1 + GPU_SMMU_CBA2R(1), 1u);
++			gpu_wr_quiet(smmu, GPU_SMMU_GR1 + GPU_SMMU_CBAR(1), GPU_CBAR_S1);
++			gpu_wr_quiet(b1, GPU_SMMU_CB_TTBCR2, GPU_TCR2_CB);
++			gpu_wr_quiet(b1, GPU_SMMU_CB_TCR, GPU_TCR_CB);
++			__asm__ volatile("dmb oshst" ::: "memory");
++			*(volatile uint64_t *)(b1 + GPU_SMMU_CB_TTBR0) = ttbr;
++			__asm__ volatile("dsb osh" ::: "memory");
++			gpu_wr_quiet(b1, GPU_SMMU_CB_MAIR0, GPU_MAIR0_CB);
++			gpu_wr_quiet(b1, GPU_SMMU_CB_MAIR1, 0);
++			gpu_wr_quiet(b1, GPU_SMMU_CB_ACTLR, GPU_ACTLR_CB);
++			gpu_wr_quiet(b1, GPU_SMMU_CB_FSR, gpu_rd_quiet(b1, GPU_SMMU_CB_FSR));
++			gpu_wr_quiet(b1, GPU_SMMU_CB_TLBIALL, 0);
++			for (int i = 0; i < 100; i++) {
++				if (!(gpu_rd_quiet(b1, GPU_SMMU_CB_TLBSTATUS) & 1u)) {
++					break;
++				}
++				gpu_wait_ms(1);
++			}
++			gpu_wr_quiet(b1, GPU_SMMU_CB_SCTLR, GPU_SCTLR_CB);
++
++			uint32_t want_s2 = GPU_S2CR_TRANS(1), want_smr = GPU_SMR_VALID | 0u;
++			gpu_wr_quiet(smmu, GPU_SMMU_S2CR(2), want_s2);
++			gpu_wr_quiet(smmu, GPU_SMMU_SMR(2), want_smr);
++			__asm__ volatile("dmb oshst" ::: "memory");
++			uint32_t got_s2 = gpu_rd_quiet(smmu, GPU_SMMU_S2CR(2));
++			uint32_t got_smr = gpu_rd_quiet(smmu, GPU_SMMU_SMR(2));
++			printf("SWEET GPU: cb1 sctlr %#x ttbr0 %#x%08x | smr2 sid 0: wrote %#x/%#x read %#x/%#x sGFSR %#x\n",
++			    gpu_rd_quiet(b1, GPU_SMMU_CB_SCTLR), gpu_rd_quiet(b1, GPU_SMMU_CB_TTBR0 + 4),
++			    gpu_rd_quiet(b1, GPU_SMMU_CB_TTBR0), want_s2, want_smr, got_s2, got_smr,
++			    gpu_rd_quiet(smmu, GPU_SMMU_SGFSR));
++			printf("SWEET GPU: cp context %s\n",
++			    (got_s2 == want_s2 && got_smr == want_smr) ? "took" : "DID NOT TAKE");
++		}
++
+ 		gpu_wr_quiet(smmu, GPU_SMMU_TLBIALLNSNH, 0);
+ 		for (int i = 0; i < 100; i++) {
+ 			if (!(gpu_rd_quiet(smmu, GPU_SMMU_sTLBGSTATUS) & 1u)) {
