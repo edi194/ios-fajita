@@ -1,0 +1,65 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -465,16 +465,54 @@
+ 	 */
+ 	if (gpu_rd_quiet(gmu, GPU_GMU_SYSRESET) != 1) {
+ 		gpu_probe_wr("gmu sysreset hold", gmu, GPU_GMU_SYSRESET, 1);
+-		gpu_wait_ms(5);
+-		uint32_t held = gpu_rd_quiet(gmu, GPU_GMU_SYSRESET);
++		uint32_t held = 0;
++		for (int i = 0; i < 100; i++) {
++			held = gpu_rd_quiet(gmu, GPU_GMU_SYSRESET);
++			if (held == 1) {
++				break;
++			}
++			gpu_wait_ms(1);
++		}
+ 		printf("SWEET GPU: gmu sysreset now %#x\n", held);
+ 		if (held != 1) {
+-			/* A running GMU that will not go back into reset: writing its TCM
+-			 * would corrupt a live processor, so nothing is written. A cold boot
+-			 * clears this (0127; console55/56 saw it after console54 left the GMU
+-			 * running). */
+-			printf("SWEET GPU: the GMU will not hold in reset; firmware not loaded (cold boot to clear)\n");
+-			return;
++			/*
++			 * The ABL runs the GPU for its boot splash and can leave the GMU
++			 * running, where SYSRESET is a status and will not be set. A GDSC
++			 * collapse and release resets the whole GPU block, which the hardware
++			 * has to honour.
++			 */
++			printf("SWEET GPU: the core will not hold in reset; resetting the block through the CX GDSC\n");
++			uint32_t gdscr = gpu_probe_rd("gpucc cx gdscr", cc, GPUCC_CX_GDSCR);
++			gpu_probe_wr("gpucc cx gdscr collapse", cc, GPUCC_CX_GDSCR,
++			    (gdscr | GDSC_SW_COLLAPSE) & ~(GDSC_HW_CONTROL));
++			for (int i = 0; i < 100; i++) {
++				if (!(gpu_rd_quiet(cc, GPUCC_CX_GDSCR) & GDSC_POWER_ON)) {
++					break;
++				}
++				gpu_wait_ms(1);
++			}
++			printf("SWEET GPU: cx gdscr collapsed %#x\n", gpu_rd_quiet(cc, GPUCC_CX_GDSCR));
++			gpu_probe_wr("gpucc cx gdscr release", cc, GPUCC_CX_GDSCR,
++			    gpu_rd_quiet(cc, GPUCC_CX_GDSCR) & ~(GDSC_SW_COLLAPSE));
++			for (int i = 0; i < 100; i++) {
++				if (gpu_rd_quiet(cc, GPUCC_CX_GDSCR) & GDSC_POWER_ON) {
++					break;
++				}
++				gpu_wait_ms(1);
++			}
++			printf("SWEET GPU: cx gdscr back on %#x\n", gpu_rd_quiet(cc, GPUCC_CX_GDSCR));
++			gpu_probe_wr("gmu sysreset hold", gmu, GPU_GMU_SYSRESET, 1);
++			for (int i = 0; i < 100; i++) {
++				held = gpu_rd_quiet(gmu, GPU_GMU_SYSRESET);
++				if (held == 1) {
++					break;
++				}
++				gpu_wait_ms(1);
++			}
++			printf("SWEET GPU: gmu sysreset after the block reset %#x\n", held);
++			if (held != 1) {
++				printf("SWEET GPU: still not held; loading anyway (a load into a running core is harmless)\n");
++			}
+ 		}
+ 	}
+ 	char arg[64];
