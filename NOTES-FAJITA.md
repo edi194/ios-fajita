@@ -1431,3 +1431,43 @@ value is the HFI version 1.7. Cosmetic, one line to fix when convenient.)
 iOS boots normally afterwards with the full probe: CX GDSC, clocks, firmware,
 GMU boot, SMMU context and streams, HFI INIT/FW_VER/TEST, GMU back in reset. This
 is the state to build on - `adreno=9` is the switch.
+
+### Ready for stage 5 (GX rail + SPTPRAC)
+
+Our device tree's GPU OPP levels, in order (`dtb/fajita2.dts`):
+**710, 675, 596, 520, 414, 342, 257, 0 MHz**, and `qcom,initial-pwrlevel = 6`,
+i.e. the boot level is **257 MHz** - the same level Bergamota's stage 5 votes for
+("boot OOB at 257 MHz"). The GMU levels are 0/200/500 MHz.
+
+What stage 5 needs, from Bergamota's `0103` (function names there):
+
+* `gpu_gmu_rpmh_ucode()` first - we skipped it in 0123. It reads the three ARC
+  resource addresses from the **cmd-db** (`mx.lvl`, `cx.lvl`, `gfx.lvl`; the
+  Linux constants 0x30010/0x30000/0x30080 are the fallback), programs the RSCC
+  (`RSCC_RSC_STATUS0_DRV0`, `RSCC_PDC_SLAVE_ID_DRV0`, `RSCC_HIDDEN_TCS_CMD0_*`,
+  `RSCC_PDC_SEQ_START_ADDR 0x4520`, match values 0x4510/0x4514, the five-word
+  `rsc_seq` `0xa7a506a0, 0xa1e6a6e7, 0xa2e081e1, 0xe9a982e2, 0x0020e8a8`) and the
+  PDC block at `0xb200000` (the five-word `pdc_seq`
+  `0xfebea1e1, 0xa5a4a3a2, 0x8382a6e0, 0xbce3e284, 0x002081fc`, the TCS1/TCS3
+  enable banks and the three `pdc_tcs_cmd` writes with trigger 1/2/3).
+* `gpu_rpmh_start()` - `RSCC_CONTROL_REQ = 1<<1`, poll `CONTROL_ACK` and
+  `RSCC_SEQ_BUSY_DRV0`, then clear. Their comment: a failure is logged, not fatal.
+* `gpu_gx_rail_on()` - `GMU_BOOT_SLUMBER_OPTION = OOB_BOOT_OPTION`,
+  `GMU_GX_VOTE_IDX`/`GMU_MX_VOTE_IDX` = the boot level's ARC indices, then the
+  boot OOB (`GMU_HOST2GMU_INTR_SET = 1 << (OOB_BOOT_SLUMBER + 24)`, poll
+  `GMU_GMU2HOST_INTR_INFO` for bit `OOB_CHECK`).
+* `gpu_sptprac(true)` - `GMU_GX_SPTPRAC_POWER_CONTROL = 0x778000`, poll
+  `GMU_SPTPRAC_PWR_CLK_STATUS` until `(val & 0x38) == 0x28` (off: `0x778001`
+  and bit 2). Our console54 read SPTPRAC 0xd4 with GX off, so the status register
+  is live.
+* Then the first GPU-core reads: `RBBM_STATUS`, `CP_ALWAYS_ON` - **only** while
+  the GX GDSC is on and `gx_gfx3d` runs; their doc is explicit that a read of a
+  gated core hangs the bus.
+* Slumber afterwards (`a6xx_gmu_notify_slumber`): power counter off, SPTPRAC off,
+  `GMU_BOOT_SLUMBER_OPTION = OOB_SLUMBER_OPTION`, boot OOB set/cleared,
+  `RPMH_POWER_STATE` should read the slumber value, then
+  `GMU_AO_AHB_FENCE_CTRL = 0`.
+
+The GX GDSC (gpucc `0x100c`) also needs its `core_root_clk` (the DT says
+`clocks = <&gpucc 2>` with `qcom,force-enable-root-clk`), and it has `sw-reset`
+and `domain-addr` properties - read them from the DT before writing the GDSCR.
