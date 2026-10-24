@@ -1,0 +1,78 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -841,7 +841,7 @@
+ 	gpu_ring_flush(core, gpu_cp_wptr);
+ 
+ 	bool idle = gpu_ring_wait_idle(core, "NOP submission");
+-	for (unsigned i = 0; i < 50000 && (*memwr != memval || *ts != seq); i++) {
++	for (unsigned i = 0; i < 5000 && (*memwr != memval || *ts != seq); i++) {
+ 		gpu_wait_ms(1);
+ 	}
+ 	uint32_t irq = gpu_cp_rd(core, A6XX_RBBM_INT_0_STATUS);
+@@ -866,6 +866,8 @@
+ 
+ /* ---- stage 7c: the zap shader through SCM/PAS -------------------------- */
+ 
++static bool gpu_zap_started;    /* AUTH_AND_RESET returned 0: SHUTDOWN is owed */
++
+ struct gpu_scm_regs {
+ 	uint64_t a[7];
+ };
+@@ -1079,9 +1081,23 @@
+ 		return false;
+ 	}
+ 	printf("SWEET GPU: zap authenticated and started (PAS %u quiesced into reset)\n", SCM_PAS_GPU);
++	gpu_zap_started = true;
+ 	return true;
+ }
+ 
++/* Released once the test is done: the secure world should not hold the GPU while
++ * the GMU goes back into reset. */
++static void
++gpu_zap_shutdown(void)
++{
++	if (!gpu_zap_started) {
++		return;
++	}
++	gpu_zap_started = false;
++	printf("SWEET GPU: zap shutdown (PAS %u)\n", SCM_PAS_GPU);
++	(void)gpu_scm_pas("SHUTDOWN", 6, 1, 0, 0);
++}
++
+ /* ---- stage 5: the GX rail through the GMU's OOB interface ------------- */
+ 
+ /* HOST2GMU_INTR_SET / GMU2HOST_INTR_INFO are the ones stage 4 already uses. */
+@@ -2033,19 +2049,24 @@
+ 					if (gpu_cp_hw_init(gpu) &&
+ 					    gpu_cp_start(gpu, g + GPU_CP_RING)) {
+ 						/* The zap is the only step that enters the secure
+-						 * world, so it stays behind `zap=1` until the
+-						 * ladder below it is known good. */
++						 * world, so it stays behind `zap=1`; once it has run
++						 * the CP can leave secure mode and take the NOP test,
++						 * which is the first real submission. */
+ 						int cp_zap = 0;
+ 						(void)PE_parse_boot_argn("zap", &cp_zap, sizeof(cp_zap));
+ 						if (cp_zap) {
+ 							printf("SWEET GPU: --- stage 7c: the zap shader\n");
+-							(void)gpu_zap_load(g, gmem_pa);
+-						}
+-						int cp_nop = 0;
+-						(void)PE_parse_boot_argn("cpnop", &cp_nop, sizeof(cp_nop));
+-						if (cp_nop) {
+-							printf("SWEET GPU: --- stage 7b: the first PM4 packets\n");
+-							(void)gpu_cp_nop_test(gpu, g);
++							if (gpu_zap_load(g, gmem_pa)) {
++								printf("SWEET GPU: --- stage 7d: out of secure mode, the first submission\n");
++								gpu_ring_emit(g + GPU_CP_RING,
++								    gpu_pkt7(GPU_CP_SET_SECURE_MODE, 1));
++								gpu_ring_emit(g + GPU_CP_RING, 0);
++								gpu_ring_flush(gpu, gpu_cp_wptr);
++								if (gpu_ring_wait_idle(gpu, "CP_SET_SECURE_MODE 0")) {
++									(void)gpu_cp_nop_test(gpu, g);
++								}
++								gpu_zap_shutdown();
++							}
+ 						}
+ 					} else {
+ 						printf("SWEET GPU: CP bring-up stopped before the NOP test\n");
