@@ -1,0 +1,87 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -68,6 +68,13 @@
+ }
+ 
+ /* A read that does not announce itself: for groups that are flushed once. */
++static void
++gpu_wr_quiet(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dmb oshst" ::: "memory");
++}
++
+ static uint32_t
+ gpu_rd_quiet(vm_offset_t base, uint32_t off)
+ {
+@@ -158,6 +165,11 @@
+ #define GPU_GMU_PWR_COL_INTER_FRAME 0x14300u /* 0x50c0: 0x9c40400 in a6xx_gmu_power_config */
+ #define GPU_GMU_VA_HFI        0x60100000u   /* KGSL's GPU address for the HFI table */
+ #define GPU_GMU_VA_LOG        0x60300000u   /* ... and for the log */
++
++/* stage 3e: qsmmuv2_device_reset - the SMMU's own impl-defs, from the DT */
++#define GPU_SMMU_MICRO_MMU_CTRL 0x6000u
++#define GPU_SMMU_MICRO_HALT     (1u << 2)
++#define GPU_SMMU_MICRO_IDLE     (1u << 3)
+ #define GPU_GMU_HFI_SFR       0x14608u      /* 0x5182: which GPU this is */
+ #define GPU_GMU_HFI_QTBL_INFO 0x14610u      /* 0x5184 */
+ #define GPU_GMU_HFI_QTBL_ADDR 0x14614u      /* 0x5185: the HFI table, 32 bits */
+@@ -569,5 +581,58 @@
+ 		extern void sweet_log_panic_flush(void);
+ 		sweet_log_panic_flush();
+ 	}
++	if (level < 9) {
++		return;
++	}
++
++	/* ---- stage 3e: the SMMU's impl-defs, then a no-op SMR/S2CR write ------- */
++	printf("SWEET GPU: --- stage 3e: smmu impl-defs\n");
++	if (smmu == 0) {
++		printf("SWEET GPU: no SMMU mapping\n");
++		return;
++	}
++	{
++		/* dtb/fajita2.dts: qcom,kgsl-iommu attach-impl-defs */
++		static const uint32_t impl_defs[][2] = {
++			{ 0x6000, 0x2378 }, { 0x6060, 0x1055 }, { 0x678c, 0x8 }, { 0x6794, 0x28 },
++			{ 0x6800, 0x6 }, { 0x6900, 0x3ff }, { 0x6924, 0x204 }, { 0x6928, 0x11000 },
++			{ 0x6930, 0x800 }, { 0x6960, 0xffffffff }, { 0x6b64, 0x1a5551 },
++			{ 0x6b68, 0x9a82a382 },
++		};
++		uint32_t ctrl = gpu_rd_quiet(smmu, GPU_SMMU_MICRO_MMU_CTRL);
++		printf("SWEET GPU: smmu micro-mmu ctrl %#x, halting\n", ctrl);
++		gpu_wr_quiet(smmu, GPU_SMMU_MICRO_MMU_CTRL, ctrl | GPU_SMMU_MICRO_HALT);
++		bool idle = false;
++		for (int i = 0; i < 300; i++) {
++			if (gpu_rd_quiet(smmu, GPU_SMMU_MICRO_MMU_CTRL) & GPU_SMMU_MICRO_IDLE) {
++				idle = true;
++				break;
++			}
++			gpu_wait_ms(1);
++		}
++		printf("SWEET GPU: smmu micro-mmu idle=%d ctrl %#x\n", idle,
++		    gpu_rd_quiet(smmu, GPU_SMMU_MICRO_MMU_CTRL));
++		for (unsigned i = 0; i < sizeof(impl_defs) / sizeof(impl_defs[0]); i++) {
++			gpu_wr_quiet(smmu, impl_defs[i][0], impl_defs[i][1]);
++		}
++		gpu_wr_quiet(smmu, GPU_SMMU_MICRO_MMU_CTRL,
++		    gpu_rd_quiet(smmu, GPU_SMMU_MICRO_MMU_CTRL) & ~GPU_SMMU_MICRO_HALT);
++		__asm__ volatile("dmb oshst" ::: "memory");
++		printf("SWEET GPU: smmu resumed: ctrl %#x scr0 %#x\n",
++		    gpu_rd_quiet(smmu, GPU_SMMU_MICRO_MMU_CTRL), gpu_rd_quiet(smmu, GPU_SMMU_SCR0));
++	}
++
++	/* A no-op write: the values SMR0/S2CR0 already hold. If they read back the
++	 * same, the stream table takes writes now. */
++	uint32_t smr0 = gpu_rd_quiet(smmu, GPU_SMMU_SMR(0));
++	uint32_t s2cr0 = gpu_rd_quiet(smmu, GPU_SMMU_S2CR(0));
++	printf("SWEET GPU: smmu smr0 %#x s2cr0 %#x before\n", smr0, s2cr0);
++	gpu_wr_quiet(smmu, GPU_SMMU_S2CR(0), s2cr0);
++	gpu_wr_quiet(smmu, GPU_SMMU_SMR(0), smr0);
++	__asm__ volatile("dmb oshst" ::: "memory");
++	printf("SWEET GPU: smmu smr0 %#x s2cr0 %#x after, sgfsr %#x\n",
++	    gpu_rd_quiet(smmu, GPU_SMMU_SMR(0)), gpu_rd_quiet(smmu, GPU_SMMU_S2CR(0)),
++	    gpu_rd_quiet(smmu, GPU_SMMU_SGFSR));
++	printf("SWEET GPU: stage 3e done\n");
+ }
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
