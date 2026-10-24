@@ -1,0 +1,30 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -253,6 +253,9 @@
+ #define GPU_GMU_RSCC_ACK      0x24c20u   /* 0x9308 */
+ #define GPU_GMU_GX_SPTPRAC_POWER 0x204u  /* 0x0081 */
+ #define GPU_GMU_RPMH_POWER_STATE 0x143b0u /* 0x50ec */
++#define GPU_GMU_AO_COUNTER_L  0x14220u   /* 0x5088: counts the 19.2 MHz crystal */
++#define GPU_CORE_RBBM_STATUS  0x840u     /* a6xx 0x0210 off the GPU base */
++#define GPU_CORE_CP_STATUS_1  0x20d4u    /* a6xx 0x0825 */
+ #define GPU_GMU_SPTPRAC_STATUS 0x14340u  /* 0x50d0 */
+ #define GPU_GMU_BOOT_SLUMBER  0x8fe0u   /* 0x23f8 */
+ #define GPU_GMU_GX_VOTE_IDX   0x8fe4u   /* 0x23f9 */
+@@ -1383,6 +1386,17 @@
+ 					printf("SWEET GPU: gx gdscr %#x -> %#x -> %s\n", gx, now,
+ 					    (now & GDSC_POWER_ON) ? "GX ON" : "GX STILL OFF");
+ 				}
++
++				/* The core, at last: reads are safe only with GX powered. */
++				if (gpu_rd_quiet(cc, GPUCC_GX_GDSCR) & GDSC_POWER_ON) {
++					uint32_t c0 = gpu_rd_quiet(gmu, GPU_GMU_AO_COUNTER_L);
++					uint32_t rbbm = gpu_probe_rd("gpu core rbbm status", gpu, GPU_CORE_RBBM_STATUS);
++					uint32_t cp1 = gpu_probe_rd("gpu core cp status1", gpu, GPU_CORE_CP_STATUS_1);
++					gpu_wait_ms(2);
++					uint32_t c1 = gpu_rd_quiet(gmu, GPU_GMU_AO_COUNTER_L);
++					printf("SWEET GPU: GPU ANSWERS: rbbm_status %#x, cp_status1 %#x, GMU counter %#x -> %#x (%s)\n",
++					    rbbm, cp1, c0, c1, c0 != c1 ? "ticking" : "still");
++				}
+ 			}
+ 		}
+ 	}
