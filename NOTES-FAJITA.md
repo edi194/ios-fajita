@@ -1857,3 +1857,57 @@ and CP_INTERRUPT_STATUS stay 0 throughout, so nothing was rejected.
 
 Optional cleanup on the way: flip the default so the ladder runs without `zap=1`,
 add CP_PROTECT, interrupts/fences for real waits, and per-process page tables.
+
+### console77: the GPU stays up (stage 8 keep-alive, 2026-10-24)
+
+```
+cp after NOP: cp_status1 0x1000000 hw_fault 0 irq 0 rptr 22
+CP NOP TEST PASSED: the CP fetched, executed and wrote back through the GPU SMMU
+cp fill test: 0 of 64 words differ (ok)
+GPU KEPT UP: GMU live, OOB gpu held, zap authenticated, ring live at wptr 278
+stage 8: GPU kept up, slumber and GMU reset skipped
+```
+
+The 256-byte fill (64 CP_MEM_WRITEs) landed word for word, and the GPU has now
+survived a whole iOS boot powered, with the GMU live, OOB_GPU held, the zap
+unauthenticated-not and the ring at wptr 278. iOS runs normally (446 processes,
+SpringBoard and backboardd up) and there is no fault, no timeout and no drain
+failure anywhere in the log. The keep-alive is an early `return` before the slumber
+block: one place, so the three teardown steps (SPTPRAC off, slumber, GMU reset)
+cannot drift apart.
+
+`console77-nohold.img` (same kernel, `zap=1` only) is the control: it still hands the
+rail back like stage 7.
+
+### Stage 8 remaining: buffers, submission and the msm-shaped ABI
+
+Bergamota's kernel half (their 0181) is the reference and it is a *specification*, so
+copy its shape rather than inventing one:
+
+- GPU VA space: 32 bit for clients, `0x80000000`-`0xfffff000`, first-fit, one guard
+  page; the CP's own buffers stay below it (ring `0x40000000`, SQE `0x40010000`,
+  scratch `0x40020000`, all in context bank 1). Page tables from a pool of
+  non-cacheable pages, `TLBIALL` + sync after unmap.
+- One ring, one fence sequence: submit = 2 CCU invalidate events, one
+  `CP_INDIRECT_BUFFER` per IB, and `CP_EVENT_WRITE CACHE_FLUSH_TS` writing the
+  sequence number to scratch+0x200 as the tail (Linux `a6xx_submit`).
+- IOKit: service `SweetAdreno630`, selector = `0x40 + DRM_MSM_*`, msm uapi structs
+  passed straight through, so a libdrm stand-in forwards `drmIoctl` 1:1. BOs are
+  always write-combined and always resident, mapped with
+  `kIOMapWriteCombineCache`; `SURFACE_BO` enters an IOSurface's pages (that is the
+  drawable path) and `BO_SYNC` does `dc civac`.
+
+**Warning worth carrying forward:** their own notes say stage 8 passed but "user
+submissions never ran". So the ABI above is designed, not proven, and the first
+userspace submission is unexplored territory on this SoC family.
+
+Suggested order for us, one boot per step:
+
+1. kernel-side dynamic buffers: a page-table pool + first-fit VA allocator, prove it
+   by mapping a fresh page at `0x80000000` and writing to it with `CP_MEM_WRITE`;
+2. submission with an `CP_INDIRECT_BUFFER` (needs the correct packet encoding - check
+   freedreno's `fd_pkt7` before guessing) and a `CACHE_FLUSH_TS` fence into
+   scratch+0x200, i.e. the ring used as a ring;
+3. a sysctl-triggered kernel test that does 1 + 2 from a thread while iOS runs (the
+   GPU is kept up, so no reboot is needed to submit again);
+4. only then the IOKit user client and the msm ABI.
