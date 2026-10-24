@@ -22,7 +22,20 @@
  /* stage 8e: the device node and its ABI (selector numbers as in Linux msm) */
  /* The group letter and the numbers, following msm where they exist. The command
   * words are built with _IOWR below, once the struct sizes are known. */
-@@ -1335,6 +1350,188 @@
+@@ -442,6 +457,12 @@
+ static uint64_t gpu_arena_pa;
+ static uint32_t gpu_arena_size;
+ static uint32_t gpu_arena_used;
++
++/* State the driver needs after the bring-up function returns. */
++static vm_offset_t gpu_blob;
++static vm_offset_t gpu_core;
++static bool gpu_live;
++static uint32_t gpu_last_fence;
+ static vm_offset_t gpu_pt_blob;      /* where the page tables live */
+ 
+ static bool
+@@ -1335,13 +1356,191 @@
  	return ok;
  }
  
@@ -210,8 +223,16 @@
 +
  /* ---- stage 8e: the ABI the device node exposes ------------------------- */
  
- /* State the driver needs after the bring-up function returns. */
-@@ -1695,8 +1892,33 @@
+-/* State the driver needs after the bring-up function returns. */
+-static vm_offset_t gpu_blob;
+-static vm_offset_t gpu_core;
+-static bool gpu_live;
+-static uint32_t gpu_last_fence;
++/* the driver state the ladder and the 8f surface share */
+ 
+ static struct gpu_bo *
+ gpu_bo_by_handle(uint32_t handle)
+@@ -1695,8 +1894,33 @@
  	printf("SWEET GPU: abi test: SELECT ok %s, unknown handle refused, read/write armed\n",
  	    sel_ok ? "yes" : "NO");
  
