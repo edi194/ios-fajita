@@ -64,9 +64,18 @@ done
 # A second blob: 64 KiB of zeroes, the memory the GMU reaches through the GPU
 # SMMU (page tables, dummy, HFI, dump, log). Nothing of it is committed.
 GMEM_BLOB=${GMEM_BLOB:-$HOME/gpu-fw/gmem.bin}
-if [[ ! -f "$GMEM_BLOB" || $(stat -c%s "$GMEM_BLOB" 2>/dev/null || echo 0) -lt 147456 ]]; then
-	mkdir -p "$(dirname "$GMEM_BLOB")"
-	dd if=/dev/zero of="$GMEM_BLOB" bs=1024 count=144 status=none
+SQE_FW=${SQE_FW:-$HOME/gpu-fw/a630_sqe.fw}
+# 148 KiB, rebuilt every time so it cannot go stale: the GMU's 64 KiB at +0, then
+# the CP block (L1 +0x10000, L2 +0x11000, L3 +0x12000, ring +0x14000, SQE +0x1c000,
+# scratch +0x24000).
+mkdir -p "$(dirname "$GMEM_BLOB")"
+dd if=/dev/zero of="$GMEM_BLOB" bs=1024 count=148 status=none
+# The SQE microcode, without its four-byte header (Linux loads from byte 4).
+if [[ -f "$SQE_FW" ]]; then
+	tail -c +5 "$SQE_FW" | dd of="$GMEM_BLOB" bs=1024 seek=112 conv=notrunc status=none
+	echo "gmem: $(stat -c%s "$SQE_FW") bytes of sqe microcode at +0x1c000"
+else
+	echo "gmem: WARNING no $SQE_FW - the CP will not be able to fetch" >&2
 fi
 BLOB_ARGS+=(--blob "$GMEM_BLOB")
 python3 tools/mkpayload.py "$XNU_KERNEL" "$ADT" "$PAYLOAD" --cmdline "$CMDLINE" "${BLOB_ARGS[@]}"

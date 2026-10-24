@@ -1,0 +1,214 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -261,7 +261,7 @@
+ #define GPU_CORE_CP_STATUS_1  0x20d4u    /* a6xx 0x0825 */
+ 
+ /* stage 7: the CP's memory, carved out of the blob after the GMU's 64 KiB */
+-#define GPU_BLOB_BYTES        0x24000u
++#define GPU_BLOB_BYTES        0x25000u
+ #define GPU_CP_BASE           0x10000u   /* offset inside the blob */
+ #define GPU_CP_L1             (GPU_CP_BASE + 0x0000u)
+ #define GPU_CP_L2             (GPU_CP_BASE + 0x1000u)
+@@ -315,6 +315,19 @@
+ #define A6XX_HLSQ_ADDR_MODE_CNTL 0xbe05u
+ #define A6XX_VBIF_GATE_OFF_WRREQ_EN 0x302au
+ #define CP_RB_CNTL_VALUE       ((1u << 27) | (2u << 8) | 12u)
++/* stage 7b: PM4 opcodes and the interrupt registers the submission touches */
++#define GPU_CP_NOP             16u
++#define GPU_CP_ME_INIT         72u
++#define GPU_CP_MEM_WRITE       61u
++#define GPU_CP_EVENT_WRITE     70u
++#define GPU_CP_SET_SECURE_MODE 102u
++#define GPU_CP_CACHE_FLUSH_TS  4u
++#define GPU_CP_EVENT_WRITE_IRQ 0x80000000u
++#define A6XX_RBBM_INT_0_STATUS  0x0201u
++#define A6XX_RBBM_INT_CLEAR_CMD 0x0037u
++#define A6XX_CP_PROTECT_STATUS  0x0824u
++#define GPU_CP_SCRATCH_MEMWR   0x100u   /* the value CP_MEM_WRITE leaves behind */
++#define GPU_CP_SCRATCH_TS      0x110u   /* CACHE_FLUSH_TS writes the sequence here */
+ #define GPU_GMU_SPTPRAC_STATUS 0x14340u  /* 0x50d0 */
+ #define GPU_GMU_BOOT_SLUMBER  0x8fe0u   /* 0x23f8 */
+ #define GPU_GMU_GX_VOTE_IDX   0x8fe4u   /* 0x23f9 */
+@@ -698,6 +711,135 @@
+ 	return true;
+ }
+ 
++/* ---- stage 7b: the ring, CP_ME_INIT and the first PM4 packets ---------- */
++
++static unsigned gpu_cp_wptr;            /* dwords written into the ring */
++
++/* PM4 type 7 carries a parity bit for the count and one for the opcode, so the
++ * CP can reject a packet that was mangled on its way through the ring. */
++static uint32_t
++gpu_pm4_parity(uint32_t v)
++{
++	return (0x9669u >> (0xfu & (v ^ (v >> 4) ^ (v >> 8) ^ (v >> 12) ^
++	    (v >> 16) ^ (v >> 20) ^ (v >> 24) ^ (v >> 28)))) & 1u;
++}
++
++static uint32_t
++gpu_pkt7(unsigned opcode, unsigned cnt)
++{
++	return 0x70000000u | cnt | (gpu_pm4_parity(cnt) << 15) |
++	    ((opcode & 0x7fu) << 16) | (gpu_pm4_parity(opcode) << 23);
++}
++
++static void
++gpu_ring_emit(vm_offset_t ring, uint32_t v)
++{
++	*(volatile uint32_t *)(ring + 4u * gpu_cp_wptr) = v;
++	gpu_cp_wptr = (gpu_cp_wptr + 1) % (GPU_CP_RING_BYTES / 4);
++}
++
++/* a6xx_flush: make the packets visible to the GPU, then move WPTR. */
++static void
++gpu_ring_flush(vm_offset_t core, unsigned wptr)
++{
++	__asm__ volatile("dsb sy" ::: "memory");
++	gpu_cp_wr(core, A6XX_CP_RB_WPTR, wptr);
++}
++
++static bool
++gpu_ring_wait_idle(vm_offset_t core, const char *what)
++{
++	for (unsigned i = 0; i < 100000; i++) {
++		if (gpu_cp_rd(core, A6XX_CP_RB_RPTR) == gpu_cp_wptr) {
++			printf("SWEET GPU: cp %s: ring idle (RPTR=WPTR=%u) rbbm_status %#x\n",
++			    what, gpu_cp_wptr, gpu_cp_rd(core, A6XX_RBBM_STATUS));
++			return true;
++		}
++		gpu_wait_ms(1);
++	}
++	printf("SWEET GPU: cp %s: ring did NOT drain: rptr %u wptr %u rbbm_status %#x "
++	    "cp_status1 %#x hw_fault %#x irq %#x protect %#x rbbm_irq %#x\n",
++	    what, gpu_cp_rd(core, A6XX_CP_RB_RPTR), gpu_cp_wptr,
++	    gpu_cp_rd(core, A6XX_RBBM_STATUS), gpu_cp_rd(core, A6XX_CP_STATUS_1),
++	    gpu_cp_rd(core, A6XX_CP_HW_FAULT), gpu_cp_rd(core, A6XX_CP_INTERRUPT_STATUS),
++	    gpu_cp_rd(core, A6XX_CP_PROTECT_STATUS), gpu_cp_rd(core, A6XX_RBBM_INT_0_STATUS));
++	return false;
++}
++
++/* a6xx_cp_init: enable the SQE (this starts the engine) and let it configure the
++ * ME. Completion is polled because RBBM_INT_0_MASK stays 0 - no interrupts. */
++static bool
++gpu_cp_start(vm_offset_t core, vm_offset_t ring)
++{
++	gpu_cp_wptr = 0;
++	gpu_cp_wr(core, A6XX_CP_SQE_CNTL, 1);
++	printf("SWEET GPU: cp: SQE enabled, cp_status1 %#x\n", gpu_cp_rd(core, A6XX_CP_STATUS_1));
++
++	gpu_ring_emit(ring, gpu_pkt7(GPU_CP_ME_INIT, 8));
++	gpu_ring_emit(ring, 0x0000002fu);
++	gpu_ring_emit(ring, 0x00000003u);     /* multiple hardware contexts */
++	gpu_ring_emit(ring, 0x20000000u);     /* error detection */
++	gpu_ring_emit(ring, 0);
++	gpu_ring_emit(ring, 0);
++	gpu_ring_emit(ring, 0);
++	gpu_ring_emit(ring, 0);
++	gpu_ring_emit(ring, 0);
++	gpu_ring_flush(core, gpu_cp_wptr);
++
++	return gpu_ring_wait_idle(core, "CP_ME_INIT");
++}
++
++/* The first packets this kernel would ever submit: a NOP, a write into the
++ * scratch page and the timestamp the CP stores when the write retires. */
++static bool
++gpu_cp_nop_test(vm_offset_t core, vm_offset_t blob)
++{
++	vm_offset_t ring = blob + GPU_CP_RING;
++	volatile uint32_t *memwr = (volatile uint32_t *)(blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_MEMWR);
++	volatile uint32_t *ts = (volatile uint32_t *)(blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_TS);
++	const uint32_t memval = 0x5ee70001u, seq = 0x600d0001u;
++
++	*memwr = 0;
++	*ts = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	gpu_ring_emit(ring, gpu_pkt7(GPU_CP_NOP, 1));
++	gpu_ring_emit(ring, 0);
++	gpu_ring_emit(ring, gpu_pkt7(GPU_CP_MEM_WRITE, 3));
++	gpu_ring_emit(ring, (uint32_t)(GPU_VA_CP_SCRATCH + GPU_CP_SCRATCH_MEMWR));
++	gpu_ring_emit(ring, 0);
++	gpu_ring_emit(ring, memval);
++	gpu_ring_emit(ring, gpu_pkt7(GPU_CP_EVENT_WRITE, 4));
++	gpu_ring_emit(ring, GPU_CP_EVENT_WRITE_IRQ | GPU_CP_CACHE_FLUSH_TS);
++	gpu_ring_emit(ring, (uint32_t)(GPU_VA_CP_SCRATCH + GPU_CP_SCRATCH_TS));
++	gpu_ring_emit(ring, 0);
++	gpu_ring_emit(ring, seq);
++	gpu_ring_flush(core, gpu_cp_wptr);
++
++	bool idle = gpu_ring_wait_idle(core, "NOP submission");
++	for (unsigned i = 0; i < 50000 && (*memwr != memval || *ts != seq); i++) {
++		gpu_wait_ms(1);
++	}
++	uint32_t irq = gpu_cp_rd(core, A6XX_RBBM_INT_0_STATUS);
++	printf("SWEET GPU: cp NOP test: mem_write %#x (want %#x), cache_flush_ts %#x "
++	    "(want %#x), rbbm_int_0_status %#x\n", *memwr, memval, *ts, seq, irq);
++	if (irq) {
++		gpu_cp_wr(core, A6XX_RBBM_INT_CLEAR_CMD, irq & 0x00ffffffu);
++	}
++	printf("SWEET GPU: cp after NOP: cp_status1 %#x hw_fault %#x irq %#x rptr %u\n",
++	    gpu_cp_rd(core, A6XX_CP_STATUS_1), gpu_cp_rd(core, A6XX_CP_HW_FAULT),
++	    gpu_cp_rd(core, A6XX_CP_INTERRUPT_STATUS), gpu_cp_rd(core, A6XX_CP_RB_RPTR));
++
++	if (idle && *memwr == memval && *ts == seq) {
++		printf("SWEET GPU: CP NOP TEST PASSED: the CP fetched, executed and wrote back "
++		    "through the GPU SMMU\n");
++		return true;
++	}
++	printf("SWEET GPU: CP NOP TEST FAILED (%s)\n",
++	    !idle ? "the ring did not drain" : "the ring drained but the memory was not updated");
++	return false;
++}
++
+ /* ---- stage 5: the GX rail through the GMU's OOB interface ------------- */
+ 
+ /* HOST2GMU_INTR_SET / GMU2HOST_INTR_INFO are the ones stage 4 already uses. */
+@@ -1244,7 +1386,12 @@
+ 		return;
+ 	}
+ 	printf("SWEET GPU: gmu memory at %#llx -> %#llx\n", (unsigned long long)gmem_pa, (uint64_t)g);
++	/* Everything but the SQE's microcode, which the build packs into the blob
++	 * at GPU_CP_SQE: the CP fetches from that window and it must survive. */
+ 	for (uint32_t off = 0; off < GPU_BLOB_BYTES; off += 4) {
++		if (off >= GPU_CP_SQE && off < GPU_CP_SQE + GPU_CP_SQE_BYTES) {
++			continue;
++		}
+ 		*(volatile uint32_t *)(g + off) = 0;
+ 	}
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+@@ -1295,6 +1442,14 @@
+ 		}
+ 		l3cp[(GPU_VA_CP_SCRATCH >> 12) & 0x1ff] =
+ 		    (uint64_t)(gmem_pa + GPU_CP_SCRATCH) | GPU_PTE_PAGE;
++
++		/* a630_sqe.fw reached the blob? Its first word is the microcode's own. */
++		uint32_t s0 = *(volatile uint32_t *)(g + GPU_CP_SQE);
++		uint32_t s1 = *(volatile uint32_t *)(g + GPU_CP_SQE + 4);
++		uint32_t s2 = *(volatile uint32_t *)(g + GPU_CP_SQE + 8);
++		printf("SWEET GPU: sqe microcode at +%#x: %#x %#x %#x %s\n",
++		    GPU_CP_SQE, s0, s1, s2,
++		    (s0 == 0 && s1 == 0) ? "(MISSING - the CP cannot fetch)" : "(loaded)");
+ 		__asm__ volatile("dsb sy" ::: "memory");
+ 		printf("SWEET GPU: cp memory: ring %#x (%u KiB) sqe %#x (%u KiB, read-only) scratch %#x; l2[%u]=%#llx l3[%u]=%#llx\n",
+ 		    GPU_VA_CP_RING, GPU_CP_RING_BYTES / 1024, GPU_VA_CP_SQE, GPU_CP_SQE_BYTES / 1024,
+@@ -1629,7 +1784,17 @@
+ 
+ 					/* ---- stage 7a: the CP's hardware initialisation ---- */
+ 					printf("SWEET GPU: --- stage 7a: cp hw_init\n");
+-					(void)gpu_cp_hw_init(gpu);
++					if (gpu_cp_hw_init(gpu) &&
++					    gpu_cp_start(gpu, g + GPU_CP_RING)) {
++						int cp_nop = 0;
++						(void)PE_parse_boot_argn("cpnop", &cp_nop, sizeof(cp_nop));
++						if (cp_nop) {
++							printf("SWEET GPU: --- stage 7b: the first PM4 packets\n");
++							(void)gpu_cp_nop_test(gpu, g);
++						}
++					} else {
++						printf("SWEET GPU: CP bring-up stopped before the NOP test\n");
++					}
+ 
+ 					/* a6xx_gmu_notify_slumber: give the rail back. */
+ 					gpu_probe_wr("gmu power counter off", gmu, GPU_GMU_POWER_COUNTER, 0);
