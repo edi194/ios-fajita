@@ -1926,3 +1926,51 @@ page, and the CP wrote to it. That is the walk every client buffer will take; th
 pages come from the blob only until buffers have to be handed to userspace.
 
 The blob is 208 KiB now: L2 +0x28000, L3 +0x29000, eight data pages +0x2a000.
+
+### console79: a submission as a buffer plus a fence (2026-10-24)
+
+```
+cp ib test: 12 dwords at 0x80001000, ring drained, fence 1 retired,
+            writes 0x1b000001 0x1b000002 (want 0x1b000001 0x1b000002)
+cp ib test: PASSED - a command buffer plus a fence, the shape userspace will use
+```
+
+CP_INDIRECT_BUFFER_PFE (0x3f, `addr_lo`, `addr_hi`, `dwordCount`) fetches commands
+from a buffer in the client address range, and the tail CACHE_FLUSH_TS carrying a
+sequence number works as a fence. This is Linux's a6xx_submit tail; from here the
+submission path is "a buffer plus a fence", and the IOKit layer only has to hand us
+the buffers.
+
+### CORRECTION: which acceleration path is real on iOS 16.7.16
+
+The note above about HackiOS's EAGLContext swap is not the route for this system.
+From `berg-GPU_PHASE0_DISCOVERY.md` (static analysis of OUR 16.7.16 binaries):
+
+- QuartzCore has four backends: `MetalContext`, `GLESContext`, `SWContext`,
+  `NullContext`. Metal is tried first and **GLES on iOS 16 is Metal-backed**, so
+  replacing EAGLContext (HackiOS's approach, aimed at older iOS) cannot accelerate
+  CoreAnimation here. What we run today is `SWContext` - the CPU path.
+- A smooth UI therefore needs a **real Metal device**: an `IOAcceleratorES` service
+  carrying the `MetalPluginName` property, whose bundle's principal class subclasses
+  `_MTLDevice`, discovered by `_MTLRegisterDevices` (`0x181b144c8`) via
+  `_getMetalPluginClassForService` (`0x181a3c7c8`). Returning nil from
+  `-initWithAcceleratorPort:` is a clean "no GPU", so a stub can log how far Metal
+  gets without breaking anything.
+- That is what Bergamota set out to build ("phase C and D of METAL_ADRENO630.md");
+  their kernel side is "built and compile-checked, never run on the phone", and their
+  own summary says stage 8 passed but **user submissions never ran**.
+
+The hard wall on that path is shaders: CA's pipelines live in AGXMetalA11.bundle as
+already-compiled AGX machine code, which a630 cannot run. Either AIR/metallib is
+translated to a6xx ISA (a compiler backend) or CA's specific pipelines are hand
+written and mapped by name. Lower bound for "smooth SpringBoard" is therefore months
+with real uncertainty, and it is a different project from finishing this ladder.
+
+### Order agreed with the user: finish stage 8, then the Metal probe
+
+1. **BO layer, kernel-internal and testable in the log**: allocate contiguous pages,
+   map them into client VA, submit a command buffer that references them, fence and
+   free. This is what the IOKit layer will call into, and it needs no userspace.
+2. Then the IOKit user client + msm ABI (thin once the BO layer exists).
+3. Then the Metal probe (stub device that logs selectors) to measure how far
+   CoreAnimation gets before the first shader.
