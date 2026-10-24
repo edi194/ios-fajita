@@ -1300,3 +1300,48 @@ and our probe should put it back into reset when it is done.
   write index, bump `QH_WRITE_INDEX`, then `HOST2GMU_INTR_SET = 1`; receive =
   poll `GMU2HOST_INTR_INFO & 1`, clear it, read the MSG queue; ACK is
   `MSG_TYPE == 2`, `ack[2]` must be 0.
+
+### *** GMU runs AND the SMMU is programmable (console59, adreno=9, 2026-10-24) ***
+
+```
+stage 2a: cx_gdscr 0xf8222000 -> ON
+stage 3a: gmu sysreset = 0x1, firmware 0 of 3 words differ
+stage 3d: fw_init 0xbabeface (THE GMU FIRMWARE RUNS)
+stage 3e: smmu micro-mmu ctrl 0x2378 -> halt (0x237c, idle=1) -> resume
+          smmu smr0 0x80000005 after writing 0x80000005: EXACT SMR STICKS
+          (the stream table is writable), sgfsr 0
+          gmu sysreset at the end 0x1
+```
+
+SpringBoard runs afterwards. `adreno=9` is the level: 2a power, 2b/2c clocks,
+3a firmware, 3d GMU boot, 3e SMMU impl-defs + stream-table test, and the GMU put
+back into reset at the end.
+
+**Two bugs of ours were hiding all of this** (both found from console58's photo):
+
+1. 0115's "leave the block alone" gate was `if (level >= 8)`, so every
+   `adreno=9` boot from console55 to console58 skipped stages 2a-2c and ran with
+   the **GPU block unpowered**. That is why SYSRESET and SPTPRAC read 0, why S2CR
+   writes looked "dropped", why the micro-MMU read a stale 0x2378 and why 0128's
+   GDSC fallback fired. None of those runs said anything about the SMMU. Fixed in
+   0129 (`level == 8`).
+2. The stream-table test wrote S2CR alone. An S2CR entry is only honoured once the
+   SMR beside it is VALID (their 0084/0085: exact SMRs stick, masked ones read
+   back 0). 0127 writes the pair.
+
+So: **exact SMRs stick, the SMMU takes programming, and the GMU boots
+repeatably** - the two blockers of the last few hours were ours, not the
+hardware's.
+
+### Next: stage 4 (the HFI handshake)
+
+Everything needed is in the recipe above (see "Their stage 4 recipe"): a 64 KiB
+physically contiguous block switched to `VM_WIMG_WCOMB` (`kmem_alloc_contig` +
+`pmap_find_phys` + `pmap_set_cache_attributes`; **never `ml_io_map` on managed
+RAM**), L1/L2/L3A/L3B 4 KiB tables, `TCR = (2<<12)|(1<<23)|32`,
+`MAIR0 = 0x0004ff44`, `SCTLR = 0x00c01067`, `CBAR = (1<<16)|(3<<8)|(0xf<<12)`,
+`CBA2R = 1`, SMR0 = VALID|5 (gmu_kernel), SMR1 = VALID|4 (gmu_user), S2CR =
+`(3<<8)|cb`, `TLBIALLNSNH` + `sTLBGSYNC`, then the 4-queue HFI table at
+`0x60100000`, `HFI_CTRL_INIT = 1`, poll `HFI_CTRL_STATUS == 1`, reject
+`HFI_VERSION_INFO >> 28 >= 2`, then `H2F_MSG_INIT` (dump VA 0x60200000, size
+0x4000, GMU_COLD_BOOT), `FW_VER` (wants 1.10), `PERF_TBL`, `BW_VOTE_TBL`, `TEST`.
