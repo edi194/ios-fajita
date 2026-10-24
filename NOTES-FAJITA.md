@@ -1534,3 +1534,28 @@ if the core later refuses to answer.
   `GMU_AO_AHB_FENCE_CTRL = 0`.
 * After that: the CP (ring + SQE in a second SMMU context for SID 0, the zap
   through SCM PAS 13, a NOP + `CACHE_FLUSH_TS` test).
+
+### console68: GX is ON - stage 5 complete (2026-10-24)
+
+```
+OOB boot_slumber: acknowledged (INTR_INFO 0x40000000, RPMH_POWER_STATE 0xf, SPTPRAC 0x28)
+SPTPRAC power on: ok (status 0x28)
+gpucc gx gdscr +0x100c = 0xf8222000
+gx gdscr already on 0xf8222000
+```
+
+The GX GDSC came up **by itself** once the rail was voted and SPTPRAC was on: by
+the time we read it, POWER_ON (bit 31) was already set, so 0138 never had to
+clear SW_COLLAPSE. That is the vendor's behaviour too ("force-enable-root-clk" and
+the domain following SPTPRAC).
+
+So the whole ladder up to a powered 3D core works on this phone:
+CX GDSC + clocks -> cmd-db/PDC/RSC -> firmware -> GMU boot -> SMMU context +
+streams -> HFI v1 (INIT/FW_VER 1.7/TEST) -> GX rail (ARC 3, 257 MHz) -> SPTPRAC ->
+**GX ON**, with the GMU put back into reset and iOS booting normally afterwards.
+
+The next step is the one that finally reads the GPU as a processor: `RBBM_STATUS`
+and `CP_ALWAYS_ON` while GX stays on (Bergamota's stage 5 tail reads them, then
+slumbers with `gpu_gx_slumber`: power counter off, SPTPRAC off,
+`BOOT_SLUMBER_OPTION = 1`, OOB set/clear, `RPMH_POWER_STATE == 0xf`,
+`AO_AHB_FENCE_CTRL = 0`).
