@@ -1974,3 +1974,26 @@ with real uncertainty, and it is a different project from finishing this ladder.
 2. Then the IOKit user client + msm ABI (thin once the BO layer exists).
 3. Then the Metal probe (stub device that logs selectors) to measure how far
    CoreAnimation gets before the first shader.
+
+### console80: kmem_alloc_contig is unsafe for GPU memory on this port
+
+```
+panic(cpu 1): phys_to_kv_range: illegal PA: 0x52a0000,
+  phys base 0x80000000, size 0x17c7a0000 @arm_vm_init.c:406
+```
+
+The buffer layer's `kmem_alloc_contig` handed back a page **below `gPhysBase`**, and
+`pmap_set_cache_attributes` died in `pa_valid()` -> `phys_to_kv_range`, which panics
+rather than returning false. This port evidently keeps pages below `gPhysBase` on its
+free lists, and the allocator can only reject pages by testing
+`(pfn & pnum_mask) == 0` (vm_resident.c:835) - there is no way to demand
+"pfn >= 0x80000". So it cannot be made safe by arguments; `sweet_ufs`'s DMA
+allocation works only because it happened to get a good page.
+
+Hence 0153: buffers come from a 1 MiB payload blob (`sweetfw2`), reached uncached
+through `ml_io_map` - the same memory the GMU firmware, the ring, the SQE and the page
+tables already come from. Contiguous by construction, no runtime allocation, no pmap
+attribute changes, and a later mmap can hand out physical pages trivially.
+
+The ladder up to and including `cp ib test: PASSED` in that boot was unaffected; the
+panic came afterwards, inside the buffer test, before its first print.

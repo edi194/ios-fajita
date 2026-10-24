@@ -89,6 +89,15 @@ else
 	echo "gmem: WARNING no zap files - stage 7c will report them missing" >&2
 fi
 BLOB_ARGS+=(--blob "$GMEM_BLOB")
+# A third blob: the buffer arena the ABI hands out (sweetfw2). kmem_alloc_contig is
+# unusable for GPU memory here: this port keeps pages below gPhysBase on its free
+# lists and any pmap call on one panics (console80).
+ARENA_BLOB=${ARENA_BLOB:-$HOME/gpu-fw/arena.bin}
+if [[ ! -f "$ARENA_BLOB" || $(stat -c%s "$ARENA_BLOB" 2>/dev/null || echo 0) -ne 1048576 ]]; then
+	mkdir -p "$(dirname "$ARENA_BLOB")"
+	dd if=/dev/zero of="$ARENA_BLOB" bs=1024 count=1024 status=none
+fi
+BLOB_ARGS+=(--blob "$ARENA_BLOB")
 python3 tools/mkpayload.py "$XNU_KERNEL" "$ADT" "$PAYLOAD" --cmdline "$CMDLINE" "${BLOB_ARGS[@]}"
 # shim/build.sh cds into shim/, so hand it absolute paths. SHIM_HDR=1 is the
 # stock fajita layout (header v1, gzipped Image.gz-dtb): a v2 header with a dtb
