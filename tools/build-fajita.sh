@@ -65,17 +65,28 @@ done
 # SMMU (page tables, dummy, HFI, dump, log). Nothing of it is committed.
 GMEM_BLOB=${GMEM_BLOB:-$HOME/gpu-fw/gmem.bin}
 SQE_FW=${SQE_FW:-$HOME/gpu-fw/a630_sqe.fw}
-# 148 KiB, rebuilt every time so it cannot go stale: the GMU's 64 KiB at +0, then
-# the CP block (L1 +0x10000, L2 +0x11000, L3 +0x12000, ring +0x14000, SQE +0x1c000,
-# scratch +0x24000).
+ZAP_MDT=${ZAP_MDT:-$HOME/gpu-fw/a630_zap.mdt}
+ZAP_SEG=${ZAP_SEG:-$HOME/gpu-fw/a630_zap.b02}
+# 160 KiB, rebuilt every time so it cannot go stale:
+#   +0x00000 GMU firmware block (64 KiB)
+#   +0x10000 CP block: L1, L2, L3, ring (0x14000), SQE (0x1c000), scratch (0x24000)
+#   +0x25000 zap metadata (.mdt), +0x27000 its loadable segment (b02)
 mkdir -p "$(dirname "$GMEM_BLOB")"
-dd if=/dev/zero of="$GMEM_BLOB" bs=1024 count=148 status=none
+dd if=/dev/zero of="$GMEM_BLOB" bs=1024 count=160 status=none
 # The SQE microcode, without its four-byte header (Linux loads from byte 4).
 if [[ -f "$SQE_FW" ]]; then
 	tail -c +5 "$SQE_FW" | dd of="$GMEM_BLOB" bs=1024 seek=112 conv=notrunc status=none
 	echo "gmem: $(stat -c%s "$SQE_FW") bytes of sqe microcode at +0x1c000"
 else
 	echo "gmem: WARNING no $SQE_FW - the CP will not be able to fetch" >&2
+fi
+# The zap: only the .mdt and the single loadable segment (a630_zap.b02) are used.
+if [[ -f "$ZAP_MDT" && -f "$ZAP_SEG" ]]; then
+	dd if="$ZAP_MDT" of="$GMEM_BLOB" bs=4 seek=$((0x25000 / 4)) conv=notrunc status=none
+	dd if="$ZAP_SEG" of="$GMEM_BLOB" bs=4 seek=$((0x27000 / 4)) conv=notrunc status=none
+	echo "gmem: zap mdt $(stat -c%s "$ZAP_MDT") + segment $(stat -c%s "$ZAP_SEG") at +0x25000"
+else
+	echo "gmem: WARNING no zap files - stage 7c will report them missing" >&2
 fi
 BLOB_ARGS+=(--blob "$GMEM_BLOB")
 python3 tools/mkpayload.py "$XNU_KERNEL" "$ADT" "$PAYLOAD" --cmdline "$CMDLINE" "${BLOB_ARGS[@]}"

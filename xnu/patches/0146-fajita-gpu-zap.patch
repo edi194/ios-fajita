@@ -1,0 +1,301 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -261,7 +261,7 @@
+ #define GPU_CORE_CP_STATUS_1  0x20d4u    /* a6xx 0x0825 */
+ 
+ /* stage 7: the CP's memory, carved out of the blob after the GMU's 64 KiB */
+-#define GPU_BLOB_BYTES        0x25000u
++#define GPU_BLOB_BYTES        0x28000u
+ #define GPU_CP_BASE           0x10000u   /* offset inside the blob */
+ #define GPU_CP_L1             (GPU_CP_BASE + 0x0000u)
+ #define GPU_CP_L2             (GPU_CP_BASE + 0x1000u)
+@@ -329,6 +329,29 @@
+ #define A6XX_CP_PROTECT_STATUS  0x0824u
+ #define GPU_CP_SCRATCH_MEMWR   0x100u   /* the value CP_MEM_WRITE leaves behind */
+ #define GPU_CP_SCRATCH_TS      0x110u   /* CACHE_FLUSH_TS writes the sequence here */
++/* stage 7c: the zap shader through SCM (PAS id 13) */
++#define GPU_ZAP_BASE           0x25000u   /* offset inside the blob */
++#define GPU_ZAP_BYTES          0x3000u    /* .mdt 0x25000, b02 segment 0x27000 */
++#define GPU_ZAP_MDT            (GPU_ZAP_BASE + 0x0000u)
++#define GPU_ZAP_SEG            (GPU_ZAP_BASE + 0x2000u)
++#define GPU_ZAP_MDT_MAX        0x2000u
++#define ZAP_REGION_PA          0x8c415000ull   /* fajita DT gpu_region, no-map, 0x2000 */
++#define ZAP_REGION_SIZE        0x2000u
++
++#define SCM_SIP                0x02000000u
++#define SCM_64                 0x40000000u
++#define SCM_FAST               0x80000000u
++#define SCM_INFO_AVAIL         (SCM_SIP | 0x0601u)
++#define SCM_PAS_GPU            13u
++#define SCM_INTERRUPTED        1
++#define SCM_BUSY               (-12)
++#define SCM_RESUME_LIMIT       64u
++#define SCM_BUSY_LIMIT         3u
++#define MDT_MAX_PHDRS          16u
++#define MDT_PT_LOAD            1u
++#define MDT_TYPE_MASK          (7u << 24)
++#define MDT_TYPE_HASH          (2u << 24)
++#define MDT_RELOCATABLE        (1u << 27)
+ #define GPU_GMU_SPTPRAC_STATUS 0x14340u  /* 0x50d0 */
+ #define GPU_GMU_BOOT_SLUMBER  0x8fe0u   /* 0x23f8 */
+ #define GPU_GMU_GX_VOTE_IDX   0x8fe4u   /* 0x23f9 */
+@@ -841,6 +864,224 @@
+ 	return false;
+ }
+ 
++/* ---- stage 7c: the zap shader through SCM/PAS -------------------------- */
++
++struct gpu_scm_regs {
++	uint64_t a[7];
++};
++
++/* SMCCC64: x0 carries the function id, x1 the arginfo, then the arguments. */
++static void
++gpu_scm_smccc(struct gpu_scm_regs *r)
++{
++	register uint64_t x0 __asm__("x0") = r->a[0];
++	register uint64_t x1 __asm__("x1") = r->a[1];
++	register uint64_t x2 __asm__("x2") = r->a[2];
++	register uint64_t x3 __asm__("x3") = r->a[3];
++	register uint64_t x4 __asm__("x4") = r->a[4];
++	register uint64_t x5 __asm__("x5") = r->a[5];
++	register uint64_t x6 __asm__("x6") = r->a[6];
++	__asm__ volatile("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
++	    : : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16",
++	        "x17", "cc", "memory");
++	*r = (struct gpu_scm_regs) { { x0, x1, x2, x3, x4, x5, x6 } };
++}
++
++/* Reissue interrupted calls (x0 == 1, x6 holds the continuation token); retry busy. */
++static bool
++gpu_scm_invoke(const struct gpu_scm_regs *initial, struct gpu_scm_regs *out)
++{
++	for (unsigned busy = 0; busy <= SCM_BUSY_LIMIT; busy++) {
++		*out = *initial;
++		for (unsigned resume = 0;; resume++) {
++			gpu_scm_smccc(out);
++			if ((int32_t)out->a[0] != SCM_INTERRUPTED) {
++				break;
++			}
++			if (resume == SCM_RESUME_LIMIT) {
++				printf("SWEET GPU: SCM call interrupted without completing\n");
++				return false;
++			}
++		}
++		if ((int32_t)out->a[0] != SCM_BUSY) {
++			return true;
++		}
++		if (busy == SCM_BUSY_LIMIT) {
++			printf("SWEET GPU: SCM busy; giving up\n");
++			return false;
++		}
++		gpu_wait_ms(30);
++	}
++	return false;
++}
++
++static int
++gpu_scm_pas(const char *name, uint32_t cmd, uint32_t arginfo, uint64_t arg1, uint64_t arg2)
++{
++	struct gpu_scm_regs r;
++	const struct gpu_scm_regs initial = {
++		{ SCM_64 | SCM_SIP | 0x0200u | cmd, arginfo, SCM_PAS_GPU, arg1, arg2, 0, 0 }
++	};
++	printf("SWEET GPU: scm pas %s fn=%#llx arginfo=%#x args=%#llx/%#llx\n",
++	    name, (unsigned long long)initial.a[0], arginfo,
++	    (unsigned long long)arg1, (unsigned long long)arg2);
++	__asm__ volatile("dsb sy" ::: "memory");
++	bool done = gpu_scm_invoke(&initial, &r);
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (!done) {
++		return -1;
++	}
++	printf("SWEET GPU: scm pas %s: status %d result %d\n",
++	    name, (int32_t)r.a[0], (int32_t)r.a[1]);
++	return (int32_t)r.a[0] == 0 && (int32_t)r.a[1] == 0 ? 0 : -1;
++}
++
++/* SCM_INFO IS_CALL_AVAILABLE for the four PAS calls: logged, never fatal. */
++static void
++gpu_scm_availability(void)
++{
++	static const struct { const char *name; uint32_t cmd; } q[] = {
++		{ "INIT_IMAGE", 1 }, { "MEM_SETUP", 2 }, { "AUTH_AND_RESET", 5 }, { "SHUTDOWN", 6 },
++	};
++	for (unsigned i = 0; i < sizeof(q) / sizeof(q[0]); i++) {
++		struct gpu_scm_regs r;
++		const struct gpu_scm_regs init = {
++			{ SCM_64 | SCM_INFO_AVAIL, 1, SCM_SIP | 0x0200u | q[i].cmd, 0, 0, 0, 0 }
++		};
++		if (gpu_scm_invoke(&init, &r)) {
++			printf("SWEET GPU: scm pas %s available: status %d result %llu\n",
++			    q[i].name, (int32_t)r.a[0], (unsigned long long)r.a[1]);
++		}
++	}
++}
++
++static uint32_t
++gpu_u32le(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
++}
++
++static uint16_t
++gpu_u16le(const uint8_t *p)
++{
++	return (uint16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
++}
++
++/*
++ * qcom_mdt_load + qcom_scm_pas_auth_and_reset: hand the metadata to the secure
++ * world, set up the carve-out, copy the loadable segment in and start it.
++ */
++static bool
++gpu_zap_load(vm_offset_t blob, uint64_t blob_pa)
++{
++	const uint8_t *e = (const uint8_t *)(uintptr_t)(blob + GPU_ZAP_MDT);
++	const uint64_t meta_pa = blob_pa + GPU_ZAP_MDT;
++
++	uint32_t phoff = gpu_u32le(e + 28);
++	unsigned phnum = gpu_u16le(e + 44);
++	printf("SWEET GPU: zap metadata at +%#x (PA %#llx): magic %#x class %u bits %u phnum %u phoff %u\n",
++	    GPU_ZAP_MDT, (unsigned long long)meta_pa, gpu_u32le(e), e[4], gpu_u16le(e + 42), phnum, phoff);
++	if (gpu_u32le(e) != 0x464c457fu || e[4] != 1 || e[5] != 1 || gpu_u16le(e + 42) != 32 ||
++	    phnum == 0 || phnum > MDT_MAX_PHDRS || phoff < 52 ||
++	    phoff + 32u * phnum > GPU_ZAP_MDT_MAX) {
++		printf("SWEET GPU: a630_zap.mdt is not a Qualcomm ELF32; zap skipped\n");
++		return false;
++	}
++
++	/* The extent of the loadable, non-hash segments. */
++	uint64_t min_addr = ~0ull, max_addr = 0;
++	bool relocate = false;
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint8_t *p = e + phoff + 32 * i;
++		uint32_t type = gpu_u32le(p), paddr = gpu_u32le(p + 12);
++		uint32_t filesz = gpu_u32le(p + 16), memsz = gpu_u32le(p + 20);
++		uint32_t flags = gpu_u32le(p + 24);
++		printf("SWEET GPU: zap phdr %u: type %u off %#x paddr %#x filesz %u memsz %u flags %#x\n",
++		    i, type, gpu_u32le(p + 4), paddr, filesz, memsz, flags);
++		if (type != MDT_PT_LOAD || (flags & MDT_TYPE_MASK) == MDT_TYPE_HASH || memsz == 0) {
++			continue;
++		}
++		relocate = relocate || !!(flags & MDT_RELOCATABLE);
++		if (paddr < min_addr) {
++			min_addr = paddr;
++		}
++		uint64_t end = ((uint64_t)paddr + memsz + 0xfffull) & ~0xfffull;
++		if (end > max_addr) {
++			max_addr = end;
++		}
++	}
++	if (min_addr == ~0ull || max_addr <= min_addr || max_addr - min_addr > ZAP_REGION_SIZE) {
++		printf("SWEET GPU: zap extent %#llx-%#llx does not fit the %#x byte carve-out; zap skipped\n",
++		    (unsigned long long)min_addr, (unsigned long long)max_addr, ZAP_REGION_SIZE);
++		return false;
++	}
++	uint32_t mem_size = (uint32_t)(max_addr - min_addr);
++	printf("SWEET GPU: zap: %s image, %u bytes -> carve-out %#llx (%u bytes)\n",
++	    relocate ? "relocatable" : "fixed", mem_size, (unsigned long long)ZAP_REGION_PA, ZAP_REGION_SIZE);
++	if (!relocate && min_addr != ZAP_REGION_PA) {
++		printf("SWEET GPU: fixed-address zap outside the carve-out; zap skipped\n");
++		return false;
++	}
++
++	gpu_scm_availability();
++
++	if (gpu_scm_pas("INIT_IMAGE", 1, 0x82, meta_pa, 0) != 0) {
++		printf("SWEET GPU: zap INIT_IMAGE failed\n");
++		return false;
++	}
++	if (gpu_scm_pas("MEM_SETUP", 2, 3, ZAP_REGION_PA, mem_size) != 0) {
++		printf("SWEET GPU: zap MEM_SETUP failed\n");
++		(void)gpu_scm_pas("SHUTDOWN", 6, 1, 0, 0);
++		return false;
++	}
++
++	vm_offset_t region = ml_io_map((vm_offset_t)ZAP_REGION_PA, ZAP_REGION_SIZE);
++	if (region == 0) {
++		printf("SWEET GPU: cannot map the zap carve-out\n");
++		(void)gpu_scm_pas("SHUTDOWN", 6, 1, 0, 0);
++		return false;
++	}
++	for (uint32_t o = 0; o < mem_size; o += 4) {
++		*(volatile uint32_t *)(region + o) = 0;
++	}
++	for (unsigned i = 0; i < phnum; i++) {
++		const uint8_t *p = e + phoff + 32 * i;
++		uint32_t type = gpu_u32le(p), paddr = gpu_u32le(p + 12);
++		uint32_t filesz = gpu_u32le(p + 16), memsz = gpu_u32le(p + 20);
++		uint32_t flags = gpu_u32le(p + 24);
++		if (type != MDT_PT_LOAD || (flags & MDT_TYPE_MASK) == MDT_TYPE_HASH ||
++		    memsz == 0 || filesz == 0) {
++			continue;
++		}
++		/* Only the single loadable segment travels in the blob (b02). */
++		const uint8_t *s = (const uint8_t *)(uintptr_t)(blob + GPU_ZAP_SEG);
++		uint64_t off = relocate ? (uint64_t)paddr - min_addr : (uint64_t)paddr - ZAP_REGION_PA;
++		if (off + filesz > mem_size) {
++			printf("SWEET GPU: zap segment %u outside the image\n", i);
++			(void)gpu_scm_pas("SHUTDOWN", 6, 1, 0, 0);
++			return false;
++		}
++		for (uint32_t o = 0; o < filesz; o += 4) {
++			uint32_t w = 0;
++			for (uint32_t b = 0; b < 4 && o + b < filesz; b++) {
++				w |= (uint32_t)s[o + b] << (8 * b);
++			}
++			*(volatile uint32_t *)(region + off + o) = w;
++		}
++		printf("SWEET GPU: zap segment %u: %u bytes -> carve-out +%#llx\n",
++		    i, filesz, (unsigned long long)off);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	if (gpu_scm_pas("AUTH_AND_RESET", 5, 1, 0, 0) != 0) {
++		printf("SWEET GPU: zap AUTH_AND_RESET failed\n");
++		return false;
++	}
++	printf("SWEET GPU: zap authenticated and started (PAS %u quiesced into reset)\n", SCM_PAS_GPU);
++	return true;
++}
++
+ /* ---- stage 5: the GX rail through the GMU's OOB interface ------------- */
+ 
+ /* HOST2GMU_INTR_SET / GMU2HOST_INTR_INFO are the ones stage 4 already uses. */
+@@ -1387,12 +1628,16 @@
+ 		return;
+ 	}
+ 	printf("SWEET GPU: gmu memory at %#llx -> %#llx\n", (unsigned long long)gmem_pa, (uint64_t)g);
+-	/* Everything but the SQE's microcode, which the build packs into the blob
+-	 * at GPU_CP_SQE: the CP fetches from that window and it must survive. */
++	/* Everything but the windows the build fills in: the SQE's microcode (the CP
++	 * fetches from there) and the zap's metadata plus segment (the secure world
++	 * reads them). */
+ 	for (uint32_t off = 0; off < GPU_BLOB_BYTES; off += 4) {
+ 		if (off >= GPU_CP_SQE && off < GPU_CP_SQE + GPU_CP_SQE_BYTES) {
+ 			continue;
+ 		}
++		if (off >= GPU_ZAP_BASE && off < GPU_ZAP_BASE + GPU_ZAP_BYTES) {
++			continue;
++		}
+ 		*(volatile uint32_t *)(g + off) = 0;
+ 	}
+ 	__asm__ volatile("dmb oshst" ::: "memory");
+@@ -1787,6 +2032,15 @@
+ 					printf("SWEET GPU: --- stage 7a: cp hw_init\n");
+ 					if (gpu_cp_hw_init(gpu) &&
+ 					    gpu_cp_start(gpu, g + GPU_CP_RING)) {
++						/* The zap is the only step that enters the secure
++						 * world, so it stays behind `zap=1` until the
++						 * ladder below it is known good. */
++						int cp_zap = 0;
++						(void)PE_parse_boot_argn("zap", &cp_zap, sizeof(cp_zap));
++						if (cp_zap) {
++							printf("SWEET GPU: --- stage 7c: the zap shader\n");
++							(void)gpu_zap_load(g, gmem_pa);
++						}
+ 						int cp_nop = 0;
+ 						(void)PE_parse_boot_argn("cpnop", &cp_nop, sizeof(cp_nop));
+ 						if (cp_nop) {

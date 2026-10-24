@@ -9,11 +9,12 @@
  #define GPU_CP_BASE           0x10000u   /* offset inside the blob */
  #define GPU_CP_L1             (GPU_CP_BASE + 0x0000u)
  #define GPU_CP_L2             (GPU_CP_BASE + 0x1000u)
-@@ -315,6 +315,19 @@
+@@ -315,6 +315,20 @@
  #define A6XX_HLSQ_ADDR_MODE_CNTL 0xbe05u
  #define A6XX_VBIF_GATE_OFF_WRREQ_EN 0x302au
  #define CP_RB_CNTL_VALUE       ((1u << 27) | (2u << 8) | 12u)
 +/* stage 7b: PM4 opcodes and the interrupt registers the submission touches */
++#define A6XX_RBBM_STATUS        0x0210u   /* byte 0x840, the read that answers 0x1 */
 +#define GPU_CP_NOP             16u
 +#define GPU_CP_ME_INIT         72u
 +#define GPU_CP_MEM_WRITE       61u
@@ -29,7 +30,7 @@
  #define GPU_GMU_SPTPRAC_STATUS 0x14340u  /* 0x50d0 */
  #define GPU_GMU_BOOT_SLUMBER  0x8fe0u   /* 0x23f8 */
  #define GPU_GMU_GX_VOTE_IDX   0x8fe4u   /* 0x23f9 */
-@@ -698,6 +711,135 @@
+@@ -698,6 +712,135 @@
  	return true;
  }
  
@@ -165,7 +166,7 @@
  /* ---- stage 5: the GX rail through the GMU's OOB interface ------------- */
  
  /* HOST2GMU_INTR_SET / GMU2HOST_INTR_INFO are the ones stage 4 already uses. */
-@@ -1244,7 +1386,12 @@
+@@ -1244,7 +1387,12 @@
  		return;
  	}
  	printf("SWEET GPU: gmu memory at %#llx -> %#llx\n", (unsigned long long)gmem_pa, (uint64_t)g);
@@ -178,7 +179,7 @@
  		*(volatile uint32_t *)(g + off) = 0;
  	}
  	__asm__ volatile("dmb oshst" ::: "memory");
-@@ -1295,6 +1442,14 @@
+@@ -1295,6 +1443,14 @@
  		}
  		l3cp[(GPU_VA_CP_SCRATCH >> 12) & 0x1ff] =
  		    (uint64_t)(gmem_pa + GPU_CP_SCRATCH) | GPU_PTE_PAGE;
@@ -193,7 +194,7 @@
  		__asm__ volatile("dsb sy" ::: "memory");
  		printf("SWEET GPU: cp memory: ring %#x (%u KiB) sqe %#x (%u KiB, read-only) scratch %#x; l2[%u]=%#llx l3[%u]=%#llx\n",
  		    GPU_VA_CP_RING, GPU_CP_RING_BYTES / 1024, GPU_VA_CP_SQE, GPU_CP_SQE_BYTES / 1024,
-@@ -1629,7 +1784,17 @@
+@@ -1629,7 +1785,17 @@
  
  					/* ---- stage 7a: the CP's hardware initialisation ---- */
  					printf("SWEET GPU: --- stage 7a: cp hw_init\n");
