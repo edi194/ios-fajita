@@ -1,0 +1,293 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -167,6 +167,65 @@
+ #define GPU_GMU_VA_LOG        0x60300000u   /* ... and for the log */
+ 
+ /* stage 3e: qsmmuv2_device_reset - the SMMU's own impl-defs, from the DT */
++/* stage 4: the GMU's memory, the SMMU context, and HFI v1 (Bergamota 0103) */
++#define GPU_GMEM_BYTES        0x10000u
++#define GPU_GMEM_L1           0x0000u
++#define GPU_GMEM_L2           0x1000u
++#define GPU_GMEM_L3A          0x2000u   /* covers 0x60000000-0x601fffff */
++#define GPU_GMEM_L3B          0x3000u   /* covers 0x60200000-0x603fffff */
++#define GPU_GMEM_DUMMY        0x4000u
++#define GPU_GMEM_HFI          0x5000u
++#define GPU_GMEM_HFI_BYTES    0x5000u
++#define GPU_GMEM_DUMP         0xa000u
++#define GPU_GMEM_DUMP_BYTES   0x4000u
++#define GPU_GMEM_LOG          0xe000u
++#define GPU_VA_DUMMY          0x60000000u
++#define GPU_VA_HFI            0x60100000u
++#define GPU_VA_DUMP           0x60200000u
++#define GPU_VA_LOG            0x60300000u
++#define GPU_PTE_TABLE         3ull
++/* AF, SH inner shareable, AP unprivileged, nG, MAIR attr 0 (non-cacheable) */
++#define GPU_PTE_PAGE          (3ull | (1ull << 10) | (2ull << 8) | (1ull << 6) | (1ull << 11))
++
++#define GPU_SMMU_GR1          0x1000u
++#define GPU_SMMU_CB(n)        (0x8000u + 0x1000u * (n))
++#define GPU_SMMU_CBAR(n)      (4u * (n))            /* in GR1 */
++#define GPU_SMMU_CBA2R(n)     (0x800u + 4u * (n))   /* in GR1 */
++#define GPU_SMMU_CB_SCTLR     0x000u
++#define GPU_SMMU_CB_ACTLR     0x004u
++#define GPU_SMMU_CB_TTBCR2    0x010u
++#define GPU_SMMU_CB_TTBR0     0x020u
++#define GPU_SMMU_CB_TCR       0x030u
++#define GPU_SMMU_CB_MAIR0     0x038u
++#define GPU_SMMU_CB_MAIR1     0x03cu
++#define GPU_SMMU_CB_FSR       0x058u
++#define GPU_SMMU_CB_TLBIALL   0x618u
++#define GPU_SMMU_CB_TLBSYNC   0x7f0u
++#define GPU_SMMU_CB_TLBSTATUS 0x7f4u
++#define GPU_SMMU_TLBIALLNSNH  0x068u
++#define GPU_SMMU_sTLBGSYNC    0x070u
++#define GPU_SMMU_sTLBGSTATUS  0x074u
++#define GPU_S2CR_TRANS(cb)    ((3u << 8) | (cb))
++#define GPU_SMR_VALID         (1u << 31)
++#define GPU_CBAR_S1           ((1u << 16) | (3u << 8) | (0xfu << 12))
++#define GPU_TCR_CB            ((2u << 12) | (1u << 23) | 32u)
++#define GPU_TCR2_CB           (1u | (7u << 15) | (1u << 4))
++#define GPU_MAIR0_CB          0x0004ff44u
++#define GPU_ACTLR_CB          0x70000000u
++#define GPU_SCTLR_CB          0x00c01067u
++
++/* HFI v1 */
++#define HFI_QHDR_DW           12u
++#define HFI_QTBL_HDR_DW       6u
++#define HFI_QMARK_HDR(id, dw, type) (((type) << 16) | (((dw) & 0xffu) << 8) | ((id) & 0xffu))
++#define HFI_MSG_ACK           2u
++#define HFI_H2F_INIT          0u
++#define HFI_H2F_FW_VER        1u
++#define GPU_GMU_HFI_CTRL_INIT 0x14618u   /* 0x5186 */
++#define GPU_GMU_GMU2HOST_CLR  0x14644u   /* 0x5191 */
++#define GPU_GMU_GMU2HOST_INFO 0x14648u   /* 0x5192 */
++#define GPU_GMU_HOST2GMU_SET  0x14650u   /* 0x5194 */
++
+ #define GPU_SMMU_MICRO_MMU_CTRL 0x6000u
+ #define GPU_SMMU_MICRO_HALT     (1u << 2)
+ #define GPU_SMMU_MICRO_IDLE     (1u << 3)
+@@ -645,12 +704,91 @@
+ 		return;
+ 	}
+ 
+-	/* ---- stage 3e: the SMMU's impl-defs, then a no-op SMR/S2CR write ------- */
+-	printf("SWEET GPU: --- stage 3e: smmu impl-defs\n");
++	/* ---- stage 3e: the GMU's memory, the SMMU context, and HFI ----------- */
++	printf("SWEET GPU: --- stage 3e: gmu memory, smmu context, hfi\n");
+ 	if (smmu == 0) {
+ 		printf("SWEET GPU: no SMMU mapping\n");
+ 		return;
+ 	}
++
++	/* the 64 KiB block the GMU reaches: sweetfw1 from the payload */
++	char gmarg[64];
++	uint64_t gm_pa64 = 0, gm_size = 0;
++	if (!PE_parse_boot_argn("sweetfw1", gmarg, sizeof(gmarg)) ||
++	    !gpu_parse_range(gmarg, &gm_pa64, &gm_size) || gm_size < GPU_GMEM_BYTES) {
++		printf("SWEET GPU: no sweetfw1 blob of %#x bytes; stage 3e skipped\n", GPU_GMEM_BYTES);
++		return;
++	}
++	uint32_t gmem_pa = (uint32_t)gm_pa64;
++	vm_offset_t g = ml_io_map((vm_offset_t)gm_pa64, GPU_GMEM_BYTES);
++	if (g == 0) {
++		printf("SWEET GPU: cannot map the gmu memory blob\n");
++		return;
++	}
++	printf("SWEET GPU: gmu memory at %#x -> %#llx\n", gmem_pa, (uint64_t)g);
++	for (uint32_t off = 0; off < GPU_GMEM_BYTES; off += 4) {
++		*(volatile uint32_t *)(g + off) = 0;
++	}
++	__asm__ volatile("dmb oshst" ::: "memory");
++
++	/* Page tables: 4 KiB pages, L1 by VA[31:30], L2 by VA[29:21], L3 by VA[20:12]. */
++	{
++		volatile uint64_t *l1 = (volatile uint64_t *)(g + GPU_GMEM_L1);
++		volatile uint64_t *l2 = (volatile uint64_t *)(g + GPU_GMEM_L2);
++		volatile uint64_t *l3a = (volatile uint64_t *)(g + GPU_GMEM_L3A);
++		volatile uint64_t *l3b = (volatile uint64_t *)(g + GPU_GMEM_L3B);
++
++		l1[(GPU_VA_HFI >> 30) & 0x1ff] = (uint64_t)(gmem_pa + GPU_GMEM_L2) | GPU_PTE_TABLE;
++		l2[(GPU_VA_DUMMY >> 21) & 0x1ff] = (uint64_t)(gmem_pa + GPU_GMEM_L3A) | GPU_PTE_TABLE;
++		l2[(GPU_VA_DUMP >> 21) & 0x1ff] = (uint64_t)(gmem_pa + GPU_GMEM_L3B) | GPU_PTE_TABLE;
++		l3a[(GPU_VA_DUMMY >> 12) & 0x1ff] = (uint64_t)(gmem_pa + GPU_GMEM_DUMMY) | GPU_PTE_PAGE;
++		for (uint32_t i = 0; i < GPU_GMEM_HFI_BYTES / 0x1000; i++) {
++			l3a[((GPU_VA_HFI >> 12) & 0x1ff) + i] =
++			    (uint64_t)(gmem_pa + GPU_GMEM_HFI + 0x1000 * i) | GPU_PTE_PAGE;
++		}
++		for (uint32_t i = 0; i < GPU_GMEM_DUMP_BYTES / 0x1000; i++) {
++			l3b[((GPU_VA_DUMP >> 12) & 0x1ff) + i] =
++			    (uint64_t)(gmem_pa + GPU_GMEM_DUMP + 0x1000 * i) | GPU_PTE_PAGE;
++		}
++		l3b[(GPU_VA_LOG >> 12) & 0x1ff] = (uint64_t)(gmem_pa + GPU_GMEM_LOG) | GPU_PTE_PAGE;
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("SWEET GPU: tables at %#x: l1[%u]=%#llx l2[%u]=%#llx l2[%u]=%#llx\n", gmem_pa,
++		    (GPU_VA_HFI >> 30) & 0x1ff, (unsigned long long)l1[(GPU_VA_HFI >> 30) & 0x1ff],
++		    (GPU_VA_DUMMY >> 21) & 0x1ff, (unsigned long long)l2[(GPU_VA_DUMMY >> 21) & 0x1ff],
++		    (GPU_VA_DUMP >> 21) & 0x1ff, (unsigned long long)l2[(GPU_VA_DUMP >> 21) & 0x1ff]);
++	}
++
++	/* The legacy HFI table: four queues, data at +0xe0 + 0x1000*i. */
++	{
++		volatile uint32_t *t = (volatile uint32_t *)(g + GPU_GMEM_HFI);
++		static const struct { uint32_t id, pri; } q[4] = {
++			{ 0, 10 },      /* CMD */
++			{ 4, 10 },      /* MSG (legacy) */
++			{ 5, 40 },      /* DBG (legacy) */
++			{ 1, 20 },      /* DSP */
++		};
++		t[0] = 0;
++		t[1] = HFI_QTBL_HDR_DW + 4 * HFI_QHDR_DW;
++		t[2] = HFI_QTBL_HDR_DW;
++		t[3] = HFI_QHDR_DW;
++		t[4] = 4;
++		t[5] = 4;
++		for (uint32_t i = 0; i < 4; i++) {
++			volatile uint32_t *qh = t + HFI_QTBL_HDR_DW + i * HFI_QHDR_DW;
++			qh[0] = (i == 3) ? 0u : 1u;                 /* status */
++			qh[1] = GPU_VA_HFI + 0xe0u + 0x1000u * i;   /* start address */
++			qh[2] = ((i == 0 ? 10u : q[i].pri) << 8) | q[i].id;
++			qh[3] = 1024u;                              /* words */
++			qh[6] = 1u;                                 /* rx watermark */
++			qh[7] = 1u;                                 /* tx watermark */
++			qh[8] = 1u;                                 /* rx request */
++			qh[10] = 0u;
++			qh[11] = 0u;
++		}
++		__asm__ volatile("dmb oshst" ::: "memory");
++		printf("SWEET GPU: hfi table at %#x: size %u words, 4 queues at +%#x/+%#x\n",
++		    GPU_VA_HFI, t[1], GPU_VA_HFI + 0xe0u, GPU_VA_HFI + 0x10e0u);
++	}
+ 	{
+ 		/* dtb/fajita2.dts: qcom,kgsl-iommu attach-impl-defs */
+ 		static const uint32_t impl_defs[][2] = {
+@@ -697,9 +835,127 @@
+ 	printf("SWEET GPU: smmu smr0 %#x after writing %#x: %s, sgfsr %#x\n", smr_now,
+ 	    (1u << 31) | 5u, smr_now == ((1u << 31) | 5u) ? "EXACT SMR STICKS (the stream table is writable)" : "dropped",
+ 	    gpu_rd_quiet(smmu, GPU_SMMU_SGFSR));
+-	gpu_wr_quiet(smmu, GPU_SMMU_SMR(0), smr0);
+-	__asm__ volatile("dmb oshst" ::: "memory");
+-	printf("SWEET GPU: smmu smr0 restored to %#x\n", gpu_rd_quiet(smmu, GPU_SMMU_SMR(0)));
++	(void)smr0;
++
++	/* ---- context bank 0 with those tables ---- */
++	{
++		vm_offset_t b = smmu + GPU_SMMU_CB(0);
++		uint64_t ttbr = (uint64_t)(gmem_pa + GPU_GMEM_L1) | ((uint64_t)1 << 48);
++
++		gpu_wr_quiet(smmu, GPU_SMMU_GR1 + GPU_SMMU_CBA2R(0), 1u);
++		gpu_wr_quiet(smmu, GPU_SMMU_GR1 + GPU_SMMU_CBAR(0), GPU_CBAR_S1);
++		gpu_wr_quiet(b, GPU_SMMU_CB_TTBCR2, GPU_TCR2_CB);
++		gpu_wr_quiet(b, GPU_SMMU_CB_TCR, GPU_TCR_CB);
++		__asm__ volatile("dmb oshst" ::: "memory");
++		*(volatile uint64_t *)(b + GPU_SMMU_CB_TTBR0) = ttbr;
++		__asm__ volatile("dsb osh" ::: "memory");
++		gpu_wr_quiet(b, GPU_SMMU_CB_MAIR0, GPU_MAIR0_CB);
++		gpu_wr_quiet(b, GPU_SMMU_CB_MAIR1, 0);
++		gpu_wr_quiet(b, GPU_SMMU_CB_ACTLR, GPU_ACTLR_CB);
++		gpu_wr_quiet(b, GPU_SMMU_CB_FSR, gpu_rd_quiet(b, GPU_SMMU_CB_FSR));
++		gpu_wr_quiet(b, GPU_SMMU_CB_TLBIALL, 0);
++		for (int i = 0; i < 100; i++) {
++			if (!(gpu_rd_quiet(b, GPU_SMMU_CB_TLBSTATUS) & 1u)) {
++				break;
++			}
++			gpu_wait_ms(1);
++		}
++		gpu_wr_quiet(b, GPU_SMMU_CB_SCTLR, GPU_SCTLR_CB);
++		__asm__ volatile("dmb oshst" ::: "memory");
++		printf("SWEET GPU: cb0 sctlr %#x tcr %#x tcr2 %#x ttbr0 %#x%08x mair0 %#x\n",
++		    gpu_rd_quiet(b, GPU_SMMU_CB_SCTLR), gpu_rd_quiet(b, GPU_SMMU_CB_TCR),
++		    gpu_rd_quiet(b, GPU_SMMU_CB_TTBCR2),
++		    gpu_rd_quiet(b, GPU_SMMU_CB_TTBR0 + 4), gpu_rd_quiet(b, GPU_SMMU_CB_TTBR0),
++		    gpu_rd_quiet(b, GPU_SMMU_CB_MAIR0));
++	}
++
++	/* ---- the GMU's streams 5 (kernel) and 4 (user) through context 0 ---- */
++	{
++		static const uint32_t sids[2] = { 5, 4 };
++		bool routed = true;
++		for (unsigned i = 0; i < 2; i++) {
++			uint32_t want_s2 = GPU_S2CR_TRANS(0), want_smr = GPU_SMR_VALID | sids[i];
++			gpu_wr_quiet(smmu, GPU_SMMU_S2CR(i), want_s2);
++			gpu_wr_quiet(smmu, GPU_SMMU_SMR(i), want_smr);
++			__asm__ volatile("dmb oshst" ::: "memory");
++			uint32_t got_s2 = gpu_rd_quiet(smmu, GPU_SMMU_S2CR(i));
++			uint32_t got_smr = gpu_rd_quiet(smmu, GPU_SMMU_SMR(i));
++			printf("SWEET GPU: smr%u sid %u: wrote %#x/%#x read %#x/%#x sGFSR %#x\n", i, sids[i],
++			    want_s2, want_smr, got_s2, got_smr, gpu_rd_quiet(smmu, GPU_SMMU_SGFSR));
++			routed &= (got_s2 == want_s2) && (got_smr == want_smr);
++		}
++		gpu_wr_quiet(smmu, GPU_SMMU_TLBIALLNSNH, 0);
++		for (int i = 0; i < 100; i++) {
++			if (!(gpu_rd_quiet(smmu, GPU_SMMU_sTLBGSTATUS) & 1u)) {
++				break;
++			}
++			gpu_wait_ms(1);
++		}
++		printf("SWEET GPU: smmu %s (sTLBGSTATUS %#x)\n",
++		    routed ? "routes sid 5 and 4 through context 0" : "DID NOT TAKE the stream table",
++		    gpu_rd_quiet(smmu, GPU_SMMU_sTLBGSTATUS));
++		if (!routed) {
++			return;
++		}
++	}
++
++	/* ---- HFI: start the queues and say hello ---- */
++	gpu_probe_wr("gmu hfi ctrl init", gmu, GPU_GMU_HFI_CTRL_INIT, 1);
++	uint32_t hfi_status = 0;
++	for (int i = 0; i < 100; i++) {
++		hfi_status = gpu_rd_quiet(gmu, GPU_GMU_HFI_STATUS);
++		if (hfi_status & 1u) {
++			break;
++		}
++		gpu_wait_ms(1);
++	}
++	printf("SWEET GPU: hfi ctrl status %#x %s, version info %#x\n", hfi_status,
++	    (hfi_status & 1u) ? "(THE HFI QUEUES ARE UP)" : "(no answer)",
++	    gpu_rd_quiet(gmu, 0x14604u));
++	if (!(hfi_status & 1u)) {
++		return;
++	}
++
++	/* H2F_MSG_INIT: header, 0, dump address, dump size, cold boot */
++	{
++		volatile uint32_t *cmd = (volatile uint32_t *)(g + GPU_GMEM_HFI + 0xe0);
++		uint32_t msg[5];
++		msg[0] = HFI_QMARK_HDR(HFI_H2F_INIT, 5, 0);
++		msg[1] = 0;
++		msg[2] = GPU_VA_DUMP;
++		msg[3] = GPU_GMEM_DUMP_BYTES;
++		msg[4] = 1;                     /* GMU_COLD_BOOT */
++		for (unsigned i = 0; i < 5; i++) {
++			cmd[i] = msg[i];
++		}
++		volatile uint32_t *qh = (volatile uint32_t *)(g + GPU_GMEM_HFI + 4 * HFI_QTBL_HDR_DW);
++		qh[11] = (qh[11] + 5u) % 1024u;  /* write index */
++		__asm__ volatile("dmb oshst" ::: "memory");
++		gpu_probe_wr("gmu host2gmu intr", gmu, GPU_GMU_HOST2GMU_SET, 1);
++
++		uint32_t info = 0;
++		for (int i = 0; i < 100; i++) {
++			info = gpu_rd_quiet(gmu, GPU_GMU_GMU2HOST_INFO);
++			if (info & 1u) {
++				break;
++			}
++			gpu_wait_ms(1);
++		}
++		printf("SWEET GPU: gmu2host intr info %#x %s\n", info,
++		    (info & 1u) ? "(the GMU answered)" : "(no answer)");
++		if (info & 1u) {
++			gpu_wr_quiet(gmu, GPU_GMU_GMU2HOST_CLR, 1);
++			volatile uint32_t *msgq = (volatile uint32_t *)(g + GPU_GMEM_HFI + 0x10e0);
++			uint32_t r = 0;
++			for (int i = 0; i < 8; i++) {
++				printf("SWEET GPU: hfi reply[%d] %#x\n", i, msgq[i]);
++				if (i == 0) {
++					r = msgq[i];
++				}
++			}
++			printf("SWEET GPU: hfi reply id %u type %u (2 = ACK)\n", r & 0xffu, (r >> 16) & 0xfu);
++		}
++	}
+ 	printf("SWEET GPU: stage 3e done\n");
+ 
+ 	/* Leave the GMU as Bergamota leaves it: in reset, so the next boot starts
