@@ -29,8 +29,51 @@ CS_PAGE_SHIFT = 12
 IDENT = b'org.sweet.init\0'
 
 
+def text_of_elf(obj):
+    """A GNU as object (aarch64-linux-gnu-gcc -c): its .text and a global _start.
+
+    clang for iOS targets is not installed everywhere, but the cross assembler is, and
+    what this tool needs from the object is only the code of one position-independent
+    section plus the entry offset.
+    """
+    assert obj[4] == 2, 'not a 64-bit ELF object'
+    e_machine, = struct.unpack_from('<H', obj, 18)
+    assert e_machine == 183, 'not an AArch64 ELF object'
+    e_shoff, = struct.unpack_from('<Q', obj, 40)
+    e_shentsize, e_shnum, e_shstrndx = struct.unpack_from('<HHH', obj, 58)
+    secs = []
+    for i in range(e_shnum):
+        o = e_shoff + i * e_shentsize
+        name, typ = struct.unpack_from('<II', obj, o)
+        off, size = struct.unpack_from('<QQ', obj, o + 24)
+        link, = struct.unpack_from('<I', obj, o + 40)
+        secs.append((name, typ, off, size, link))
+    shstr = secs[e_shstrndx]
+
+    def sname(n, base=None):
+        base = shstr[2] if base is None else base
+        return obj[base + n:].split(b'\0')[0].decode()
+
+    for i, (name, typ, off, size, _) in enumerate(secs):
+        assert not (typ in (4, 9) and size), f'section {sname(name)} has relocations: code must be position independent'
+    text = next((s for s in secs if sname(s[0]) == '.text'), None)
+    symtab = next((s for s in secs if s[1] == 2), None)          # SHT_SYMTAB
+    assert text and symtab, 'no .text or .symtab'
+    tname, ttyp, toff, tsize, _ = text
+    _, _, syoff, sysize, symlink = symtab
+    strbase = secs[symlink][2]
+    for i in range(sysize // 24):
+        strx, info, _, shndx, value = struct.unpack_from('<IBBHQ', obj, syoff + 24 * i)
+        if obj[strbase + strx:].split(b'\0')[0] == b'_start' and (info >> 4) == 1:   # GLOBAL
+            assert value < tsize, '_start outside .text'
+            return bytes(obj[toff:toff + tsize]), value
+    raise SystemExit('no global _start')
+
+
 def text_of(obj):
     """Return (__text bytes, _start offset); refuse anything that needs linking."""
+    if obj[:4] == b'\x7fELF':
+        return text_of_elf(obj)
     magic, cpu, _, ftype, ncmds, _, _, _ = struct.unpack_from('<8I', obj, 0)
     assert magic == MH_MAGIC_64 and cpu == CPU_TYPE_ARM64 and ftype == 1, 'not an arm64 object'
     text, symtab, off = None, None, 32

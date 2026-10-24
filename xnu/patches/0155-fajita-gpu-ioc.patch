@@ -1,0 +1,45 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -351,13 +351,16 @@
+ #define GPU_BO_MAX_BYTES       0x100000u
+ #define GPU_ARENA_BYTES        0x100000u   /* the sweetfw2 blob: 1 MiB */
+ /* stage 8e: the device node and its ABI (selector numbers as in Linux msm) */
+-#define SWEET_GPU_IOCTL_SELECT     0x44u   /* pick the buffer read/write use */
+-#define SWEET_GPU_IOCTL_INFO       0x70u
+-#define SWEET_GPU_IOCTL_GEM_NEW    0x42u
+-#define SWEET_GPU_IOCTL_GEM_INFO   0x43u
+-#define SWEET_GPU_IOCTL_GEM_SUBMIT 0x46u
+-#define SWEET_GPU_IOCTL_WAIT_FENCE 0x47u
+-#define SWEET_GPU_IOCTL_GEM_CLOSE  0x09u
++/* The group letter and the numbers, following msm where they exist. The command
++ * words are built with _IOWR below, once the struct sizes are known. */
++#define SWEET_GPU_IOC_GROUP        'G'
++#define SWEET_GPU_IOC_INFO_N       0x70u
++#define SWEET_GPU_IOC_GEM_NEW_N    0x42u
++#define SWEET_GPU_IOC_GEM_INFO_N   0x43u
++#define SWEET_GPU_IOC_SELECT_N     0x44u
++#define SWEET_GPU_IOC_SUBMIT_N     0x46u
++#define SWEET_GPU_IOC_WAIT_N       0x47u
++#define SWEET_GPU_IOC_CLOSE_N      0x09u
+ 
+ #define SWEET_GPU_INFO_GET_IOVA    1u
+ #define SWEET_GPU_INFO_GET_SIZE    2u
+@@ -409,6 +412,18 @@
+ 	uint32_t pad;
+ };
+ 
++/*
++ * The command word carries the struct size, otherwise sys_ioctl copies nothing and a
++ * handler would read the caller's pointer value as a struct.
++ */
++#define SWEET_GPU_IOCTL_INFO       _IOWR(SWEET_GPU_IOC_GROUP, SWEET_GPU_IOC_INFO_N, struct sweet_gpu_info)
++#define SWEET_GPU_IOCTL_GEM_NEW    _IOWR(SWEET_GPU_IOC_GROUP, SWEET_GPU_IOC_GEM_NEW_N, struct sweet_gpu_gem_new)
++#define SWEET_GPU_IOCTL_GEM_INFO   _IOWR(SWEET_GPU_IOC_GROUP, SWEET_GPU_IOC_GEM_INFO_N, struct sweet_gpu_gem_info)
++#define SWEET_GPU_IOCTL_SELECT     _IOWR(SWEET_GPU_IOC_GROUP, SWEET_GPU_IOC_SELECT_N, struct sweet_gpu_select)
++#define SWEET_GPU_IOCTL_GEM_SUBMIT _IOWR(SWEET_GPU_IOC_GROUP, SWEET_GPU_IOC_SUBMIT_N, struct sweet_gpu_gem_submit)
++#define SWEET_GPU_IOCTL_WAIT_FENCE _IOWR(SWEET_GPU_IOC_GROUP, SWEET_GPU_IOC_WAIT_N, struct sweet_gpu_wait)
++#define SWEET_GPU_IOCTL_GEM_CLOSE  _IOWR(SWEET_GPU_IOC_GROUP, SWEET_GPU_IOC_CLOSE_N, struct sweet_gpu_close)
++
+ struct gpu_bo {
+ 	vm_offset_t kva;        /* the kernel alias, write-combined */
+ 	uint64_t pa;
