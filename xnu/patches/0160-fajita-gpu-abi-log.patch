@@ -1,14 +1,6 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -21,6 +21,7 @@
- #include <pexpert/pexpert.h>
- /* stage 8: buffer allocation and cache attributes */
- #include <sys/conf.h>
-+#include <sys/proc.h>   /* struct proc: the open/ioctl log prints the pid */
- #include <sys/ioccom.h>
- #include <miscfs/devfs/devfs.h>
- 
-@@ -1899,14 +1900,23 @@
+@@ -1899,14 +1899,24 @@
  static int
  sweet_gpu_dev_write(dev_t dev, struct uio *uio, int flags)
  {
@@ -29,7 +21,8 @@
 +
 +	/* The tool's console output can scroll away or go to a serial port we do not
 +	 * have; the ring always sees this, so a client is visible as far as it got. */
-+	printf("SWEET GPU: /dev/sweetgpu opened by pid %d -> %d\n", p ? p->p_pid : 0, rc);
++	(void)p;
++	printf("SWEET GPU: /dev/sweetgpu opened -> %d\n", rc);
 +	return rc;
  }
  
@@ -46,7 +39,7 @@
  {
 +	int rc = gpu_dev_ioctl(dev, cmd, data, flags, p);
 +
-+	printf("SWEET GPU: ioctl %#lx from pid %d -> %d\n", cmd, p ? p->p_pid : 0, rc);
++	printf("SWEET GPU: ioctl %#lx -> %d\n", cmd, rc);
 +	return rc;
 +}
 +
