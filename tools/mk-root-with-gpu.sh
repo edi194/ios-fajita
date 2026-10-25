@@ -42,6 +42,7 @@ else
 fi
 
 echo "== adding the GPU files"
+mkdir -p "$work/mnt"
 mount -o loop,force "$img" "$work/mnt"
 install -d "$work/mnt/usr/local/bin" "$work/mnt/System/Library/Extensions"
 install -m 0755 -o root -g wheel "$work/sweetgputest" "$work/mnt/usr/local/bin/sweetgputest"
