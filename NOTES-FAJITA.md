@@ -2438,3 +2438,81 @@ userspace half costs:
 
 This is the road for `sweet_drm.c`, Mesa and Chlorophyll: they build with the same three
 commands, and nothing has to be re-implemented as a static `mkinit.py` binary any more.
+
+### Cosmetics backlog: status bar, real battery, charger (2026-10-25)
+
+Three small things the GUI needs, with what exists today and the cheapest way to each.
+
+#### 1. Status bar icons inside the panel's rounded corners
+
+`0061-sweet-iphone-x-display-size.patch` presents a **1125x2436 canvas** (iPhone X, 375x812
+@3x) and shows the **centred 1080x2340 crop** on the panel:
+
+```c
+#define SWEET_FB_LOGICAL_W 1125
+#define SWEET_FB_LOGICAL_H 2436
+fOffX = (fLogicalW - 1080) / 2;   /* 22 */
+fOffY = (fLogicalH - 2340) / 2;   /* 48 */
+```
+
+That is why the clock and the battery are clipped: iOS lays out for the iPhone X notch, 48
+logical pixels are cropped off the top, and the panel's own corner radius eats the tips. The
+port can already present the native panel (`sweetfb_native=1`, 1080x2340, offsets 0) - full
+screen, no crop - but then iOS knows nothing about the corners and puts the icons at the very
+edge.
+
+The user wants **the whole panel, no cropping, no scaling, icons moved inward** - i.e. the
+kernel has to report **safe-area insets** (top ~60 px, sides ~30 px) so UIKit moves the
+status bar itself. Two possible channels, in order:
+
+1. an IOMobileFramebuffer display attribute carrying the insets (`SweetFramebuffer.cpp` /
+   `0046-sweet-iosurface-iomfb.patch`), which `backboardd` -> `FBSDisplayConfiguration` ->
+   UIKit would consume;
+2. an override on the SpringBoard/UIKit side if the kernel path does not exist in 16.7.16.
+
+**Cheap research, no sudo**: Bergamota's `tools/renegade/hfsx.py` reads our HFS+ image in
+place (`ls`/`cat`/`get`), so the dyld cache and the framework binaries can be inspected the
+same way `GPU_PHASE0_DISCOVERY.md` was made - find what feeds `safeAreaInsets` on 16.7.16
+before writing anything.
+
+Interim options if that research takes long: `sweetfb_native=1` for the full screen and live
+with the corners, or `fOffY = 0` (status bar visible, 48 px cropped at the bottom instead).
+
+#### 2. Real battery level
+
+`iokit/Kernel/arm/SweetBattery.cpp` is **not** a static stub any more - it reads the PMIC
+over SPMI (`bsd/dev/sweet_spmi.c`) every 30 s (`IOTimerEventSource`, `setTimeoutMS(30000)`)
+and publishes the `IOPMPowerSource` keys plus the `0xe0024100` notification:
+
+| what | where |
+| --- | --- |
+| battery type / present | SPMI `0x4804` (== `0x0d`), `0x4808` bit 0 |
+| voltage | `readWord(0x48c0)`, scaled `* 194637 / 1000000` -> mV |
+| USB present | `0x1310` bit 4 |
+| charging path | `0x110b` bits 4/0, `0x40` inverted |
+| charger state | `0x1006` low 3 bits |
+| charger error, temperature | `0x1007`, `0x100d` |
+| SOC | voltage curve 3200..4350 mV -> 1..100 % (`soc[]`) |
+
+The catch: **those addresses are the sweet platform's** (PM6150 PMIC, SID 0). fajita has
+PM8998 + **PMI8998** (fuel gauge and SMB2 charger live there, at their own SPMI USIDs), so the
+register map and the SID have to be re-derived. The port already has the transport
+(`sweet_spmi_read(sid, addr, &byte)`).
+
+Plan: a read-only probe gated on a boot arg (like the GPU probes) that dumps the FG and SMB2
+peripherals per USID, run once with the phone on battery and once on the charger - the
+differences name the voltage, presence and charger bits. Then set the addresses and check the
+curve against a value the panel shows.
+
+#### 3. Reacting to the charger being plugged and unplugged
+
+Today the only trigger is the 30 s timer, so the icon lags. Options, cheapest first:
+
+1. shorten the timer to ~2 s while `ExternalConnected` changes and back to 30 s when stable
+   (no new hardware knowledge needed, ~10 lines);
+2. latch on the USB PHY (`bsd/dev/sweet_usb.c` already knows VBUS) and call the battery
+   update from there - immediate, and the USB side is where the event actually arrives;
+3. a PMIC interrupt (SMB2 `USBIN` IRQ over SPMI) - the proper way, but it needs the SPMI IRQ
+   path, which this port does not have yet.
+
+Do (1) now, (2) if it feels laggy, (3) only if the other things are done.
