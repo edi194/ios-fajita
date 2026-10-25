@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Runs the IOKit client once at boot, after the chardev tool, and sends the result to
+     the console. This is the path a Mesa winsys takes: IOServiceOpen, GEM, submit. -->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>org.sweet.iokittest</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/sweet-iokit-test</string>
+	</array>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>StandardOutPath</key>
+	<string>/dev/console</string>
+	<key>StandardErrorPath</key>
+	<string>/dev/console</string>
+	<key>KeepAlive</key>
+	<false/>
+</dict>
+</plist>
