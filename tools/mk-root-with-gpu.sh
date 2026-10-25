@@ -45,8 +45,9 @@ echo "== adding the GPU files"
 mkdir -p "$work/mnt"
 mount -o loop,force "$img" "$work/mnt"
 install -d "$work/mnt/usr/local/bin" "$work/mnt/System/Library/Extensions"
-install -m 0755 -o root -g wheel "$work/sweetgputest" "$work/mnt/usr/local/bin/sweetgputest"
-install -m 0644 -o root -g wheel "$here/tools/gputest.plist" \
+# numeric ids: Linux has no 'wheel' group, and HFS+ wants uid/gid 0 anyway
+install -m 0755 -o 0 -g 0 "$work/sweetgputest" "$work/mnt/usr/local/bin/sweetgputest"
+install -m 0644 -o 0 -g 0 "$here/tools/gputest.plist" \
 	"$work/mnt/Library/LaunchDaemons/org.sweet.gputest.plist"
 umount "$work/mnt"
 
