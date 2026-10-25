@@ -1,0 +1,50 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1899,14 +1899,23 @@
+ static int
+ sweet_gpu_dev_write(dev_t dev, struct uio *uio, int flags)
+ {
+-	return gpu_dev_io(dev, uio, true);
++	int rc = gpu_dev_io(dev, uio, true);
++
++	printf("SWEET GPU: write %d bytes at %lld -> %d\n", uio_resid(uio),
++	    (long long)uio->uio_offset, rc);
++	return rc;
+ }
+ 
+ /* devfs: one node, no per-open state, the GPU is a single system resource. */
+ static int
+ sweet_gpu_dev_open(dev_t dev, int flags, int devtype, struct proc *p)
+ {
+-	return gpu_live ? 0 : ENXIO;
++	int rc = gpu_live ? 0 : ENXIO;
++
++	/* The tool's console output can scroll away or go to a serial port we do not
++	 * have; the ring always sees this, so a client is visible as far as it got. */
++	printf("SWEET GPU: /dev/sweetgpu opened by pid %d -> %d\n", p ? p->p_pid : 0, rc);
++	return rc;
+ }
+ 
+ static int
+@@ -1915,9 +1924,21 @@
+ 	return 0;
+ }
+ 
++static int gpu_dev_ioctl(dev_t dev, u_long cmd, caddr_t data, int flags,
++    struct proc *p);
++
+ static int
+ sweet_gpu_dev_ioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
+ {
++	int rc = gpu_dev_ioctl(dev, cmd, data, flags, p);
++
++	printf("SWEET GPU: ioctl %#lx from pid %d -> %d\n", cmd, p ? p->p_pid : 0, rc);
++	return rc;
++}
++
++static int
++gpu_dev_ioctl(dev_t dev, u_long cmd, caddr_t data, int flags, struct proc *p)
++{
+ 	switch (cmd) {
+ 	case SWEET_GPU_IOCTL_INFO:
+ 		return gpu_client_info((struct sweet_gpu_info *)data);
