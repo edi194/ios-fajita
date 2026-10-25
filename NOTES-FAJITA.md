@@ -2609,3 +2609,35 @@ Ways forward, cheapest first:
   i.e. flash + migration again;
 - skip launchd entirely: run the tool from an existing root daemon we control - we have none
   in userspace, so this needs one of the above first.
+
+### Upstream news, checked 2026-10-25 (Bergamota, Chlorophyll, HackiOS)
+
+**Chlorophyll** (Metal driver) kept moving overnight and this morning:
+
+- `00:01` samplers and sampler views stay bound across draws; `00:07` misaligned unbounded
+  constant buffers bound in place with the shader adding the offset; `23:52` linear sampled
+  textures with the flag on the allocation only; `23:39` a constant binding a stage never reads
+  uploads 4 bytes instead of the 4 KB cap; `23:24` destroyed textures' resources pooled, bound
+  computed constant offsets.
+- `21:59` the compositor marks work "scheduled" when it is submitted again rather than when the
+  GPU finished: **with kernel 0229 (the fb GPU gate) and their 0240/0241 GPU scan-out copy the
+  render server no longer waits for the GPU before every swap - 28.4 -> 29.4 fps on a kernel
+  that still holds swaps, and Control Center renders correctly**. So their ceiling is currently
+  the *presentation* path, not the drawing.
+
+**Bergamota** (their kernel/userland repo):
+
+- `15:37` handoff doc: **both iOS 26 branches pushed**, phone recovered on boot 33b, plus
+  Wi-Fi/Bluetooth work, "Renegade in Rust" and a web flasher - i.e. they are now on iOS 26 and
+  have moved past Metal bring-up into features.
+- `14:12` **xnu 0251: the GPU zap loader resumes an interrupted SCM call like Linux** - it
+  restores the original x1-x5, keeps the x6 token and passes x7 = 0 on the resume. Our
+  `gpu_scm_invoke` re-issues the same call with x6 kept but does not restore x1-x5; worth
+  matching if our zap ever reports "interrupted" on this board.
+
+**HackiOS** (`oosexgang/hackios-xnu-kernel`): nothing new since 2026-10-23 (loader mode
+negotiation, 7z version check).
+
+Practical read: nothing there changes our plan - we are behind them on the userspace stack,
+not on the kernel ladder - but their fps note says the *presentation* path becomes the limit
+once drawing works, and the zap-resume detail in 0251 is a one-line improvement we may need.
