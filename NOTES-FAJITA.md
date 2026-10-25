@@ -2531,3 +2531,30 @@ Verified on `~/ipsw-x/ios16-root-gpu.simg`: the root lists (`Applications`, `Sys
 pieces. That is the tool for the safe-area research: pull the cache (or `cat` a path through a
 filter) and look for what feeds `safeAreaInsets` on 16.7.16, exactly the way
 `GPU_PHASE0_DISCOVERY.md` was produced.
+
+### console86/console89/console90: two lessons, one patch (2026-10-25)
+
+**1. The first boot after flashing userdata is the iOS data migration.** After the 12 GB
+flash the phone sat on the Apple logo for minutes and looked hung; both logs had
+`exec com.apple.datamigrator` and the system reached 540 processes with SpringBoard and
+backboardd running once each. Letting it finish (~10-15 min) brought up SpringBoard; the
+next boots are back to normal. Do not judge a fresh `userdata` image before that migration
+has completed once. The volume is fine - `fsck.hfsplus` reports the same "Volume header needs
+minor repair" on the *original* image, which is the known Linux quirk in NOTES.
+
+**2. A userspace result is invisible on this board.** The tools print to `/dev/console`: with
+`sweetecon=1` the text is drawn over the GUI and scrolls away in seconds (the console carries
+launchd, AKS and the sampler too), and with `sweetfb_noconsole=1` it goes to a serial port
+that does not exist. The persistent ring only sees kernel `printf` (the hook is in
+`_cnputs`, osfmk/console/serial_console.c), so nothing from userspace reached the log - which
+is why both boots showed no `GPU TEST`/`GPU IOKIT` lines even though the tools are in the
+image with the right modes and owners.
+
+**0160 fixes the visibility without touching the image**: the kernel logs the ABI calls -
+`/dev/sweetgpu` open with the pid, every ioctl with its command and return value, and the
+write size and offset. The client is then visible in the ring exactly as far as it got, and a
+failure names itself. That avoided another 12 GB flash plus a repeat of the migration.
+
+If a future change needs new *tool* code, the same trick applies (log from the kernel side),
+or the tools have to travel another way - e.g. written into the writable root from a payload
+blob at boot, since `rootrw=1`.
