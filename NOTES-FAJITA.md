@@ -2367,3 +2367,35 @@ Two defects, both mine, both fixed in the 0159 fix:
    copies differ in wording ("the C surface" from 0156, "the C contract" later), so a plain
    string match cannot collapse them. The generator now collapses them with a regex and
    keeps one. Worth remembering for any future edit of that block.
+
+### console88: the address space is right, and there is no 0160 (2026-10-25)
+
+```
+capi test: ready 1; va 0x80020000..0xc001ffff; param yes; taken yes;
+           two-l3 map/unmap yes; reuse yes; tables 2 of 64
+abi test: PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C surface
+```
+
+Best fit now reuses the freed hole instead of the untouched 1 GiB tail, one print, iOS up
+with 446 processes and no fault.
+
+**The kernel half of the GPU is done.** `surface_bo` turned out not to need a patch of its
+own: their `SweetAdrenoUserClient::surfaceBo()` is built entirely on what we already have -
+`sweet_surface_copy()` and `SweetSurface::kernelAddress()`/`memory` from our own port,
+`sweet_gpu_ready()`, and their `mapGem()`, which calls our `sweet_gpu_iova_alloc` and
+`sweet_gpu_vm_map` page by page. `boSync()` uses our `sweet_gpu_cache_sync`. So the full msm
+ABI their userspace opens - parameters, GEM, submission, fences, IOSurface import, cache
+sync - is implemented and the parts that can be tested in the kernel test green.
+
+What is left is entirely userspace, and nothing is blocked on the kernel any more:
+
+1. a client that opens `SweetAdreno630`, `GEM_NEW`, `IOConnectMapMemory64`, writes PM4,
+   `SUBMIT`, `WAIT_FENCE` - the no-SDK route is to declare the handful of IOKit functions
+   and resolve them with `dlsym(RTLD_DEFAULT, ...)` so `mkinit.py` can wrap the object;
+2. their `gpu/freedreno-sweet/sweet_drm.c` as the libdrm stand-in;
+3. Mesa freedreno and then Chlorophyll for our iOS arm64;
+4. `MetalPluginName` on an `IOAcceleratorES` service for Metal to find the bundle, and their
+   `inject/` profile for backboardd.
+
+Anything the user client needs that the kernel does not do yet will only show up when a real
+Mesa walks the ABI - expect that, not a clean first run.
