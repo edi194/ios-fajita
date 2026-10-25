@@ -2516,3 +2516,18 @@ Today the only trigger is the 30 s timer, so the icon lags. Options, cheapest fi
    path, which this port does not have yet.
 
 Do (1) now, (2) if it feels laggy, (3) only if the other things are done.
+
+### Reading the iOS root without mounting it
+
+`/home/edi194/ref/Bergamota/tools/renegade/hfsx.py` reads our Android-sparse HFS+ image **in
+place** - no mount, no sudo, no free disk:
+
+```bash
+python3 ~/ref/Bergamota/tools/renegade/hfsx.py IMG.simg ls / | cat PATH | get PATH OUT | find NAME
+```
+
+Verified on `~/ipsw-x/ios16-root-gpu.simg`: the root lists (`Applications`, `System`, ...) and
+`/System/Library/Caches/com.apple.dyld` shows `dyld_shared_cache_arm64` plus the `.01`..`.07`
+pieces. That is the tool for the safe-area research: pull the cache (or `cat` a path through a
+filter) and look for what feeds `safeAreaInsets` on 16.7.16, exactly the way
+`GPU_PHASE0_DISCOVERY.md` was produced.
