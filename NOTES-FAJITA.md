@@ -2641,3 +2641,39 @@ negotiation, 7z version check).
 Practical read: nothing there changes our plan - we are behind them on the userspace stack,
 not on the kernel ladder - but their fps note says the *presentation* path becomes the limit
 once drawing works, and the zap-resume detail in 0251 is a one-line improvement we may need.
+
+### MILESTONE 2026-10-25 evening: a user process submits to the GPU
+
+```
+SWEET GPU: /dev/sweetgpu opened -> 0
+SWEET GPU: ioctl 0xc0184770 -> 0      INFO
+SWEET GPU: ioctl 0xc0104742 -> 0      GEM_NEW (command buffer)
+SWEET GPU: ioctl 0xc0104742 -> 0      GEM_NEW (target)
+SWEET GPU: ioctl 0xc0104743 -> 0      GEM_INFO GET_IOVA
+SWEET GPU: ioctl 0xc0084744 -> 0      SELECT
+SWEET GPU: write 0 bytes at 40 -> 0   (40 bytes of PM4 copied; the log prints the uio AFTER the
+                                       transfer, so resid is already 0 and the offset 40)
+SWEET GPU: ioctl 0xc0104746 -> 0      SUBMIT (returns a fence)
+SWEET GPU: ioctl 0xc0104747 -> 0      WAIT_FENCE (the fence retired)
+SWEET GPU: ioctl 0xc0084744 -> 0      SELECT (target, before the read-back)
+```
+
+Every call returned 0, so an iOS process opened the device, allocated two buffers, mapped one,
+wrote a PM4 command buffer into it, submitted it to the CP and waited for the fence.
+
+**How userspace code finally runs here** (three wrong turns first, all in NOTES above): launchd on
+this port does not source its jobs from `/Library/LaunchDaemons` **or**
+`/System/Library/LaunchDaemons` - our plists were ignored, and after replacing
+`com.apple.DumpPanic`'s plist the log still said `exec DumpPanic`, i.e. the job set is cached
+somewhere else. What launchd does do is exec the stock binaries, so the working trick is to
+replace one: `/usr/libexec/DumpPanic` is now our tool (`tools/replace-daemon-binary.sh`, original
+kept as `.orig`).
+
+**And the tool needed its own stack**: launched by launchd the first attempt died with SIGBUS on
+its first `ldr [sp]` because the sp the kernel hands a static binary sits outside the mapped
+stack (crash report: sp `0x16fdffb58` vs a stack ending at `0x16f60400`). `tools/sweet-gputest.S`
+now `mmap`s 16 KiB and switches sp before touching it. 455 crash-loop relaunches were visible in
+the log until then.
+
+Next: the same trick for `sweet-iokit-test` (replace another stock binary with it) to prove the
+IOKit path, which is the one Mesa and Chlorophyll use.
