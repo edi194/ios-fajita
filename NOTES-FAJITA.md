@@ -2340,3 +2340,30 @@ Either way the first milestone is the same: a userspace program that opens
 with `IOConnectMapMemory64`, writes PM4 into it, submits and waits - i.e. what
 `tools/sweet-gputest.S` already does over the chardev, but through IOKit. That proves the
 ABI end to end from userspace, which is the last item of stage 8.
+
+### console87: the pool and the second L3 work; two things to fix (2026-10-25)
+
+```
+capi test: ready 1; va 0x80020000..0xc001ffff; param yes; taken yes;
+           two-l3 map/unmap yes; reuse NO; tables 2 of 64
+abi test: FAILED   (three times)
+```
+
+The good part is the new machinery: the `sweetfw3` pool hands out L3s on demand (`tables 2
+of 64`), a 3 MiB allocation really spans two 2 MiB chunks with **different** L3 tables, the
+read-only bit is set where asked, and `taken` reports the rounded size. Note `GPU_VA_BASE`
+is `0x80020000` (the arena started above the 0149/0150 test pages), so the range prints as
+`0x80020000..0xc001ffff` - correct, just not the round number the name suggests.
+
+Two defects, both mine, both fixed in the 0159 fix:
+
+1. **`reuse NO` was the test's fault.** First fit takes the first extent that fits, and
+   index 0 is still the untouched 1 GiB tail, so the hole freed a moment earlier is never
+   chosen. Allocation is **best fit** now (smallest extent that fits): it prefers freed
+   holes and lowers fragmentation - the right policy for a client that allocates and frees
+   all day - and the test asks for the same size it freed.
+2. **Three `abi test:` lines.** Every rewrite of this test left one copy of its final
+   print, because the TEST text contains the print while the slice ends before it - and the
+   copies differ in wording ("the C surface" from 0156, "the C contract" later), so a plain
+   string match cannot collapse them. The generator now collapses them with a regex and
+   keeps one. Worth remembering for any future edit of that block.
