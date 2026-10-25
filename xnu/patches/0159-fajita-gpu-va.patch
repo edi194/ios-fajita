@@ -71,7 +71,7 @@
  		break;
  	default:
  		return false;
-@@ -1413,66 +1452,96 @@
+@@ -1413,66 +1452,106 @@
  	return true;
  }
  
@@ -101,7 +101,8 @@
  
 -static uint32_t
 -gpu_extent_alloc(uint32_t size)
-+/* First fit; the allocation takes its guard page with it. */
++/* Best fit: the smallest extent that fits, so a freed hole is reused before the
++ * untouched tail and fragmentation stays down. The guard page goes with it. */
 +static bool
 +gpu_va_take(uint64_t size, uint64_t *off)
  {
@@ -111,17 +112,26 @@
 -			gpu_free_ext[i].off += size;
 -			gpu_free_ext[i].size -= size;
 -			return off;
++	unsigned best = GPU_VA_EXTENTS;
++	uint64_t best_size = 0;
++
 +	for (unsigned i = 0; i < GPU_VA_EXTENTS; i++) {
 +		if (gpu_va_free[i].size < size + 0x1000) {
 +			continue;
++		}
++		if (best == GPU_VA_EXTENTS || gpu_va_free[i].size < best_size) {
++			best = i;
++			best_size = gpu_va_free[i].size;
  		}
-+		*off = gpu_va_free[i].off;
-+		gpu_va_free[i].off += size + 0x1000;
-+		gpu_va_free[i].size -= size + 0x1000;
-+		return true;
  	}
 -	return gpu_arena_used;
-+	return false;
++	if (best == GPU_VA_EXTENTS) {
++		return false;
++	}
++	*off = gpu_va_free[best].off;
++	gpu_va_free[best].off += size + 0x1000;
++	gpu_va_free[best].size -= size + 0x1000;
++	return true;
  }
  
  static void
@@ -197,7 +207,7 @@
  	*iova = GPU_VA_BASE + off;
  	if (taken != NULL) {
  		*taken = sz;
-@@ -1480,38 +1549,65 @@
+@@ -1480,38 +1559,65 @@
  	return true;
  }
  
@@ -277,7 +287,7 @@
  		return false;
  	}
  	l3[(iova >> 12) & 0x1ff] = (pa & ~0xfffull) | GPU_PTE_PAGE |
-@@ -1523,13 +1619,14 @@
+@@ -1523,13 +1629,14 @@
  void
  sweet_gpu_vm_unmap(uint64_t iova, uint64_t size)
  {
@@ -296,7 +306,7 @@
  	}
  	__asm__ volatile("dsb sy" ::: "memory");
  }
-@@ -1597,9 +1694,9 @@
+@@ -1597,9 +1704,9 @@
  void
  sweet_gpu_report(const char *why)
  {
@@ -308,7 +318,7 @@
  }
  
  /* ---- stage 8e: the ABI the device node exposes ------------------------- */
-@@ -1958,42 +2055,47 @@
+@@ -1958,44 +2065,45 @@
  	printf("SWEET GPU: abi test: SELECT ok %s, unknown handle refused, read/write armed\n",
  	    sel_ok ? "yes" : "NO");
  
@@ -366,9 +376,9 @@
 +			map_ok = map_ok && l3a[(a >> 12) & 0x1ff] == 0;
 +		}
 +		sweet_gpu_iova_free(a, 0x300000);
-+		reuse = sweet_gpu_iova_alloc(0x1000, &c, &taken) && c == a;
++		reuse = sweet_gpu_iova_alloc(0x300000, &c, &taken) && c == a;
 +		sweet_gpu_iova_free(b, 0x1000);
-+		sweet_gpu_iova_free(c, 0x1000);
++		sweet_gpu_iova_free(c, 0x300000);
 +	}
 +
  	sweet_gpu_report("after the capi test");
@@ -380,9 +390,9 @@
 +	    reuse ? "yes" : "NO", gpu_pte_used, gpu_pte_tables);
  
 -	ok = ok && param_ok && reuse && map_ok;
+-	printf("SWEET GPU: abi test: %s\n", ok ?
+-	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C contract" : "FAILED");
 +	ok = ok && param_ok && taken_ok && map_ok && reuse;
-+	printf("SWEET GPU: abi test: %s\n", ok ?
-+	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C contract" : "FAILED");
  	printf("SWEET GPU: abi test: %s\n", ok ?
- 	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C contract" : "FAILED");
- 	printf("SWEET GPU: abi test: %s\n", ok ?
+ 	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C surface" : "FAILED");
+ 	return ok;
