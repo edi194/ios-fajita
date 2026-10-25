@@ -2558,3 +2558,19 @@ failure names itself. That avoided another 12 GB flash plus a repeat of the migr
 If a future change needs new *tool* code, the same trick applies (log from the kernel side),
 or the tools have to travel another way - e.g. written into the writable root from a payload
 blob at boot, since `rootrw=1`.
+
+### CI applies patches with `git apply`, which has no fuzz
+
+Twice now a patch applied locally (`patch -p1`) and was skipped in CI with
+`patch failed: bsd/dev/sweet_gpu.c:NN` - the local `patch` fuzzes context and matches an
+offset, `git apply` does not. The second case was an include hunk: adding `<sys/proc.h>` for
+a `p->p_pid` in a log line, which `patch` accepted and CI refused, costing a 12 minute run.
+
+Rules:
+
+- **before pushing a new patch, run `git apply --check FILE.patch`** in a tree that has the
+  preceding series applied (that is what CI does), not only `patch --dry-run`;
+- when a hunk keeps fighting the base, remove the need for it instead of nudging context -
+  here the fix was to drop the pid from the log line, which removed `sys/proc.h` entirely;
+- keep each patch's hunks anchored in files our own series creates (`sweet_gpu.c` from 0099)
+  rather than in shared kernel files the pre-0099 series rewrites.
