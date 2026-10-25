@@ -2399,3 +2399,42 @@ What is left is entirely userspace, and nothing is blocked on the kernel any mor
 
 Anything the user client needs that the kernel does not do yet will only show up when a real
 Mesa walks the ABI - expect that, not a clean first run.
+
+### Userspace toolchain without macOS or Xcode (2026-10-25)
+
+There is a working iOS userland toolchain on this Linux box now, and it changes what the
+userspace half costs:
+
+- **SDK**: `theos/sdks` as a sparse checkout, `~/ios-sdk/iPhoneOS16.5.sdk` (233 MiB, has
+  `usr/lib/libSystem.tbd`, `IOKit.framework/IOKit.tbd`, `CoreFoundation.tbd`):
+
+  ```bash
+  git clone --depth 1 --filter=blob:none --sparse https://github.com/theos/sdks.git ~/ios-sdk
+  cd ~/ios-sdk && git sparse-checkout set iPhoneOS16.5.sdk
+  ```
+
+- **Compiler/linker**: the distro's `clang` (22) and **`ld64.lld`** are enough. Note
+  `-fuse-ld=ld64.lld` is rejected as a linker name - use `-fuse-ld=lld`, which picks
+  ld64.lld for a Darwin target:
+
+  ```bash
+  clang --target=arm64-apple-ios16.0 -isysroot $SDK -fuse-ld=lld -O2 \
+        -L$SDK/usr/lib -Wl,-adhoc_codesign -o tool tool.c \
+        -framework IOKit -framework CoreFoundation -lSystem
+  ```
+
+  Result: a normal dynamic Mach-O (`NOUNDEFS|DYLDLINK|TWOLEVEL|PIE`) with `LC_LOAD_DYLIB`
+  on IOKit, CoreFoundation and libSystem, ad-hoc signed for dyld. No Xcode, no macOS.
+
+- **`tools/sweet-iokit-test.c`** is the first client of the IOKit service: INFO, two
+  GEM_NEW, GET_IOVA, `IOConnectMapMemory64` (the handle is the memoryType), a PM4 command
+  buffer written into the mapping, GEM_SUBMIT with the bos[]/cmds[] arrays, WAIT_FENCE and
+  the target read back. It carries the structs and selector numbers from
+  `iokit/Kernel/arm/SweetAdrenoABI.h` so it needs nothing else.
+
+- `tools/mk-root-with-gpu.sh` builds **both** tools and installs both LaunchDaemons
+  (`org.sweet.gputest`, `org.sweet.iokittest`); under `sudo` it now searches
+  `/home/<user>/ios-sdk` for the SDK instead of `$HOME` = `/root`.
+
+This is the road for `sweet_drm.c`, Mesa and Chlorophyll: they build with the same three
+commands, and nothing has to be re-implemented as a static `mkinit.py` binary any more.
