@@ -1,6 +1,14 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -1899,14 +1899,23 @@
+@@ -21,6 +21,7 @@
+ #include <pexpert/pexpert.h>
+ /* stage 8: buffer allocation and cache attributes */
+ #include <sys/conf.h>
++#include <sys/proc.h>   /* struct proc: the open/ioctl log prints the pid */
+ #include <sys/ioccom.h>
+ #include <miscfs/devfs/devfs.h>
+ 
+@@ -1899,14 +1900,23 @@
  static int
  sweet_gpu_dev_write(dev_t dev, struct uio *uio, int flags)
  {
@@ -26,7 +34,7 @@
  }
  
  static int
-@@ -1915,9 +1924,21 @@
+@@ -1915,9 +1925,21 @@
  	return 0;
  }
  
