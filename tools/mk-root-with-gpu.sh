@@ -32,7 +32,15 @@ python3 "$here/tools/mkinit.py" "$work/gputest.o" "$work/sweetgputest"
 
 # The IOKit client is a normal dynamic iOS binary: clang targets arm64-apple-ios and
 # ld64.lld links it against the SDK's .tbd stubs, ad-hoc signed so dyld accepts it.
-SDK=${SDK:-$HOME/ios-sdk/iPhoneOS16.5.sdk}
+# run under sudo, $HOME is /root: look in the usual places too
+SDK=${SDK:-}
+if [[ -z $SDK ]]; then
+	for cand in "$HOME/ios-sdk/iPhoneOS16.5.sdk" \
+	            "/home/$(logname 2>/dev/null || echo edi194)/ios-sdk/iPhoneOS16.5.sdk" \
+	            /home/edi194/ios-sdk/iPhoneOS16.5.sdk; do
+		[[ -d $cand ]] && { SDK=$cand; break; }
+	done
+fi
 iokit_built=0
 if [[ -d $SDK ]]; then
 	echo "== building the IOKit client against $SDK"
