@@ -1,0 +1,388 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -460,6 +460,27 @@
+ static uint32_t gpu_arena_size;
+ static uint32_t gpu_arena_used;
+ 
++/* GPU address space (stage 8f): all of L1[2], first fit, a guard page between buffers. */
++#define GPU_VA_BYTES       0x40000000ull        /* 1 GiB */
++#define GPU_VA_EXTENTS     32u
++#define GPU_PTE_TABLES     64u                  /* 2 MiB each: 128 MiB mappable */
++
++struct gpu_va_extent {
++	uint64_t off;                                   /* from GPU_VA_BASE */
++	uint64_t size;
++};
++
++static struct gpu_va_extent gpu_va_free[GPU_VA_EXTENTS];
++
++/* Pool of L3 tables from the sweetfw3 blob, and which L2 slot each one serves. */
++static vm_offset_t gpu_pte_pool;
++static uint64_t gpu_pte_pool_pa;
++static uint32_t gpu_pte_tables;
++static uint32_t gpu_pte_l2i[GPU_PTE_TABLES];
++static uint32_t gpu_pte_off[GPU_PTE_TABLES];
++static uint32_t gpu_pte_used;
++
++
+ /* State the driver needs after the bring-up function returns. */
+ static vm_offset_t gpu_blob;
+ static vm_offset_t gpu_core;
+@@ -494,6 +515,25 @@
+ 	}
+ 	printf("SWEET GPU: buffer arena %u KiB at %#llx -> %#llx\n", GPU_ARENA_BYTES / 1024,
+ 	    (unsigned long long)pa, (uint64_t)gpu_arena);
++
++	/* The page-table pool and the client address space. */
++	if (!PE_parse_boot_argn("sweetfw3", arg, sizeof(arg)) ||
++	    !gpu_parse_range(arg, &pa, &size) || size < (uint64_t)GPU_PTE_TABLES * 0x1000) {
++		printf("SWEET GPU: no sweetfw3 page-table pool; vm_map will refuse\n");
++		gpu_pte_pool = 0;
++		gpu_pte_tables = 0;
++	} else {
++		gpu_pte_pool = ml_io_map((vm_offset_t)pa, GPU_PTE_TABLES * 0x1000);
++		gpu_pte_pool_pa = pa;
++		gpu_pte_tables = GPU_PTE_TABLES;
++		printf("SWEET GPU: %u page tables (%u MiB mappable) at %#llx\n",
++		    gpu_pte_tables, gpu_pte_tables * 2, (unsigned long long)pa);
++	}
++	gpu_va_free[0].off = 0;
++	gpu_va_free[0].size = GPU_VA_BYTES;
++	for (unsigned i = 1; i < GPU_VA_EXTENTS; i++) {
++		gpu_va_free[i].size = 0;
++	}
+ 	return true;
+ }
+ 
+@@ -1362,7 +1402,6 @@
+ 
+ /* Prototypes exactly as their SweetAdreno.cpp declares them. */
+ static bool gpu_lost;
+-static struct gpu_extent gpu_free_ext[GPU_EXTENT_MAX];
+ 
+ bool
+ sweet_gpu_ready(void)
+@@ -1405,7 +1444,7 @@
+ 		*value = GPU_VA_BASE;
+ 		break;
+ 	case GPU_PARAM_VA_SIZE:
+-		*value = gpu_arena_size;
++		*value = GPU_VA_BYTES;
+ 		break;
+ 	default:
+ 		return false;
+@@ -1413,66 +1452,96 @@
+ 	return true;
+ }
+ 
+-/* A GPU address is GPU_VA_BASE + an arena offset, and both are 64-bit. */
+ static bool
+-gpu_iova_to_off(uint64_t iova, uint64_t size, uint32_t *off)
++gpu_va_to_local(uint64_t iova, uint64_t size, uint64_t *off)
+ {
+-	uint64_t o;
+-
+ 	if (iova < GPU_VA_BASE) {
+ 		return false;
+ 	}
+-	o = iova - GPU_VA_BASE;
+-	if (o + size > gpu_arena_size) {
++	uint64_t o = iova - GPU_VA_BASE;
++
++	if (o + size > GPU_VA_BYTES) {
+ 		return false;
+ 	}
+-	*off = (uint32_t)o;
++	if (off != NULL) {
++		*off = o;
++	}
+ 	return true;
+ }
+ 
+-static uint32_t
+-gpu_extent_alloc(uint32_t size)
++/* First fit; the allocation takes its guard page with it. */
++static bool
++gpu_va_take(uint64_t size, uint64_t *off)
+ {
+-	for (unsigned i = 0; i < GPU_EXTENT_MAX; i++) {
+-		if (gpu_free_ext[i].size >= size) {
+-			uint32_t off = gpu_free_ext[i].off;
+-			gpu_free_ext[i].off += size;
+-			gpu_free_ext[i].size -= size;
+-			return off;
++	for (unsigned i = 0; i < GPU_VA_EXTENTS; i++) {
++		if (gpu_va_free[i].size < size + 0x1000) {
++			continue;
+ 		}
++		*off = gpu_va_free[i].off;
++		gpu_va_free[i].off += size + 0x1000;
++		gpu_va_free[i].size -= size + 0x1000;
++		return true;
+ 	}
+-	return gpu_arena_used;
++	return false;
+ }
+ 
+ static void
+-gpu_extent_free(uint32_t off, uint32_t size)
++gpu_va_give(uint64_t off, uint64_t size)
+ {
+-	for (unsigned i = 0; i < GPU_EXTENT_MAX; i++) {
+-		if (gpu_free_ext[i].size == 0) {
+-			gpu_free_ext[i].off = off;
+-			gpu_free_ext[i].size = size;
++	size += 0x1000;                 /* the guard page goes with it */
++	for (unsigned i = 0; i < GPU_VA_EXTENTS; i++) {
++		if (gpu_va_free[i].size == 0) {
++			gpu_va_free[i].off = off;
++			gpu_va_free[i].size = size;
+ 			return;
+ 		}
+ 	}
++	printf("SWEET GPU: va free table full, %#llx (%llu bytes) left unused\n",
++	    (unsigned long long)(GPU_VA_BASE + off), (unsigned long long)size);
++}
++
++/* The L3 serving a 2 MiB chunk, taken from the pool on first touch. */
++static volatile uint64_t *
++gpu_l3_for(uint64_t iova)
++{
++	volatile uint64_t *l2 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L2);
++	uint32_t l2i = (uint32_t)((iova >> 21) & 0x1ff);
++
++	for (unsigned i = 0; i < gpu_pte_used; i++) {
++		if (gpu_pte_l2i[i] == l2i) {
++			return (volatile uint64_t *)(gpu_pte_pool + gpu_pte_off[i]);
++		}
++	}
++	if (gpu_pte_pool == 0 || gpu_pte_used >= gpu_pte_tables) {
++		printf("SWEET GPU: no page table for %#llx\n", (unsigned long long)iova);
++		return NULL;
++	}
++	uint32_t off = 0x1000u * gpu_pte_used;
++	for (uint32_t i = 0; i < 0x1000; i += 4) {
++		*(volatile uint32_t *)(gpu_pte_pool + off + i) = 0;
++	}
++	gpu_pte_l2i[gpu_pte_used] = l2i;
++	gpu_pte_off[gpu_pte_used] = off;
++	gpu_pte_used++;
++	l2[l2i] = (gpu_pte_pool_pa + off) | GPU_PTE_TABLE;
++	__asm__ volatile("dsb sy" ::: "memory");
++	return (volatile uint64_t *)(gpu_pte_pool + off);
+ }
+ 
+ bool
+ sweet_gpu_iova_alloc(uint64_t size, uint64_t *iova, uint64_t *taken)
+ {
+-	uint64_t sz;
+-	uint32_t off;
++	uint64_t sz, off;
+ 
+-	if (!gpu_live || size == 0 || size > gpu_arena_size) {
++	if (!gpu_live || size == 0 || size > GPU_VA_BYTES) {
+ 		return false;
+ 	}
+ 	sz = (size + 0xfff) & ~0xfffull;
+-	off = gpu_extent_alloc((uint32_t)sz);
+-	if ((uint64_t)off + sz > gpu_arena_size) {
++	if (!gpu_va_take(sz, &off)) {
++		printf("SWEET GPU: no room for %llu bytes in the client range\n",
++		    (unsigned long long)sz);
+ 		return false;
+ 	}
+-	if (off == gpu_arena_used) {
+-		gpu_arena_used += (uint32_t)sz;
+-	}
+ 	*iova = GPU_VA_BASE + off;
+ 	if (taken != NULL) {
+ 		*taken = sz;
+@@ -1480,38 +1549,65 @@
+ 	return true;
+ }
+ 
+-/* msm SET_IOVA: the client picked an address; refuse it if it is not ours to give. */
++/* msm SET_IOVA: the client picked an address; carve it out of the free space. */
+ bool
+ sweet_gpu_iova_reserve(uint64_t iova, uint64_t size)
+ {
+-	uint32_t off;
++	uint64_t off, sz;
+ 
+-	return gpu_live && gpu_iova_to_off(iova, size, &off);
++	if (!gpu_live || size == 0) {
++		return false;
++	}
++	sz = (size + 0xfff) & ~0xfffull;
++	if (!gpu_va_to_local(iova, sz, &off)) {
++		return false;
++	}
++	for (unsigned i = 0; i < GPU_VA_EXTENTS; i++) {
++		uint64_t e_off = gpu_va_free[i].off, e_size = gpu_va_free[i].size;
++
++		if (e_size == 0 || off < e_off || off + sz > e_off + e_size) {
++			continue;
++		}
++		uint64_t tail_off = off + sz + 0x1000;
++		uint64_t tail_size = e_off + e_size - tail_off;
++
++		gpu_va_free[i].size = off - e_off;
++		if (tail_size > 0) {
++			for (unsigned j = 0; j < GPU_VA_EXTENTS; j++) {
++				if (j != i && gpu_va_free[j].size == 0) {
++					gpu_va_free[j].off = tail_off;
++					gpu_va_free[j].size = tail_size;
++					break;
++				}
++			}
++		}
++		return true;
++	}
++	return false;
+ }
+ 
+ void
+ sweet_gpu_iova_free(uint64_t iova, uint64_t size)
+ {
+-	uint32_t off;
++	uint64_t off, sz;
+ 
+-	if (gpu_iova_to_off(iova, size, &off)) {
+-		gpu_extent_free(off, (uint32_t)size);
++	if (size == 0) {
++		return;
++	}
++	sz = (size + 0xfff) & ~0xfffull;
++	if (gpu_va_to_local(iova, sz, &off)) {
++		gpu_va_give(off, sz);
+ 	}
+ }
+ 
+ bool
+ sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly)
+ {
+-	volatile uint64_t *l3 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L3);
+-	uint32_t l2i;
+-
+-	if (!gpu_live) {
++	if (!gpu_live || !gpu_va_to_local(iova, 0x1000, NULL)) {
+ 		return false;
+ 	}
+-	l2i = (uint32_t)((iova >> 21) & 0x1ff);
+-	if (l2i != 0) {
+-		printf("SWEET GPU: vm_map %#llx is past the first 2 MiB (L2[%u])\n",
+-		    (unsigned long long)iova, l2i);
++	volatile uint64_t *l3 = gpu_l3_for(iova);
++	if (l3 == NULL) {
+ 		return false;
+ 	}
+ 	l3[(iova >> 12) & 0x1ff] = (pa & ~0xfffull) | GPU_PTE_PAGE |
+@@ -1523,13 +1619,14 @@
+ void
+ sweet_gpu_vm_unmap(uint64_t iova, uint64_t size)
+ {
+-	volatile uint64_t *l3 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L3);
+-
+-	if (!gpu_live) {
++	if (!gpu_live || !gpu_va_to_local(iova, size, NULL)) {
+ 		return;
+ 	}
+ 	for (uint64_t o = 0; o < size; o += 0x1000) {
+-		l3[((iova + o) >> 12) & 0x1ff] = 0;
++		volatile uint64_t *l3 = gpu_l3_for(iova + o);
++		if (l3 != NULL) {
++			l3[((iova + o) >> 12) & 0x1ff] = 0;
++		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+@@ -1597,9 +1694,9 @@
+ void
+ sweet_gpu_report(const char *why)
+ {
+-	printf("SWEET GPU: report%s%s: live %d lost %d ring wptr %u fence %u\n",
++	printf("SWEET GPU: report%s%s: live %d lost %d ring wptr %u fence %u tables %u\n",
+ 	    why ? " " : "", why ? why : "", gpu_live ? 1 : 0, gpu_lost ? 1 : 0,
+-	    gpu_cp_wptr, gpu_cp_seq);
++	    gpu_cp_wptr, gpu_cp_seq, gpu_pte_used);
+ }
+ 
+ /* ---- stage 8e: the ABI the device node exposes ------------------------- */
+@@ -1958,42 +2055,47 @@
+ 	printf("SWEET GPU: abi test: SELECT ok %s, unknown handle refused, read/write armed\n",
+ 	    sel_ok ? "yes" : "NO");
+ 
+-	/* the surface the IOKit user client calls, with their prototypes */
++	/* the address space a real client uses: full range, page tables on demand */
+ 	uint64_t capv = 0;
+ 	bool param_ok = sweet_gpu_param(GPU_PARAM_GPU_ID, &capv) && capv == 630;
+-	param_ok = param_ok && sweet_gpu_param(GPU_PARAM_CHIP_ID, &capv) && capv == 0x06030001u;
+-	param_ok = param_ok && sweet_gpu_param(GPU_PARAM_GMEM_SIZE, &capv) && capv == 0x100000u;
++	param_ok = param_ok && sweet_gpu_param(GPU_PARAM_VA_SIZE, &capv) && capv == GPU_VA_BYTES;
+ 	param_ok = param_ok && !sweet_gpu_param(999, &capv);
+ 
+-	uint64_t iova_a = 0, iova_b = 0, iova_c = 0, taken = 0;
+-	bool reuse = false, map_ok = false;
+-	if (sweet_gpu_iova_alloc(0x1000, &iova_a, &taken) &&
+-	    sweet_gpu_iova_alloc(0x1000, &iova_b, &taken)) {
+-		uint32_t off = 0;
+-		if (gpu_iova_to_off(iova_b, 0x1000, &off) &&
+-		    sweet_gpu_vm_map(iova_b, gpu_arena_pa + off, false)) {
+-			volatile uint64_t *l3 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L3);
+-			map_ok = l3[(iova_b >> 12) & 0x1ff] ==
+-			    ((gpu_arena_pa + off) | GPU_PTE_PAGE);
+-			sweet_gpu_vm_unmap(iova_b, 0x1000);
+-			map_ok = map_ok && l3[(iova_b >> 12) & 0x1ff] == 0;
+-		}
+-		sweet_gpu_iova_free(iova_a, 0x1000);
+-		reuse = sweet_gpu_iova_alloc(0x1000, &iova_c, &taken) && iova_c == iova_a;
+-		sweet_gpu_iova_free(iova_b, 0x1000);
+-		sweet_gpu_iova_free(iova_c, 0x1000);
+-	}
+-	sweet_gpu_cache_sync((void *)gpu_arena, 0x1000);
+-
+-	printf("SWEET GPU: capi test: ready %d selector %u; param gpu %llu chip %#llx gmem %#llx; "
+-	    "iova reuse %s; vm_map/unmap %s; fence %u done %s\n",
+-	    sweet_gpu_ready(), sweet_gpu_selector(), (unsigned long long)630,
+-	    (unsigned long long)0x06030001ull, (unsigned long long)0x100000ull,
+-	    reuse ? "yes" : "NO", map_ok ? "yes" : "NO", sweet_gpu_fence_last(),
+-	    sweet_gpu_fence_done(sweet_gpu_fence_last()) ? "yes" : "NO");
++	uint64_t a = 0, b = 0, c = 0, taken = 0;
++	bool reuse = false, map_ok = false, taken_ok = false;
++	if (sweet_gpu_iova_alloc(0x300000, &a, &taken) &&          /* 3 MiB: two L3 chunks */
++	    sweet_gpu_iova_alloc(0x1000, &b, &taken)) {
++		uint64_t far = a + 0x200000;                      /* the next 2 MiB chunk */
++		taken_ok = taken == 0x1000;                       /* the last one asked */
++		if (sweet_gpu_vm_map(a, gpu_arena_pa, false) &&
++		    sweet_gpu_vm_map(far, gpu_arena_pa + 0x1000, true)) {
++			volatile uint64_t *l3a = gpu_l3_for(a);
++			volatile uint64_t *l3b = gpu_l3_for(far);
++
++			map_ok = l3a != NULL && l3b != NULL && l3a != l3b &&
++			    l3a[(a >> 12) & 0x1ff] == (gpu_arena_pa | GPU_PTE_PAGE) &&
++			    l3b[(far >> 12) & 0x1ff] ==
++			    ((gpu_arena_pa + 0x1000) | GPU_PTE_PAGE | (1ull << 7));
++			sweet_gpu_vm_unmap(a, 0x300000);
++			map_ok = map_ok && l3a[(a >> 12) & 0x1ff] == 0;
++		}
++		sweet_gpu_iova_free(a, 0x300000);
++		reuse = sweet_gpu_iova_alloc(0x1000, &c, &taken) && c == a;
++		sweet_gpu_iova_free(b, 0x1000);
++		sweet_gpu_iova_free(c, 0x1000);
++	}
++
+ 	sweet_gpu_report("after the capi test");
++	printf("SWEET GPU: capi test: ready %d; va %#x..%#llx; param %s; taken %s; "
++	    "two-l3 map/unmap %s; reuse %s; tables %u of %u\n",
++	    sweet_gpu_ready(), GPU_VA_BASE,
++	    (unsigned long long)(GPU_VA_BASE + GPU_VA_BYTES - 1),
++	    param_ok ? "yes" : "NO", taken_ok ? "yes" : "NO", map_ok ? "yes" : "NO",
++	    reuse ? "yes" : "NO", gpu_pte_used, gpu_pte_tables);
+ 
+-	ok = ok && param_ok && reuse && map_ok;
++	ok = ok && param_ok && taken_ok && map_ok && reuse;
++	printf("SWEET GPU: abi test: %s\n", ok ?
++	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C contract" : "FAILED");
+ 	printf("SWEET GPU: abi test: %s\n", ok ?
+ 	    "PASSED - INFO, GEM_NEW, SUBMIT, WAIT_FENCE, GEM_INFO, GEM_CLOSE, the C contract" : "FAILED");
+ 	printf("SWEET GPU: abi test: %s\n", ok ?
