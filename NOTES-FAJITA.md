@@ -2574,3 +2574,38 @@ Rules:
   here the fix was to drop the pid from the log line, which removed `sys/proc.h` entirely;
 - keep each patch's hunks anchored in files our own series creates (`sweet_gpu.c` from 0099)
   rather than in shared kernel files the pre-0099 series rewrites.
+
+### console91: two blockers found, both named (2026-10-25)
+
+**1. The USB device never comes up, so there is no live log yet.**
+
+```
+SWEET USB: GDSC usb30_prim 0x00222001 (off)
+SWEET USB: clk master       CBCR 0x80000000 (off)
+SWEET USB: clk sleep/utmi/cfg-noc-axi/aggre-axi  0x80000000 (off)
+SWEET USB: controller unpowered or unclocked; DWC3 not read
+```
+
+`sweetusb=2` only reaches the "powered?" check: the USB30 GDSC is off and all five clocks are
+off, and the driver then refuses to touch DWC3. The offsets in that driver are the `sweet`
+platform's (SM7150), not fajita's, so it cannot power the block - the same class of work as
+GPU stages 1-2: fajita's GDSC offset and bit, the five CBCRs with their halt bits, then the
+DWC3 reset and the ECM bring-up. Worth it: `sweetusblog` is already in the kernel (ring ->
+UDP 192.168.7.1:5140) and `tools/sweet-usbnet.sh` is the host side, so live logs are one
+powered USB block away, with `usbipd attach --wsl` on the PC.
+
+**2. launchd does not load our daemons** - no `sweetgpu opened` line in the ring even though
+0160 logs it, and the image has both binaries (0755, 0:0) and both plists (0644, 0:0) in
+`/Library/LaunchDaemons`. launchd logs nothing about job loading at all (by design), so this is
+an absence of evidence, not proof - but after three boots it is the working assumption.
+
+Ways forward, cheapest first:
+
+- **kernel injection** (recommended): the root is mounted read-write (`rootrw=1`), so the
+  kernel can write `/usr/local/bin/sweet-*` and the plists into it at boot from a payload blob
+  before launchd starts. That removes the 12 GB flash *and* the 15 minute iOS data migration
+  from every iteration, and it is the only path that keeps iterating cheap;
+- put the plists in `/System/Library/LaunchDaemons` (definitely scanned): one image change,
+  i.e. flash + migration again;
+- skip launchd entirely: run the tool from an existing root daemon we control - we have none
+  in userspace, so this needs one of the above first.
