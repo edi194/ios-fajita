@@ -61,7 +61,7 @@
  void SweetAdrenoPublish(void);
  }
  
-@@ -372,17 +374,23 @@
+@@ -372,17 +374,24 @@
  	if (r->size == 0 || size > GEM_SIZE_MAX) {
  		return kIOReturnBadArgument;
  	}
@@ -82,8 +82,9 @@
 -	uint8_t *kva = (uint8_t *)buf->getBytesNoCopy();
 -	if (kva == NULL) {
 -		buf->release();
-+	IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::withPhysicalAddress(
++	OSPtr<IOBufferMemoryDescriptor> bufRef = IOBufferMemoryDescriptor::withPhysicalAddress(
 +	    (IOPhysicalAddress)pa, (IOByteCount)size, kIODirectionInOut);
++	IOBufferMemoryDescriptor *buf = bufRef.detach();
 +	if (buf == NULL) {
 +		sweet_gpu_free_pages(pa, size);
  		return kIOReturnNoMemory;
