@@ -1,0 +1,38 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -657,6 +657,8 @@
+ 		r->fence = fence;
+ 		r->fence_fd = -1;
+ 		ret = kIOReturnSuccess;
++		IOLog("SWEET ADRENO: submit %u bos %u cmds, ib %#llx %u dwords, fence %u\n",
++		    r->nr_bos, r->nr_cmds, ib[0], ibn[0], fence);
+ 	}
+ unlock:
+ 	IOLockUnlock(gAdrenoLock);
+@@ -690,6 +692,26 @@
+ 		uint64_t ns = (r->timeout.tv_sec < 0 || r->timeout.tv_nsec < 0) ? 0 :
+ 		    (uint64_t)r->timeout.tv_sec * NSEC_PER_SEC + (uint64_t)r->timeout.tv_nsec;
+ 		ret = waitFence(r->fence, ns) ? kIOReturnSuccess : (sweet_gpu_ready() ? kIOReturnTimeout : kIOReturnNotReady);
++		IOLog("SWEET ADRENO: wait fence %u (%llu ns) -> %#x, last %u\n", r->fence,
++		    (unsigned long long)ns, ret, sweet_gpu_fence_last());
++		/*
++		 * The client's own output does not reach the console (launchd gives it a stdout nobody
++		 * reads), so the kernel reports what the GPU actually produced: the first dwords of every
++		 * buffer we allocated. The tester writes 0x600d0001/0x600d0002 at +0x10/+0x20 of the
++		 * target, so seeing them here means the command buffer ran and the fence is honest.
++		 */
++		if (ret == kIOReturnSuccess) {
++			for (uint32_t i = 0; i < GEM_MAX; i++) {
++				struct sweet_gem *g = &fGems[i];
++				if (g->md == NULL || g->pa == 0 || g->kva == NULL) {
++					continue;
++				}
++				volatile uint32_t *p = (volatile uint32_t *)(void *)g->kva;
++				IOLog("SWEET ADRENO: bo %u iova %#llx: %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n",
++				    i + 1, g->iova, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
++				    p[8], p[9], p[10], p[11]);
++			}
++		}
+ 	}
+ 	IOLockUnlock(gAdrenoLock);
+ 	return ret;

@@ -2829,3 +2829,42 @@ Two known traps on the way here:
 
 `0163` also turns every `mapGem()` failure into `panic("SWEET DIAG: ...")` with the numbers, so
 the next panel photo names the page, the iova and the pa instead of just "GEM_NEW failed".
+
+### 2026-10-26 late night: the IOKit client runs the whole sequence, no panic
+
+`0163` (arena `pa` in the slot + `mapGem` mapping it directly) fixed it. The ring from that boot:
+/usr/local/bin/sweet-iokit-test` was exec'd by the chardev tool and the kernel logged
+
+```
+SWEET ADRENO: selector 0x70 in 0 bytes          INFO
+SWEET ADRENO: selector 0x42 in 16 bytes         GEM_NEW
+SWEET GPU: arena: 16384 bytes at arena+0x1c000 pa 0x102538000
+SWEET ADRENO: selector 0x42 in 16 bytes         GEM_NEW
+SWEET GPU: arena: 16384 bytes at arena+0x20000 pa 0x10253c000
+SWEET ADRENO: selector 0x43 in 24 bytes         GEM_INFO
+IOMemoryDescriptor physical with managed page 0x102538000:0x4000   (warning, both buffers)
+SWEET ADRENO: selector 0x46 in 72 bytes         SUBMIT
+SWEET GPU: cp submit: ring idle (RPTR=WPTR=327) rbbm_status 0x800005
+SWEET ADRENO: selector 0x47 in 32 bytes         WAIT_FENCE
+```
+
+and the boot continued into launchd/SpringBoard (backboardd, bluetoothd, searchd...). That is
+the first end-to-end userspace submission through IOKit on this port: open service, INFO, two
+GEM_NEW from the arena, GEM_INFO, IOConnectMapMemory64 twice, SUBMIT, WAIT_FENCE.
+
+Two observations to carry forward:
+
+- **Userspace output is invisible.** The tester's `printf()` goes to stdout, which launchd does
+  not wire to the console; only explicit `/dev/console` writes show up (that is why the assembly
+  tool's `GPU TEST:` lines appear). Worse, the ring never carries the last seconds before a
+  panic. So `0164` makes the kernel verify instead: `submit()` logs the fence, `waitFenceCall()`
+  logs the wait result and dumps the first 12 dwords of every GEM_NEW buffer through the kernel
+  alias. The tester writes 0x600d0001/0x600d0002 at +0x10/+0x20 of the target, so those words
+  appearing in the dump prove the userspace write reached GPU-visible memory, the CP ran the
+  command buffer and the fence retired.
+- **`IOMemoryDescriptor physical with managed page ...`** is IOKit warning that a physical
+  descriptor points at memory the VM manages (our payload blob). It is not fatal (the maps
+  succeeded), but it is the reason a userspace mapping of arena memory may be cacheable: the
+  CPU's stores then sit in cache and the CP reads stale DRAM. If the `0164` dump shows zeros at
+  +0x10/+0x20, the fix is to return `kIOMapWriteCombineCache` from `clientMemoryForType()` (or
+  flush in the client) rather than to change the allocator.
