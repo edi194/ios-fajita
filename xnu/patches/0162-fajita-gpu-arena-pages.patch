@@ -60,7 +60,7 @@
  void SweetAdrenoPublish(void);
  }
  
-@@ -372,17 +374,26 @@
+@@ -372,19 +374,32 @@
  	if (r->size == 0 || size > GEM_SIZE_MAX) {
  		return kIOReturnBadArgument;
  	}
@@ -90,11 +90,19 @@
 +		sweet_gpu_free_pages(pa, size);
  		return kIOReturnNoMemory;
  	}
+-	bzero(kva, (size_t)size);
+-	sweet_gpu_cache_sync(kva, (size_t)size);
 +	uint8_t *kva = (uint8_t *)akva;
- 	bzero(kva, (size_t)size);
- 	sweet_gpu_cache_sync(kva, (size_t)size);
++	/*
++	 * Not bzero(): bzero uses dc zva (osfmk/arm64/bzero.s), and dc zva is not permitted on
++	 * I/O mapped memory - the arena comes from ml_io_map, so it faults (unaligned kernel data
++	 * abort). sweet_gpu_alloc_pages() already zeroed these pages with 32-bit stores, and
++	 * uncached memory needs no cache maintenance.
++	 */
  
-@@ -397,7 +408,6 @@
+ 	IOLockLock(gAdrenoLock);
+ 	IOReturn ret = kIOReturnNoResources;
+@@ -397,7 +412,6 @@
  				struct sweet_gem *g = &fGems[i];
  				bzero(g, sizeof(*g));
  				g->md = buf;
@@ -102,7 +110,7 @@
  				g->kva = kva;
  				g->size = size;
  				ret = mapGem(g, r->flags, &r->handle, 0);
-@@ -587,7 +597,7 @@
+@@ -587,7 +601,7 @@
  			struct sweet_gem *cb = objs[c->submit_idx];
  			for (uint32_t k = 0; k < c->nr_relocs; k++) {
  				struct sweet_msm_gem_submit_reloc *rl = &relocs[at + k];

@@ -1,0 +1,54 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -76,6 +76,7 @@
+ 	IOBufferMemoryDescriptor *buf;          /* == md for BOs made by GEM_NEW, else NULL */
+ 	SweetSurface             *surface;      /* retained for surface BOs */
+ 	uint8_t                  *kva;          /* kernel alias (write-combined for GEM_NEW BOs) */
++	uint64_t                  pa;           /* arena physical address for GEM_NEW BOs, else 0 */
+ 	uint64_t                  size;
+ 	uint64_t                  iova;
+ 	uint64_t                  vaLen;        /* what was taken from the allocator (size + guard) */
+@@ -326,6 +327,7 @@
+ 		g->surface = NULL;
+ 	}
+ 	g->kva = NULL;
++	g->pa = 0;
+ 	g->iova = IOVA_UNSET;
+ }
+ 
+@@ -344,14 +346,24 @@
+ 		taken = size;
+ 	} else if (!sweet_gpu_iova_alloc(size, &iova, &taken)) {
+ 		IOLog("SWEET GPU: no GPU address space for %llu bytes\n", size);
+-		return kIOReturnNoSpace;
++		panic("SWEET DIAG: no iova for %llu bytes (arena %#llx)", size, slot->pa);
+ 	}
+ 	bool ok = true;
+ 	uint64_t mapped = 0;
+ 	for (; mapped < size && ok; mapped += PAGE_SIZE) {
+-		IOByteCount length = 0;
+-		addr64_t pa = slot->md->getPhysicalSegment(mapped, &length, kIOMemoryMapperNone);
++		uint64_t pa;
++		if (slot->pa != 0) {
++			/* GEM_NEW: the arena address is already known, no descriptor walk needed. */
++			pa = slot->pa + mapped;
++		} else {
++			IOByteCount length = 0;
++			pa = (uint64_t)slot->md->getPhysicalSegment(mapped, &length, kIOMemoryMapperNone);
++		}
+ 		ok = pa != 0 && (pa & (PAGE_SIZE - 1)) == 0 && sweet_gpu_vm_map(iova + mapped, pa, ro);
++		if (!ok) {
++			panic("SWEET DIAG: mapGem page %llu of %llu: iova %#llx pa %#llx arena %#llx",
++			    mapped / PAGE_SIZE, size / PAGE_SIZE, iova, pa, slot->pa);
++		}
+ 	}
+ 	if (!ok) {
+ 		sweet_gpu_vm_unmap(iova, mapped);
+@@ -413,6 +425,7 @@
+ 				bzero(g, sizeof(*g));
+ 				g->md = buf;
+ 				g->kva = kva;
++				g->pa = pa;
+ 				g->size = size;
+ 				ret = mapGem(g, r->flags, &r->handle, 0);
+ 				if (ret != kIOReturnSuccess) {
