@@ -61,7 +61,7 @@
  void SweetAdrenoPublish(void);
  }
  
-@@ -372,17 +374,24 @@
+@@ -372,17 +374,33 @@
  	if (r->size == 0 || size > GEM_SIZE_MAX) {
  		return kIOReturnBadArgument;
  	}
@@ -82,9 +82,18 @@
 -	uint8_t *kva = (uint8_t *)buf->getBytesNoCopy();
 -	if (kva == NULL) {
 -		buf->release();
-+	OSPtr<IOBufferMemoryDescriptor> bufRef = IOBufferMemoryDescriptor::withPhysicalAddress(
-+	    (IOPhysicalAddress)pa, (IOByteCount)size, kIODirectionInOut);
-+	IOBufferMemoryDescriptor *buf = bufRef.detach();
++	/* Constructed here rather than with the withPhysicalAddress() factory: that one's return
++	 * type differs between XNU trees (OSPtr alias vs class), and initWithPhysicalAddress()
++	 * simply answers bool. */
++	IOBufferMemoryDescriptor *buf = OSTypeAlloc(IOBufferMemoryDescriptor);
++	if (buf == NULL || !buf->initWithPhysicalAddress((IOPhysicalAddress)pa,
++	    (IOByteCount)size, kIODirectionInOut)) {
++		if (buf != NULL) {
++			buf->release();
++		}
++		sweet_gpu_free_pages(pa, size);
++		return kIOReturnNoMemory;
++	}
 +	if (buf == NULL) {
 +		sweet_gpu_free_pages(pa, size);
  		return kIOReturnNoMemory;
