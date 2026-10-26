@@ -19,6 +19,7 @@
 #define SYS_write	4
 #define SYS_open	5
 #define SYS_ioctl	54
+#define SYS_execve	59
 
 #define IOC_INFO	0xc0184770
 #define IOC_GEM_NEW	0xc0104742
@@ -49,9 +50,27 @@
 	.globl	_start
 	.p2align 2
 _start:
-	/* No alignment fix-up needed: every stack access below is a 32-bit
-	 * ldr/str, which AArch64 allows unaligned. */
-	sub	sp, sp, #512
+	/*
+	 * Do not trust the sp the kernel hands a static binary spawned by launchd:
+	 * the crash report of the first attempt (2026-10-25) showed sp outside the
+	 * mapped stack (0x16fdffb58 vs a stack ending at 0x16f604000), so the first
+	 * ldr [sp] was a SIGBUS. mmap one page pair and switch to it first.
+	 */
+	mov	x0, #0			/* addr: let the kernel pick */
+	mov	x1, #0x4000		/* 16 KiB */
+	mov	x2, #3			/* PROT_READ | PROT_WRITE */
+	mov	x3, #0x1002		/* MAP_PRIVATE | MAP_ANON */
+	mov	x4, #-1
+	mov	x5, #0
+	mov	x16, #197		/* SYS_mmap */
+	svc	#0x80
+	b.cc	1f
+	mov	x0, sp			/* mmap refused: keep what we were given */
+	b	2f
+1:
+	add	x0, x0, #0x3000	/* top of our page, leaving room below */
+2:
+	mov	sp, x0
 
 	/* console */
 	adr	x0, s_console
@@ -226,10 +245,23 @@ fail:
 	adr	x1, m_fail
 	bl	puts
 stop:
+	/*
+	 * Hand over to the IOKit client. This tool runs as a stock daemon binary, which is the
+	 * only way we have to get userspace code running at boot, so the IOKit test rides behind
+	 * it instead of replacing another system binary.
+	 */
+	adr	x0, s_iokit
+	add	x1, sp, #0x400
+	str	x0, [x1]
+	str	xzr, [x1, #8]
+	mov	x2, #0
+	mov	x16, #SYS_execve
+	svc	#0x80
+	/* execve failed: exit quietly */
 	mov	x0, #0
 	mov	x16, #SYS_exit
 	svc	#0x80
-	b	stop			/* init must not return */
+	b	stop
 
 /* ioctl(fd=x0, cmd=x1, arg=x2) -> x0 = 0 or -1 */
 ioctl:
@@ -259,6 +291,8 @@ s_console:
 	.asciz	"/dev/console"
 s_dev:
 	.asciz	"/dev/sweetgpu"
+s_iokit:
+	.asciz	"/usr/local/bin/sweet-iokit-test"
 m_nodev:
 	.asciz	"GPU TEST: /dev/sweetgpu is not there\n"
 m_abi:

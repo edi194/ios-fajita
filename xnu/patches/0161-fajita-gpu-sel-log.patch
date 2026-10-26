@@ -1,0 +1,12 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -824,6 +824,9 @@
+ 	}
+ 
+ #define NEED(T) do { if (in < sizeof(T)) { return kIOReturnBadArgument; } } while (0)
++	/* Which selector the client asked for, before anything can panic on it. */
++	IOLog("SWEET ADRENO: selector %#x in %u bytes\n", selector, (unsigned)in);
++
+ 	switch (selector) {
+ 	case SWEET_GPU_SEL_GET_PARAM:
+ 		NEED(struct sweet_msm_param);
