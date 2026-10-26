@@ -1,0 +1,103 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -479,6 +479,9 @@
+ static uint32_t gpu_pte_l2i[GPU_PTE_TABLES];
+ static uint32_t gpu_pte_off[GPU_PTE_TABLES];
+ static uint32_t gpu_pte_used;
++static vm_offset_t gpu_smmu;    /* SMMU base, for TLB invalidation after PTE changes */
++
++static void gpu_tlb_invalidate(void);
+ 
+ 
+ /* State the driver needs after the bring-up function returns. */
+@@ -567,6 +570,7 @@
+ 		l3[((va + o) >> 12) & 0x1ff] = (pa + o) | GPU_PTE_PAGE;
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	gpu_tlb_invalidate();
+ 	return true;
+ }
+ 
+@@ -637,6 +641,7 @@
+ 		l3[((bo->va + o) >> 12) & 0x1ff] = 0;
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	gpu_tlb_invalidate();
+ 	printf("SWEET GPU: bo: freed va %#x handle %u (%lu bytes)\n", bo->va, bo->handle,
+ 	    (unsigned long)bo->size);
+ 	bo->used = false;
+@@ -710,6 +715,41 @@
+ 	delay(ms * 1000u);
+ }
+ 
++/*
++ * A rewritten (or cleared) PTE is invisible to the CP until its TLB forgets the old entry, and
++ * the GPU caches the walk. Every place that touches a PTE calls this: the chardev map/free and
++ * the IOKit map/unmap. Same sequence the boot uses: both contexts, status polled, then the
++ * global non-secure invalidate.
++ */
++static void
++gpu_tlb_invalidate(void)
++{
++	if (gpu_smmu == 0) {
++		gpu_smmu = ml_io_map(GPU_SMMU, 0x10000);
++		if (gpu_smmu == 0) {
++			return;
++		}
++	}
++	for (unsigned c = 0; c < 2; c++) {
++		vm_offset_t b = gpu_smmu + GPU_SMMU_CB(c);
++		gpu_wr_quiet(b, GPU_SMMU_CB_TLBIALL, 0);
++		for (int i = 0; i < 100; i++) {
++			if (!(gpu_rd_quiet(b, GPU_SMMU_CB_TLBSTATUS) & 1u)) {
++				break;
++			}
++			gpu_wait_ms(1);
++		}
++	}
++	gpu_wr_quiet(gpu_smmu, GPU_SMMU_TLBIALLNSNH, 0);
++	for (int i = 0; i < 100; i++) {
++		if (!(gpu_rd_quiet(gpu_smmu, GPU_SMMU_sTLBGSTATUS) & 1u)) {
++			break;
++		}
++		gpu_wait_ms(1);
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ /* ---- the GMU's own memory ------------------------------------------------- */
+ 
+ /*
+@@ -1517,6 +1557,16 @@
+ 	volatile uint64_t *l2 = (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L2);
+ 	uint32_t l2i = (uint32_t)((iova >> 21) & 0x1ff);
+ 
++	/*
++	 * The first 2 MiB has a fixed L3 in the payload that the boot linked into L2, and the
++	 * chardev path maps through it. Allocating a pool table here and rewriting L2[0] moves the
++	 * mapping to a table the GPU does not walk: it keeps the old L3, where gpu_bo_free() has
++	 * already cleared the PTE for this iova, and faults on the command buffer.
++	 */
++	if (l2i == 0) {
++		return (volatile uint64_t *)(gpu_pt_blob + GPU_ARENA_L3);
++	}
++
+ 	for (unsigned i = 0; i < gpu_pte_used; i++) {
+ 		if (gpu_pte_l2i[i] == l2i) {
+ 			return (volatile uint64_t *)(gpu_pte_pool + gpu_pte_off[i]);
+@@ -1623,6 +1673,7 @@
+ 	l3[(iova >> 12) & 0x1ff] = (pa & ~0xfffull) | GPU_PTE_PAGE |
+ 	    (readonly ? (1ull << 7) : 0ull);
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	gpu_tlb_invalidate();
+ 	return true;
+ }
+ 
+@@ -1639,6 +1690,7 @@
+ 		}
+ 	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	gpu_tlb_invalidate();
+ }
+ 
+ /* Their buffers are cacheable IOBufferMemoryDescriptors and this is dc civac over the

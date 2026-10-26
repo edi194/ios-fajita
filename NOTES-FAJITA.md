@@ -2899,3 +2899,30 @@ from `MSM_IOCTL_GEM_CPU_FINI`.
 
 `0165` also logs the command buffer through the uncached alias before submitting (what the CP will
 read) and dumps the buffers on timeout as well as on success.
+
+### 2026-10-27: the CP faults on the command buffer - page-table chain and TLB
+
+`0165` proved the data path is fine: the kernel logged the command buffer through the uncached
+alias and it holds the client's PM4 exactly
+
+```
+SWEET ADRENO: ib 0x80020000: 0x70100001 0 0x703d8003 0x80025010 0 0x600d0001 ...
+```
+
+yet the CP wrote nothing to the target, and `wait fence 5` timed out. So the CP fetches the ring
+(RPTR catches up) but faults on the indirect buffer.
+
+The difference from the working paths (kernel self-tests, chardev BOs) is which L3 table the
+iova goes through. `gpu_pt_map()` (chardev) writes the fixed `GPU_ARENA_L3` that the boot linked
+into `L2[0]`; `sweet_gpu_vm_map()` (IOKit) goes through `gpu_l3_for()`, which **allocates a pool
+table for every chunk including `l2i == 0` and rewrites `L2[0]`**. The GPU keeps walking the old
+L3 - where `gpu_bo_free()` had already cleared the PTE for this exact iova (the allocator handed
+the client the same address the chardev had just freed) - finds zero and faults.
+
+`0166`:
+
+1. `gpu_l3_for()` returns the fixed `GPU_ARENA_L3` for `l2i == 0`, so the chain the GPU knows is
+   never rewritten; the pool still serves the other 63 chunks.
+2. every PTE change (chardev map/free, IOKit map/unmap) now invalidates the SMMU TLB: both
+   context banks (`CB_TLBIALL`, `TLBSTATUS` polled) and the global `TLBIALLNSNH`/`sTLBGSTATUS`,
+   the same sequence the boot runs. Without it a rewritten PTE is invisible to the CP.
