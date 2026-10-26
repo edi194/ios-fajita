@@ -2965,3 +2965,30 @@ exactly the selectors we implement - their `sweet_adreno_abi.h` and our `SweetAd
 identical selector defines and the shim never touches the two structs we lack, `sweet_gpu_debug`
 and `sweet_gpu_surface_plane`). Build it for iOS arm64, then Mesa freedreno, then Chlorophyll
 with `MetalPluginName` on an `IOAcceleratorES` service.
+
+### 2026-10-27: the libdrm stand-in builds for our target
+
+`~/ref/Bergamota/gpu/freedreno-sweet/sweet_drm.c` compiles unchanged with the Linux toolchain,
+no macOS and no `renegade`:
+
+```
+clang --target=arm64-apple-ios16.0 -isysroot ~/ios-sdk/iPhoneOS16.5.sdk -O2 -Wall \
+  -dynamiclib -install_name @rpath/libdrm.2.dylib -current_version 2.4.0 -compatibility_version 2.0.0 \
+  -fuse-ld=lld -L $SDK/usr/lib -lSystem sweet_drm.c -o libdrm.2.dylib \
+  -framework IOKit -framework CoreFoundation
+```
+
+It produces an arm64 Mach-O dylib exporting `drmIoctl`, `drmCommandWriteRead`, `drmGetVersion`,
+`drmOpenWithType`, the syncobj stubs and `sweet_drm_mmap`/`munmap` (the mmap interposers). Their
+`build.sh` targets arm64e + `renegade` signing, but our existing userspace binaries are plain
+arm64 ad-hoc and AMFI accepts them, so plain arm64 is enough here. Output kept out of the repo:
+`~/ios-userland/libdrm.2.dylib`.
+
+Two blockers for the *Metal* path (Chlorophyll), worth knowing before choosing the next route:
+
+- Chlorophyll's probe needs `libbgair.dylib` built from its Mesa 25.0.7 fork, and their build
+  scripts are macOS/meson with `xcrun` (`build-ios.sh`, `build-host.sh`); nothing has been built
+  on Linux yet.
+- The AIR/Metal pipeline needs Apple's `metal`/`metallib` compiler, which does not exist on Linux
+  (Xcode-only). Any `bg_kernels.metallib` has to come prebuilt from their `results/` or from a
+  Mac. The GL path (Mesa freedreno + ir3, GLES) does not need it.
