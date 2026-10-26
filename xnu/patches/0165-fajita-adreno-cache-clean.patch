@@ -1,0 +1,71 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -55,6 +55,8 @@
+ void sweet_gpu_report(const char *why);
+ bool     sweet_gpu_alloc_pages(uint64_t size, uint64_t *pa, void **kva);
+ void     sweet_gpu_free_pages(uint64_t pa, uint64_t size);
++/* osfmk/arm64/caches_asm.s: clean the dcache for a physical range via the linear map. */
++void     flush_dcache64(addr64_t addr, unsigned length, boolean_t phys);
+ void SweetAdrenoPublish(void);
+ }
+ 
+@@ -640,6 +642,25 @@
+ 			ibn[i] = c->size / 4;
+ 		}
+ 	}
++	/*
++	 * The client writes through a cacheable mapping (the map options it passes override whatever
++	 * clientMemoryForType() asks for), so its stores may still be dirty in the CPU cache when the
++	 * CP reads. Clean every buffer in this submission through the linear map - flush_dcache64()
++	 * does that by physical address, which is why it works for a mapping we do not own.
++	 */
++	for (uint32_t i = 0; i < r->nr_bos; i++) {
++		struct sweet_gem *g = objs[i];
++		if (g->pa != 0 && g->size != 0) {
++			flush_dcache64((addr64_t)g->pa, (unsigned)g->size, TRUE);
++		}
++	}
++	/* What the CP is about to read, through the uncached alias. */
++	{
++		struct sweet_gem *cb = objs[cmds[0].submit_idx];
++		volatile uint32_t *q = (volatile uint32_t *)(void *)cb->kva;
++		IOLog("SWEET ADRENO: ib %#llx: %#x %#x %#x %#x %#x %#x %#x %#x\n", cb->iova,
++		    q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
++	}
+ 	{
+ 		uint32_t fence = sweet_gpu_submit(ib, ibn, r->nr_cmds);
+ 		if (fence == 0) {
+@@ -696,21 +717,19 @@
+ 		    (unsigned long long)ns, ret, sweet_gpu_fence_last());
+ 		/*
+ 		 * The client's own output does not reach the console (launchd gives it a stdout nobody
+-		 * reads), so the kernel reports what the GPU actually produced: the first dwords of every
+-		 * buffer we allocated. The tester writes 0x600d0001/0x600d0002 at +0x10/+0x20 of the
+-		 * target, so seeing them here means the command buffer ran and the fence is honest.
++		 * reads), so the kernel reports what the GPU produced - on timeout too, which is exactly
++		 * when the contents matter. The tester writes 0x600d0001/0x600d0002 at +0x10/+0x20 of the
++		 * target, so seeing them means the command buffer ran and the fence is honest.
+ 		 */
+-		if (ret == kIOReturnSuccess) {
+-			for (uint32_t i = 0; i < GEM_MAX; i++) {
+-				struct sweet_gem *g = &fGems[i];
+-				if (g->md == NULL || g->pa == 0 || g->kva == NULL) {
+-					continue;
+-				}
+-				volatile uint32_t *p = (volatile uint32_t *)(void *)g->kva;
+-				IOLog("SWEET ADRENO: bo %u iova %#llx: %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n",
+-				    i + 1, g->iova, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
+-				    p[8], p[9], p[10], p[11]);
+-			}
++		for (uint32_t i = 0; i < GEM_MAX; i++) {
++			struct sweet_gem *g = &fGems[i];
++			if (g->md == NULL || g->pa == 0 || g->kva == NULL) {
++				continue;
++			}
++			volatile uint32_t *p = (volatile uint32_t *)(void *)g->kva;
++			IOLog("SWEET ADRENO: bo %u iova %#llx: %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x %#x\n",
++			    i + 1, g->iova, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7],
++			    p[8], p[9], p[10], p[11]);
+ 		}
+ 	}
+ 	IOLockUnlock(gAdrenoLock);

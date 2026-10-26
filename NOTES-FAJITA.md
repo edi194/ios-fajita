@@ -2868,3 +2868,34 @@ Two observations to carry forward:
   CPU's stores then sit in cache and the CP reads stale DRAM. If the `0164` dump shows zeros at
   +0x10/+0x20, the fix is to return `kIOMapWriteCombineCache` from `clientMemoryForType()` (or
   flush in the client) rather than to change the allocator.
+
+### 2026-10-27: the fence times out because the client's stores stay in cache
+
+`0164` produced the numbers: the CP consumed the ring (`cp submit: ring idle (RPTR=WPTR=327)`),
+the kernel handed out `fence 5`, and the wait answered `0xe00002d6` (kIOReturnTimeout) after 2 s.
+The kernel's own self-tests retire fences 1-3 through the same path, so the CP and the fence
+mechanism are fine. The difference is *who wrote the command buffer*.
+
+The client maps its buffers with `IOConnectMapMemory64(..., kIOMapAnywhere)`. In
+`IOUserClient::mapClientMemory64()`:
+
+```
+options = (options & ~kIOMapUserOptionsMask) | (mapFlags & kIOMapUserOptionsMask);
+```
+
+`kIOMapUserOptionsMask` is `0xfff` and the cache field is `kIOMapCacheMask = 0xf00`, so the
+client's `kIOMapAnywhere` (`0x1`) rewrites the cache bits to zero: the mapping is
+**kIOMapDefaultCache**, cacheable. Nothing the kernel returns from `clientMemoryForType()` can
+change that. The client's PM4 therefore sits dirty in the CPU cache, the CP reads stale DRAM,
+executes nothing that reaches CACHE_FLUSH_TS, and the fence never retires. (`IOMemoryDescriptor
+physical with managed page ...` in the log is IOKit warning about the same mapping.)
+
+`0165` fixes it in the kernel, so the client does not have to know: xnu's
+`flush_dcache64(addr, len, TRUE)` (osfmk/arm64/caches_asm.s -> flush_dcache) converts a physical
+address through `gPhysBase`/`gVirtBase` and runs `dc civac` on the linear mapping - cacheable, so
+the operation is legal and cleans the lines the client dirtied. `submit()` cleans every GEM_NEW
+buffer in the submission before ringing the doorbell; that is the same contract Mesa's msm gets
+from `MSM_IOCTL_GEM_CPU_FINI`.
+
+`0165` also logs the command buffer through the uncached alias before submitting (what the CP will
+read) and dumps the buffers on timeout as well as on success.
