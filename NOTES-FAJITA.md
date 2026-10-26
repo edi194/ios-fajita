@@ -2789,3 +2789,43 @@ tree settles it, so writing it down before anyone guesses again:
 `IOMemoryDescriptor`; a physical-address descriptor is exactly what `SweetSurface` publishes, so
 this is consistent. `getPhysicalSegment(..., kIOMemoryMapperNone)` reads the range directly and
 needs no `prepare()` for a physical descriptor.
+
+### 2026-10-26 night: how to read a panic from the panel (slide is 0)
+
+The ring pull from the panicked boot ends at `exec xpcproxy` and does not contain the tester
+phase - the last seconds before a panic are never flushed, which matches the old note about
+`flush #4294967295`. So the panel photo has to be decoded, and it can be:
+
+**The kernel runs at its link address: slide 0.** Checked against `kernel.development.sweet`
+with `llvm-nm` from the same CI run: the panic's `lr` resolved to
+`SweetAdrenoUserClient::gemNew+0x17c`, another core's PC to `machine_idle+0xf4`, and a backtrace
+frame to `handle_debugger_trap+0x4ec`. No KASLR slide to solve - use the symbol table directly.
+
+Method (tools/symbolicate.py in this session's scratch, easily redone):
+
+1. `llvm-nm -n --defined-only xnu/out/kernel.development.sweet` - full symbol table, local
+   symbols included.
+2. Resolve each address from the photo by bisecting the sorted symbol table.
+3. The printed `caller 0x...` in `panic(cpu N caller ...)` is the return address inside
+   `panic_with_thread_kernel_state` (it calls `panic("%s", reason)`), so it is a fixed anchor
+   if the slide is ever in doubt: find `_panic_with_thread_kernel_state`, disassemble, take the
+   `bl _panic` site + 4.
+
+What that decoded this time: the panic is `is_alignment_fault` in `sleh.c` (`Unaligned kernel
+data abort`), and `lr` is the instruction after the `blr` that calls `buf->release()` in
+`gemNew`'s error path. So **`mapGem()` failed** and gemNew released the descriptor - the fault
+happens while unwinding a failed map, not in the happy path.
+
+Two known traps on the way here:
+
+- `bzero()` on the arena is illegal: `osfmk/arm64/bzero.s:79` uses `dc zva`, and `dc zva` on
+  I/O mapped memory (the arena comes from `ml_io_map`) is not permitted. That is why
+  `gpu_bo_alloc()` has always zeroed with `volatile uint32_t` stores. `gemNew()` was calling
+  `bzero(kva, size)`; removed.
+- `getPhysicalSegment()` on the physical-address descriptor is now out of the GPU mapping path:
+  `0163` stores the arena `pa` in the slot and maps `pa + offset` directly. The descriptor is
+  still created, because `clientMemoryForType()` must hand a real `IOMemoryDescriptor` to
+  `IOConnectMapMemory64()`, which the tester calls before submitting.
+
+`0163` also turns every `mapGem()` failure into `panic("SWEET DIAG: ...")` with the numbers, so
+the next panel photo names the page, the iova and the pa instead of just "GEM_NEW failed".
