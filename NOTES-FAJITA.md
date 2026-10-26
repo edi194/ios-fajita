@@ -2677,3 +2677,44 @@ the log until then.
 
 Next: the same trick for `sweet-iokit-test` (replace another stock binary with it) to prove the
 IOKit path, which is the one Mesa and Chlorophyll use.
+
+### 2026-10-26: the IOKit test panicked, and the slot trap
+
+**The IOKit tool panicked the kernel.** With `/usr/libexec/DumpPanic` replaced by
+`sweet-iokit-test`, the phone panicked and then would not boot at all - and the ring only held
+15 KB (`flush #4294967295`, ending at GPU stage 3d), so the panic text never reached the log.
+`adreno=0` did not help, which made the picture confusing.
+
+**Then the real cause of "it does not even reach the kernel" appeared: the boot slot.**
+
+```
+fastboot getvar current-slot   ->  b
+fastboot getvar slot-successful:a -> no
+fastboot getvar slot-successful:b -> yes
+```
+
+After a few failed boots ABL switched its active slot to **b** (the old Android installation),
+so every `boot_a` flash was written to a partition the bootloader was no longer reading: the
+phone showed the OnePlus logo and rebooted. `fastboot --set-active=a` **does work on this ABL**
+(contrary to the earlier note) and brings it back:
+
+```
+fastboot --set-active=a        ->  OKAY
+fastboot getvar current-slot   ->  a
+```
+
+Rules that follow:
+
+- **Check `fastboot getvar current-slot` before blaming an image.** Symptom of the wrong slot:
+  the OnePlus logo and a reboot, nothing of ours ever appears.
+- `fastboot --set-active=a` is the fix; it is not read-only and it is safe.
+- Do not chase a panic while the slot is wrong - nothing we flash is being run.
+
+**State after recovery:** `boot_a` = `console88-va2.img` (0159, `adreno=9 zap=1 gpuhold=1`) and
+`userdata` = the image with every replacement undone (`tools/restore-daemons.sh`), so no
+userspace tool runs at boot. The phone boots, which is where we were before the IOKit attempt.
+
+**Do not replace /usr/libexec/* binaries again to run a test.** It cost two 12 GB flashes and a
+slot switch. The plan for the next attempt: the chardev tool (which demonstrably runs and leaves
+a clean log) ends with `execve("/usr/local/bin/sweet-iokit-test")`, and the kernel logs their
+`externalMethod` selector before doing anything, so a panic names the call instead of implying it.
