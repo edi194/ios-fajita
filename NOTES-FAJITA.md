@@ -2926,3 +2926,42 @@ the client the same address the chardev had just freed) - finds zero and faults.
 2. every PTE change (chardev map/free, IOKit map/unmap) now invalidates the SMMU TLB: both
    context banks (`CB_TLBIALL`, `TLBSTATUS` polled) and the global `TLBIALLNSNH`/`sTLBGSTATUS`,
    the same sequence the boot runs. Without it a rewritten PTE is invisible to the CP.
+
+## MILESTONE (2026-10-27): userspace submits through IOKit and the GPU executes it
+
+The ring from `console101-tlb` (0166), the same boot that reached SpringBoard:
+
+```
+SWEET ADRENO: selector 0x70 in 0 bytes                        INFO
+SWEET ADRENO: selector 0x42 in 16 bytes                       GEM_NEW   (arena 16 KiB)
+SWEET ADRENO: selector 0x42 in 16 bytes                       GEM_NEW   (arena 16 KiB)
+SWEET ADRENO: selector 0x43 in 24 bytes                       GEM_INFO
+SWEET ADRENO: selector 0x46 in 72 bytes                       SUBMIT
+SWEET ADRENO: ib 0x80020000: 0x70100001 0 0x703d8003 0x80025010 0 0x600d0001 ...
+SWEET ADRENO: submit 2 bos 1 cmds, ib 0x80020000 10 dwords, fence 5
+SWEET ADRENO: selector 0x47 in 32 bytes                       WAIT_FENCE
+SWEET ADRENO: wait fence 5 (2000000000 ns) -> 0, last 5       kIOReturnSuccess
+SWEET ADRENO: bo 2 iova 0x80025000: 0 0 0 0 0x600d0001 0 0 0 0x600d0002 0 0 0
+```
+
+That is the whole chain, proven from one ring pull: a userspace process opened the IOKit
+service, got buffers from the arena, mapped them into itself, wrote a PM4 command stream,
+submitted it with the fence, and the GPU executed the two CP_MEM_WRITEs at the addresses the
+client put in the stream (0x600d0001 at +0x10, 0x600d0002 at +0x20 of the target).
+
+The three fixes that got here, in order:
+
+- `0163`: the client's buffers come from the arena (VM pages below `gPhysBase` panic in pmap),
+  and `mapGem()` maps the known `pa` instead of walking the descriptor;
+- `0165`: `flush_dcache64(pa, size, TRUE)` before ringing - the client's mapping is cacheable
+  and cannot be made write-combined from the kernel (`mapClientMemory64` lets the user mask
+  override `clientMemoryForType`), so without the clean the CP read stale DRAM;
+- `0166`: `gpu_l3_for()` must return the fixed `GPU_ARENA_L3` for the first 2 MiB (a pool table
+  there rewrites `L2[0]` behind the GPU's back) and every PTE change must invalidate the SMMU
+  TLB.
+
+Next: the libdrm stand-in (`~/ref/Bergamota/gpu/freedreno-sweet/sweet_drm.c`, 597 lines, uses
+exactly the selectors we implement - their `sweet_adreno_abi.h` and our `SweetAdrenoABI.h` have
+identical selector defines and the shim never touches the two structs we lack, `sweet_gpu_debug`
+and `sweet_gpu_surface_plane`). Build it for iOS arm64, then Mesa freedreno, then Chlorophyll
+with `MetalPluginName` on an `IOAcceleratorES` service.
