@@ -2754,3 +2754,38 @@ first pmap operation on it kills the boot.
 
 Option 1 is the path of least risk, and it also makes the client's memory visible to the GPU
 through the same arena the ring and the buffers already use.
+
+### 2026-10-26 late: how this tree wraps physical memory (read, not guessed)
+
+Three CI cycles were spent guessing the descriptor API, and all three guesses were wrong. The
+tree settles it, so writing it down before anyone guesses again:
+
+- `libkern/libkern/c++/OSPtr.h`: `OSPtr<T>` **is `T*`** unless the translation unit defines
+  `IOKIT_ENABLE_SHARED_PTR`. `SweetAdreno.cpp` does not, so there is no `detach()`, no `get()`,
+  and a plain pointer assignment is correct.
+- `iokit/IOKit/IOMemoryDescriptor.h:519`:
+  `static OSPtr<IOMemoryDescriptor> withPhysicalAddress(IOPhysicalAddress, IOByteCount, IODirection)`
+  - it is `IOMemoryDescriptor`'s static, inherited by `IOBufferMemoryDescriptor`, but the result
+    is an **`IOMemoryDescriptor *`**, never an `IOBufferMemoryDescriptor *`. Assigning to the
+    latter is what failed first, and `initWithPhysicalAddress()` does not exist at all.
+- The working precedent is in this very series: `SweetSurface.cpp:242` wraps the panel with
+  `IOMemoryDescriptor::withPhysicalAddress(phys, len, kIODirectionInOut)` and maps it to the
+  client, so the same call is known to work for client-visible memory here.
+
+`0162` therefore is three small things:
+
+1. kernel: `sweet_gpu_alloc_pages(size, &pa, &kva)` / `sweet_gpu_free_pages()` - zeroed,
+   contiguous arena pages above `gPhysBase`, sharing `gpu_arena_used` with `gpu_bo_alloc()` so
+   the chardev BOs and the IOKit client cannot overlap (bump allocator, no reuse: the arena is
+   1 MiB, fine for the ABI test);
+2. client: `gemNew()` uses that memory and wraps `pa` with
+   `IOMemoryDescriptor::withPhysicalAddress()`, instead of `inTaskWithOptions()` asking the VM
+   for a page below the base (the `phys_to_kv_range` panic);
+3. client: the slot's `buf` field was only the marker "relocations may patch this buffer", so
+   with no `IOBufferMemoryDescriptor` the check in `submit` becomes `cb->surface != NULL` -
+   surface BOs are still refused, meaning preserved.
+
+`clientMemoryForType()` hands `g->md` to the mapping path with a retain, so it must stay a real
+`IOMemoryDescriptor`; a physical-address descriptor is exactly what `SweetSurface` publishes, so
+this is consistent. `getPhysicalSegment(..., kIOMemoryMapperNone)` reads the range directly and
+needs no `prepare()` for a physical descriptor.
