@@ -2718,3 +2718,39 @@ userspace tool runs at boot. The phone boots, which is where we were before the 
 slot switch. The plan for the next attempt: the chardev tool (which demonstrably runs and leaves
 a clean log) ends with `execve("/usr/local/bin/sweet-iokit-test")`, and the kernel logs their
 `externalMethod` selector before doing anything, so a panic names the call instead of implying it.
+
+### 2026-10-26 evening: why the IOKit client panics - it is the page allocator
+
+The selector logging did its job on the first try. The panic (panel photo) is:
+
+```
+panic(cpu 1 caller 0xfffffe0007aaec8): phys_to_kv_range: illegal PA: 0x24114000:
+  phys base 0x100000000, size 0x17c7a0000 @arm_vm_init.c:406
+Panicked task 0xfffffe2011a92698: 55 pages, 1 threads: pid 46: sweet-iokit-test
+```
+
+So the client reached the kernel, and the kernel died in `phys_to_kv_range` on a page **below
+`gPhysBase`** - exactly the trap we hit with `kmem_alloc_contig` for the buffer arena (see the
+console80 entry): this port keeps pages below the physical base on its free lists, and `pmap`
+does not fail on them, it panics.
+
+The chardev tool never hit it because it takes memory from the payload arena, which is real
+memory above the base. Their `SweetAdreno.cpp` allocates buffers with
+`IOBufferMemoryDescriptor`, so the kernel allocator hands out one of those bad pages and the
+first pmap operation on it kills the boot.
+
+**Fix directions, cheapest first:**
+
+1. **Give their client our memory**: add a kernel function that hands out arena pages
+   (`sweet_gpu_alloc_pages(size, &pa, &kva)`) and change their `mapGem()` to build the
+   descriptor with `IOBufferMemoryDescriptor::withPhysicalAddress(pa, size, direction)` instead
+   of `withOptions(...)`. The arena is 1 MiB and contiguous, enough for the ABI test and for
+   small buffers, and it is the memory we have already proven with the CP.
+2. **Fix the allocator properly**: keep pages below `gPhysBase` off the free lists (or have
+   `pa_valid` fail instead of panicking). This is the real fix and benefits every driver, but
+   it touches VM internals we have not studied.
+3. A one-line guard in the client (`if (pa < 0x100000000) fail`) would only turn the panic into
+   an error - not useful.
+
+Option 1 is the path of least risk, and it also makes the client's memory visible to the GPU
+through the same arena the ring and the buffers already use.
