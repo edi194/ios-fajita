@@ -19,6 +19,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdlib.h>
 
 #define SEL_GEM_NEW     0x42
 #define SEL_GEM_INFO    0x43
@@ -102,6 +105,24 @@ struct sweet_msm_wait_fence {
 	uint32_t queueid;
 };
 
+
+/*
+ * IOKit leaves no trace in the kernel log (their SweetAdreno.cpp does not print), so a run
+ * that works and a run that never happened look the same. Opening the chardev at the end
+ * makes the driver log "SWEET GPU: /dev/sweetgpu opened -> 0" - a PASS marker in the ring.
+ * A failure aborts instead, which shows as a CRASH line with the pc.
+ */
+static void
+mark(const char *what)
+{
+	int fd = open("/dev/sweetgpu", O_RDWR);
+
+	if (fd >= 0) {
+		(void)close(fd);
+	}
+	printf("GPU IOKIT: reach %s\n", what);
+}
+
 /* PM4 type 7 header with the parity bits, as the kernel computes them */
 static uint32_t
 pkt7(uint32_t opcode, uint32_t count)
@@ -140,20 +161,20 @@ main(void)
 	svc = IOServiceGetMatchingService(kIOMainPortDefault, match);
 	if (svc == 0) {
 		printf("GPU IOKIT: SweetAdreno630 not in the registry\n");
-		return 1;
+		abort();
 	}
 	kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
 	IOObjectRelease(svc);
 	if (kr != KERN_SUCCESS) {
 		printf("GPU IOKIT: open failed %#x\n", kr);
-		return 1;
+		abort();
 	}
 
 	memset(&info, 0, sizeof(info));
 	len = sizeof(info);
 	if (call(conn, SEL_INFO, NULL, 0, &info, &len) != 0) {
 		printf("GPU IOKIT: INFO failed\n");
-		return 1;
+		abort();
 	}
 	printf("GPU IOKIT: abi %u flags %#x gpu %u chip %#x va %#llx+%#llx fence %u\n",
 	    info.abi_version, info.flags, info.gpu_id, info.chip_id,
@@ -166,14 +187,14 @@ main(void)
 	if (call(conn, SEL_GEM_NEW, &cmd, sizeof(cmd), &cmd, &len) != 0 || cmd.handle == 0 ||
 	    call(conn, SEL_GEM_NEW, &dst, sizeof(dst), &dst, &len) != 0 || dst.handle == 0) {
 		printf("GPU IOKIT: GEM_NEW failed\n");
-		return 1;
+		abort();
 	}
 
 	struct sweet_msm_gem_info gi = { .handle = dst.handle, .info = INFO_GET_IOVA };
 	len = sizeof(gi);
 	if (call(conn, SEL_GEM_INFO, &gi, sizeof(gi), &gi, &len) != 0 || gi.value == 0) {
 		printf("GPU IOKIT: GET_IOVA failed\n");
-		return 1;
+		abort();
 	}
 	uint64_t dst_va = gi.value;
 
@@ -184,13 +205,13 @@ main(void)
 	    kIOMapAnywhere);
 	if (kr != KERN_SUCCESS) {
 		printf("GPU IOKIT: map of the command buffer failed %#x\n", kr);
-		return 1;
+		abort();
 	}
 	kr = IOConnectMapMemory64(conn, dst.handle, mach_task_self(), &dst_map, &dst_map_size,
 	    kIOMapAnywhere);
 	if (kr != KERN_SUCCESS) {
 		printf("GPU IOKIT: map of the target failed %#x\n", kr);
-		return 1;
+		abort();
 	}
 
 	/* NOP, MEM_WRITE(dst+0x10, 0x600d0001), MEM_WRITE(dst+0x20, 0x600d0002) */
@@ -222,7 +243,7 @@ main(void)
 	len = sizeof(sub);
 	if (call(conn, SEL_GEM_SUBMIT, &sub, sizeof(sub), &sub, &len) != 0 || sub.fence == 0) {
 		printf("GPU IOKIT: GEM_SUBMIT failed\n");
-		return 1;
+		abort();
 	}
 	printf("GPU IOKIT: submitted %u dwords, fence %u\n", n, sub.fence);
 
@@ -232,7 +253,7 @@ main(void)
 	len = sizeof(wait);
 	if (call(conn, SEL_WAIT_FENCE, &wait, sizeof(wait), &wait, &len) != 0) {
 		printf("GPU IOKIT: WAIT_FENCE failed\n");
-		return 1;
+		abort();
 	}
 
 	uint32_t *out = (uint32_t *)(uintptr_t)dst_map;
@@ -244,8 +265,10 @@ main(void)
 		rc = 0;
 	} else {
 		printf("GPU IOKIT: FAIL\n");
+		abort();
 	}
 
+	mark("end");
 	IOServiceClose(conn);
 	return rc;
 }
