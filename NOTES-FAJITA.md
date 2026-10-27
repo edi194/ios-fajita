@@ -3128,3 +3128,34 @@ the other patch's own text).
 
 Hunk line counts are checked strictly: `git apply` says "corrupt patch" when `+N` is off by one,
 even if the context is right.
+
+## MILESTONE (2026-10-27): Metal loads our plugin on iOS 16.7.16
+
+C1 answered the only open question in the Metal path, and the answer is the good one. From the
+console102-metalstub ring, in `backboardd` (= CoreAnimation):
+
+```
+SWEET FB: IOAcceleratorES published, MetalPluginName SweetMetalProbe (properties set: yes)
+IOK backboardd: matching <IOProviderClass = IOAcceleratorES> -> 1 found
+SWEET METAL: bundle loaded, SweetMetalDevice registered (_MTLDevice subclass)
+SWEET METAL: -initWithAcceleratorPort:39471 called, declining (nil)
+```
+
+So on 16.7.16 Metal does exactly what Bergamota's docs describe for 18.7.8:
+`IOServiceMatching("IOAcceleratorES")` -> read `MetalPluginName` -> `NSBundle` from
+`/System/Library/Extensions` -> principal class -> `-initWithAcceleratorPort:` with the service's
+mach port. The iOS-18 SPI in their *plugin* (`MTLIOAccelServiceGlobalContext -init`) is only their
+way of kicking the same lookup; the kernel-service route works here without any of that.
+
+Consequences:
+
+- no iOS 18 rebase is needed for Metal;
+- the real work is the device implementation (`libbgair` = AIR -> NIR -> ir3, `bgmtl` = the
+  `_MTLDevice` subclass), and it talks to the GPU through the same ABI we proved works
+  (`sweet_drm` shim + `SweetAdreno630`), so the kernel side is done;
+- a Mac is available after all: macOS CI (`macos-14`, free, public repo) can build `libbgair.dylib`
+  and the `.metallib` test shaders.
+
+Next: build their userspace stack in CI, install it as `SweetMetalProbe`-style bundle, and move the
+principal class from "return nil" to a real device, one missing selector at a time. The GPU IOKit
+path is regression-free in this boot (`wait fence 5 -> 0`, target holds 0x600d0001/0x600d0002).
