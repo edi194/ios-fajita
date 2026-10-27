@@ -2992,3 +2992,35 @@ Two blockers for the *Metal* path (Chlorophyll), worth knowing before choosing t
 - The AIR/Metal pipeline needs Apple's `metal`/`metallib` compiler, which does not exist on Linux
   (Xcode-only). Any `bg_kernels.metallib` has to come prebuilt from their `results/` or from a
   Mac. The GL path (Mesa freedreno + ir3, GLES) does not need it.
+
+### 2026-10-27: is the Chlorophyll (Metal) path viable without a Mac? - assessed
+
+Checked the reference tree (`~/ref/Chlorophyll`, its `results/`, `build-*.sh`, `plugin/`).
+
+What their results prove: the stack genuinely works on an Adreno 630 under **iOS 18.7.8**
+(22H352) - compute kernels, textures/samplers, render passes, CoreAnimation `nextDrawable`
+over IOSurface, and `MTLAddDevice` registering `BGMTLDevice` so `MTLCreateSystemDefaultDevice`
+returns it. That is the target to aim at.
+
+What is missing here, concretely:
+
+- **No prebuilt binaries.** `results/` is measurements only (JSON/TSV/txt); there is no
+  `libbgair.dylib`, no `Chlorophyll.bundle`, no `.metallib` anywhere in the checkout.
+- **Mesa source is not there.** `Chlorophyll/mesa` is an empty submodule directory; their build
+  needs Mesa 25.0.7 plus `Bergamota/gpu/eagl/mesa/bergamota-mesa-25.0.7.patch` and Chlorophyll's
+  seven patches, applied by `build-host.sh` (macOS/brew path).
+- **`libbgair.dylib` would have to be cross-built on Linux.** Possible in principle: the eagl
+  cross file exists (`Bergamota/gpu/eagl`), network works (Mesa 25.0 branch reachable), and
+  meson/ninja can be installed. Their script assumes macOS (`xcrun`, `brew --prefix bison`) and
+  arm64e + `renegade` signing, so it would be a rewrite, not a run.
+- **No Metal compiler.** Their probes' shaders (`bg_kernels.metal` -> `.metallib`) need Apple's
+  `metal`/`metallib`, which is Xcode-only. At runtime system apps bring their own metallibs, but
+  *validating* the stack needs at least one shader we can build - i.e. a Mac, or a prebuilt
+  `.metallib` from somewhere.
+- **iOS 18 SPI.** `plugin/chlorophyll_plugin.m` hooks `MTLIOAccelServiceGlobalContext -init` and
+  was written against the 22H352 (iOS 18.7.x) shared cache. This port is iOS 16.7.16; that SPI and
+  parts of Metal 3.1 are not what 16.7.16 ships, so the plugin is not a drop-in here.
+
+Verdict: **B is not a next step without a Mac**, and even with one it means an iOS 18 baseline
+first. A (Mesa freedreno GLES over the ABI we just proved + the libdrm stand-in that already
+builds) needs no Metal compiler and no iOS-18 SPI, and it exercises the same kernel path.
