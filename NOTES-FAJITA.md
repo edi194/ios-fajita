@@ -3159,3 +3159,32 @@ Consequences:
 Next: build their userspace stack in CI, install it as `SweetMetalProbe`-style bundle, and move the
 principal class from "return nil" to a real device, one missing selector at a time. The GPU IOKit
 path is regression-free in this boot (`wait fence 5 -> 0`, target holds 0x600d0001/0x600d0002).
+
+### 2026-10-27: libbgair.dylib built on Linux (Chlorophyll's device half)
+
+`tools/build-bgair-ios.sh` now produces it from a clean tree:
+
+```
+build-ios/src/gallium/drivers/freedreno/libbgair.dylib   9.9 MB, Mach-O arm64
+llvm-objdump --macho --dylibs-used:
+  @rpath/libbgair.dylib, /usr/lib/libSystem.B.dylib, /usr/lib/libz.1.dylib, @rpath/libdrm.2.dylib
+```
+
+and `Chlorophyll/src/bgmtl.m` (the `_MTLDevice` subclass) compiles against the 16.5 SDK with only
+warnings. `tools/mesa-ios/README.md` records every fix and why it is needed; the short version:
+
+- Mesa 25.0.7 + Bergamota's patch + Chlorophyll's 7 patches; `src/compiler/air` symlinked from
+  `Chlorophyll/air`; libdrm 2.4.124 cloned separately (`Chlorophyll/libdrm` is an empty submodule);
+- `zlib.pc` -> the iOS SDK stub, or Mesa links the Linux `libz.so` into an arm64 Mach-O;
+- three Meson edits (`dep_libdrm` and `subdir('drm')` when a freedreno KMD is selected, conditional
+  `libvdrm`) - Mesa has no "msm without KMS on Darwin" configuration;
+- cross file: `cpp_args` must repeat `--target`/`-isysroot` (otherwise every C++ object is built for
+  the build machine), plus `-DHAVE_STRUCT_TIMESPEC`, `-DHAVE_DLADDR`, `-DHAVE_DLFCN_H`,
+  `-DHAVE_FUNC_ATTRIBUTE_PACKED` (meson's link-based checks fail in a cross build) and
+  `-Wno-c++11-narrowing` (clang 22 vs Apple clang 16).
+
+Next: build the `bgmtl_adddev`-style test (their `test/bgmtl_adddev.m`) against libbgair + the
+libdrm stand-in, install it and libbgair/libdrm into the root, and run it **in a test process**
+(not in backboardd) to see whether `MTLCreateSystemDefaultDevice` returns our device. The kernel
+side (IOAcceleratorES + MetalPluginName) already loads a bundle and calls
+`-initWithAcceleratorPort:` under backboardd, so the remaining work is userspace.
