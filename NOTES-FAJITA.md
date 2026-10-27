@@ -3024,3 +3024,34 @@ What is missing here, concretely:
 Verdict: **B is not a next step without a Mac**, and even with one it means an iOS 18 baseline
 first. A (Mesa freedreno GLES over the ABI we just proved + the libdrm stand-in that already
 builds) needs no Metal compiler and no iOS-18 SPI, and it exercises the same kernel path.
+
+### 2026-10-27: what Mesa can and cannot accelerate on this port
+
+Worth writing down before spending days on it: **Mesa/GLES will not accelerate CoreAnimation.**
+On iOS 16 the whole UI (SpringBoard, UIKit apps, CA) renders through Metal:
+
+```
+CoreAnimation -> MTLDevice (Metal framework) -> IOAcceleratorES service -> GPU driver
+                                                        |
+                                              MetalPluginName -> /System/Library/Extensions/<name>.bundle
+```
+
+Chlorophyll's *plugin* is only 142 lines: for every IOService of class `IOAcceleratorES` it reads the
+registry property `MetalPluginName`, loads that bundle, and registers the device with
+`MTLAddDevice()`. The bulk of their work is the device itself (`libbgair` = AIR -> NIR -> ir3 on
+Mesa, plus `bgmtl.m` = the `_MTLDevice` subclass). So UI acceleration on this port means:
+
+1. kernel: publish an `IOAcceleratorES` service with `MetalPluginName` (and whatever else Metal
+   wants to read), next to our `SweetAdreno630` user client;
+2. userspace: a Metal device bundle that does the work through our ABI.
+
+Mesa freedreno speaks GLES, so it only helps processes that render through GLES (EAGL), and only
+if they pick up our `libGLESv2`. It is still useful - it validates the ABI under a real driver
+with real shaders - but it does not touch the UI. Without a Metal device, the UI keeps using
+Apple's CPU renderer, which is why it works at all today but slowly.
+
+The iOS-18 question is only about *where Metal looks for the plugin*: on 18 they hook
+`MTLIOAccelServiceGlobalContext -init` (SPI read from the 22H352 shared cache). Whether 16.7.16 has
+the same entry point is exactly the cheap thing to test: publish `IOAcceleratorES` +
+`MetalPluginName` on our kernel side and see if Metal loads the bundle; no Mac and no Mesa needed
+for that step.
