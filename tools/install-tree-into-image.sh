@@ -25,10 +25,12 @@ cp -R "$src" "$work/m$dest/"
 chown -R 0:0 "$work/m$dest/$(basename "$src")"
 find "$work/m$dest/$(basename "$src")" -type d -exec chmod 0755 {} +
 find "$work/m$dest/$(basename "$src")" -type f -exec chmod 0644 {} +
-# executables keep +x
-if [ -f "$work/m$dest/$(basename "$src")/$(basename "$src")" ]; then
-	chmod 0755 "$work/m$dest/$(basename "$src")/$(basename "$src")"
-fi
+# Mach-O files get the exec bit (dlopen does not need it, execve would), everything else stays 0644
+find "$work/m$dest/$(basename "$src")" -type f -print0 | while IFS= read -r -d '' f; do
+	if file -b "$f" 2>/dev/null | grep -q 'Mach-O'; then
+		chmod 0755 "$f"
+	fi
+done
 ls -la "$work/m$dest/$(basename "$src")"
 echo "note: a Mach-O on the system volume changes the volume's signature - if AMFI refuses it, the"
 echo "log will show nothing after the service is published."
