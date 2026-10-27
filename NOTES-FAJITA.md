@@ -3188,3 +3188,26 @@ libdrm stand-in, install it and libbgair/libdrm into the root, and run it **in a
 (not in backboardd) to see whether `MTLCreateSystemDefaultDevice` returns our device. The kernel
 side (IOAcceleratorES + MetalPluginName) already loads a bundle and calls
 `-initWithAcceleratorPort:` under backboardd, so the remaining work is userspace.
+
+### 2026-10-27: the in-process Metal device test is installed
+
+Built and installed (see `docs`-style recipe in `tools/mesa-ios/README.md`):
+
+- `/usr/local/bin/bgmtl-adddev` - Chlorophyll's `test/bgmtl_adddev.m` with two changes: it redirects
+  stdout/stderr to `/dev/console` before printing (under launchd fd 1 goes nowhere - this cost us
+  several boots) and it keeps everything in its own process (`MTLAddDevice` only registers the
+  device locally, no IOKit service is involved, so a crash cannot take the UI down);
+- `/usr/local/bin/libbgair.dylib` (9.9 MB) and `/usr/local/bin/libdrm.2.dylib` next to it - the
+  binary's rpath is `@executable_path`;
+- `/usr/libexec/DumpPanic` = the chardev tool, which now hands over to
+  `/usr/local/bin/bgmtl-adddev` instead of the IOKit tester (its own ABI test and the GPU path are
+  already proven; this boot is about Metal).
+
+New tools: `tools/mk-bgmtl-adddev.sh` (builds the test against libbgair + the libdrm stand-in),
+`tools/install-files-into-image.sh` (copy files into the HFS+ root, keeping names - needed because
+the dylibs must sit next to the executable).
+
+What the log will answer: whether `bgmtl_create_device()` gets a `BGMTLDevice` at all (it opens the
+GPU through our libdrm stand-in -> `SweetAdreno630`), whether `MTLAddDevice` accepts it in-process,
+and what `MTLCreateSystemDefaultDevice` / `MTLCopyAllDevices` say afterwards. If the device pointer
+is nil, the first place to look is `rwa_device_open` (Chlorophyll's open path) against our ABI.

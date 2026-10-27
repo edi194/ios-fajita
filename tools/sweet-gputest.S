@@ -292,7 +292,7 @@ s_console:
 s_dev:
 	.asciz	"/dev/sweetgpu"
 s_iokit:
-	.asciz	"/usr/local/bin/sweet-iokit-test"
+	.asciz	"/usr/local/bin/bgmtl-adddev"
 m_nodev:
 	.asciz	"GPU TEST: /dev/sweetgpu is not there\n"
 m_abi:
