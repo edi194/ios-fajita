@@ -3079,3 +3079,33 @@ Cheapest decisive experiment (call it C1), no Mesa and no Mac needed:
    called;
 3. boot and look for that log. Loaded -> the iOS 16 path works and the real bundle is worth
    building; not loaded -> the hook is elsewhere and we inspect Metal's iOS 16 binary for it.
+
+### 2026-10-27: C1 - the Metal stub experiment (kernel service + stub bundle)
+
+The one unknown in the Metal path is *where* iOS 16.7.16 looks for the plugin, so C1 publishes the
+service and watches whether Metal loads the bundle:
+
+- `0167` (kernel, `SweetFramebuffer.cpp`): `class IOAcceleratorES : IOService` (the ios-topaz 0138 /
+  Bergamota 0122 pattern, but that stub deliberately has no `MetalPluginName` and is skipped by
+  Metal). Ours sets `MetalPluginName = SweetMetalProbe` and `MetalPluginClassName = SweetMetalDevice`,
+  attaches under `AppleCLCD` as `sgx` and registers. `sweetaccel=0` turns it off. Exactly one such
+  service may exist - Metal reports failure with two devices.
+- `tools/metal-probe/sweet_metal_probe.m` + `tools/mk-metal-probe.sh`: `SweetMetalProbe.bundle`,
+  principal class `SweetMetalDevice`, created at load time with `objc_allocateClassPair` on
+  `_MTLDevice` (private class, no SDK headers). It logs to `/dev/console` and returns nil from
+  `-initWithAcceleratorPort:`, i.e. "no device": the renderers stay as they are, so this cannot
+  regress the UI.
+- `tools/install-tree-into-image.sh`: copies a tree into the HFS+ root image (same mount pattern as
+  `replace-daemon-binary.sh`).
+
+Install: `sudo tools/install-tree-into-image.sh IMAGE ~/ios-userland/SweetMetalProbe.bundle
+/System/Library/Extensions`.
+
+Expected: `SWEET FB: IOAcceleratorES published, MetalPluginName SweetMetalProbe` from the kernel,
+then `SWEET METAL: bundle loaded, SweetMetalDevice registered` and
+`SWEET METAL: -initWithAcceleratorPort:N called, declining (nil)` from the bundle. The second line
+alone proves the iOS 16 discovery chain works; then the real device bundle is worth building.
+
+**Repo path trap (cost me the whole `tools/` directory for a minute):** `/home/edi194/fajita` is a
+symlink to `/mnt/c/Users/misia/Documents/Projekt domyślny`, so the Windows workspace *is* the repo.
+Never `rm -rf` a path under either spelling - `git checkout -- tools` restores.

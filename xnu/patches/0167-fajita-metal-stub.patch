@@ -1,0 +1,51 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -88,6 +88,21 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
++/*
++ * The graphics accelerator service class (ios-topaz 0138, Bergamota 0122). Metal's
++ * _MTLRegisterDevices matches IOServiceMatching("IOAcceleratorES"), reads MetalPluginName on each
++ * hit and loads /System/Library/Extensions/<name>.bundle; its principal class (or
++ * MetalPluginClassName) must be a _MTLDevice subclass, which Metal then inits with
++ * -initWithAcceleratorPort:. A service *without* MetalPluginName is found and skipped (that is
++ * what the old stub did: it only stopped QuartzCore's 30 s poll). Exactly one service may exist -
++ * Metal reports failure when it sees two devices.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
+ class IOMobileFramebufferUserClient;
+ 
+ class AppleCLCD : public IOMobileFramebuffer {
+@@ -166,6 +181,26 @@
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
++	/*
++	 * C1: does iOS 16.7.16 load a Metal plugin named by our service? The bundle is a stub that
++	 * logs to /dev/console and returns nil from -initWithAcceleratorPort:, so Metal reports no
++	 * device and the renderers stay as they are. sweetaccel=0 turns the service off.
++	 */
++	uint32_t accelOn = 1;
++	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
++	if (accelOn) {
++		IOAcceleratorES *accel = OSTypeAlloc(IOAcceleratorES);
++		if (accel != NULL && accel->init()) {
++			bool named = accel->setProperty("MetalPluginName", "SweetMetalProbe") &&
++			    accel->setProperty("MetalPluginClassName", "SweetMetalDevice");
++			accel->setName("sgx");
++			if (accel->attach(this) && accel->registerService()) {
++				IOLog("SWEET FB: IOAcceleratorES published, MetalPluginName SweetMetalProbe"
++				    " (properties set: %s)\n", named ? "yes" : "NO");
++			}
++		}
++		OSSafeReleaseNULL(accel);
++	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
