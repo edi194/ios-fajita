@@ -3109,3 +3109,22 @@ alone proves the iOS 16 discovery chain works; then the real device bundle is wo
 **Repo path trap (cost me the whole `tools/` directory for a minute):** `/home/edi194/fajita` is a
 symlink to `/mnt/c/Users/misia/Documents/Projekt domyślny`, so the Windows workspace *is* the repo.
 Never `rm -rf` a path under either spelling - `git checkout -- tools` restores.
+
+### 2026-10-27: how patches must be anchored (the 0167 lesson)
+
+`0167` failed CI with `redefinition of IOAcceleratorES`: our own `0087-fajita-empty-ioacceleratores`
+**already** publishes that class, and the CI tree has it. My local `xnu-t1xx` trees are built from
+`~/xnu-135`, which is **not** the base CI uses - CI fetches `blacktop/darwin-xnu-build` at a fixed
+SHA (`.github/workflows/xnu.yml`: DXB_REPO/DXB_SHA) and applies blacktop's patches first, then ours
+from `dxb/patches`. So a local tree can silently lack patches that CI has (0087 was one), and
+`git apply --check` there proves less than it looks.
+
+Rule that works anyway: when a patch must change code that another series patch added, anchor on
+that patch's **literal added lines** (read them in the patch file) instead of re-adding anything,
+and keep the hunk small. `0167` is now exactly that - it replaces the 0087 block's log line and
+adds the two `setProperty` calls, nothing else. Validation: take any local tree, `patch --fuzz=3`
+the earlier patch in, then `git apply --check` the new one (offset-independent, since the context is
+the other patch's own text).
+
+Hunk line counts are checked strictly: `git apply` says "corrupt patch" when `+N` is off by one,
+even if the context is right.
