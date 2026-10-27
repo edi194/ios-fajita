@@ -3055,3 +3055,27 @@ The iOS-18 question is only about *where Metal looks for the plugin*: on 18 they
 the same entry point is exactly the cheap thing to test: publish `IOAcceleratorES` +
 `MetalPluginName` on our kernel side and see if Metal loads the bundle; no Mac and no Mesa needed
 for that step.
+
+### 2026-10-27: the Mac problem is already solved - CI runs on macos-14
+
+Two facts that change the Chlorophyll plan:
+
+- `edi194/ios-fajita` is a **public** repository, so GitHub Actions macOS minutes are free, and
+  the existing kernel workflow already runs on `runs-on: macos-14` - i.e. the runner has Xcode in
+  every run, including `xcrun metal`/`metallib`.
+- Docker-OSX is not an option here: there is no `/dev/kvm` inside WSL (it would need nested
+  virtualisation enabled), and a macOS VM would still need an Apple ID to fetch Xcode.
+
+So the Mac-only pieces of the Metal path - `bg_kernels.metallib` and friends, and `libbgair.dylib`
+built from Chlorophyll's Mesa fork with their cross file - can be produced by a macOS CI job and
+downloaded as artifacts. That removes the "needs a Mac" blocker from the assessment above; the
+remaining unknown is only the **iOS 16.7.16 hook point** for Metal's plugin lookup.
+
+Cheapest decisive experiment (call it C1), no Mesa and no Mac needed:
+
+1. kernel: publish an `IOAcceleratorES` IOService with `MetalPluginName` (and the properties Metal
+   reads) next to `SweetAdreno630`;
+2. install a stub bundle at `/System/Library/Extensions/<name>.bundle` that logs when its factory is
+   called;
+3. boot and look for that log. Loaded -> the iOS 16 path works and the real bundle is worth
+   building; not loaded -> the hook is elsewhere and we inspect Metal's iOS 16 binary for it.
