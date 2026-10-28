@@ -26,8 +26,9 @@ adb get-state >/dev/null 2>&1 || { echo "no adb device (phone must be in recover
 dev=${SWEET_USERDATA:-$DEV}
 echo "device: $(adb get-state)   partition: $dev   chunk: ${CHUNK_MIB} MiB"
 
-work=$(mktemp -d)
-trap 'rm -rf "$work"' EXIT
+work=${SWEET_DIFF_DIR:-$HOME/sweetdiff}
+rm -rf "$work"; mkdir -p "$work"
+# keep the chunks: the next run can resume if a push fails
 echo "comparing $((bsz / 1024 / 1024 / 1024)) GiB, ${CHUNK_MIB} MiB chunks ..."
 python3 - "$BASE" "$NEW" "$CHUNK" "$work" <<'PY'
 import sys, hashlib, os
@@ -55,17 +56,17 @@ manifest="$work/manifest.txt"
 [ -s "$manifest" ] || { echo "nothing to do: images are identical"; exit 0; }
 
 echo "===== pushing ====="
-while read -r idx file hash; do
-    adb push -q "$work/$file" "/tmp/$file" >/dev/null
+while read -r idx file hash <&3; do
+    adb push -q "$(wslpath -w "$work/$file")" "/tmp/$file" </dev/null >/dev/null
     echo -n "chunk $idx ($file): writing at $((idx * CHUNK_MIB)) MiB ... "
-    adb shell "dd if=/tmp/$file of=$dev bs=1048576 seek=$((idx * CHUNK_MIB)) conv=notrunc 2>/dev/null; sync" >/dev/null
-    got=$(adb shell "dd if=$dev bs=1048576 skip=$((idx * CHUNK_MIB)) count=$CHUNK_MIB 2>/dev/null | sha256sum" | cut -d' ' -f1 | tr -d '\r')
+    adb shell "dd if=/tmp/$file of=$dev bs=1048576 seek=$((idx * CHUNK_MIB)) conv=notrunc 2>/dev/null; sync" </dev/null >/dev/null
+    got=$(adb shell "dd if=$dev bs=1048576 skip=$((idx * CHUNK_MIB)) count=$CHUNK_MIB 2>/dev/null | sha256sum" </dev/null | cut -d' ' -f1 | tr -d '\r')
     want=$(adb shell "sha256sum /tmp/$file" | cut -d' ' -f1 | tr -d '\r')
     if [ "$got" != "$want" ]; then
         echo "MISMATCH (want $want got $got)"
         exit 1
     fi
-    adb shell "rm -f /tmp/$file"
+    adb shell "rm -f /tmp/$file" </dev/null
     echo "ok"
-done < "$manifest"
+done 3< "$manifest"
 echo "device partition updated - reboot to iOS (no migration expected)"
