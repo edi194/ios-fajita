@@ -42,14 +42,14 @@
 -	if (sz > gpu_arena_window_bytes || (uint64_t)off + sz > gpu_arena_size) {
 -		printf("SWEET GPU: arena: %llu bytes do not fit a %u KiB window (%u used)\n",
 -		    (unsigned long long)sz, gpu_arena_window_bytes / 1024, off);
-+	vm_offset_t kva = 0;
++	vm_offset_t alias = 0;
 +	if (sz <= gpu_arena_window_bytes) {
 +		/* Fits one window: keep the buffer inside it so its kernel alias is contiguous. */
 +		if ((off % gpu_arena_window_bytes) + sz > gpu_arena_window_bytes) {
 +			off = ((off + gpu_arena_window_bytes - 1) / gpu_arena_window_bytes) *
 +			    gpu_arena_window_bytes;
 +		}
-+		kva = gpu_arena_kva(off);
++		alias = gpu_arena_kva(off);
 +	}
 +	if ((uint64_t)off + sz > gpu_arena_size) {
 +		printf("SWEET GPU: arena: %llu bytes do not fit (%u used of %u)\n",
@@ -59,9 +59,9 @@
  	gpu_arena_used = off + (uint32_t)sz;
 -	for (uint64_t i = 0; i < sz; i += 4) {
 -		*(volatile uint32_t *)gpu_arena_kva(off + (uint32_t)i) = 0;
-+	if (kva != 0) {
++	if (alias != 0) {
 +		for (uint64_t i = 0; i < sz; i += 4) {
-+			*(volatile uint32_t *)(kva + (uint32_t)i) = 0;
++			*(volatile uint32_t *)(alias + (uint32_t)i) = 0;
 +		}
 +	} else {
 +		/* No alias for this one: the payload blob is built zeroed and the client writes it. */
@@ -70,7 +70,7 @@
  	}
  	*pa = gpu_arena_pa + off;
 -	*kva = (void *)gpu_arena_kva(off);
-+	*kva = (void *)kva;
++	*kva = (void *)alias;
  	printf("SWEET GPU: arena: %llu bytes at arena+%#x pa %#llx\n",
  	    (unsigned long long)sz, off, (unsigned long long)*pa);
  	return true;
