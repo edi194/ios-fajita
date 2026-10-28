@@ -3448,3 +3448,29 @@ Verdict: worth taking. It is the cleanest available base for the command side of
 port, it is testable without a phone, and it complements (`libbgair`) rather than duplicates what we have.
 First cheap use: build their probe for our SDK against the libdrm stand-in, change the service name, and
 run it next to `bgmtl-adddev` - it exercises SUBMIT/fences/blits, the part our kernel already proves.
+
+### 2026-10-28: the probe itself panicked - sizes must not be tried, and big buffers need no alias
+
+`0170`'s first boot died at the very first probe:
+
+```
+panic(cpu 0 caller 0xfffffe0007ad6d68): kmem_alloc(…, 16777216, 0x100021): failed with 3 @vm_kern.c:178
+```
+
+16 MiB. The lesson is not "16 MiB does not fit" but **`kmem_alloc()` in this port panics on failure**
+(`__kmem_failed_panic`), so a probe cannot ask for a size and look at NULL - it kills the boot. Only
+sizes known to work may be requested: 1 MiB, which is what the old arena used and the largest mapping
+that has ever succeeded here.
+
+`0171` therefore fixes the window at 1 MiB and - more importantly - stops treating a kernel alias as
+required:
+
+- a buffer that fits a window gets one (contiguous alias): chardev BOs, command buffers, everything the
+  reloc patcher writes into;
+- a buffer larger than a window gets `kva = NULL`. Nothing needs the alias: the client maps the BO into
+  itself with `IOConnectMapMemory64` and the GPU reaches it by physical address, and the payload blob is
+  built zeroed so there is nothing to clear;
+- relocation patching now refuses a command buffer without an alias instead of dereferencing NULL.
+
+That is what freedreno's 4 MiB buffer needs: memory, not an alias. The real VM fix (pages below
+`gPhysBase` panic in pmap) stays the long-term goal, but the Metal path no longer waits for it.
