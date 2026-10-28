@@ -1,0 +1,58 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -353,14 +353,21 @@
+ #define GPU_BO_MAX_BYTES       0x100000u
+ #define GPU_ARENA_BYTES        0x100000u   /* the sweetfw2 blob: 1 MiB */
+ /* stage 8f: the C surface the IOKit user client calls */
++/*
++ * The numbers are libdrm's MSM_PARAM_* and must match them exactly: Mesa asks through libdrm, so an
++ * off-by-one is not a missing answer but a wrong one. That is how MSM_PARAM_PRIORITIES (7) used to
++ * return VA_START (0x80000000), which made freedreno keep prio = 1 for its submitqueue.
++ */
+ #define GPU_PARAM_GPU_ID        1u   /* msm_param / MSM_PARAM_* */
+-#define GPU_PARAM_CHIP_ID       2u
+-#define GPU_PARAM_GMEM_SIZE     3u
++#define GPU_PARAM_GMEM_SIZE     2u
++#define GPU_PARAM_CHIP_ID       3u
+ #define GPU_PARAM_MAX_FREQ      4u
+ #define GPU_PARAM_TIMESTAMP     5u
+ #define GPU_PARAM_GMEM_BASE     6u
+-#define GPU_PARAM_VA_START      7u
+-#define GPU_PARAM_VA_SIZE       8u
++#define GPU_PARAM_PRIORITIES    7u
++#define GPU_PARAM_PP_PGTABLE    8u
++#define GPU_PARAM_VA_START      0x0eu
++#define GPU_PARAM_VA_SIZE       0x0fu
+ #define GPU_EXTENT_MAX          8u
+ 
+ struct gpu_extent {
+@@ -1480,6 +1487,12 @@
+ 	case GPU_PARAM_GMEM_BASE:
+ 		*value = 0x100000u;
+ 		break;
++	case GPU_PARAM_PRIORITIES:
++		*value = 1;             /* one ring, no priority levels */
++		break;
++	case GPU_PARAM_PP_PGTABLE:
++		*value = 0;             /* one address space for everybody */
++		break;
+ 	case GPU_PARAM_VA_START:
+ 		*value = GPU_VA_BASE;
+ 		break;
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -958,7 +958,13 @@
+ 		NEED(struct sweet_msm_submitqueue);
+ 		IOLockLock(gAdrenoLock);
+ 		ret = kIOReturnNoResources;
+-		if (r.queue.prio != 0 || r.queue.flags != 0) {
++		/*
++		 * One ring, so there are no priority levels: freedreno asks for prio 1 unconditionally
++		 * (fd_pipe_new -> fd_pipe_new2(dev, id, 1)) and its own comment calls that the default.
++		 * Keep the preempt hint bit allowed too, refuse anything else.
++		 */
++		IOLog("SWEET ADRENO: submitqueue_new flags %#x prio %u\n", r.queue.flags, r.queue.prio);
++		if ((r.queue.flags & ~1u) != 0) {
+ 			ret = kIOReturnBadArgument;
+ 		} else {
+ 			for (uint32_t id = 1; id < QUEUE_IDS; id++) {

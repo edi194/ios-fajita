@@ -3300,3 +3300,30 @@ The way out (next infrastructure step, one more `userdata` flash, then never aga
 After that, every change to the Metal userspace is `boot_a` only (~1 min, no migration), and the
 root image is only needed for the loader itself. Worth doing before the `bgmtl` iteration starts for
 real, because that iteration will be many rounds.
+
+### 2026-10-28: the submitqueue failure was a wrong MSM param number
+
+Mesa died with `could not create submitqueue! -22` and `fd_pipe_new2: allocation failed`, so
+`bgmtl_create_device()` returned nil even though the GPU opened ("GPU ready (kernel ABI minor 0)").
+
+Root cause: our `GPU_PARAM_*` numbers were offset from libdrm's `MSM_PARAM_*`. Mesa asks through
+libdrm, so a wrong number is not a missing answer but a wrong one:
+
+| Mesa asks | msm id | we answered |
+|---|---|---|
+| `MSM_PARAM_GMEM_SIZE` | 2 | `CHIP_ID` |
+| `MSM_PARAM_CHIP_ID` | 3 | `GMEM_SIZE` |
+| `MSM_PARAM_PRIORITIES` | 7 | `VA_START` = 0x80000000 |
+| `MSM_PARAM_VA_START` | 0x0e | `VA_SIZE` |
+
+`fd_pipe_get_param(FD_NR_PRIORITIES)` therefore returned 0x80000000, freedreno kept `prio = 1`
+(its `fd_pipe_new()` asks for 1 unconditionally), and our submitqueue handler refused anything but
+`prio == 0` with `kIOReturnBadArgument` -> -22.
+
+`0168`: the table now matches msm exactly (`GMEM_SIZE 2`, `CHIP_ID 3`, `PRIORITIES 7`,
+`PP_PGTABLE 8`, `VA_START 0x0e`, `VA_SIZE 0x0f`), `PRIORITIES` answers 1 and `PP_PGTABLE` 0, and
+the submitqueue handler accepts the priority and the preempt hint bit (logging both) instead of
+insisting on 0. One ring means the priority is meaningless here.
+
+Also confirmed on this boot: iOS 16.7.16 has `MTLAddDevice` and `MTLCreateSystemDefaultDevice` but
+**no `MTLCopyAllDevices`**.
