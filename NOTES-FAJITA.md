@@ -3580,3 +3580,77 @@ adding (`device table initialised via MTLCreateSystemDefaultDevice: nil (as expe
 Also visible in the same log: the arena is mapped whole and the free list works - the same 4 MiB BO is
 handed out to the fifth `bgmtl-adddev` run at `arena+0x43c000` and again at `arena+0x83c000` instead of
 "do not fit".
+
+## Handoff: 2026-10-28 end of day - the Metal device exists
+
+### Where the GPU work stands
+
+The whole chain works and has been seen on hardware:
+
+```
+kernel: GPU powered, CP live, submissions+fences            (0099-0174)
+IOAcceleratorES + MetalPluginName -> bundle -> -initWithAcceleratorPort:   (0167, C1)
+libbgair.dylib (AIR->NIR->ir3) + bgmtl (_MTLDevice) built from Linux        (tools/)
+bgmtl opens the GPU: rwa_device_open: FD630                (console110)
+bgmtl_create_device() returns a real device: "created FD630 (Bergamota)"
+```
+
+The last boot stopped one line later: `MTLAddDevice` asserted `_deviceArray != NULL` because Metal builds
+its device table lazily on the first `MTLCreateSystemDefaultDevice`/`MTLCopyAllDevices` call, and
+`MTLCopyAllDevices` does not exist on iOS 16. The wrapper now calls `MTLCreateSystemDefaultDevice()`
+first (returns nil, as expected) so the table exists before `MTLAddDevice`.
+
+**Running when this was written:** a full `userdata` flash (`ensure-fastboot-and-flash.sh`) of the image
+containing that fixed `/usr/local/bin/bgmtl-adddev`, then reboot. It was at the checksum stage, ~15 min
+from the end. Nothing needs to be done about it: either it ends with `== done` and the phone boots, or it
+fails on the USB (see the quirks above) and the phone needs a replug.
+
+### Next, in order
+
+1. **Pull the log** (`tools/sweet-log-pull.sh`, phone in OrangeFox) and look for:
+   `device table initialised via MTLCreateSystemDefaultDevice: nil (as expected)`,
+   `MTLAddDevice returned`, `devices after: 1`, `MTLCreateSystemDefaultDevice: FD630 (BGMTLDevice)`.
+   That is the milestone: a Metal device registered in a process.
+2. **Make the kernel name the real bundle** instead of `SweetMetalProbe`: `MetalPluginName` ->
+   the real bundle, `MetalPluginClassName` -> `BGMTLDevice` (one line in 0167). Then `backboardd` itself
+   gets the device - the point where `MTLCreateSystemDefaultDevice` inside the UI process can return
+   ours. Do this only after the in-process test passes, and keep `sweetaccel=0` as the escape hatch.
+3. **Shaders**: `bgmtl` calls `rwa_*` in `libbgair` for pipeline creation (AIR -> NIR -> ir3). Expect the
+   next failures there; `libbgair` is built but has never run on a real AIR payload. Their own probe
+   (`bgair_vertex_test`, `bgair_test`) exercises that path without Metal and is a cheaper first test.
+4. **Iteration cost**: the root image is read-write at runtime, so every userspace change currently needs
+   a ~25 min `userdata` flash. The planned fix (not built yet) is to ship the changing files in the boot
+   payload and install a one-time loader in the root that unpacks them - then everything is `boot_a`
+   (~1 min). Worth doing before the shader work, which will be many rounds.
+
+### Memory (the part that took the day)
+
+- `ml_io_map()` takes its VA from an **8 MiB** IOKit submap (`osfmk/arm/io_map.c`, `IO_MAP_SIZE`) created
+  with `KMS_NOFAIL`, so a full submap panics instead of failing. `0174` raises it to 256 MiB. This was the
+  real reason 16 MiB, 40 MiB and even forty 1 MiB mappings all died - `kernel_map` itself was never the
+  limit (`vm_allocate` handed out 64 MiB happily, `0173`'s probe proved it).
+- The GPU arena is a payload blob (`sweetfw2`, `ARENA_MIB`, default 64, must be <= ~40 MiB to fit the
+  64 MiB `boot_a`), mapped whole since `0174`; buffers larger than the old window used to get
+  `kva = NULL` (0171) which worked for the 4 MiB BO but is no longer needed.
+- The arena has a free list (`0174`) because `bgmtl-adddev` runs five times per boot (launchd restarts it
+  after each crash) and each run used to leak its buffers until the arena was full.
+- The port's free lists still contain pages below `gPhysBase`, which panic in pmap (`phys_to_kv_range`);
+  that is why GPU memory comes from a payload blob at all. Fixing it ("option 2"/"B") is the long-term
+  path to real GPU memory and to >40 MiB arenas, but it is no longer on the critical path for Metal.
+
+### Kernel series
+
+174 patches, CI green on `macos-14`. New today: `0167` (MetalPluginName on the 0087 stub), `0168` (MSM
+param numbering + submitqueue priority), `0169`/`0170`/`0171`/`0172` (arena size, windows, alias-free big
+buffers, one window), `0173` (kernel_map probe with `vm_allocate`), `0174` (IO_MAP_SIZE 256 MiB, whole-arena
+mapping, arena free list). Useful images in `C:\Users\misia\fajita-flash\`: `console110-submap.img`
+(0174, the one flashed last) and `console103-params.img` (last known good if anything goes wrong).
+
+### Ops notes
+
+- `boot_a` is 64 MiB; an image with a 64 MiB arena does not fit ("Volume Full"), 40 MiB does.
+- After a large `userdata` flash `fastboot reboot` often fails (`AdbWriteEndpointSync failed: semaphore
+  timeout`) and the device answers as `????????????`; unplug/replug the cable fixes it.
+- `fastboot devices` is empty *while* a flash runs (that process holds the USB device).
+- `/home/edi194/fajita` is a symlink to the Windows workspace: never `rm -rf` a path under either spelling.
+- The sudo password is not recorded here on purpose.
