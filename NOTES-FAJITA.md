@@ -3351,3 +3351,33 @@ general GPU memory:
 This is still the payload-memory shortcut, not a real allocator: the day we need more than
 `ARENA_MIB`, either raise it (RAM cost) or fix the VM properly (pages below `gPhysBase` panic in
 pmap - option 2 in the 2026-10-26 entry).
+
+### 2026-10-28: the arena cannot be mapped in one piece - kernel_map has no 40 MiB hole
+
+`console104` (arena 64 MiB) never flashed: `FAILED (remote: 'Error flashing partition : Volume
+Full')` - `boot_a` is exactly 64 MiB (`0x4000000`), and with the current kernel the image overhead is
+~17.7 MB, so the payload arena can be at most ~40 MiB. `console105` used that 40 MiB and booted into
+a panic instead:
+
+```
+panic(cpu 0 caller 0xfffffe0007ad5d48): kmem_alloc(0xfffffe10035cadf0, 41943040, 0x100021):
+  failed with 3 @vm_kern.c:170
+```
+
+`ml_io_map()` of the whole arena is a single `kmem_alloc()` of its size, and this port's
+`kernel_map` has no 40 MiB contiguous hole (the biggest mapping that has ever succeeded here is the
+1 MiB arena). So a bigger arena needs either:
+
+1. **chunked mapping**: map the arena in windows (2 MiB / 4 MiB) and make every buffer live inside a
+   single window - the four `gpu_arena + off` uses are easy to convert, but a BO larger than the
+   window then needs its own rule (this is the cheap path, and 4 MiB is what freedreno asked for);
+2. **the real allocator**: allocate GPU pages from the VM and map them with pmap ourselves, i.e. fix
+   option 2 from the 2026-10-26 entry (pages below `gPhysBase` panic in pmap; that is the reason the
+   payload arena exists at all).
+
+State of the Metal path at this point: `bgmtl` opens the GPU (INFO with the 40-byte struct), gets the
+five parameters, creates a submitqueue (`submitqueue_new flags 0 prio 0`), allocates small BOs and
+closes them - and stops at the first 4 MiB buffer, which the 1 MiB arena refuses. The work left is
+memory, not protocol: every selector Mesa touches so far is answered correctly.
+
+The phone was returned to `console103-params` (0168, 1 MiB arena), which boots and shows the UI.
