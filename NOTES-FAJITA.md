@@ -3381,3 +3381,19 @@ closes them - and stops at the first 4 MiB buffer, which the 1 MiB arena refuses
 memory, not protocol: every selector Mesa touches so far is answered correctly.
 
 The phone was returned to `console103-params` (0168, 1 MiB arena), which boots and shows the UI.
+
+### 2026-10-28: the arena mapped in windows (0170) - and what its first boot answers
+
+`ml_io_map()` wants one contiguous `kmem_alloc()` for the whole arena; this port's `kernel_map` has
+no 40 MiB hole, and the largest mapping that has ever worked here is 1 MiB - so the ceiling is
+unknown and worth measuring instead of guessing.
+
+`0170`: at init the kernel tries to map the first arena window at 16, 8, 4, 2 and 1 MiB, keeps the
+largest that maps, logs it, and then maps the rest of the arena in windows of that size. The bump
+allocator keeps every buffer inside a single window (a buffer's kernel alias must be contiguous) and
+refuses anything larger than a window, which caps a buffer at the window size. `gpu_arena_kva(off)`
+is the only way the driver reaches the arena now.
+
+The first boot of `console106` answers three things at once: the real mapping ceiling
+(`SWEET GPU: arena window try N MiB -> ...`), whether freedreno's 4 MiB buffer fits a window, and
+therefore whether `bgmtl_create_device()` gets past it.

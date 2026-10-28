@@ -1,0 +1,159 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -462,8 +462,15 @@
+ static uint32_t gpu_va_next;         /* bump allocator, one guard page, no reuse */
+ static uint32_t next_handle = 1;
+ 
+-/* the buffer arena (a payload blob) */
+-static vm_offset_t gpu_arena;
++/*
++ * The buffer arena (a payload blob), mapped in windows. ml_io_map() maps the whole size with one
++ * kmem_alloc(), and this port's kernel_map has no hole anywhere near the arena's size (the largest
++ * mapping that ever worked here is 1 MiB), so the arena is a list of windows and every buffer stays
++ * inside one of them - that keeps its kernel alias contiguous.
++ */
++#define GPU_ARENA_WINDOWS      128u
++static vm_offset_t gpu_arena_windows[GPU_ARENA_WINDOWS];
++static uint32_t gpu_arena_window_bytes;     /* chosen at init: 16, 8, 4, 2 or 1 MiB */
+ static uint64_t gpu_arena_pa;
+ static uint32_t gpu_arena_size;
+ static uint32_t gpu_arena_used;
+@@ -499,6 +506,18 @@
+ static uint32_t gpu_last_fence;
+ static vm_offset_t gpu_pt_blob;      /* where the page tables live */
+ 
++/* The kernel alias of an offset in the arena; every buffer lives inside one window. */
++static vm_offset_t
++gpu_arena_kva(uint32_t off)
++{
++	uint32_t w = off / gpu_arena_window_bytes;
++
++	if (gpu_arena_window_bytes == 0 || w >= GPU_ARENA_WINDOWS) {
++		return 0;
++	}
++	return gpu_arena_windows[w] + (off % gpu_arena_window_bytes);
++}
++
+ static bool
+ gpu_bo_init(vm_offset_t blob)
+ {
+@@ -524,14 +543,42 @@
+ 	 */
+ 	gpu_arena_pa = pa;
+ 	gpu_arena_size = (uint32_t)size;
+-	gpu_arena = ml_io_map((vm_offset_t)pa, (vm_size_t)gpu_arena_size);
+-	if (gpu_arena == 0) {
+-		printf("SWEET GPU: cannot map the %llu KiB buffer arena\n",
+-		    (unsigned long long)(size / 1024));
+-		return false;
++	{
++		static const uint32_t tries[] = { 16u << 20, 8u << 20, 4u << 20, 2u << 20, 1u << 20 };
++		for (unsigned i = 0; i < sizeof(tries) / sizeof(tries[0]); i++) {
++			vm_offset_t w = ml_io_map((vm_offset_t)pa, tries[i]);
++			printf("SWEET GPU: arena window try %u MiB -> %#llx\n", tries[i] >> 20,
++			    (uint64_t)w);
++			if (w != 0) {
++				gpu_arena_windows[0] = w;
++				gpu_arena_window_bytes = tries[i];
++				break;
++			}
++		}
++		if (gpu_arena_window_bytes == 0) {
++			printf("SWEET GPU: cannot map even a 1 MiB arena window\n");
++			return false;
++		}
++		uint32_t windows = (gpu_arena_size + gpu_arena_window_bytes - 1) / gpu_arena_window_bytes;
++		if (windows > GPU_ARENA_WINDOWS) {
++			windows = GPU_ARENA_WINDOWS;
++			gpu_arena_size = windows * gpu_arena_window_bytes;
++		}
++		for (uint32_t w = 1; w < windows; w++) {
++			gpu_arena_windows[w] = ml_io_map((vm_offset_t)(pa + (uint64_t)w * gpu_arena_window_bytes),
++			    gpu_arena_window_bytes);
++			if (gpu_arena_windows[w] == 0) {
++				printf("SWEET GPU: arena window %u of %u failed; using %llu KiB\n",
++				    w, windows, (unsigned long long)((uint64_t)w * gpu_arena_window_bytes / 1024));
++				gpu_arena_size = w * gpu_arena_window_bytes;
++				windows = w;
++				break;
++			}
++		}
++		printf("SWEET GPU: buffer arena %u KiB in %u windows of %u KiB at %#llx\n",
++		    gpu_arena_size / 1024, windows, gpu_arena_window_bytes / 1024,
++		    (unsigned long long)pa);
+ 	}
+-	printf("SWEET GPU: buffer arena %llu KiB at %#llx -> %#llx\n",
+-	    (unsigned long long)(size / 1024), (unsigned long long)pa, (uint64_t)gpu_arena);
+ 
+ 	/* The page-table pool and the client address space. */
+ 	if (!PE_parse_boot_argn("sweetfw3", arg, sizeof(arg)) ||
+@@ -600,7 +647,7 @@
+ 	struct gpu_bo *bo = NULL;
+ 
+ 	size = round_page(size);
+-	if (size == 0 || size > GPU_BO_MAX_BYTES || gpu_arena == 0) {
++	if (size == 0 || size > GPU_BO_MAX_BYTES || gpu_arena_window_bytes == 0) {
+ 		return NULL;
+ 	}
+ 	for (unsigned i = 0; i < GPU_BO_MAX; i++) {
+@@ -619,14 +666,26 @@
+ 		return NULL;
+ 	}
+ 
++	/*
++	 * Keep the buffer inside one window: its kernel alias must be contiguous. A buffer larger than
++	 * a window has to start at a window boundary and is refused if it does not fit.
++	 */
+ 	uint32_t off = gpu_arena_used;
++	if ((off % gpu_arena_window_bytes) + size > gpu_arena_window_bytes) {
++		off = ((off + gpu_arena_window_bytes - 1) / gpu_arena_window_bytes) * gpu_arena_window_bytes;
++	}
++	if (size > gpu_arena_window_bytes || off + size > gpu_arena_size) {
++		printf("SWEET GPU: bo: %lu bytes do not fit a %u KiB window (%u used of %u)\n",
++		    (unsigned long)size, gpu_arena_window_bytes / 1024, off, gpu_arena_size);
++		return NULL;
++	}
+ 	gpu_arena_used = off + size;
+-	volatile uint32_t *zero = (volatile uint32_t *)(gpu_arena + off);
++	volatile uint32_t *zero = (volatile uint32_t *)gpu_arena_kva(off);
+ 	for (uint32_t i = 0; i < size / 4; i++) {
+ 		zero[i] = 0;
+ 	}
+ 
+-	bo->kva = gpu_arena + off;
++	bo->kva = gpu_arena_kva(off);
+ 	bo->pa = gpu_arena_pa + off;
+ 	bo->size = size;
+ 	bo->va = gpu_va_next;
+@@ -1796,7 +1855,7 @@
+ 	uint64_t sz = (size + 0xfffull) & ~0xfffull;
+ 	uint32_t off;
+ 
+-	if (!gpu_live || gpu_arena == 0 || sz == 0 || sz > gpu_arena_size) {
++	if (!gpu_live || gpu_arena_window_bytes == 0 || sz == 0 || sz > gpu_arena_size) {
+ 		return false;
+ 	}
+ 	if ((uint64_t)gpu_arena_used + sz > gpu_arena_size) {
+@@ -1805,12 +1864,20 @@
+ 		return false;
+ 	}
+ 	off = gpu_arena_used;
++	if ((off % gpu_arena_window_bytes) + sz > gpu_arena_window_bytes) {
++		off = ((off + gpu_arena_window_bytes - 1) / gpu_arena_window_bytes) * gpu_arena_window_bytes;
++	}
++	if (sz > gpu_arena_window_bytes || (uint64_t)off + sz > gpu_arena_size) {
++		printf("SWEET GPU: arena: %llu bytes do not fit a %u KiB window (%u used)\n",
++		    (unsigned long long)sz, gpu_arena_window_bytes / 1024, off);
++		return false;
++	}
+ 	gpu_arena_used = off + (uint32_t)sz;
+ 	for (uint64_t i = 0; i < sz; i += 4) {
+-		*(volatile uint32_t *)(gpu_arena + off + i) = 0;
++		*(volatile uint32_t *)gpu_arena_kva(off + (uint32_t)i) = 0;
+ 	}
+ 	*pa = gpu_arena_pa + off;
+-	*kva = (void *)(gpu_arena + off);
++	*kva = (void *)gpu_arena_kva(off);
+ 	printf("SWEET GPU: arena: %llu bytes at arena+%#x pa %#llx\n",
+ 	    (unsigned long long)sz, off, (unsigned long long)*pa);
+ 	return true;
