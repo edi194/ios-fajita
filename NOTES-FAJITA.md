@@ -3515,3 +3515,44 @@ flashed yet, so one boot answers both questions:
   kernel alias;
 - how much contiguous VA the kernel map can really give, which decides whether the fix is "map the
   arena in windows of the size that works" or "repair the kernel map / pmap first".
+
+### 2026-10-28: the real ceiling was the 8 MiB IOKit submap, and the arena needed a free list
+
+The probe answered it in one boot:
+
+```
+SWEET VM: vm_allocate 1 MiB -> 0 (ok) … 64 MiB -> 0 (ok)
+```
+
+`kernel_map` was never the problem. `osfmk/arm/io_map.c` shows why `ml_io_map` kept dying:
+
+```c
+#define IO_MAP_SIZE (8ul << 20)
+io_submap = kmem_suballoc(kernel_map, …, IO_MAP_SIZE, …, KMS_NOFAIL, VM_KERN_MEMORY_IOKIT);
+```
+
+**Every `ml_io_map()` in the kernel is carved out of that 8 MiB submap**, and `KMS_NOFAIL` turns "no
+room" into a panic. That explains all of it: 16 MiB, 40 MiB and forty 1 MiB mappings could never fit,
+while `vm_allocate` (not the submap) happily returned 64 MiB.
+
+The same boot also showed the second problem: `bgmtl-adddev` starts **five times** in one boot (launchd
+restarts the tool after each crash), each run leaked its buffers, and the 40 MiB arena was at 38 MB
+when Mesa asked for its 4 MiB one:
+
+```
+SWEET GPU: arena: 4194304 bytes do not fit (38371328 of 41943040 used)
+MESA: warning: bo_new(4194304): kernel refused; caches emptied, retry failed
+```
+
+`0174` fixes both and simplifies the mapping:
+
+- `IO_MAP_SIZE` 8 MiB -> 256 MiB (address space only, no RAM);
+- the arena is mapped **whole** in one `ml_io_map()`, so every buffer has a contiguous kernel alias
+  again (no windows, no alias-less buffers, relocations work for any command buffer);
+- the arena gets a **free list** (`gpu_arena_take`/`gpu_arena_give_back`, 512 entries, first fit) and
+  `releaseGem()` returns arena memory through `sweet_gpu_free_pages()` - a BO the GPU is still using
+  is still deliberately leaked.
+
+Note for the record: the previous boot did allocate a 4 MiB BO successfully without an alias
+(`arena: 4194304 bytes at arena+0x24000 without a kernel alias`), so the alias-free path worked; it was
+exhaustion, not the buffer size, that stopped Mesa in the end.

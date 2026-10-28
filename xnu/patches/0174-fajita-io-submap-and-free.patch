@@ -1,0 +1,167 @@
+--- a/osfmk/arm/io_map.c
++++ b/osfmk/arm/io_map.c
+@@ -62,7 +62,13 @@
+ 
+ extern vm_offset_t virtual_space_start;     /* Next available kernel VA */
+ 
+-#define IO_MAP_SIZE            (8ul << 20)
++/*
++ * fajita: 8 MiB was the ceiling for every ml_io_map() in the kernel (each one comes out of this
++ * submap, with KMS_NOFAIL - a full submap panics). The GPU arena alone wants tens of MiB: a 16 MiB,
++ * a 40 MiB and even a series of 1 MiB mappings all died here while vm_allocate() could still hand
++ * out 64 MiB, which is what finally identified this constant. 256 MiB of address space, not RAM.
++ */
++#define IO_MAP_SIZE            (256ul << 20)
+ 
+ __startup_data static struct mach_vm_range io_range;
+ static SECURITY_READ_ONLY_LATE(vm_map_t) io_submap;
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -507,6 +507,61 @@
+ static uint32_t gpu_last_fence;
+ static vm_offset_t gpu_pt_blob;      /* where the page tables live */
+ 
++/*
++ * Arena blocks. bgmtl-adddev runs several times per boot (launchd restarts it after each crash) and
++ * every run used to leak its buffers, which filled the 40 MiB arena in five goes; a freed block is
++ * now handed out again. First fit, no splitting, no coalescing - the workloads are few and chunky.
++ */
++#define GPU_ARENA_BLOCKS       512u
++static struct gpu_arena_block {
++	uint32_t off;
++	uint32_t size;
++	bool used;
++} gpu_arena_blocks[GPU_ARENA_BLOCKS];
++
++static void
++gpu_arena_give_back(uint32_t off, uint32_t size)
++{
++	for (unsigned i = 0; i < GPU_ARENA_BLOCKS; i++) {
++		if (gpu_arena_blocks[i].used && gpu_arena_blocks[i].off == off &&
++		    gpu_arena_blocks[i].size == size) {
++			gpu_arena_blocks[i].used = false;
++			return;
++		}
++	}
++}
++
++/* Reserve SZ bytes: a freed block of that size or larger, else the bump pointer. */
++static bool
++gpu_arena_take(uint32_t sz, uint32_t *off)
++{
++	for (unsigned i = 0; i < GPU_ARENA_BLOCKS; i++) {
++		if (gpu_arena_blocks[i].size == 0) {
++			continue;
++		}
++		if (!gpu_arena_blocks[i].used && gpu_arena_blocks[i].size >= sz) {
++			gpu_arena_blocks[i].used = true;
++			*off = gpu_arena_blocks[i].off;
++			return true;
++		}
++	}
++	uint32_t o = (gpu_arena_used + 0xfffu) & ~0xfffu;
++	if ((uint64_t)o + sz > gpu_arena_size) {
++		return false;
++	}
++	for (unsigned i = 0; i < GPU_ARENA_BLOCKS; i++) {
++		if (gpu_arena_blocks[i].size == 0) {
++			gpu_arena_blocks[i].off = o;
++			gpu_arena_blocks[i].size = sz;
++			gpu_arena_blocks[i].used = true;
++			gpu_arena_used = o + sz;
++			*off = o;
++			return true;
++		}
++	}
++	return false;
++}
++
+ /* The kernel alias of an offset in the arena; every buffer lives inside one window. */
+ static vm_offset_t
+ gpu_arena_kva(uint32_t off)
+@@ -553,20 +608,20 @@
+ 		 * physical address.
+ 		 */
+ 		/*
+-		 * Exactly one window. A series of 1 MiB mappings exhausts this port's kernel_map and
+-		 * kmem_alloc() panics when it cannot find room, so the count must not be discovered by
+-		 * trying: one mapping is what the 1 MiB arena did for weeks without trouble.
++		 * One mapping for the whole arena: with IO_MAP_SIZE raised (osfmk/arm/io_map.c) the IOKit
++		 * submap holds it, so every buffer gets a contiguous kernel alias and relocation patching
++		 * works for command buffers of any size.
+ 		 */
+-		gpu_arena_window_bytes = 1u << 20;
+-		gpu_arena_windows[0] = ml_io_map((vm_offset_t)pa, gpu_arena_window_bytes);
++		gpu_arena_window_bytes = gpu_arena_size;
++		gpu_arena_windows[0] = ml_io_map((vm_offset_t)pa, (vm_size_t)gpu_arena_size);
+ 		if (gpu_arena_windows[0] == 0) {
+-			printf("SWEET GPU: cannot map the first arena window\n");
++			printf("SWEET GPU: cannot map the %u KiB arena\n", gpu_arena_size / 1024);
+ 			gpu_arena_window_bytes = 0;
+ 			return false;
+ 		}
+-		gpu_arena_mapped_bytes = gpu_arena_window_bytes;
+-		printf("SWEET GPU: buffer arena %u KiB at %#llx, %u KiB with a kernel alias\n",
+-		    gpu_arena_size / 1024, (unsigned long long)pa, gpu_arena_mapped_bytes / 1024);
++		gpu_arena_mapped_bytes = gpu_arena_size;
++		printf("SWEET GPU: buffer arena %u KiB at %#llx, mapped whole\n",
++		    gpu_arena_size / 1024, (unsigned long long)pa);
+ 	}
+ 
+ 	/*
+@@ -1867,27 +1922,12 @@
+ 	if (!gpu_live || gpu_arena_window_bytes == 0 || sz == 0 || sz > gpu_arena_size) {
+ 		return false;
+ 	}
+-	if ((uint64_t)gpu_arena_used + sz > gpu_arena_size) {
++	if (!gpu_arena_take((uint32_t)sz, &off)) {
+ 		printf("SWEET GPU: arena: %llu bytes do not fit (%u of %u used)\n",
+ 		    (unsigned long long)sz, gpu_arena_used, gpu_arena_size);
+ 		return false;
+ 	}
+-	off = gpu_arena_used;
+-	vm_offset_t alias = 0;
+-	if ((uint64_t)off + sz <= gpu_arena_mapped_bytes) {
+-		/* Inside the mapped window: keep the buffer there so its kernel alias is contiguous. */
+-		if ((off % gpu_arena_window_bytes) + sz > gpu_arena_window_bytes) {
+-			off = ((off + gpu_arena_window_bytes - 1) / gpu_arena_window_bytes) *
+-			    gpu_arena_window_bytes;
+-		}
+-		alias = gpu_arena_kva(off);
+-	}
+-	if ((uint64_t)off + sz > gpu_arena_size) {
+-		printf("SWEET GPU: arena: %llu bytes do not fit (%u used of %u)\n",
+-		    (unsigned long long)sz, off, gpu_arena_size);
+-		return false;
+-	}
+-	gpu_arena_used = off + (uint32_t)sz;
++	vm_offset_t alias = gpu_arena_kva(off);
+ 	if (alias != 0) {
+ 		for (uint64_t i = 0; i < sz; i += 4) {
+ 			*(volatile uint32_t *)(alias + (uint32_t)i) = 0;
+@@ -1907,8 +1947,10 @@
+ void
+ sweet_gpu_free_pages(uint64_t pa, uint64_t size)
+ {
+-	(void)pa;
+-	(void)size;
++	if (!gpu_live || gpu_arena_window_bytes == 0 || pa < gpu_arena_pa || size == 0) {
++		return;
++	}
++	gpu_arena_give_back((uint32_t)(pa - gpu_arena_pa), (uint32_t)((size + 0xfff) & ~0xfffull));
+ }
+ 
+ /* ---- stage 8e: the ABI the device node exposes ------------------------- */
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -321,6 +321,10 @@
+ 	} else if (g->iova != IOVA_UNSET) {
+ 		sweet_gpu_vm_unmap(g->iova, g->size);
+ 		sweet_gpu_iova_free(g->iova, g->vaLen);
++		if (g->pa != 0) {
++			/* Arena memory goes back to the free list; a leaked BO keeps it, on purpose. */
++			sweet_gpu_free_pages(g->pa, g->size);
++		}
+ 	}
+ 	OSSafeReleaseNULL(g->md);
+ 	g->buf = NULL;
