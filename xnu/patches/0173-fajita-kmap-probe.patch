@@ -1,6 +1,14 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -569,6 +569,24 @@
+@@ -19,6 +19,7 @@
+ #include <sys/systm.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <mach/vm_map.h>        /* vm_allocate/vm_deallocate: the kmap probe below */
+ /* stage 8: buffer allocation and cache attributes */
+ #include <sys/conf.h>
+ #include <sys/ioccom.h>
+@@ -569,6 +570,24 @@
  		    gpu_arena_size / 1024, (unsigned long long)pa, gpu_arena_mapped_bytes / 1024);
  	}
  
