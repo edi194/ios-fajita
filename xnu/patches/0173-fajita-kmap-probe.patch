@@ -1,0 +1,27 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -569,6 +569,24 @@
+ 		    gpu_arena_size / 1024, (unsigned long long)pa, gpu_arena_mapped_bytes / 1024);
+ 	}
+ 
++	/*
++	 * How much contiguous VA kernel_map can give, asked without panicking: kmem_alloc() panics on
++	 * failure in this port, vm_allocate() does not. Logged, freed immediately, boot continues.
++	 */
++	{
++		static const uint32_t sizes[] = { 1u << 20, 2u << 20, 4u << 20, 8u << 20,
++			16u << 20, 32u << 20, 64u << 20 };
++		for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
++			vm_offset_t addr = 0;
++			kern_return_t kr = vm_allocate(kernel_map, &addr, sizes[i], VM_FLAGS_ANYWHERE);
++			printf("SWEET VM: vm_allocate %u MiB -> %d (%s)\n", sizes[i] >> 20, kr,
++			    kr == KERN_SUCCESS ? "ok" : "no");
++			if (kr == KERN_SUCCESS) {
++				vm_deallocate(kernel_map, addr, sizes[i]);
++			}
++		}
++	}
++
+ 	/* The page-table pool and the client address space. */
+ 	if (!PE_parse_boot_argn("sweetfw3", arg, sizeof(arg)) ||
+ 	    !gpu_parse_range(arg, &pa, &size) || size < (uint64_t)GPU_PTE_TABLES * 0x1000) {

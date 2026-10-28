@@ -3500,3 +3500,18 @@ This is also the strongest argument for the real allocator work (B): **`kernel_m
 map even a few MiB of GPU memory**, so GPU buffers must either come without a kernel alias (as now) or
 the kernel map / pmap has to be fixed first. Anything that needs a large *alias* - a big command buffer
 that takes relocations, for instance - is blocked until then.
+
+### 2026-10-28: measuring kernel_map without panicking (0173)
+
+Every attempt to grow the arena has died inside `kmem_alloc`, which panics on failure here, so the
+ceiling of `kernel_map` has never been measured - only bumped into. `vm_allocate(kernel_map, ...)`
+returns a `kern_return_t` instead, so `0173` asks it for 1, 2, 4, 8, 16, 32 and 64 MiB, logs each
+answer and frees what it got. The boot continues either way.
+
+This boot also carries `0172` (one 1 MiB window, everything beyond it alias-free), which had not been
+flashed yet, so one boot answers both questions:
+
+- does the arena boot at all with a single window, and does freedreno get its 4 MiB buffer without a
+  kernel alias;
+- how much contiguous VA the kernel map can really give, which decides whether the fix is "map the
+  arena in windows of the size that works" or "repair the kernel map / pmap first".
