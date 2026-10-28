@@ -3211,3 +3211,24 @@ What the log will answer: whether `bgmtl_create_device()` gets a `BGMTLDevice` a
 GPU through our libdrm stand-in -> `SweetAdreno630`), whether `MTLAddDevice` accepts it in-process,
 and what `MTLCreateSystemDefaultDevice` / `MTLCopyAllDevices` say afterwards. If the device pointer
 is nil, the first place to look is `rwa_device_open` (Chlorophyll's open path) against our ABI.
+
+### 2026-10-28: how to update the iOS root without a 12 GB flash (tools/push-image-blocks.sh)
+
+A `userdata` flash of the root image now costs ~4 min of `img2simg` + ~6 min of fastboot + 10-15 min
+of iOS data migration, and after the first mount-and-copy the sparse image grew from ~357 MB to
+12.1 GB, so nothing trims it any more. Iterating on a 10 MB `bgmtl` dylib that way is untenable.
+
+`tools/push-image-blocks.sh BASE.img NEW.img [CHUNK_MiB]` diffs the image that is on the device
+(keep a sparse copy: `cp --sparse=always ios16-root-gpu.img ios16-root-gpu.base.img`) against the
+edited one, and writes only the changed 4 MiB chunks with `dd` to `/dev/block/sda17` from recovery.
+Byte-identical to flashing the partition, seconds instead of minutes, and **no migration** - iOS
+just sees changed files.
+
+Recovery needs no HFS+ support for this: no filesystem is interpreted, only blocks copied. Every
+chunk is verified by reading it back and comparing sha256 on the device. Requirements: phone in a
+recovery with adb, partition unmounted, and BASE must be exactly what was flashed last.
+
+Note the per-boot quirks seen repeatedly this week: after a large `userdata` flash `fastboot reboot`
+often fails with `AdbWriteEndpointSync failed: semaphore timeout` and the device answers as
+`????????????`; the fix is physical - unplug/replug the cable (or power-cycle). `fastboot devices`
+is also empty *while* a flash is running, because that process holds the USB device exclusively.
