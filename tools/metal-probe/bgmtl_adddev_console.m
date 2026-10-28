@@ -44,24 +44,31 @@ main(int argc, char **argv)
 	printf("SWEET METAL: bgmtl_adddev starting\n");
 	@autoreleasepool {
 		void (*add)(id) = dlsym(RTLD_DEFAULT, "MTLAddDevice");
-		printf("MTLAddDevice symbol: %p\n", add);
-		NSArray *before = ((NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices"))();
+		NSArray *(*copy_all)(void) = dlsym(RTLD_DEFAULT, "MTLCopyAllDevices");
+		id (*create_default)(void) = dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice");
+		printf("symbols: MTLAddDevice %p, MTLCopyAllDevices %p, MTLCreateSystemDefaultDevice %p\n",
+		    add, copy_all, create_default);
+		NSArray *before = copy_all ? copy_all() : nil;
 		printf("devices before: %lu\n", (unsigned long)[before count]);
 		id dev = bgmtl_create_device();
 		printf("created %s\n", dev ? [[dev name] UTF8String] : "nil");
-		if (!dev || !add) {
-			printf("SWEET METAL: bgmtl_adddev: no device or no MTLAddDevice\n");
+		if (!dev) {
+			printf("SWEET METAL: bgmtl_create_device returned nil - the GPU open failed\n");
+			return 2;
+		}
+		if (!add) {
+			printf("SWEET METAL: no MTLAddDevice symbol on this iOS - cannot register\n");
 			return 2;
 		}
 		printf("calling MTLAddDevice ...\n");
 		add(dev);
 		printf("MTLAddDevice returned\n");
-		NSArray *after = ((NSArray * (*)(void))dlsym(RTLD_DEFAULT, "MTLCopyAllDevices"))();
+		NSArray *after = copy_all ? copy_all() : nil;
 		printf("devices after: %lu\n", (unsigned long)[after count]);
 		for (id d in after) {
 			printf("  %s (%s)\n", [[d name] UTF8String], class_getName([d class]));
 		}
-		id def = ((id (*)(void))dlsym(RTLD_DEFAULT, "MTLCreateSystemDefaultDevice"))();
+		id def = create_default ? create_default() : nil;
 		printf("MTLCreateSystemDefaultDevice: %s (%s)\n",
 		    def ? [[def name] UTF8String] : "nil", def ? class_getName([def class]) : "-");
 		if (def) {

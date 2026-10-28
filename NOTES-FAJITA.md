@@ -3266,3 +3266,37 @@ Rules from now on:
 Full `userdata` flash of the current image is the safe path, and the image already contains
 `/usr/local/lib/{libbgair.dylib,libdrm.2.dylib}` (dyld searches `/usr/local/lib`; `@rpath` expansion
 is blocked by AMFI on this port: "security policy does not allow @ path expansion").
+
+### 2026-10-28: the Metal test runs; and why root-fs iteration must move to the payload
+
+`bgmtl-adddev` finally loads (dylibs found in `/usr/local/lib`) and prints:
+
+```
+SWEET METAL: bgmtl_adddev starting
+MTLAddDevice symbol: 0x1cf7b3368
+CRASH bgmtl-adddev sig 11 … pc 0x0
+```
+
+`pc 0x0` is their test calling `dlsym(RTLD_DEFAULT, "MTLCopyAllDevices")` without a NULL check:
+**iOS 16 has no `MTLCopyAllDevices`** (macOS-only). The wrapper now resolves all three symbols, prints
+all three pointers and guards every call, so the next run says which of them exist on 16.7.16.
+
+Iteration cost is now the real problem. After a full `userdata` flash iOS mounts the root read-write
+(`rootrw=1`) and writes to it (journal, `/var`, caches), so the BASE image no longer describes the
+device and a block push would clobber or desynchronise the volume - that is exactly how the previous
+`mount[7] … exit status 74` came about. Each userspace iteration therefore costs ~12 min of sparse +
+fastboot and ~12 min of iOS migration.
+
+The way out (next infrastructure step, one more `userdata` flash, then never again):
+
+1. put the files that change (the test binary, `libbgair`, `libdrm`, later the real bundle) into the
+   **boot payload** - `boot_a` is 18 MB and flashes in under a second;
+2. expose the payload to userspace from the kernel (one chardev ioctl: read N bytes at offset O from
+   the payload blob - the machinery to map the blob already exists for the GPU);
+3. install, once, a small loader in the root (`/usr/local/bin/sweet-install`) that reads a simple
+   TOC+data archive from the payload and writes the files into `/usr/local/lib` and
+   `/usr/local/bin` at boot, before `DumpPanic` hands over to the test.
+
+After that, every change to the Metal userspace is `boot_a` only (~1 min, no migration), and the
+root image is only needed for the loader itself. Worth doing before the `bgmtl` iteration starts for
+real, because that iteration will be many rounds.
