@@ -1,14 +1,6 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -19,6 +19,7 @@
- #include <sys/systm.h>
- #include <machine/machine_routines.h>
- #include <pexpert/pexpert.h>
-+#include <mach/vm_map.h>        /* vm_allocate/vm_deallocate: the kmap probe below */
- /* stage 8: buffer allocation and cache attributes */
- #include <sys/conf.h>
- #include <sys/ioccom.h>
-@@ -569,6 +570,24 @@
+@@ -569,6 +569,26 @@
  		    gpu_arena_size / 1024, (unsigned long long)pa, gpu_arena_mapped_bytes / 1024);
  	}
  
@@ -17,6 +9,8 @@
 +	 * failure in this port, vm_allocate() does not. Logged, freed immediately, boot continues.
 +	 */
 +	{
++		extern kern_return_t vm_allocate(vm_map_t, vm_offset_t *, vm_size_t, int);
++		extern kern_return_t vm_deallocate(vm_map_t, vm_offset_t, vm_size_t);
 +		static const uint32_t sizes[] = { 1u << 20, 2u << 20, 4u << 20, 8u << 20,
 +			16u << 20, 32u << 20, 64u << 20 };
 +		for (unsigned i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
