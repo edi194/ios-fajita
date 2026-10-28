@@ -3474,3 +3474,29 @@ required:
 
 That is what freedreno's 4 MiB buffer needs: memory, not an alias. The real VM fix (pages below
 `gPhysBase` panic in pmap) stays the long-term goal, but the Metal path no longer waits for it.
+
+### 2026-10-28: kernel_map is smaller than one arena - a *series* of 1 MiB mappings dies too
+
+`0171` (40 windows of 1 MiB) panicked on a 1 MiB mapping:
+
+```
+panic(cpu 0 caller 0xfffffe0007ad5f70): kmem_alloc(…, 1048576, 0x100021): failed with 3 @vm_kern.c:178
+```
+
+Not because 1 MiB is too big - the 1 MiB arena worked for weeks - but because **mapping it forty times
+exhausts the kernel map**. Together with the 40 MiB and 16 MiB panics this pins the real constraint:
+
+- one 1 MiB `ml_io_map`: works;
+- 16 MiB in one go, 40 MiB in one go, or 40 × 1 MiB: panic in `kmem_alloc` (`__kmem_failed_panic`,
+  so a failure kills the boot instead of returning NULL).
+
+`0172` therefore maps **one** window (1 MiB, the proven size and count) and lets everything beyond it
+live without a kernel alias: `gpu_arena_mapped_bytes` gates the alias, `sweet_gpu_alloc_pages()` gives
+one only for buffers inside the window, the rest get `kva = NULL` (the client maps them, the GPU uses the
+physical address, the payload blob is built zeroed). The chardev path still requires the alias, so it
+keeps refusing anything that does not fit - it only allocates 16 KiB.
+
+This is also the strongest argument for the real allocator work (B): **`kernel_map` in this port cannot
+map even a few MiB of GPU memory**, so GPU buffers must either come without a kernel alias (as now) or
+the kernel map / pmap has to be fixed first. Anything that needs a large *alias* - a big command buffer
+that takes relocations, for instance - is blocked until then.

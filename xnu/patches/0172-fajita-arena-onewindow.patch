@@ -1,0 +1,82 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -470,7 +470,8 @@
+  */
+ #define GPU_ARENA_WINDOWS      128u
+ static vm_offset_t gpu_arena_windows[GPU_ARENA_WINDOWS];
+-static uint32_t gpu_arena_window_bytes;     /* chosen at init: 16, 8, 4, 2 or 1 MiB */
++static uint32_t gpu_arena_window_bytes;     /* one window: 1 MiB, the mapping known to work */
++static uint32_t gpu_arena_mapped_bytes;     /* how much of the arena has a kernel alias at all */
+ static uint64_t gpu_arena_pa;
+ static uint32_t gpu_arena_size;
+ static uint32_t gpu_arena_used;
+@@ -512,7 +513,7 @@
+ {
+ 	uint32_t w = off / gpu_arena_window_bytes;
+ 
+-	if (gpu_arena_window_bytes == 0 || w >= GPU_ARENA_WINDOWS) {
++	if (gpu_arena_window_bytes == 0 || w >= GPU_ARENA_WINDOWS || off >= gpu_arena_mapped_bytes) {
+ 		return 0;
+ 	}
+ 	return gpu_arena_windows[w] + (off % gpu_arena_window_bytes);
+@@ -551,6 +552,11 @@
+ 		 * all (see sweet_gpu_alloc_pages) - the client maps them itself and the GPU reaches them by
+ 		 * physical address.
+ 		 */
++		/*
++		 * Exactly one window. A series of 1 MiB mappings exhausts this port's kernel_map and
++		 * kmem_alloc() panics when it cannot find room, so the count must not be discovered by
++		 * trying: one mapping is what the 1 MiB arena did for weeks without trouble.
++		 */
+ 		gpu_arena_window_bytes = 1u << 20;
+ 		gpu_arena_windows[0] = ml_io_map((vm_offset_t)pa, gpu_arena_window_bytes);
+ 		if (gpu_arena_windows[0] == 0) {
+@@ -558,25 +564,9 @@
+ 			gpu_arena_window_bytes = 0;
+ 			return false;
+ 		}
+-		uint32_t windows = (gpu_arena_size + gpu_arena_window_bytes - 1) / gpu_arena_window_bytes;
+-		if (windows > GPU_ARENA_WINDOWS) {
+-			windows = GPU_ARENA_WINDOWS;
+-			gpu_arena_size = windows * gpu_arena_window_bytes;
+-		}
+-		for (uint32_t w = 1; w < windows; w++) {
+-			gpu_arena_windows[w] = ml_io_map((vm_offset_t)(pa + (uint64_t)w * gpu_arena_window_bytes),
+-			    gpu_arena_window_bytes);
+-			if (gpu_arena_windows[w] == 0) {
+-				printf("SWEET GPU: arena window %u of %u failed; using %llu KiB\n",
+-				    w, windows, (unsigned long long)((uint64_t)w * gpu_arena_window_bytes / 1024));
+-				gpu_arena_size = w * gpu_arena_window_bytes;
+-				windows = w;
+-				break;
+-			}
+-		}
+-		printf("SWEET GPU: buffer arena %u KiB in %u windows of %u KiB at %#llx\n",
+-		    gpu_arena_size / 1024, windows, gpu_arena_window_bytes / 1024,
+-		    (unsigned long long)pa);
++		gpu_arena_mapped_bytes = gpu_arena_window_bytes;
++		printf("SWEET GPU: buffer arena %u KiB at %#llx, %u KiB with a kernel alias\n",
++		    gpu_arena_size / 1024, (unsigned long long)pa, gpu_arena_mapped_bytes / 1024);
+ 	}
+ 
+ 	/* The page-table pool and the client address space. */
+@@ -673,7 +663,7 @@
+ 	if ((off % gpu_arena_window_bytes) + size > gpu_arena_window_bytes) {
+ 		off = ((off + gpu_arena_window_bytes - 1) / gpu_arena_window_bytes) * gpu_arena_window_bytes;
+ 	}
+-	if (size > gpu_arena_window_bytes || off + size > gpu_arena_size) {
++	if ((uint64_t)off + size > gpu_arena_mapped_bytes || off + size > gpu_arena_size) {
+ 		printf("SWEET GPU: bo: %lu bytes do not fit a %u KiB window (%u used of %u)\n",
+ 		    (unsigned long)size, gpu_arena_window_bytes / 1024, off, gpu_arena_size);
+ 		return NULL;
+@@ -1864,8 +1854,8 @@
+ 	}
+ 	off = gpu_arena_used;
+ 	vm_offset_t alias = 0;
+-	if (sz <= gpu_arena_window_bytes) {
+-		/* Fits one window: keep the buffer inside it so its kernel alias is contiguous. */
++	if ((uint64_t)off + sz <= gpu_arena_mapped_bytes) {
++		/* Inside the mapped window: keep the buffer there so its kernel alias is contiguous. */
+ 		if ((off % gpu_arena_window_bytes) + sz > gpu_arena_window_bytes) {
+ 			off = ((off + gpu_arena_window_bytes - 1) / gpu_arena_window_bytes) *
+ 			    gpu_arena_window_bytes;
