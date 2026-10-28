@@ -3397,3 +3397,54 @@ is the only way the driver reaches the arena now.
 The first boot of `console106` answers three things at once: the real mapping ceiling
 (`SWEET GPU: arena window try N MiB -> ...`), whether freedreno's 4 MiB buffer fits a window, and
 therefore whether `bgmtl_create_device()` gets past it.
+
+### 2026-10-28: oosexgang/hakios-metal - assessed, and it is directly usable here
+
+`https://github.com/oosexgang/hakios-metal` (MIT, C++, created 2026-10-28, ~40 KB): "the Metal driver of
+hakios, in C++: Metal's command model on the Adreno through the kernel's GPU driver". Read the README,
+`gpu.hpp`, `gpu.cpp`, `iokit_transport.cpp` and `hakios_metal.h`.
+
+**It speaks our ABI.** Their transport is exactly ours:
+
+```c
+IOServiceGetMatchingService(..., IOServiceMatching("HakiosGPU"));
+IOServiceOpen(...);
+IOConnectCallStructMethod(c, request, data, size, data, &returned);   // selector = msm request number
+IOConnectMapMemory64(c, handle, mach_task_self(), &addr, &size, kIOMapAnywhere);  // BO memory by handle
+```
+
+and the requests they use are the ones we implement: `0x09` GEM_CLOSE, `0x40` GET_PARAM, `0x42` GEM_NEW,
+`0x43` GEM_INFO (GET_IOVA), `0x44` CPU_PREP, `0x45` CPU_FINI, `0x46` SUBMIT, `0x47` WAIT_FENCE, `0x4a`
+SUBMITQUEUE_NEW, `0x4b` SUBMITQUEUE_CLOSE. Their `MsmGemSubmit` (72 bytes), `MsmGemInfo` (24),
+`MsmSubmitCmd` (32), `MsmSubmitBo` (16) match our structs, and their param numbers are msm's (1..4), i.e.
+the numbering `0168` just fixed.
+
+What it adds that we do not have:
+
+- a **tested C++ Metal command model**: `CommandQueue` / `CommandBuffer` with Metal's states, completed
+  handlers in commit order, `waitUntilCompleted`, and blits done by the CP (`CP_MEMCPY`, `CP_MEM_WRITE`),
+  with 9 tests under TSan/ASan;
+- a **fake GPU** that interprets PM4 packets as strictly as the CP (parity, count past the end, unknown
+  opcode, address outside every buffer -> fault). Runs on any machine: free validation of packet streams
+  and of our understanding of them;
+- a **`.metallib` parser** (thin and universal, the AIR64 slice, every offset checked) - we need exactly
+  that to load the system's own metallibs later.
+
+What it does not have is exactly what we already built: shaders. Their README says running a Metal
+function needs AIR -> NIR -> ir3 and that joining hakios's AIR front end is their next step - that is our
+`libbgair.dylib` (Chlorophyll's Mesa 25.0.7 AIR front end), already compiled for iOS 16.
+
+Differences to bridge before it runs on this port (all small):
+
+1. service name `HakiosGPU` -> `SweetAdreno630`;
+2. `MsmParam` is `{ pipe, param, value, len, pad }` (24 bytes) - check it against our `sweet_msm_param`
+   (ours may be `{ param, pad, value, ... }`), because the field order decides whether GET_PARAM reads
+   the right number;
+3. deadlines: they send an **absolute** time (`now + timeout`) like msm, our kernel treats `tv_sec/nsec`
+   as a **relative** duration (that is why the libdrm stand-in converts). Either send a duration in their
+   transport or make the kernel follow msm; the kernel should follow msm.
+
+Verdict: worth taking. It is the cleanest available base for the command side of a Metal device on this
+port, it is testable without a phone, and it complements (`libbgair`) rather than duplicates what we have.
+First cheap use: build their probe for our SDK against the libdrm stand-in, change the service name, and
+run it next to `bgmtl-adddev` - it exercises SUBMIT/fences/blits, the part our kernel already proves.
