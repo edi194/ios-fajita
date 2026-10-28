@@ -3327,3 +3327,27 @@ insisting on 0. One ring means the priority is meaningless here.
 
 Also confirmed on this boot: iOS 16.7.16 has `MTLAddDevice` and `MTLCreateSystemDefaultDevice` but
 **no `MTLCopyAllDevices`**.
+
+### 2026-10-28: Mesa needs more than the 1 MiB arena (0169)
+
+With `0168` freedreno got all the way through pipe creation and buffer allocation, then stopped at
+the first large buffer:
+
+```
+MESA: warning: bo_new(4194304): kernel refused; caches emptied, retry failed
+CRASH bgmtl-adddev sig 11
+```
+
+Our arena is the 1 MiB `sweetfw2` payload blob and `sweet_gpu_alloc_pages()` refuses anything bigger
+than it. Metal/CA needs many MiB for buffers, textures and shader storage, so the arena becomes the
+general GPU memory:
+
+- `build-fajita.sh`: `ARENA_MIB` (default 64) sizes the blob. It travels in the payload, so a bigger
+  arena costs boot-image size and a `boot_a` flash - **not** a `userdata` flash;
+- `0169`: the kernel no longer assumes exactly 1 MiB - it takes the size the payload announces
+  (1 MiB minimum, 256 MiB cap), maps that much and sets `gpu_arena_size` accordingly;
+  `GPU_BO_MAX_BYTES` rises from 1 MiB to 64 MiB.
+
+This is still the payload-memory shortcut, not a real allocator: the day we need more than
+`ARENA_MIB`, either raise it (RAM cost) or fix the VM properly (pages below `gPhysBase` panic in
+pmap - option 2 in the 2026-10-26 entry).

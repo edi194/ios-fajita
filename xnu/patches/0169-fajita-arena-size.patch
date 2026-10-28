@@ -1,0 +1,49 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -350,8 +350,9 @@
+ /* stage 8d: buffers (BOs) in the client address range */
+ #define GPU_BO_MAX             8u
+ #define GPU_VA_BASE            0x80020000u   /* after the 0149/0150 test pages */
+-#define GPU_BO_MAX_BYTES       0x100000u
+-#define GPU_ARENA_BYTES        0x100000u   /* the sweetfw2 blob: 1 MiB */
++#define GPU_BO_MAX_BYTES       (64u << 20)
++#define GPU_ARENA_BYTES        0x100000u   /* minimum: the sweetfw2 blob must hold a 1 MiB BO */
++#define GPU_ARENA_MAX_BYTES    (256u << 20) /* the payload blob decides, within these bounds */
+ /* stage 8f: the C surface the IOKit user client calls */
+ /*
+  * The numbers are libdrm's MSM_PARAM_* and must match them exactly: Mesa asks through libdrm, so an
+@@ -511,20 +512,26 @@
+ 		gpu_bos[i].used = false;
+ 	}
+ 	if (!PE_parse_boot_argn("sweetfw2", arg, sizeof(arg)) ||
+-	    !gpu_parse_range(arg, &pa, &size) || size < GPU_ARENA_BYTES) {
+-		printf("SWEET GPU: no sweetfw2 arena of %u KiB; buffers unavailable\n",
+-		    GPU_ARENA_BYTES / 1024);
++	    !gpu_parse_range(arg, &pa, &size) || size < GPU_ARENA_BYTES || size > GPU_ARENA_MAX_BYTES) {
++		printf("SWEET GPU: no sweetfw2 arena of %u KiB..%u MiB (got %llu); buffers unavailable\n",
++		    GPU_ARENA_BYTES / 1024, GPU_ARENA_MAX_BYTES >> 20, (unsigned long long)size);
+ 		return false;
+ 	}
++	/*
++	 * The blob's size is the arena's size: Metal asks freedreno for buffers, textures and shader
++	 * storage of many MiB, and this is the only memory here the pmap does not have to touch (the
++	 * port's free lists hold pages below gPhysBase and pmap panics on those).
++	 */
+ 	gpu_arena_pa = pa;
+-	gpu_arena_size = GPU_ARENA_BYTES;
+-	gpu_arena = ml_io_map((vm_offset_t)pa, GPU_ARENA_BYTES);
++	gpu_arena_size = (uint32_t)size;
++	gpu_arena = ml_io_map((vm_offset_t)pa, (vm_size_t)gpu_arena_size);
+ 	if (gpu_arena == 0) {
+-		printf("SWEET GPU: cannot map the buffer arena\n");
++		printf("SWEET GPU: cannot map the %llu KiB buffer arena\n",
++		    (unsigned long long)(size / 1024));
+ 		return false;
+ 	}
+-	printf("SWEET GPU: buffer arena %u KiB at %#llx -> %#llx\n", GPU_ARENA_BYTES / 1024,
+-	    (unsigned long long)pa, (uint64_t)gpu_arena);
++	printf("SWEET GPU: buffer arena %llu KiB at %#llx -> %#llx\n",
++	    (unsigned long long)(size / 1024), (unsigned long long)pa, (uint64_t)gpu_arena);
+ 
+ 	/* The page-table pool and the client address space. */
+ 	if (!PE_parse_boot_argn("sweetfw3", arg, sizeof(arg)) ||

@@ -92,11 +92,16 @@ BLOB_ARGS+=(--blob "$GMEM_BLOB")
 # A third blob: the buffer arena the ABI hands out (sweetfw2). kmem_alloc_contig is
 # unusable for GPU memory here: this port keeps pages below gPhysBase on its free
 # lists and any pmap call on one panics (console80).
+# Size in MiB: Metal needs buffers/textures far beyond the old 1 MiB, and this blob is the only
+# GPU memory the pmap never has to touch. It travels in the payload, so it costs boot-image size,
+# not a userdata flash.
+ARENA_MIB=${ARENA_MIB:-64}
 ARENA_BLOB=${ARENA_BLOB:-$HOME/gpu-fw/arena.bin}
-if [[ ! -f "$ARENA_BLOB" || $(stat -c%s "$ARENA_BLOB" 2>/dev/null || echo 0) -ne 1048576 ]]; then
+if [[ ! -f "$ARENA_BLOB" || $(stat -c%s "$ARENA_BLOB" 2>/dev/null || echo 0) -ne $((ARENA_MIB * 1048576)) ]]; then
 	mkdir -p "$(dirname "$ARENA_BLOB")"
-	dd if=/dev/zero of="$ARENA_BLOB" bs=1024 count=1024 status=none
+	dd if=/dev/zero of="$ARENA_BLOB" bs=1048576 count="$ARENA_MIB" status=none
 fi
+echo "arena: $ARENA_MIB MiB"
 BLOB_ARGS+=(--blob "$ARENA_BLOB")
 # A fourth blob: the GPU page-table pool (stage 8f). 64 L3 tables of 4 KiB, each covering
 # a 2 MiB chunk of client address space.
