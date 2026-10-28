@@ -50,6 +50,16 @@ main(int argc, char **argv)
 		    add, copy_all, create_default);
 		NSArray *before = copy_all ? copy_all() : nil;
 		printf("devices before: %lu\n", (unsigned long)[before count]);
+		/*
+		 * Metal builds its device table lazily, on the first MTLCreateSystemDefaultDevice /
+		 * MTLCopyAllDevices call. MTLCopyAllDevices does not exist on iOS 16 and we call
+		 * MTLAddDevice before anything else, so the table is still NULL and MTLAddDevice asserts
+		 * (`_deviceArray != NULL`, MTLDevice.m:833). Asking for the default device first
+		 * initialises it (and returns nil - there is no device yet).
+		 */
+		id def0 = create_default ? create_default() : nil;
+		printf("device table initialised via MTLCreateSystemDefaultDevice: %s\n",
+		    def0 ? [[def0 name] UTF8String] : "nil (as expected)");
 		id dev = bgmtl_create_device();
 		printf("created %s\n", dev ? [[dev name] UTF8String] : "nil");
 		if (!dev) {

@@ -3556,3 +3556,27 @@ MESA: warning: bo_new(4194304): kernel refused; caches emptied, retry failed
 Note for the record: the previous boot did allocate a 4 MiB BO successfully without an alias
 (`arena: 4194304 bytes at arena+0x24000 without a kernel alias`), so the alias-free path worked; it was
 exhaustion, not the buffer size, that stopped Mesa in the end.
+
+### 2026-10-28: THE DEVICE EXISTS - MTLAddDevice just needs Metal's table initialised
+
+`console110` (0174) is the first boot where the Metal device was actually built:
+
+```
+bgmtl[242]: rwa_device_open: FD630
+created FD630 (Bergamota)
+calling MTLAddDevice ...
+bgmtl-adddev failed assertion _deviceArray != NULL at line 833 in MTLAddDevice
+```
+
+So the whole chain works: the kernel GPU driver, the libdrm stand-in, `rwa_device_open`, the 4 MiB BO
+(with a kernel alias now), and `bgmtl_create_device()` returning a real `BGMTLDevice`.
+
+The assertion is Metal's own lazy initialisation: `_deviceArray` is created on the first
+`MTLCreateSystemDefaultDevice`/`MTLCopyAllDevices` call, and the test calls `MTLAddDevice` first
+(`MTLCopyAllDevices` does not even exist on iOS 16). The wrapper now asks for the default device before
+adding (`device table initialised via MTLCreateSystemDefaultDevice: nil (as expected)`), which should let
+`MTLAddDevice` register `FD630` and `MTLCreateSystemDefaultDevice` return it afterwards.
+
+Also visible in the same log: the arena is mapped whole and the free list works - the same 4 MiB BO is
+handed out to the fifth `bgmtl-adddev` run at `arena+0x43c000` and again at `arena+0x83c000` instead of
+"do not fit".
