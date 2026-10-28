@@ -3232,3 +3232,37 @@ Note the per-boot quirks seen repeatedly this week: after a large `userdata` fla
 often fails with `AdbWriteEndpointSync failed: semaphore timeout` and the device answers as
 `????????????`; the fix is physical - unplug/replug the cable (or power-cycle). `fastboot devices`
 is also empty *while* a flash is running, because that process holds the USB device exclusively.
+
+### 2026-10-28: block pushes work, but the base must still match the device *now*
+
+The mechanism is proven: 8 changed 4 MiB chunks, each written with `dd` and verified by reading the
+range back from the device (`ok` for all eight). Two tool bugs were found and fixed on the way:
+`adb`/`fastboot` here are **Windows** binaries (local paths need `wslpath -w`), and `adb shell`
+eats the script's stdin, which silently ended the `while read` loop after the first chunk while the
+script still reported success.
+
+What went wrong is the assumption, not the tool: after the first chunk-only write the volume did not
+mount, iOS/`launchd` wrote to it (journal/fsck) during the failed boot, and my BASE
+(`ios16-root-gpu.base.img`, a copy of what had been flashed) no longer described the device. Writing
+the remaining chunks on top of that produced a hybrid that HFS+ refuses to mount:
+
+```
+panic(cpu 1 caller …): mount[7] exited -- no exit reason available -- (signal 0, exit status 74)
+```
+
+`mount[7]` is `launchd`'s root mount; exit 74 = the volume did not mount. Black screen before that.
+
+Rules from now on:
+
+- take the BASE copy from the image **immediately before** diffing, and only when the device is
+  known to hold exactly that image (i.e. right after a full flash, before any boot that can write);
+- do a block update in **one go** (all chunks in one run), then boot once and check that the volume
+  mounted; never leave the device half-updated;
+- if a mount fails (black screen, `mount[7]` 74), do not try to repair by pushing more chunks - go
+  straight to a full `userdata` flash, which is known good;
+- after any failed boot, refresh the BASE copy: it is invalid the moment the device writes to the
+  volume.
+
+Full `userdata` flash of the current image is the safe path, and the image already contains
+`/usr/local/lib/{libbgair.dylib,libdrm.2.dylib}` (dyld searches `/usr/local/lib`; `@rpath` expansion
+is blocked by AMFI on this port: "security policy does not allow @ path expansion").
