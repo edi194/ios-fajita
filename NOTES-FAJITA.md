@@ -3654,3 +3654,37 @@ mapping, arena free list). Useful images in `C:\Users\misia\fajita-flash\`: `con
 - `fastboot devices` is empty *while* a flash runs (that process holds the USB device).
 - `/home/edi194/fajita` is a symlink to the Windows workspace: never `rm -rf` a path under either spelling.
 - The sudo password is not recorded here on purpose.
+
+### 2026-10-29: the last full flash booted an old kernel (and the fix)
+
+The log of the boot after the full flash showed the submitqueue failure again:
+
+```
+MESA: error: open_submitqueue:181: could not create submitqueue! -22
+MESA: error: fd_pipe_new2:34: allocation failed
+SWEET GPU: buffer arena 1024 KiB at 0x10251c000
+```
+
+That is a **1 MiB arena and no `submitqueue_new` line**, i.e. a kernel from before `0168`/`0169` -
+`full-flash-again.sh` still had `BOOT='console102-metalstub.img'` hard-coded and reflashed it over
+`console110`. Nothing was wrong with `0174` or with the new test binary, which did run and printed
+`device table initialised via MTLCreateSystemDefaultDevice: nil (as expected)`.
+
+Two results of that boot are worth keeping anyway:
+
+- the probe bundle still loads and declines: `-initWithAcceleratorPort:4867 called, declining (nil)`;
+- a failed `rwa_device_open` is handled: `created nil`, `bgmtl_create_device returned nil - the GPU
+  open failed` followed by a normal exit, no crash.
+
+`full-flash-again.sh` now points at `console110-submap.img`, and `boot_a` was reflashed with it.
+
+### 2026-10-29: choosing the Metal plugin by boot argument (0175) and the real bundle
+
+`0375`/`mk-bgmtl-bundle.sh` builds `SweetBGMTL.bundle`, whose principal class is Chlorophyll's
+`BGMTLDevice` - the same object `bgmtl-adddev` makes in-process, with `-initWithAcceleratorPort:`
+already implemented and `+load` installing the `MTLDeviceSPI` fallbacks. The executable links
+`libbgair.dylib` and `libdrm.2.dylib`, both already in `/usr/local/lib` of the root image.
+
+`0175` makes the bundle name a boot argument instead of a build: `metalplugin=1` -> `SweetBGMTL` /
+`BGMTLDevice`, default -> the declining `SweetMetalProbe` stub. That way a misbehaving real device can
+be backed out by flashing `boot_a` alone, without touching the root.
