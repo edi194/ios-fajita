@@ -3709,3 +3709,269 @@ The CI shape was reproduced for real: `xnu-clean` plus `0167` gives byte-identic
 **Rule:** generate a patch from a tree whose base is known to match CI (`xnu-clean` plus the patches
 that touch the file), never from an older `xnu-t1xx` tree - those accumulate local edits that CI has
 never seen. `check-hunk-counts.py` cannot catch this; only applying to a CI-shaped tree can.
+
+### 2026-10-29: the `exec mount` hang is not 0174 and not the 40 MiB arena
+
+Four ring dumps exist and they separate the variables (all from `tools/sweet-log-pull.sh`):
+
+| log | `io_submap` | `sweetfw2` / arena | root image | result |
+|---|---|---|---|---|
+| `sweetlog-0162-arena.txt` | 8 M | 1 MiB | old | boots, no backboardd |
+| `sweetlog-adddev2.txt` | 8 M (pre-`0174`) | 1 MiB | **new** (bundle) | boots to `backboardd` |
+| `sweetlog-0163-mapgem.txt` | 256 M | 40 MiB | old | **boots to `backboardd`, `created FD630`** |
+| `sweetlog-0174adddev.txt` | 256 M | 40 MiB | **new** (bundle) | **hangs at `exec mount`** |
+
+So `0174` with a 40 MiB whole-mapped arena is *not* the cause - `sweetlog-0163-mapgem.txt` reached
+`mount_hfs`, all the boot tasks, `backboardd`, and opened the GPU six times on exactly that kernel.
+The hang needs **`0174` + the bundle-bearing root image** together: the same image boots on the
+pre-`0174` kernel, and the old image boots on `0174`.
+
+The two logs are byte-identical (after stripping the touch-spam and normalising addresses) right up to
+`exec mount`; the hung one then prints **nothing at all**, while a good boot prints `failed to get
+filesystem info` / `mount: data volume missing...` within milliseconds. So `/sbin/mount` is stuck
+before its first `write(2)` - in dyld/exec or in its first syscall, not in the HFS code that the later
+lines come from.
+
+Image-level diff (`mount -o loop,ro,force` of `ios16-root-gpu.base.img` vs `.img`):
+
+- `/sbin/mount` is **identical** (md5 `e2c7c8b1e6fb12682a41c90abf2ac11b`), `mount_hfs` identical,
+  `dyld_shared_cache_arm64*` identical in size and mtime;
+- only 7 paths are newer than Oct 29 00:00: `System/Library/Extensions/SweetBGMTL.bundle`
+  (`Info.plist`, `SweetBGMTL`), `usr/local/lib` + `libbgair.dylib` + `libdrm.2.dylib`, and the two
+  parent directory entries.
+
+None of those is on `/sbin/mount`'s path, so the suspects are a filesystem-layout/journal side effect
+of writing them, or nondeterminism. `console112-sampler.img` (kernel `0175`, `sweetsample=mount,
+launchd,backboardd`, `metalplugin=1`) is on `boot_a` since 16:33:27 to settle it with stacks.
+
+### 2026-10-29: block-level root updates (`sparsediff.py`, `push-image-blocks.sh`) validated
+
+`tools/sparsediff.py OLD NEW OUT.simg` emits a sparse image whose RAW chunks are only the differing
+blocks (DONT_CARE elsewhere), so `fastboot flash userdata` rewrites nothing else. Tested on a 16 MiB
+synthetic pair with changes at block 0, inside the 5 MiB block, across a MiB boundary and in the last
+block: 6 of 4096 blocks, 4 runs, and overlaying the RAW chunks on OLD reproduces NEW byte-for-byte
+(`simg2img` expansion also agrees). `tools/push-image-blocks.sh BASE NEW [CHUNK_MiB]` does the same
+over adb/`dd` in recovery and verifies every chunk by reading it back and comparing `sha256sum`.
+
+Caveat that matters: `BASE` must equal what the partition holds *now*. iOS mounts the root read-write
+(`rootrw=1`), so a successful boot invalidates `BASE` - keep `BASE` as a copy of the image last
+flashed and only push right after a flash or after a boot that hung before writing.
+
+### 2026-10-29: hypothesis to test - the 40 MiB arena, not the image (NOT yet confirmed)
+
+Reading `0174` again, nothing in it touches `exec`/VFS: it raises `IO_MAP_SIZE` (a VA submap, not RAM)
+and maps the whole 40 MiB `sweetfw2` blob with one `ml_io_map()`. The image diff for the bundle is
+three files that `/sbin/mount` never opens. So a *third* explanation fits the same evidence better
+than "0174 x new image": the 40 MiB firmware/arena region may overlap memory the pmap later hands out,
+which would corrupt a random code path at a random time - `exec mount` here, something else next boot.
+`0163` (40 MiB, old image) passing and the same 40 MiB hanging twice would then be luck, which the
+"identical files, three of them irrelevant to mount" result supports.
+
+Ready to fire as soon as the sampler ring is pulled - `console113-smallarena.img` (18.7 MB,
+`ARENA_MIB=1`, kernel `0175` + `metalplugin=1` + `sweetsample=mount,launchd,backboardd`,
+sha256 `3c4ab0e8738df22c4a641fa7a8ebdff12e292b5111a2c14c0279ab82e1048cf1`):
+
+- boots to `backboardd` -> the arena size matters, and `0174`'s whole-arena mapping has to be fixed
+  before any Metal work can lean on it (the arena is 40 MiB for a reason);
+- hangs again -> the arena is innocent and the image (or a real `0174` x image interaction) is next.
+
+Also noted while checking the Metal chain: the image needs no new LaunchDaemon - the existing
+`org.sweet.gputest.plist` -> `/usr/local/bin/sweetgputest` -> `exec /usr/local/bin/bgmtl-adddev`
+(and `/usr/local/bin/libbgair.dylib` + `libdrm.2.dylib` beside it, rpath `@executable_path`) is
+already complete; `/usr/local/lib` copies only exist for the bundle's `@rpath`.
+
+### 2026-10-29: the sampler boot **worked** - iOS is up and Metal makes a device and a queue
+
+`console112-sampler.img` (the same `0175` kernel that hung twice, same image, plus
+`sweetsample=mount,launchd,backboardd`) booted **all the way**: `mount-phase-1`, `mount-phase-2`,
+`exec SpringBoard`, `SpringBoard`, `InCallService`, `searchd`, `bluetoothd`, `backboardd[56]`,
+`SWEET FB: display on`. So the `exec mount` hang is **nondeterministic** - not a property of `0174` or
+of the image; three boots with that kernel gave hang, hang, boot.
+
+`bgmtl-adddev` reached the GPU and Metal on the *real* plugin path (`metalplugin=1`):
+
+```
+SWEET FB: IOAcceleratorES published, MetalPluginName SweetBGMTL class BGMTLDevice (properties set: yes)
+bgmtl[46]: rwa_device_open: FD630
+created FD630 (Bergamota)
+calling MTLAddDevice ...
+MTLAddDevice returned
+devices after: 0
+MTLCreateSystemDefaultDevice: FD630 (Bergamota) (BGMTLDevice)
+maxThreads 1024 x 1024, maxBufferLength 268435456, unified 1, Apple2 1 Apple4 0 Common1 1
+queue via default device: BGMTLCommandQueue
+SWEET METAL: bgmtl_adddev done
+```
+
+That is a real `MTLDevice` + `MTLCommandQueue` in a real process on the phone, with the 40 MiB arena
+(`maxBufferLength` 256 MiB) - the in-process half of the Metal plan is done.
+
+**What is still missing:** `backboardd` never loads the bundle. The log has 175
+`IOK backboardd: matching1 ... IOAcceleratorES ...` calls (so Metal's plugin machinery is looking at
+our IOKit service over and over) but **no** `dlopen`, no `+load`, no `rwa_device_open` from
+backboardd. `SweetBGMTL` appears exactly once, in the kernel's property line. So CoreAnimation either
+cannot find/accept the bundle or never gets as far as instantiating it.
+
+`tools/metal-probe/bgmtl_bundle_log.m` is compiled into the bundle from now on
+(`tools/mk-bgmtl-bundle.sh`) and hooks `+load` and `-initWithAcceleratorPort:` with
+`SWEET BUNDLE: ...` lines on stderr (which the console ring shows as `|backboardd| ...`). The next
+boot with it says whether the bundle is ever loaded; silence means Metal never tries.
+
+Also: `rootrw=1` is the only thing that writes to the volume (`0031`), so booting without it mounts the
+root **read-only** and the image on the device stops changing - that is what makes block pushes
+(`tools/push-image-blocks.sh`) safe for every later iteration instead of one full flash per attempt.
+`console114-rometal.img` (sha256 `9262d5284454ed61d09a163039e574e0ce9e9874e47f2e4f1910c4ffe948a963`)
+is `0175` + `metalplugin=1` + the sampler with `rootrw=1` removed.
+
+#### Read-only root: confirmed, and it is what makes iteration cheap
+
+That image booted (17:17 ring): `exec mount` -> `mount_hfs` -> `SpringBoard` -> `backboardd` ->
+`bgmtl_adddev done` -> `queue via default device: BGMTLCommandQueue` -> `display on`, with no
+write-related failure. So the volume can be mounted read-only and iOS still reaches the UI.
+
+The block-push pipeline is now real and measured:
+
+1. `adb exec-out dd if=/dev/block/sda17 bs=1M count=16384` = 16 GiB in **1036 s** (16.5 MB/s) - one
+   readback gives the exact image the partition holds (`~/ipsw-x/ios16-root-device-1029-1647.img`,
+   sha256 `731071f2…`);
+2. that readback was left **dirty** by iOS (`attributes=0x80002000`, `unmounted=False`) and Linux then
+   mounts it read-only - `fsck.hfsplus -fy` fixes it (`0x80002100`, unmounted) and repaired hard-link
+   chains iOS had broken;
+3. after installing files, `tools/push-image-blocks.sh SRC NEW 4` pushed **13 chunks / 52 MiB** in
+   seconds with every chunk read back and compared (`ok` on all 13).
+
+So: keep the readback as `BASE`, change files in a copy, push, reboot. No sparse, no 25-minute flash.
+
+`boot_a` stays `console114-rometal.img` for this whole loop.
+
+#### Metal plugin discovery: what backboardd actually asks for
+
+In the 17:17 log, `backboardd` queries, in order:
+
+```
+matching1 IOProviderClass AGXAccelerator  -> none
+matching1 IONameMatch    IOCoreSurfaceRoot -> IOCoreSurfaceRoot   (opened)
+matching1 IOProviderClass IOAcceleratorES -> IOAcceleratorES      (found, 175 times)
+```
+
+It finds our service through the fallback class but **never calls `IOServiceOpen` on it** and never
+`dlopen`s a bundle (no `map_with_linking_np` for a plugin, no `+load`). Two candidate reasons, both
+cheap to test: (a) Metal only loads a plugin from the `AGXAccelerator` match, not from the
+`IOAcceleratorES` fallback - which would mean our nub needs an `AGXAccelerator` class in its
+hierarchy; (b) the bundle itself fails to load. The rebuilt bundle answers (b) directly:
+
+- dependencies rewritten to absolute `/usr/local/lib/libbgair.dylib` + `libdrm.2.dylib` with
+  `llvm-install-name-tool` (the bundle previously depended on `@rpath/...` with **no** `LC_RPATH`,
+  which cannot resolve inside backboardd), plus `-add_rpath /usr/local/lib`;
+- `Info.plist` now carries what `AGXMetalA11.bundle` has: `CFBundleSupportedPlatforms`
+  (`iPhoneOS`), `MinimumOSVersion`, `DTPlatformName`, `UIDeviceFamily`, `UIRequiredDeviceCapabilities`,
+  `CFBundleSignature`, `CFBundleInfoDictionaryVersion`;
+- `tools/metal-probe/bgmtl_bundle_log.m` logs `SWEET BUNDLE: BGMTLDevice +load` / hooked
+  `-initWithAcceleratorPort:` on stderr.
+
+Plan B, built and not yet deployed: `tools/mk-bgmtl-inject.sh` makes
+`/usr/local/lib/libSweetBGMTL.dylib`, whose constructor does what the working test does
+(`bgmtl_create_device()` + `MTLAddDevice`) inside whatever process loads it - for
+`DYLD_INSERT_LIBRARIES` in `com.apple.backboardd.plist` if Metal's own plugin path stays closed.
+
+### 2026-10-29: Metal in backboardd works end to end; the blocker was pixel format 551
+
+With the instrumented bundle on `boot_a` = `console114-rometal.img` (read-only root), the ring shows
+the whole path working **inside backboardd**:
+
+```
+IOK backboardd: matching IOAcceleratorES -> 1 found
+|backboardd| SWEET BUNDLE: BGMTLDevice +load in backboardd pid 57
+|backboardd| SWEET BUNDLE: -initWithAcceleratorPort: port 33799 in pid 57
+|backboardd| SWEET BUNDLE: -initWithAcceleratorPort: -> BGMTLDevice
+IOK backboardd: open SweetAdreno630 type 0 -> 0x0
+SWEET ADRENO: submitqueue_new flags 0 prio 0
+SWEET GPU: arena: 4194304 bytes at arena+0x20000 pa 0x102540000
+|backboardd| library /System/Library/Frameworks/QuartzCore.framework/default.metallib: AIR slice 1014944 bytes -> loaded
+```
+
+So: Metal finds our `IOAcceleratorES`, reads `MetalPluginName`, dlopens
+`/System/Library/Extensions/SweetBGMTL.bundle/SweetBGMTL` (**the absolute-dependency rebuild is what
+made this loadable**), instantiates `BGMTLDevice`, which opens `/dev/sweetgpu`, makes a submitqueue,
+allocates arena buffers, and loads QuartzCore's own AIR.
+
+Then backboardd aborted every time (~2 min apart, 57/182/220/234/... new pid each time) with
+`reason ns 13 code 0x4: Metal failed to build render pipeline`, and the line before it says why:
+
+```
+bgmtl[57]: refusing: colour attachment 0: pixel format 551 is not a value of MTLPixelFormat
+           this library knows
+```
+
+**551 is Apple's private `RGB10A8_2P_XR10_sRGB`**: `air_metal.c` already served 550 (the linear
+`RGB10A8_2P_XR10`, stood in for by `B8G8R8A8_UNORM`) and 552/553/554/555 (the `BGRA10_XR`/`BGR10_XR`
+pairs), but the sRGB sibling of 550 was missing, so QuartzCore's deep-colour display pipeline was
+refused - and QuartzCore builds that pipeline whatever the device answers, aborting the render server
+when it cannot. The fix is one table entry in `Chlorophyll/air/air_metal.c`
+(`{ 551, ..., PIPE_FORMAT_B8G8R8A8_SRGB }`), rebuilt with `ninja -C ~/mesa-25.0.7/build-ios
+src/gallium/drivers/freedreno/libbgair.dylib` (the build dir symlinks `src/compiler/air` at
+`Chlorophyll/air`, so editing the reference tree is enough) - md5 `062713f0…`.
+
+Also learned: with the plugin present, `bgmtl-adddev` itself now aborts (sig 6) because Metal loads the
+bundle into it too and both copies define `BGMTLDevice` etc. - harmless, but the class duplication
+means the in-process test binary is no longer a clean measurement once the bundle is installed.
+
+### 2026-10-29: root image iteration is now a 0.5 s fastboot flash, not a 20-minute one
+
+`adb`-based block pushes (`tools/push-image-blocks.sh`) work but the recovery drops off USB in the
+middle of a run (twice, right after the first chunk, `UtilAcceptVsock ... accept4 failed 110`), which
+leaves the volume half-updated. The same idea through **fastboot** has none of that:
+
+```
+python3 tools/sparsediff.py OLD NEW OUT.simg --block 4096
+fastboot flash userdata OUT.simg
+```
+
+`OLD` must be what the partition holds; `NEW` the edited copy; `OUT` carries RAW chunks only where
+they differ and `DONT_CARE` everywhere else, which the bootloader skips. Measured today: 4096-block
+granularity turned a 64 MiB change into a **19.3 MB image that flashed in 0.47 s**
+(`Sending 'userdata' (18893 KB) OKAY [0.453s]`), versus ~25 min for `img2simg` + full userdata + iOS
+migration. A half-finished `dd` push is also repaired by the next diff flash, because every block that
+differs from `OLD` is rewritten.
+
+So the loop for a userspace change is: copy the image, install files, `sparsediff`, `fastboot flash
+userdata`, `fastboot flash boot_a` only when the kernel changes, reboot - about a minute end to end.
+
+### 2026-10-29: `fsck.hfsplus -fy` on the device readback poisoned the volume (journal)
+
+The 551 boot (`next3`) came up with the pipeline aborts gone (`Metal failed to build render pipeline`
+= 0, `CRASH backboardd` = 0) but **no bundle load at all**, and the HFS started complaining at mount:
+
+```
+hfs: BlockMarkFreeInternal() trying to free unallocated blocks on volume iOSRoot <3063854, 15>
+hfs_mark_inconsistent: Runtime corruption detected on iOSRoot, fsck will be forced on next mount.
+```
+
+That message repeated **3981** times in the boot (9 in the previous one, 0 in every boot before the
+readback was "repaired"). The flash itself was innocent: reading back the 63 RAW runs of the sparse
+diff from the device matched `next3` byte for byte in 60 of them, and the 3 exceptions were the volume
+header and two metadata blocks iOS itself had just marked inconsistent.
+
+The cause is the **journal**. Parsed little-endian (magic `0x4a4e4c78`, `endian 0x12345678`):
+
+| image | journal | pending |
+|---|---|---|
+| `ios16-root-gpu.base.img` (Oct 28) | info flags `0x5`, header magic **0** = uninitialised | none |
+| `ios16-root-next.img`, `next3`, device readback | flags `0x1`, `start=0x3d8000 end=0x723000` | **3.3 MiB to replay** |
+
+`fsck.hfsplus -fy` (17:12) left a journal full of transactions while marking the volume clean
+(`attributes=0x80002100`), and everything derived from that readback carries it. Apple's HFS in this
+port then replays/notices the mismatch and marks the volume inconsistent, which is also the most
+likely reason the rebuilt bundle failed to `dlopen` (its metadata is exactly what the stale journal
+describes).
+
+`fsck_hfs -fy` cannot fix this: it reports "appears to be OK" and changes **0 blocks**. The reliable
+move is to go back to an image whose journal was never initialised:
+
+- `ios16-root-next5.img` = `ios16-root-gpu.base.img` (Oct 28) + new `libbgair` in `/usr/local/bin`
+  **and** `/usr/local/lib` + `libdrm` in `/usr/local/lib` + `SweetBGMTL.bundle`;
+- after installing, `fsck.hfsplus -fy` says OK **and** the journal header magic is still `0x0`.
+
+So: keep writing files with the Linux `hfsplus` driver only on a volume whose journal is uninitialised,
+and never derive a working image from one that came back from iOS dirty - the readback → fsck route is
+a trap, not a shortcut.

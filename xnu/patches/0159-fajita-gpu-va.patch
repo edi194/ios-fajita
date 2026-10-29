@@ -7,7 +7,7 @@
 +/* GPU address space (stage 8f): all of L1[2], first fit, a guard page between buffers. */
 +#define GPU_VA_BYTES       0x40000000ull        /* 1 GiB */
 +#define GPU_VA_EXTENTS     32u
-+#define GPU_PTE_TABLES     64u                  /* 2 MiB each: 128 MiB mappable */
++#define GPU_PTE_TABLES     512u                 /* 2 MiB each: the whole 1 GiB client range */
 +
 +struct gpu_va_extent {
 +	uint64_t off;                                   /* from GPU_VA_BASE */

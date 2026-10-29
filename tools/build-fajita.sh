@@ -103,12 +103,14 @@ if [[ ! -f "$ARENA_BLOB" || $(stat -c%s "$ARENA_BLOB" 2>/dev/null || echo 0) -ne
 fi
 echo "arena: $ARENA_MIB MiB"
 BLOB_ARGS+=(--blob "$ARENA_BLOB")
-# A fourth blob: the GPU page-table pool (stage 8f). 64 L3 tables of 4 KiB, each covering
-# a 2 MiB chunk of client address space.
+# A fourth blob: the GPU page-table pool (stage 8f). 512 L3 tables of 4 KiB, each covering
+# a 2 MiB chunk of client address space - one per chunk of the whole 1 GiB range, because
+# QuartzCore spreads its buffers across it and 64 tables (128 MiB) ran out on the first
+# SpringBoard-driven Metal frame.
 PTE_BLOB=${PTE_BLOB:-$HOME/gpu-fw/pte.bin}
-if [[ ! -f "$PTE_BLOB" || $(stat -c%s "$PTE_BLOB" 2>/dev/null || echo 0) -ne 262144 ]]; then
+if [[ ! -f "$PTE_BLOB" || $(stat -c%s "$PTE_BLOB" 2>/dev/null || echo 0) -ne 2097152 ]]; then
 	mkdir -p "$(dirname "$PTE_BLOB")"
-	dd if=/dev/zero of="$PTE_BLOB" bs=1024 count=256 status=none
+	dd if=/dev/zero of="$PTE_BLOB" bs=1024 count=2048 status=none
 fi
 BLOB_ARGS+=(--blob "$PTE_BLOB")
 python3 tools/mkpayload.py "$XNU_KERNEL" "$ADT" "$PAYLOAD" --cmdline "$CMDLINE" "${BLOB_ARGS[@]}"

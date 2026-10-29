@@ -21,7 +21,7 @@
  	} else if (!sweet_gpu_iova_alloc(size, &iova, &taken)) {
  		IOLog("SWEET GPU: no GPU address space for %llu bytes\n", size);
 -		return kIOReturnNoSpace;
-+		panic("SWEET DIAG: no iova for %llu bytes (arena %#llx)", size, slot->pa);
++		{ IOLog("SWEET GPU: no iova for %llu bytes (arena %#llx)\n", size, slot->pa); return kIOReturnNoSpace; }
  	}
  	bool ok = true;
  	uint64_t mapped = 0;
@@ -38,8 +38,8 @@
 +		}
  		ok = pa != 0 && (pa & (PAGE_SIZE - 1)) == 0 && sweet_gpu_vm_map(iova + mapped, pa, ro);
 +		if (!ok) {
-+			panic("SWEET DIAG: mapGem page %llu of %llu: iova %#llx pa %#llx arena %#llx",
-+			    mapped / PAGE_SIZE, size / PAGE_SIZE, iova, pa, slot->pa);
++			IOLog("SWEET GPU: mapGem page %llu of %llu failed: iova %#llx pa %#llx\n",
++			    mapped / PAGE_SIZE, size / PAGE_SIZE, iova, pa);
 +		}
  	}
  	if (!ok) {
