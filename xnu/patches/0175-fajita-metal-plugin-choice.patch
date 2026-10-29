@@ -1,39 +1,30 @@
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -182,21 +182,29 @@
- 		return false;
- 	}
- 	/*
--	 * C1: does iOS 16.7.16 load a Metal plugin named by our service? The bundle is a stub that
--	 * logs to /dev/console and returns nil from -initWithAcceleratorPort:, so Metal reports no
--	 * device and the renderers stay as they are. sweetaccel=0 turns the service off.
-+	 * C1: does iOS 16.7.16 load a Metal plugin named by our service? Two bundles live in
-+	 * /System/Library/Extensions: SweetMetalProbe, a stub that logs and returns nil, and SweetBGMTL,
-+	 * Chlorophyll's BGMTLDevice over libbgair, which opens this port's GPU. MetalPluginName decides
-+	 * which one Metal loads into every process that creates a device - backboardd first of all - so
-+	 * it is a boot argument rather than a build: metalplugin=1 selects the real one, the default
-+	 * keeps the stub (the screen keeps working if the real device misbehaves). sweetaccel=0 turns
-+	 * the service off entirely.
- 	 */
- 	uint32_t accelOn = 1;
-+	uint32_t realPlugin = 0;
- 	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
-+	(void)PE_parse_boot_argn("metalplugin", &realPlugin, sizeof(realPlugin));
-+	const char *pluginName = realPlugin ? "SweetBGMTL" : "SweetMetalProbe";
-+	const char *pluginClass = realPlugin ? "BGMTLDevice" : "SweetMetalDevice";
- 	if (accelOn) {
- 		IOAcceleratorES *accel = OSTypeAlloc(IOAcceleratorES);
- 		if (accel != NULL && accel->init()) {
--			bool named = accel->setProperty("MetalPluginName", "SweetMetalProbe") &&
--			    accel->setProperty("MetalPluginClassName", "SweetMetalDevice");
-+			bool named = accel->setProperty("MetalPluginName", pluginName) &&
-+			    accel->setProperty("MetalPluginClassName", pluginClass);
- 			accel->setName("sgx");
- 			if (accel->attach(this) && accel->registerService()) {
--				IOLog("SWEET FB: IOAcceleratorES published, MetalPluginName SweetMetalProbe"
--				    " (properties set: %s)\n", named ? "yes" : "NO");
-+				IOLog("SWEET FB: IOAcceleratorES published, MetalPluginName %s class %s"
-+				    " (properties set: %s)\n", pluginName, pluginClass, named ? "yes" : "NO");
- 			}
+@@ -227,13 +227,23 @@
+ 		 * or MetalPluginClassName) to -initWithAcceleratorPort:. Until this
+ 		 * patch the service had no name, so Metal found it and passed it over.
+ 		 */
+-		bool named = accel->setProperty("MetalPluginName", "SweetMetalProbe") &&
+-		    accel->setProperty("MetalPluginClassName", "SweetMetalDevice");
++		/*
++		 * Which plugin Metal loads is a boot argument, not a build: metalplugin=1 names the real
++		 * one, SweetBGMTL - Chlorophyll's BGMTLDevice over libbgair, which opens this port's GPU -
++		 * and the default keeps the stub that declines. Both bundles live in
++		 * /System/Library/Extensions, so backing out a misbehaving device is a boot_a flash.
++		 */
++		uint32_t realPlugin = 0;
++		(void)PE_parse_boot_argn("metalplugin", &realPlugin, sizeof(realPlugin));
++		const char *pluginName = realPlugin ? "SweetBGMTL" : "SweetMetalProbe";
++		const char *pluginClass = realPlugin ? "BGMTLDevice" : "SweetMetalDevice";
++		bool named = accel->setProperty("MetalPluginName", pluginName) &&
++		    accel->setProperty("MetalPluginClassName", pluginClass);
+ 		accel->setName("sgx");
+ 		if (accel->attach(this)) {
+ 			accel->registerService();
+-			IOLog("SWEET FB: IOAcceleratorES published, MetalPluginName SweetMetalProbe"
+-			    " (properties set: %s)\n", named ? "yes" : "NO");
++			IOLog("SWEET FB: IOAcceleratorES published, MetalPluginName %s class %s"
++			    " (properties set: %s)\n", pluginName, pluginClass, named ? "yes" : "NO");
  		}
- 		OSSafeReleaseNULL(accel);
+ 	}
+ 	OSSafeReleaseNULL(accel);

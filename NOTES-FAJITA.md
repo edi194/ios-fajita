@@ -3688,3 +3688,24 @@ already implemented and `+load` installing the `MTLDeviceSPI` fallbacks. The exe
 `0175` makes the bundle name a boot argument instead of a build: `metalplugin=1` -> `SweetBGMTL` /
 `BGMTLDevice`, default -> the declining `SweetMetalProbe` stub. That way a misbehaving real device can
 be backed out by flashing `boot_a` alone, without touching the root.
+
+### 2026-10-29: 0175 v1 was rejected by CI - the base tree was not CI's tree
+
+CI skipped the first `0175`:
+
+```
+Skipping patch .../0175-fajita-metal-plugin-choice.patch: error: patch failed:
+iokit/Kernel/arm/SweetFramebuffer.cpp:182
+```
+
+The patch was generated from `~/xnu-t174`, and that tree carries a **local edit this file never got
+in the repository**: it wraps the accel block in `if (accelOn) {` and indents the Metal properties
+with three tabs, while `0087` plus `0167` produce the same lines at two tabs. The context lines of
+the patch therefore did not exist in CI.
+
+The CI shape was reproduced for real: `xnu-clean` plus `0167` gives byte-identical text (checked with
+`cat -A`), and `0175` was regenerated from that tree (30 lines, one hunk, applies with `patch --dry-run`).
+
+**Rule:** generate a patch from a tree whose base is known to match CI (`xnu-clean` plus the patches
+that touch the file), never from an older `xnu-t1xx` tree - those accumulate local edits that CI has
+never seen. `check-hunk-counts.py` cannot catch this; only applying to a CI-shaped tree can.
