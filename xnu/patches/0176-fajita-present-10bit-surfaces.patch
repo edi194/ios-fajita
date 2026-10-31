@@ -1,0 +1,55 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -81,6 +81,7 @@
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
++static const uint32_t SWEET_FB_FORMAT_B3A8 = 0x62336138;   /* 10-bit colour + alpha plane, CA's Metal path */
+ 
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+@@ -444,17 +445,40 @@
+ 		if (h > (int32_t)fHeight - dy) {
+ 			h = (int32_t)fHeight - dy;
+ 		}
++		/*
++		 * fajita: CoreAnimation composites into 10-bit surfaces once it has a Metal device ('b3a8':
++		 * 30 bits of colour in a 32-bit word, plus a second plane of alpha), and the panel is 8-bit
++		 * BGRA. Copying those words raw paints the screen black, which is what a Metal-capable
++		 * backboardd did on this port; convert per pixel instead.
++		 */
++		bool wide = s->pixelFormat == SWEET_FB_FORMAT_B3A8;
+ 		uint64_t last = (uint64_t)s->offset + (uint64_t)(sy + h - 1) * s->bytesPerRow +
+ 		    (uint64_t)(sx + w) * 4;
+-		if (w <= 0 || h <= 0 || s->elementWidth != 1 || s->elementHeight != 1 ||
++		if (w <= 0 || h <= 0 || (!wide && (s->elementWidth != 1 || s->elementHeight != 1)) ||
+ 		    s->memory == NULL || last > s->memory->getLength()) {
+ 			src = 0;
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+-				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+-				    (size_t)w * 4);
++				const uint8_t *row = (const uint8_t *)(src + s->offset +
++				    (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4);
++				uint8_t *out = (uint8_t *)(fPixels + (uint64_t)(dy + y) * fRowBytes +
++				    (uint64_t)dx * 4);
++				if (!wide) {
++					memcpy(out, row, (size_t)w * 4);
++					continue;
++				}
++				for (int32_t x = 0; x < w; x++) {
++					uint32_t v;
++					memcpy(&v, row + (uint64_t)x * 4, sizeof(v));
++					uint32_t b = v & 0x3ff;
++					uint32_t g = (v >> 10) & 0x3ff;
++					uint32_t r = (v >> 20) & 0x3ff;
++					out[x * 4 + 0] = (uint8_t)(b >> 2);
++					out[x * 4 + 1] = (uint8_t)(g >> 2);
++					out[x * 4 + 2] = (uint8_t)(r >> 2);
++					out[x * 4 + 3] = 0xff;
++				}
+ 			}
+ 		}
+ 		s->release();
