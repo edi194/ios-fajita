@@ -1,0 +1,37 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -294,11 +294,33 @@
+ 		proc_name(proc_pid(p), name, sizeof(name));
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
++	/*
++	 * fajita: the container operations are the ones that must return data. libMobileGestalt asks
++	 * for the system-group container of com.apple.mobilegestaltcache, and with ENOENT it reports
++	 * "Failed to look up system group" and then waits for a helper that this port cannot start -
++	 * which is what stalls lsd the moment the GPU is in use. The ABI of the argument block is not
++	 * in any open header, so this version logs it: sixteen words of the user block and the process,
++	 * one line per call, to be read off the ring and implemented in the next patch.
++	 */
+ 	switch (call) {
+ 	case 4:         /* container path (audit token / pid) */
++	case 0x43: {    /* container expected */
++		uint64_t words[16];
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		if (arg != 0 && copyin((user_addr_t)arg, words, sizeof(words)) == 0) {
++			printf("SWEET SANDBOX ABI: %s op %d arg %#llx: %llx %llx %llx %llx %llx %llx %llx %llx"
++			    " %llx %llx %llx %llx %llx %llx %llx %llx\n", name, call, (unsigned long long)arg,
++			    words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
++			    words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]);
++		} else {
++			printf("SWEET SANDBOX ABI: %s op %d arg %#llx: copyin failed\n", name, call,
++			    (unsigned long long)arg);
++		}
++		return ENOENT;
++	}
+ 	case 5:         /* extension issue */
+ 	case 6:         /* extension consume */
+-	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:
+ 		return 0;
