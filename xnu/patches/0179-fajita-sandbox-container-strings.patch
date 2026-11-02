@@ -1,0 +1,29 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -309,10 +309,26 @@
+ 		char name[32];
+ 		proc_name(proc_pid(p), name, sizeof(name));
+ 		if (arg != 0 && copyin((user_addr_t)arg, words, sizeof(words)) == 0) {
++			char s2[96], s5[96], s7[96];
++			bzero(s2, sizeof(s2));
++			bzero(s5, sizeof(s5));
++			bzero(s7, sizeof(s7));
++			/* fajita: the two candidate meanings of w2 - a group name to look up, or the buffer
++			 * the path must be written into. Log what is actually there, and the same for w5/w7. */
++			if (words[2] != 0) {
++				(void)copyin((user_addr_t)words[2], s2, sizeof(s2) - 1);
++			}
++			if (words[5] != 0) {
++				(void)copyin((user_addr_t)words[5], s5, sizeof(s5) - 1);
++			}
++			if (words[7] != 0) {
++				(void)copyin((user_addr_t)words[7], s7, sizeof(s7) - 1);
++			}
+ 			printf("SWEET SANDBOX ABI: %s op %d arg %#llx: %llx %llx %llx %llx %llx %llx %llx %llx"
+ 			    " %llx %llx %llx %llx %llx %llx %llx %llx\n", name, call, (unsigned long long)arg,
+ 			    words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7],
+ 			    words[8], words[9], words[10], words[11], words[12], words[13], words[14], words[15]);
++			printf("SWEET SANDBOX STR: %s op %d w2='%s' w5='%s' w7='%s'\n", name, call, s2, s5, s7);
+ 		} else {
+ 			printf("SWEET SANDBOX ABI: %s op %d arg %#llx: copyin failed\n", name, call,
+ 			    (unsigned long long)arg);
