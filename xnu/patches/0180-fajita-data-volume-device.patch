@@ -1,0 +1,154 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -115,6 +115,32 @@
+ 	bool ready;
+ } su;
+ 
++/*
++ * fajita: a second region of the same partition, exposed as /dev/ufsvar0 - the data volume iOS wants for
++ * /private/var. The controller (registers, DMA, cache, locking) is shared with the root; only the region
++ * and the device node differ, so this keeps the root path untouched.
++ */
++static struct {
++	uint64_t first_block, nblocks;          /* region, in 4 KiB device blocks */
++	int bmajor, cmajor;
++	dev_t bdev;
++	bool ready;
++} su_var;
++
++/* The region a device refers to: the root, or the var volume. */
++static bool
++sweet_ufs_volume(dev_t dev, uint64_t *first, uint64_t *nblocks)
++{
++	if (su_var.ready && (dev == su_var.bdev || major(dev) == su_var.bmajor)) {
++		*first = su_var.first_block;
++		*nblocks = su_var.nblocks;
++		return true;
++	}
++	*first = su.first_block;
++	*nblocks = su.nblocks;
++	return su.ready;
++}
++
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
+ 
+@@ -408,9 +434,15 @@
+ {
+ 	int error = 0;
+ 	caddr_t vaddr = NULL;
++	uint64_t first = 0, nblocks = 0;
+ 	uint64_t off = (uint64_t)buf_blkno(bp) * su.secsize;
+ 	uint32_t count = buf_count(bp);
+-	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
++	if (!sweet_ufs_volume(buf_device(bp), &first, &nblocks)) {
++		buf_seterror(bp, ENXIO);
++		buf_biodone(bp);
++		return;
++	}
++	uint64_t part_bytes = nblocks * UFS_BLOCK;
+ 
+ 	bool rd = buf_flags(bp) & B_READ;
+ 
+@@ -440,18 +472,18 @@
+ 		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
+ 		void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 		if (rd) {
+-			error = ufs_read_blocks(su.first_block + lba, blocks);
++			error = ufs_read_blocks(first + lba, blocks);
+ 			if (!error) {
+ 				memcpy(vaddr + done, (const char *)bounce + skip, want);
+ 			}
+ 		} else {
+ 			/* Partial device blocks at either end: read, merge, write back. */
+ 			if (skip || (want % UFS_BLOCK)) {
+-				error = ufs_read_blocks(su.first_block + lba, blocks);
++				error = ufs_read_blocks(first + lba, blocks);
+ 			}
+ 			if (!error) {
+ 				memcpy((char *)bounce + skip, vaddr + done, want);
+-				error = ufs_write_blocks(su.first_block + lba, blocks);
++				error = ufs_write_blocks(first + lba, blocks);
+ 			}
+ 		}
+ 		if (error) {
+@@ -493,9 +525,12 @@
+ 	case DKIOCGETPHYSICALBLOCKSIZE:
+ 		*f = UFS_BLOCK;
+ 		return 0;
+-	case DKIOCGETBLOCKCOUNT:
+-		*o = su.nblocks * UFS_BLOCK / su.secsize;
++	case DKIOCGETBLOCKCOUNT: {
++		uint64_t first = 0, nblocks = 0;
++		(void)sweet_ufs_volume(dev, &first, &nblocks);
++		*o = nblocks * UFS_BLOCK / su.secsize;
+ 		return 0;
++	}
+ 	case DKIOCISWRITABLE:
+ 		*f = su.writable;
+ 		return 0;
+@@ -537,9 +572,12 @@
+ }
+ 
+ static int
+-sweet_ufs_psize(__unused dev_t dev)
++sweet_ufs_psize(dev_t dev)
+ {
+-	return su.ready ? (int)MIN(su.nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
++	uint64_t first = 0, nblocks = 0;
++
++	return sweet_ufs_volume(dev, &first, &nblocks) ?
++	    (int)MIN(nblocks * UFS_BLOCK / su.secsize, INT_MAX) : -1;
+ }
+ 
+ static int
+@@ -652,6 +690,49 @@
+ 	/* Only now, with the partition bounds known, can writes be allowed. */
+ 	su.writable = (rw != 0);
+ 	su.ready = true;
++
++	/*
++	 * fajita: sweetvar=<first>:<count> in 4 KiB blocks, counted from the start of this partition, makes
++	 * the region a second block device (/dev/ufsvar0) that iOS can mount as the data volume.
++	 */
++	{
++		char var[64];
++		unsigned long long vfirst = 0, vcount = 0;
++		int fields = 0;
++
++		if (PE_parse_boot_argn("sweetvar", var, sizeof(var))) {
++			/* "first:count", both decimal, parsed here: no sscanf in this path. */
++			unsigned long long *dst = &vfirst;
++			for (const char *c = var; *c != '\0'; c++) {
++				if (*c >= '0' && *c <= '9') {
++					*dst = *dst * 10 + (unsigned long long)(*c - '0');
++				} else if (*c == ':' && fields == 0) {
++					fields = 1;
++					dst = &vcount;
++				} else {
++					break;
++				}
++			}
++		}
++		if (fields == 1 && vcount > 0) {
++			su_var.first_block = su.first_block + vfirst;
++			su_var.nblocks = vcount;
++			su_var.bmajor = bdevsw_add(-1, &sweet_ufs_bdevsw);
++			if (su_var.bmajor >= 0) {
++				su_var.cmajor = cdevsw_add_with_bdev(-1, &sweet_ufs_cdevsw, su_var.bmajor);
++			}
++			if (su_var.bmajor >= 0 && su_var.cmajor >= 0) {
++				su_var.bdev = makedev(su_var.bmajor, 0);
++				devfs_make_node(su_var.bdev, DEVFS_BLOCK, UID_ROOT, GID_OPERATOR, 0640,
++				    "ufsvar0");
++				devfs_make_node(makedev(su_var.cmajor, 0), DEVFS_CHAR, UID_ROOT,
++				    GID_OPERATOR, 0640, "rufsvar0");
++				su_var.ready = true;
++				printf("SWEET UFS: var volume at block 0x%llx, %llu MiB\n",
++				    su_var.first_block, su_var.nblocks * UFS_BLOCK >> 20);
++			}
++		}
++	}
+ 	printf("SWEET UFS: \"%s\" on LUN %u: first block 0x%llx, %llu MiB, %s, DMA at 0x%llx\n",
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
