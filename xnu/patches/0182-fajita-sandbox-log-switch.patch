@@ -1,0 +1,26 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -49,6 +49,13 @@
+ /* boot-arg sweet_amfi_debug=1: log the entitlements attached to each signature. */
+ static TUNABLE(uint32_t, sweet_amfi_debug, "sweet_amfi_debug", 0);
+ 
++/*
++ * boot-arg sweetsboxlog=1: log the argument block of the container operations (0178). Off by default -
++ * cfprefsd alone calls op 4 about 21 000 times per boot, which fills the whole 4 MB ring and pushes out
++ * everything worth reading.
++ */
++static TUNABLE(uint32_t, sweet_sboxlog, "sweetsboxlog", 0);
++
+ /* The entitlements object of a process's main binary, or NULL. */
+ static void *
+ sweet_proc_entitlements(proc_t proc)
+@@ -308,6 +315,9 @@
+ 		uint64_t words[16];
+ 		char name[32];
+ 		proc_name(proc_pid(p), name, sizeof(name));
++		if (!sweet_sboxlog) {
++			return ENOENT;
++		}
+ 		if (arg != 0 && copyin((user_addr_t)arg, words, sizeof(words)) == 0) {
+ 			char s2[96], s5[96], s7[96];
+ 			bzero(s2, sizeof(s2));
