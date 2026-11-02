@@ -1,0 +1,123 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -131,7 +131,9 @@
+ static bool
+ sweet_ufs_volume(dev_t dev, uint64_t *first, uint64_t *nblocks)
+ {
+-	if (su_var.ready && (dev == su_var.bdev || major(dev) == su_var.bmajor)) {
++	/* both nodes: cdevsw_add_with_bdev gives the character device its own major */
++	if (su_var.ready &&
++	    (dev == su_var.bdev || major(dev) == su_var.bmajor || major(dev) == su_var.cmajor)) {
+ 		*first = su_var.first_block;
+ 		*nblocks = su_var.nblocks;
+ 		return true;
+@@ -300,15 +302,17 @@
+ 
+ /*
+  * WRITE(10) of count device blocks from the bounce buffer to lba. The range
+- * must lie inside the partition: this is the only place data goes out.
++ * must lie inside the region the request came from (root or data volume): this
++ * is the only place data goes out.
+  */
+ static int
+-ufs_write_blocks(uint64_t lba, uint32_t count)
++ufs_write_blocks(uint64_t lba, uint32_t count, uint64_t first, uint64_t nblocks)
+ {
+-	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+-	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+-	    count > su.nblocks - (lba - su.first_block) || lba + count - 1 > UINT32_MAX) {
+-		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
++	if (!su.writable || !nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
++	    lba < first || lba - first >= nblocks ||
++	    count > nblocks - (lba - first) || lba + count - 1 > UINT32_MAX) {
++		printf("SWEET UFS: refusing write of %u blocks at 0x%llx (region 0x%llx+%llu)\n",
++		    count, lba, first, nblocks);
+ 		return EPERM;
+ 	}
+ 	uint8_t cdb[10] = {
+@@ -483,7 +487,7 @@
+ 			}
+ 			if (!error) {
+ 				memcpy((char *)bounce + skip, vaddr + done, want);
+-				error = ufs_write_blocks(first + lba, blocks);
++				error = ufs_write_blocks(first + lba, blocks, first, nblocks);
+ 			}
+ 		}
+ 		if (error) {
+@@ -496,6 +500,20 @@
+ 	buf_unmap(bp);
+ 
+ done:
++	/* fajita: the first requests for the data volume, so a failing mount is one glance away */
++	if (su_var.ready && first == su_var.first_block) {
++		static int var_seen;
++
++		if (error || var_seen < 8) {
++			if (!error) {
++				var_seen++;
++			}
++			printf("SWEET UFS: var %s blk %llu count %u dev 0x%x region 0x%llx+%llu -> %d\n",
++			    (buf_flags(bp) & B_READ) ? "read" : "write",
++			    (unsigned long long)buf_blkno(bp), buf_count(bp), (unsigned)buf_device(bp),
++			    (unsigned long long)first, (unsigned long long)nblocks, error);
++		}
++	}
+ 	if (error) {
+ 		buf_seterror(bp, error);
+ 	}
+@@ -846,7 +864,7 @@
+ 			uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
+ 			    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+ 			memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-			error = ufs_write_blocks(base + 1 + blk, n);
++			error = ufs_write_blocks(base + 1 + blk, n, su.first_block, su.nblocks);
+ 			pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+ 		}
+ 		if (!error) {
+@@ -856,7 +874,7 @@
+ 			};
+ 			bzero(bounce, UFS_BLOCK);
+ 			memcpy(bounce, &h, sizeof(h));
+-			error = ufs_write_blocks(base, 1);
++			error = ufs_write_blocks(base, 1, su.first_block, su.nblocks);
+ 		}
+ 		if (!error) {
+ 			error = ufs_sync_cache();
+@@ -902,7 +920,7 @@
+ 		uint32_t n = (uint32_t)MIN(MIN(need, (uint64_t)(SWEET_LOG_SIZE / UFS_BLOCK - blk)),
+ 		    (uint64_t)(BOUNCE_SIZE / UFS_BLOCK));
+ 		memcpy(bounce, sweet_log_ring + (uint64_t)blk * UFS_BLOCK, n * UFS_BLOCK);
+-		error = ufs_write_blocks(base + 1 + blk, n);
++		error = ufs_write_blocks(base + 1 + blk, n, su.first_block, su.nblocks);
+ 		pos += (uint64_t)(blk + n) * UFS_BLOCK - off;
+ 	}
+ 	if (!error) {
+@@ -912,7 +930,7 @@
+ 		};
+ 		bzero(bounce, UFS_BLOCK);
+ 		memcpy(bounce, &h, sizeof(h));
+-		error = ufs_write_blocks(base, 1);
++		error = ufs_write_blocks(base, 1, su.first_block, su.nblocks);
+ 		if (!error) {
+ 			(void)ufs_sync_cache();
+ 		}
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1780,6 +1780,17 @@
+ 		return;
+ 	}
+ 
++	/*
++	 * fajita: only launchd itself takes the machine down. A boot task that exits non-zero - /sbin/mount
++	 * with an fstab line it cannot satisfy, for instance - has to be reported and survived: otherwise
++	 * every experiment with a bad mount entry costs a whole boot cycle.
++	 */
++	if (p != initproc) {
++		printf("SWEET: %s[%d] exited with status %d (signal %d); not panicking\n",
++		    p->p_name, proc_getpid(p), WEXITSTATUS(rv), WTERMSIG(rv));
++		return;
++	}
++
+ #if DEVELOPMENT
+ 	if (crash_behavior_test_mode) {
+ 		crash_behavior_test_would_panic = TRUE;
