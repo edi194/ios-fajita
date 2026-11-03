@@ -1,0 +1,28 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -712,6 +712,25 @@
+ 			}
+ 		}
+ 	}
++	/*
++	 * fajita (ibtrunc=N): submit only the first N dwords of every command buffer. The fence is appended by
++	 * sweet_gpu_submit() to the *ring*, not to the client's buffer, so a truncated stream still gets a fence -
++	 * which makes this a bisection: the shortest prefix that wedges the CP names the packet that does it, and
++	 * a prefix that ends just before a CP_INDIRECT_BUFFER separates "the packets before it" from "whatever
++	 * that nested buffer contains" (the window server's binning pass, at offset 11 of its first buffer).
++	 */
++	{
++		int trunc = 0;
++
++		if (PE_parse_boot_argn("ibtrunc", &trunc, sizeof(trunc)) && trunc > 0) {
++			for (uint32_t i = 0; i < r->nr_cmds; i++) {
++				if (ibn[i] > (uint32_t)trunc) {
++					IOLog("SWEET ADRENO: ib %u truncated %u -> %d dwords\n", i, ibn[i], trunc);
++					ibn[i] = (uint32_t)trunc;
++				}
++			}
++		}
++	}
+ 	{
+ 		uint32_t fence = sweet_gpu_submit(ib, ibn, r->nr_cmds);
+ 		if (fence == 0) {
