@@ -1,0 +1,25 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1721,10 +1721,20 @@
+ 	if (gpu_blob == 0 || kva == NULL || dwords > (PAGE_SIZE / 4)) {
+ 		return 0;
+ 	}
+-	void *dst = (void *)(gpu_blob + GPU_ARENA_DATA + 0x1000);
++	volatile uint8_t *dst = (volatile uint8_t *)(gpu_blob + GPU_ARENA_DATA + 0x1000);
++	const volatile uint8_t *src = (const volatile uint8_t *)kva;
++	uint32_t bytes = dwords * 4;
+ 
+-	memcpy(dst, kva, (size_t)dwords * 4);
++	/*
++	 * A byte at a time: the client's buffer is mapped as Device memory (nGnRE), where an unaligned
++	 * 8-byte access is a fault - memcpy's word loop took an unaligned data abort here (console144).
++	 */
++	for (uint32_t i = 0; i < bytes; i++) {
++		dst[i] = src[i];
++	}
+ 	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET GPU: bounced %u dwords, first %#x last %#x\n", dwords,
++	    ((const volatile uint32_t *)kva)[0], ((const volatile uint32_t *)kva)[dwords - 1]);
+ 	return GPU_VA_CLIENT_IB;
+ }
+ 
