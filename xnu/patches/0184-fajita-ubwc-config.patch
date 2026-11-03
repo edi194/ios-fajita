@@ -1,0 +1,41 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -320,6 +320,11 @@
+ #define A6XX_SP_ADDR_MODE_CNTL 0xae01u
+ #define A6XX_TPL1_ADDR_MODE_CNTL 0xb601u
+ #define A6XX_HLSQ_ADDR_MODE_CNTL 0xbe05u
++/* UBWC: how many bits of the address the compression tags take (a6xx_set_ubwc_config, a630 values) */
++#define A6XX_UCHE_MODE_CNTL      0x0e01u
++#define A6XX_RB_NC_MODE_CNTL     0x8e08u
++#define A6XX_SP_NC_MODE_CNTL     0xae02u
++#define A6XX_TPL1_NC_MODE_CNTL   0xb604u
+ #define A6XX_VBIF_GATE_OFF_WRREQ_EN 0x302au
+ #define CP_RB_CNTL_VALUE       ((1u << 27) | (2u << 8) | 12u)
+ /* stage 7b: PM4 opcodes and the interrupt registers the submission touches */
+@@ -1203,6 +1208,16 @@
+ 	gpu_cp_wr(core, A6XX_CP_MEM_POOL_SIZE, 128);
+ 	gpu_cp_wr(core, A6XX_PC_DBG_ECO_CNTL, 0x00180000);
+ 	gpu_cp_wr(core, A6XX_CP_AHB_CNTL, 1);
++	/*
++	 * Linux a6xx_set_ubwc_config(): the a630 values (lower_bit 2, no AMSBC, no RGB565 predictor).
++	 * The render and texture blocks and the UCHE have to agree on how many address bits the UBWC
++	 * tags take, or a compressed surface is read in a layout it was never written in - which is
++	 * exactly what CoreAnimation allocates for its 10-bit swap chain.
++	 */
++	gpu_cp_wr(core, A6XX_RB_NC_MODE_CNTL, 2u << 1);
++	gpu_cp_wr(core, A6XX_TPL1_NC_MODE_CNTL, 2u << 1);
++	gpu_cp_wr(core, A6XX_SP_NC_MODE_CNTL, 2u << 1);
++	gpu_cp_wr(core, A6XX_UCHE_MODE_CNTL, 2u << 21);
+ 	gpu_cp_wr(core, A6XX_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0x1fffffu);
+ 	gpu_cp_wr(core, A6XX_UCHE_CLIENT_PF, (1u << 7) | 1u);
+ 	/* The ring and the SQE through context CB1; completion is polled (INT mask 0). */
+@@ -1219,6 +1234,9 @@
+ 	uint32_t amode = gpu_cp_rd(core, A6XX_CP_ADDR_MODE_CNTL);
+ 	printf("SWEET GPU: cp configured: rb_cntl %#x sqe_base %#x rb_base %#x roq2 %#x addr_mode %#x\n",
+ 	    cntl, sqe, rb, roq, amode);
++	printf("SWEET GPU: ubwc: rb_nc %#x sp_nc %#x tpl1_nc %#x uche_mode %#x\n",
++	    gpu_cp_rd(core, A6XX_RB_NC_MODE_CNTL), gpu_cp_rd(core, A6XX_SP_NC_MODE_CNTL),
++	    gpu_cp_rd(core, A6XX_TPL1_NC_MODE_CNTL), gpu_cp_rd(core, A6XX_UCHE_MODE_CNTL));
+ 	if (cntl != CP_RB_CNTL_VALUE || sqe != (uint32_t)GPU_VA_CP_SQE ||
+ 	    rb != (uint32_t)GPU_VA_CP_RING || roq != 0x010000c0) {
+ 		printf("SWEET GPU: CP configuration readback mismatch\n");
