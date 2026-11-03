@@ -1,0 +1,59 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1282,6 +1282,29 @@
+ 	return false;
+ }
+ 
++/*
++ * fajita: a client fence that never came back. If RPTR is still behind WPTR the CP stopped inside a command
++ * buffer; if RPTR caught up, the CP read everything and only the fence write is missing - which would be our
++ * scratch mapping, not the GPU. The fault registers say which packet or access it died on.
++ */
++void
++sweet_gpu_dump_cp_state(const char *why)
++{
++	vm_offset_t core = gpu_core;
++
++	if (core == 0) {
++		printf("SWEET GPU: %s: no core mapping\n", why);
++		return;
++	}
++	printf("SWEET GPU: %s: rptr %u wptr %u rbbm_status %#x cp_status1 %#x hw_fault %#x "
++	    "irq %#x protect %#x rbbm_irq %#x sqe_cntl %#x\n", why,
++	    gpu_cp_rd(core, A6XX_CP_RB_RPTR), gpu_cp_wptr,
++	    gpu_cp_rd(core, A6XX_RBBM_STATUS), gpu_cp_rd(core, A6XX_CP_STATUS_1),
++	    gpu_cp_rd(core, A6XX_CP_HW_FAULT), gpu_cp_rd(core, A6XX_CP_INTERRUPT_STATUS),
++	    gpu_cp_rd(core, A6XX_CP_PROTECT_STATUS), gpu_cp_rd(core, A6XX_RBBM_INT_0_STATUS),
++	    gpu_cp_rd(core, A6XX_CP_SQE_CNTL));
++}
++
+ /* a6xx_cp_init: enable the SQE (this starts the engine) and let it configure the
+  * ME. Completion is polled because RBBM_INT_0_MASK stays 0 - no interrupts. */
+ static bool
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -52,6 +52,8 @@
+ bool sweet_gpu_fence_done(uint32_t fence);
+ uint32_t sweet_gpu_fence_last(void);
+ void sweet_gpu_mark_lost(void);
++/* bsd/dev/sweet_gpu.c: CP state when a client fence never came back. */
++void sweet_gpu_dump_cp_state(const char *why);
+ void sweet_gpu_report(const char *why);
+ bool     sweet_gpu_alloc_pages(uint64_t size, uint64_t *pa, void **kva);
+ void     sweet_gpu_free_pages(uint64_t pa, uint64_t size);
+@@ -719,6 +721,15 @@
+ 		ret = waitFence(r->fence, ns) ? kIOReturnSuccess : (sweet_gpu_ready() ? kIOReturnTimeout : kIOReturnNotReady);
+ 		IOLog("SWEET ADRENO: wait fence %u (%llu ns) -> %#x, last %u\n", r->fence,
+ 		    (unsigned long long)ns, ret, sweet_gpu_fence_last());
++		if (ret == kIOReturnTimeout) {
++			/* one dump per boot: the first hang is the interesting one, the rest repeat it */
++			static bool dumped;
++
++			if (!dumped) {
++				dumped = true;
++				sweet_gpu_dump_cp_state("client fence timeout");
++			}
++		}
+ 		/*
+ 		 * The client's own output does not reach the console (launchd gives it a stdout nobody
+ 		 * reads), so the kernel reports what the GPU produced - on timeout too, which is exactly
