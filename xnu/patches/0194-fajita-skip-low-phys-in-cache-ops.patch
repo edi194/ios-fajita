@@ -1,0 +1,60 @@
+--- a/osfmk/arm/caches.c
++++ b/osfmk/arm/caches.c
+@@ -68,10 +68,27 @@
+ 	addr64_t        paddr;
+ 	vm_size_t       count;
+ 
++	extern unsigned long gPhysBase;         /* osfmk/mach/arm/vm_param.h, not on this file's path */
++
+ 	while (length > 0) {
+ 		if (phys) {
+-			count = length;
+ 			paddr = CAST_DOWN(pmap_paddr_t, addr);
++			/*
++			 * fajita: this kernel manages physical memory from 4 GiB up (mkadt --highmem), and
++			 * phystokv_range() panics with "illegal PA" for anything below gPhysBase. A page there
++			 * has no linear alias, so there is nothing to clean or flush by virtual address either -
++			 * skip it instead of taking the machine down. Mapping an IOSurface with changed cache
++			 * attributes (pmap_set_cache_attributes_internal -> flush_dcache) is how it was reached:
++			 * backboardd's drawable pages are allocated low, while the GPU path reaches them by
++			 * physical address only.
++			 */
++			if (paddr < gPhysBase) {
++				count = MIN(length, (unsigned)PAGE_SIZE);
++				addr += count;
++				length -= count;
++				continue;
++			}
++			count = length;
+ 			vaddr = phystokv_range(paddr, &count);
+ 		} else {
+ 			paddr = kvtophys(addr);
+@@ -102,10 +119,27 @@
+ 	addr64_t        paddr;
+ 	vm_size_t       count;
+ 
++	extern unsigned long gPhysBase;         /* osfmk/mach/arm/vm_param.h, not on this file's path */
++
+ 	while (length > 0) {
+ 		if (phys) {
+-			count = length;
+ 			paddr = CAST_DOWN(pmap_paddr_t, addr);
++			/*
++			 * fajita: this kernel manages physical memory from 4 GiB up (mkadt --highmem), and
++			 * phystokv_range() panics with "illegal PA" for anything below gPhysBase. A page there
++			 * has no linear alias, so there is nothing to clean or flush by virtual address either -
++			 * skip it instead of taking the machine down. Mapping an IOSurface with changed cache
++			 * attributes (pmap_set_cache_attributes_internal -> flush_dcache) is how it was reached:
++			 * backboardd's drawable pages are allocated low, while the GPU path reaches them by
++			 * physical address only.
++			 */
++			if (paddr < gPhysBase) {
++				count = MIN(length, (unsigned)PAGE_SIZE);
++				addr += count;
++				length -= count;
++				continue;
++			}
++			count = length;
+ 			vaddr = phystokv_range(paddr, &count);
+ 		} else {
+ 			paddr = kvtophys(addr);
