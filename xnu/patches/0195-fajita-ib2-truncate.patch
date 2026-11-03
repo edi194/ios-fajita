@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetAdreno.cpp
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -651,6 +651,42 @@
+@@ -651,6 +651,47 @@
  		}
  	}
  	/*
@@ -22,8 +22,13 @@
 +					uint32_t h = q[at];
 +					uint32_t cnt;
 +
++					if ((h & 0xf0000000u) == 0x40000000u) {
++						/* type 4 is a plain register write and sits between the packets of interest */
++						at += 1 + (h & 0x7fu);
++						continue;
++					}
 +					if ((h & 0xf0000000u) != 0x70000000u) {
-+						break;          /* type 4 and the rest are not packets this test touches */
++						break;
 +					}
 +					cnt = h & 0x3fffu;
 +					if (((h >> 16) & 0x7fu) == 0x3fu && cnt >= 3 && at + 4 < words) {
