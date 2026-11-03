@@ -1,0 +1,97 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1245,7 +1245,24 @@
+ 	return true;
+ }
+ 
+-/* ---- stage 7b: the ring, CP_ME_INIT and the first PM4 packets ---------- */
++/* PM4 type 4: a plain register write, the form every client command buffer uses. */
++static uint32_t
++gpu_parity(uint32_t v)
++{
++	v ^= v >> 16;
++	v ^= v >> 8;
++	v ^= v >> 4;
++	return (~0x6996u >> (v & 0xfu)) & 1u;
++}
++
++static uint32_t
++gpu_pkt4(uint32_t reg, uint32_t cnt)
++{
++	return 0x40000000u | (cnt & 0x7fu) | (gpu_parity(cnt) << 7) |
++	    ((reg & 0x3ffffu) << 8) | (gpu_parity(reg) << 27);
++}
++
++/* stage 7b: the ring, CP_ME_INIT and the first PM4 packets ---------- */
+ 
+ static unsigned gpu_cp_wptr;            /* dwords written into the ring */
+ 
+@@ -1569,6 +1586,58 @@
+ 	return ok;
+ }
+ 
++/*
++ * fajita: the clients' command buffers are made of PM4 *type 4* register writes - every one of the 143
++ * dwords in the window server's first buffer decodes as one, and none of the kernel's own tests used that
++ * form. Three single-write buffers, each with its own fence, say whether the CP executes type 4 at all and
++ * whether the writes the client makes are the ones that wedge it:
++ *   0x8864 RB_ALPHA_CONTROL   - a real, readable a6xx register (the driver writes it from hw_init)
++ *   0x8880 RB_STENCIL_CONTROL - with the client's own value, 0x49705
++ *   0x8115                    - a hole in the a6xx register map, present in the client's stream
++ * A buffer that does not retire leaves the CP wedged, so the suspicious register goes last.
++ */
++static bool
++gpu_pkt4_test(vm_offset_t core, vm_offset_t blob, uint64_t blob_pa)
++{
++	static const struct {
++		uint32_t    reg;
++		uint32_t    val;
++		const char *what;
++	} cases[] = {
++		{ 0x8864u, 0x0u,      "RB_ALPHA_CONTROL" },
++		{ 0x8880u, 0x49705u,  "RB_STENCIL_CONTROL" },
++		{ 0x8115u, 0x0u,      "unnamed 0x8115" },
++	};
++	volatile uint32_t *ib = (volatile uint32_t *)(blob + GPU_ARENA_DATA + 0x1000);
++	bool all = true;
++
++	*(volatile uint32_t *)(blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE) = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	for (unsigned c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
++		unsigned n = 0;
++
++		ib[n++] = gpu_pkt4(cases[c].reg, 1);
++		ib[n++] = cases[c].val;
++		__asm__ volatile("dsb sy" ::: "memory");
++
++		bool idle = gpu_cp_submit(core, blob, GPU_VA_CLIENT_IB, n);
++		uint32_t seq = gpu_cp_seq;
++		bool fenced = idle && gpu_cp_wait_fence(blob, seq, 5000);
++
++		printf("SWEET GPU: pkt4 test: write %#x to %s (%s): ring %s, fence %u %s\n",
++		    cases[c].val, cases[c].what, c == 2 ? "a hole in a6xx.xml" : "a real register",
++		    idle ? "drained" : "NOT drained", seq, fenced ? "retired" : "TIMED OUT");
++		if (!fenced) {
++			all = false;
++			break;                  /* the CP is wedged: nothing after this can run */
++		}
++	}
++	printf("SWEET GPU: pkt4 test: %s\n",
++	    all ? "PASSED - type 4 register writes execute" : "a type 4 write wedged the CP");
++	return all;
++}
++
+ /* Allocate, map, submit into, fence, verify, free - the whole buffer path. */
+ static bool
+ gpu_bo_test(vm_offset_t core, vm_offset_t blob)
+@@ -3628,6 +3697,9 @@
+ 										ok = gpu_cp_ib_test(gpu, g, gmem_pa);
+ 									}
+ 									if (ok) {
++										ok = gpu_pkt4_test(gpu, g, gmem_pa);
++									}
++									if (ok) {
+ 										ok = gpu_bo_test(gpu, g);
+ 									}
+ 								}
