@@ -1,0 +1,45 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -651,6 +651,42 @@
+ 		}
+ 	}
+ 	/*
++	 * fajita (ib2trunc=N): shorten the nested command buffers that CP_INDIRECT_BUFFER starts, by rewriting
++	 * the size field of the packet itself. Truncating the outer buffer at 11 dwords retires and at 15 does
++	 * not - the difference is one CP_INDIRECT_BUFFER that runs the window server's 196-dword binning pass -
++	 * so cutting *inside* that buffer is what names the packet in it that wedges the pipe.
++	 */
++	{
++		int n2 = 0;
++
++		if (PE_parse_boot_argn("ib2trunc", &n2, sizeof(n2)) && n2 > 0) {
++			for (uint32_t i = 0; i < r->nr_cmds; i++) {
++				struct sweet_gem *cb = objs[cmds[i].submit_idx];
++				volatile uint32_t *q = (volatile uint32_t *)(void *)(cb->kva + cmds[i].submit_offset);
++				uint32_t words = ibn[i];
++
++				for (uint32_t at = 0; at + 1 < words;) {
++					uint32_t h = q[at];
++					uint32_t cnt;
++
++					if ((h & 0xf0000000u) != 0x70000000u) {
++						break;          /* type 4 and the rest are not packets this test touches */
++					}
++					cnt = h & 0x3fffu;
++					if (((h >> 16) & 0x7fu) == 0x3fu && cnt >= 3 && at + 4 < words) {
++						uint32_t size = q[at + 4];
++						if (size > (uint32_t)n2) {
++							IOLog("SWEET ADRENO: ib %u indirect at %u truncated %u -> %d dwords\n",
++							    i, at, size, n2);
++							q[at + 4] = (uint32_t)n2;
++						}
++					}
++					at += 1 + cnt;
++				}
++			}
++		}
++	}
++	/*
+ 	 * The client writes through a cacheable mapping (the map options it passes override whatever
+ 	 * clientMemoryForType() asks for), so its stores may still be dirty in the CPU cache when the
+ 	 * CP reads. Clean every buffer in this submission through the linear map - flush_dcache64()
