@@ -1,0 +1,89 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1638,6 +1638,76 @@
+ 	return all;
+ }
+ 
++/*
++ * fajita: the window server's own first command buffer, captured from the ring (0185) and replayed from
++ * the kernel. Every packet in it is a type-4 register write, and a single such write retires fine (0186),
++ * so the wedge is in this particular sequence of 136 dwords or in the values it carries. `replay=N`
++ * submits only the first N dwords, which turns the search into a bisection that needs no new kernel:
++ * a truncation that retires and a longer one that hangs bracket the offending packet.
++ */
++/* 136 dwords captured from the window server's first command buffer */
++static const uint32_t client_replay[] = {
++    0x40886401, 0x00000000, 0x40888001, 0x00000000, 0x40811501, 0x00000000,
++    0x48887101, 0x00000000, 0x48811401, 0x00000000, 0x48888802, 0x00000000,
++    0x00000000, 0x48887802, 0x00000000, 0x00000000, 0x40886401, 0x00000000,
++    0x40888001, 0x00000000, 0x40811501, 0x00000000, 0x48887101, 0x00000000,
++    0x48811401, 0x00000000, 0x48888802, 0x00000000, 0x00000000, 0x48887802,
++    0x00000000, 0x00000000, 0x40886401, 0x00000000, 0x40888001, 0x00000000,
++    0x40811501, 0x00000000, 0x48887101, 0x00000020, 0x48811401, 0x00000000,
++    0x48888802, 0x00000000, 0x00000000, 0x48887802, 0x00000000, 0x00000000,
++    0x40886401, 0x00000000, 0x40888001, 0x00000000, 0x40811501, 0x00000000,
++    0x48887101, 0x00000020, 0x48811401, 0x00000000, 0x48888802, 0x00000000,
++    0x00000000, 0x48887802, 0x00000000, 0x00000000, 0x40886401, 0x00000000,
++    0x40888001, 0x00000000, 0x40811501, 0x00000000, 0x48887101, 0x0000005f,
++    0x48811401, 0x00000001, 0x48888802, 0x00000000, 0x00000000, 0x48887802,
++    0x00000000, 0x00000000, 0x40886401, 0x00000000, 0x40888001, 0x00000000,
++    0x40811501, 0x00000000, 0x48887101, 0x0000005f, 0x48811401, 0x00000001,
++    0x48888802, 0x00000000, 0x00000000, 0x48887802, 0x00000000, 0x00000000,
++    0x40886401, 0x00000000, 0x40888001, 0x00000000, 0x40811501, 0x00000000,
++    0x48887101, 0x0000007f, 0x48811401, 0x00000001, 0x48888802, 0x00000000,
++    0x00000000, 0x48887802, 0x00000000, 0x00000000, 0x40886401, 0x00000000,
++    0x40888001, 0x00000000, 0x40811501, 0x00000000, 0x48887101, 0x0000007f,
++    0x48811401, 0x00000001, 0x48888802, 0x00000000, 0x00000000, 0x48887802,
++    0x00000000, 0x00000000, 0x40886401, 0x00000000, 0x40888001, 0x00049705,
++    0x40811501, 0x00000001, 0x48887101, 0x0000005f,
++};
++
++static bool
++gpu_replay_test(vm_offset_t core, vm_offset_t blob, uint64_t blob_pa)
++{
++	volatile uint32_t *ib = (volatile uint32_t *)(blob + GPU_ARENA_DATA + 0x1000);
++	uint32_t total = (uint32_t)(sizeof(client_replay) / sizeof(client_replay[0]));
++	uint32_t want = total;
++	int arg = 0;
++
++	if (!PE_parse_boot_argn("replay", &arg, sizeof(arg)) || arg < 0) {
++		return true;                    /* the test is opt-in */
++	}
++	if (arg == 0) {
++		printf("SWEET GPU: replay test: skipped (replay=0)\n");
++		return true;
++	}
++	if ((uint32_t)arg < total) {
++		want = (uint32_t)arg;
++	}
++
++	for (uint32_t i = 0; i < want; i++) {
++		ib[i] = client_replay[i];
++	}
++	*(volatile uint32_t *)(blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE) = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	bool idle = gpu_cp_submit(core, blob, GPU_VA_CLIENT_IB, want);
++	uint32_t seq = gpu_cp_seq;
++	bool fenced = idle && gpu_cp_wait_fence(blob, seq, 5000);
++
++	printf("SWEET GPU: replay test: %u of %u dwords: ring %s, fence %u %s\n",
++	    want, total, idle ? "drained" : "NOT drained", seq, fenced ? "retired" : "TIMED OUT");
++	printf("SWEET GPU: replay test: %s\n",
++	    fenced ? "PASSED - the client stream executes" : "the client stream wedged the CP here");
++	return fenced;
++}
++
+ /* Allocate, map, submit into, fence, verify, free - the whole buffer path. */
+ static bool
+ gpu_bo_test(vm_offset_t core, vm_offset_t blob)
+@@ -3700,6 +3770,9 @@
+ 										ok = gpu_pkt4_test(gpu, g, gmem_pa);
+ 									}
+ 									if (ok) {
++										ok = gpu_replay_test(gpu, g, gmem_pa);
++									}
++									if (ok) {
+ 										ok = gpu_bo_test(gpu, g);
+ 									}
+ 								}
