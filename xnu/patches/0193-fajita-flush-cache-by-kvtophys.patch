@@ -1,0 +1,30 @@
+--- a/iokit/Kernel/IOLib.cpp
++++ b/iokit/Kernel/IOLib.cpp
+@@ -1491,7 +1491,26 @@
+ 		return kIOReturnUnsupported;
+ 	}
+ 
+-	flush_dcache64((addr64_t) address, (unsigned) length, false );
++	/*
++	 * fajita: flush_dcache64(addr, len, FALSE) treats the address as a *physmap* one and walks
++	 * ml_static_vtop, whose arithmetic only holds inside the linear window. IOSurface memory reaches
++	 * here through a kmap window instead, so that arithmetic produced a physical address below
++	 * gPhysBase and the kernel panicked in phys_to_kv_range ("illegal PA: 0xbdfd3800, phys base
++	 * 0x100000000", arm_vm_init.c:486) the moment backboardd wrote to a drawable. kvtophys() walks the
++	 * pmap, works for any mapped kernel address and answers 0 for one that is not mapped.
++	 */
++	/* pmap.h is not on this file's include path; the type is a plain 64-bit physical address. */
++	extern uint64_t kvtophys(vm_offset_t va);
++
++	for (IOByteCount done = 0; done < length; done += PAGE_SIZE) {
++		uint64_t pa = kvtophys((vm_offset_t)address + done);
++		IOByteCount n = MIN((IOByteCount)PAGE_SIZE, length - done);
++
++		if (pa == 0) {
++			break;
++		}
++		flush_dcache64((addr64_t)pa, (unsigned)n, TRUE);
++	}
+ 
+ 	return kIOReturnSuccess;
+ }
