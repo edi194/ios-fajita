@@ -1,0 +1,71 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -334,6 +334,7 @@
+ #define GPU_CP_MEM_WRITE       61u
+ #define GPU_CP_EVENT_WRITE     70u
+ #define GPU_CP_SET_SECURE_MODE 102u
++#define GPU_CP_SET_MODE         99u     /* 0x63: what the window server's buffer starts with */
+ #define GPU_CP_CACHE_FLUSH_TS  4u
+ #define GPU_CP_EVENT_WRITE_IRQ 0x80000000u
+ #define A6XX_RBBM_INT_0_STATUS  0x0201u
+@@ -1738,6 +1739,38 @@
+ 	return GPU_VA_CLIENT_IB;
+ }
+ 
++/*
++ * fajita: the window server's first command buffer begins with CP_SET_MODE (type 7, opcode 0x63) - a packet
++ * the port has never executed, because every kernel test is NOP/MEM_WRITE/INDIRECT/EVENT_WRITE/type-4. It
++ * changes the CP's own mode, and a mode it cannot work in would explain a ring that drains with no fault and
++ * a fence that never comes back. `setmode=<value>` submits exactly that packet with that payload.
++ */
++static bool
++gpu_setmode_test(vm_offset_t core, vm_offset_t blob, uint64_t blob_pa)
++{
++	volatile uint32_t *ib = (volatile uint32_t *)(blob + GPU_ARENA_DATA + 0x1000);
++	int value = 0;
++	unsigned n = 0;
++
++	if (!PE_parse_boot_argn("setmode", &value, sizeof(value))) {
++		return true;                    /* opt-in */
++	}
++	ib[n++] = gpu_pkt7(GPU_CP_SET_MODE, 1);
++	ib[n++] = (uint32_t)value;
++	*(volatile uint32_t *)(blob + GPU_CP_SCRATCH + GPU_CP_SCRATCH_FENCE) = 0;
++	__asm__ volatile("dsb sy" ::: "memory");
++
++	bool idle = gpu_cp_submit(core, blob, GPU_VA_CLIENT_IB, n);
++	uint32_t seq = gpu_cp_seq;
++	bool fenced = idle && gpu_cp_wait_fence(blob, seq, 5000);
++
++	printf("SWEET GPU: setmode test: CP_SET_MODE %d: ring %s, fence %u %s\n",
++	    value, idle ? "drained" : "NOT drained", seq, fenced ? "retired" : "TIMED OUT");
++	printf("SWEET GPU: setmode test: %s\n",
++	    fenced ? "PASSED - the CP accepts CP_SET_MODE" : "CP_SET_MODE wedged the CP");
++	return fenced;
++}
++
+ /* Allocate, map, submit into, fence, verify, free - the whole buffer path. */
+ static bool
+ gpu_bo_test(vm_offset_t core, vm_offset_t blob)
+@@ -3803,6 +3836,9 @@
+ 										ok = gpu_replay_test(gpu, g, gmem_pa);
+ 									}
+ 									if (ok) {
++										ok = gpu_setmode_test(gpu, g, gmem_pa);
++									}
++									if (ok) {
+ 										ok = gpu_bo_test(gpu, g);
+ 									}
+ 								}
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -670,7 +670,8 @@
+ 	 */
+ 	{
+ 		struct sweet_gem *cb = objs[cmds[0].submit_idx];
+-		volatile uint32_t *q = (volatile uint32_t *)(void *)cb->kva;
++		/* the command buffer, not the start of the BO: submit_offset is where the client put it */
++		volatile uint32_t *q = (volatile uint32_t *)(void *)(cb->kva + cmds[0].submit_offset);
+ 		uint32_t n = ibn[0];
+ 		static unsigned full_dumps;
+ 
