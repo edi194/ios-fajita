@@ -1,0 +1,19 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -658,7 +658,15 @@
+ 	 */
+ 	for (uint32_t i = 0; i < r->nr_bos; i++) {
+ 		struct sweet_gem *g = objs[i];
+-		if (g->pa != 0 && g->size != 0) {
++		/*
++		 * fajita: flush_dcache64(pa, len, TRUE) reaches the memory through phystokv(), and this kernel
++		 * manages physical memory from 4 GiB up (mkadt --highmem), so a buffer that happens to sit below
++		 * that base takes PhysToKV: illegal PA and panics the machine (0x8f714000 in console148). Those
++		 * buffers are Device memory (nGnRE) - an unaligned 8-byte read from them already took an
++		 * unaligned-abort panic - and device memory is uncached, so it never needs a clean. Only buffers
++		 * in the linear-mapped range are cleaned.
++		 */
++		if (g->pa >= 0x100000000ull && g->size != 0) {
+ 			flush_dcache64((addr64_t)g->pa, (unsigned)g->size, TRUE);
+ 		}
+ 	}
