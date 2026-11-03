@@ -1,0 +1,36 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -660,12 +660,32 @@
+ 			flush_dcache64((addr64_t)g->pa, (unsigned)g->size, TRUE);
+ 		}
+ 	}
+-	/* What the CP is about to read, through the uncached alias. */
++	/*
++	 * What the CP is about to read, through the uncached alias. The first two client command buffers are
++	 * dumped in full (a few hundred dwords): the eight dwords above say the stream is real, this says what
++	 * it actually asks the GPU to do - the packets that follow are either a sane draw state sequence or
++	 * the first place the 3D pipe can be wedged.
++	 */
+ 	{
+ 		struct sweet_gem *cb = objs[cmds[0].submit_idx];
+ 		volatile uint32_t *q = (volatile uint32_t *)(void *)cb->kva;
++		uint32_t n = ibn[0];
++		static unsigned full_dumps;
++
+ 		IOLog("SWEET ADRENO: ib %#llx: %#x %#x %#x %#x %#x %#x %#x %#x\n", cb->iova,
+ 		    q[0], q[1], q[2], q[3], q[4], q[5], q[6], q[7]);
++		if (full_dumps < 2) {
++			full_dumps++;
++			if (n > 384) {
++				n = 384;
++			}
++			IOLog("SWEET ADRENO: ib %#llx full, %u dwords\n", cb->iova, n);
++			for (uint32_t i = 0; i + 8 <= n; i += 8) {
++				IOLog("SWEET ADRENO: %03u: %#010x %#010x %#010x %#010x %#010x %#010x %#010x %#010x\n",
++				    i, q[i], q[i + 1], q[i + 2], q[i + 3], q[i + 4], q[i + 5], q[i + 6],
++				    q[i + 7]);
++			}
++		}
+ 	}
+ 	{
+ 		uint32_t fence = sweet_gpu_submit(ib, ibn, r->nr_cmds);
