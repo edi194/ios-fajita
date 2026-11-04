@@ -1,6 +1,6 @@
 --- a/iokit/Kernel/arm/SweetAdreno.cpp
 +++ b/iokit/Kernel/arm/SweetAdreno.cpp
-@@ -651,6 +651,47 @@
+@@ -651,6 +651,48 @@
  		}
  	}
  	/*
@@ -31,12 +31,13 @@
 +						break;
 +					}
 +					cnt = h & 0x3fffu;
-+					if (((h >> 16) & 0x7fu) == 0x3fu && cnt >= 3 && at + 4 < words) {
-+						uint32_t size = q[at + 4];
++					/* header, then addr lo, addr hi, size: the size is the third payload dword */
++					if (((h >> 16) & 0x7fu) == 0x3fu && cnt >= 3 && at + 3 < words) {
++						uint32_t size = q[at + 3];
 +						if (size > (uint32_t)n2) {
 +							IOLog("SWEET ADRENO: ib %u indirect at %u truncated %u -> %d dwords\n",
 +							    i, at, size, n2);
-+							q[at + 4] = (uint32_t)n2;
++							q[at + 3] = (uint32_t)n2;
 +						}
 +					}
 +					at += 1 + cnt;
