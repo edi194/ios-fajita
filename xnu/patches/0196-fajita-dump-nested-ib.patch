@@ -1,0 +1,63 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -781,6 +781,60 @@
+ 			}
+ 		}
+ 	}
++	/*
++	 * fajita: the nested command buffers as well. Truncating the outer buffer names the binning pass as the
++	 * thing that wedges the pipe, and ib2trunc narrows it to the first 12 dwords of that pass - so what those
++	 * dwords are is the remaining question. Each CP_INDIRECT_BUFFER's target is looked up in this submission's
++	 * buffers and its first 16 dwords are printed, once per boot.
++	 */
++	{
++		static unsigned nested_dumps;
++
++		if (nested_dumps < 2) {
++			nested_dumps++;
++			for (uint32_t i = 0; i < r->nr_cmds; i++) {
++				struct sweet_gem *cb = objs[cmds[i].submit_idx];
++				volatile uint32_t *q = (volatile uint32_t *)(void *)(cb->kva + cmds[i].submit_offset);
++				uint32_t words = ibn[i];
++
++				for (uint32_t at = 0; at < words;) {
++					uint32_t h = q[at];
++
++					if ((h & 0xf0000000u) == 0x40000000u) {
++						at += 1 + (h & 0x7fu);
++						continue;
++					}
++					if ((h & 0xf0000000u) != 0x70000000u) {
++						break;
++					}
++					uint32_t cnt = h & 0x3fffu;
++					if (((h >> 16) & 0x7fu) == 0x3fu && cnt >= 3 && at + 3 < words) {
++						uint64_t iova = (uint64_t)q[at + 1] | ((uint64_t)q[at + 2] << 32);
++						uint32_t dwords = q[at + 3];
++
++						for (uint32_t b = 0; b < r->nr_bos; b++) {
++							struct sweet_gem *g = objs[b];
++							if (g->kva == NULL || iova < g->iova || iova >= g->iova + g->size) {
++								continue;
++							}
++							volatile uint32_t *n = (volatile uint32_t *)(void *)
++							    (g->kva + (iova - g->iova));
++							uint32_t show = dwords < 16 ? dwords : 16;
++
++							IOLog("SWEET ADRENO: nested ib %#llx, %u dwords, at %u:\n",
++							    (unsigned long long)iova, dwords, at);
++							for (uint32_t k = 0; k + 4 <= show; k += 4) {
++								IOLog("SWEET ADRENO:  +%u: %#010x %#010x %#010x %#010x\n",
++								    k, n[k], n[k + 1], n[k + 2], n[k + 3]);
++							}
++							break;
++						}
++					}
++					at += 1 + cnt;
++				}
++			}
++		}
++	}
+ 	{
+ 		uint32_t fence = sweet_gpu_submit(ib, ibn, r->nr_cmds);
+ 		if (fence == 0) {
