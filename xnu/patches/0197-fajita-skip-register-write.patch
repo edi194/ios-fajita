@@ -1,0 +1,96 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -651,6 +651,93 @@
+ 		}
+ 	}
+ 	/*
++	 * fajita (ibskip=<reg>): turn every type-4 register write to <reg> (hex, offset as in a6xx.xml) into a
++	 * CP_NOP, in every command buffer of the submission. Truncating the window server's draw-state buffer to
++	 * its first two dwords - a single write of 0x04100000 to RB_UNKNOWN_8E04 - already wedges the pipe, while
++	 * the same kind of write to registers our kernel initialises retires, so the value of that one register
++	 * is what the GPU cannot take here. Skipping it answers whether anything renders without it.
++	 */
++	{
++		int skip = 0;
++
++		if (PE_parse_boot_argn("ibskip", &skip, sizeof(skip)) && skip > 0) {
++			for (uint32_t i = 0; i < r->nr_cmds; i++) {
++				struct sweet_gem *cb = objs[cmds[i].submit_idx];
++				volatile uint32_t *q = (volatile uint32_t *)(void *)(cb->kva + cmds[i].submit_offset);
++				uint32_t words = ibn[i];
++
++				for (uint32_t at = 0; at + 1 < words;) {
++					uint32_t h = q[at];
++
++					if ((h & 0xf0000000u) == 0x40000000u) {
++						uint32_t reg = (h >> 8) & 0x7ffffu;
++						uint32_t cnt = h & 0x7fu;
++
++						if ((int)reg == skip) {
++							IOLog("SWEET ADRENO: ib %u skipped write to %#x (at %u)\n",
++							    i, reg, at);
++							q[at] = 0x70000000u | 1u | (1u << 15) | (16u << 16); /* CP_NOP, 1 dword */
++							if (cnt > 0) {
++								q[at + 1] = 0;
++							}
++						}
++						at += 1 + cnt;
++						continue;
++					}
++					if ((h & 0xf0000000u) != 0x70000000u) {
++						break;
++					}
++					uint32_t cnt = h & 0x3fffu;
++
++					/*
++					 * fajita: the state these writes belong to lives in the buffers CP_INDIRECT_BUFFER
++					 * starts, not in the outer stream - so the filter has to descend one level, exactly
++					 * like the dump does.
++					 */
++					if (((h >> 16) & 0x7fu) == 0x3fu && cnt >= 3 && at + 3 < words) {
++						uint64_t iova = (uint64_t)q[at + 1] | ((uint64_t)q[at + 2] << 32);
++						uint32_t dwords = q[at + 3];
++
++						for (uint32_t b = 0; b < r->nr_bos; b++) {
++							struct sweet_gem *g = objs[b];
++							if (g->kva == NULL || iova < g->iova || iova >= g->iova + g->size) {
++								continue;
++							}
++							volatile uint32_t *n = (volatile uint32_t *)(void *)
++							    (g->kva + (iova - g->iova));
++
++							for (uint32_t k = 0; k + 1 < dwords && k + 1 < g->size - (iova - g->iova);) {
++								uint32_t nh = n[k];
++
++								if ((nh & 0xf0000000u) == 0x40000000u) {
++									uint32_t nreg = (nh >> 8) & 0x7ffffu;
++									uint32_t ncnt = nh & 0x7fu;
++
++									if ((int)nreg == skip) {
++										IOLog("SWEET ADRENO: nested %#llx skipped write to %#x (at %u)\n",
++										    (unsigned long long)iova, nreg, k);
++										n[k] = 0x70000000u | 1u | (1u << 15) | (16u << 16);
++										if (ncnt > 0) {
++											n[k + 1] = 0;
++										}
++									}
++									k += 1 + ncnt;
++									continue;
++								}
++								if ((nh & 0xf0000000u) != 0x70000000u) {
++									break;
++								}
++								k += 1 + (nh & 0x3fffu);
++							}
++							break;
++						}
++					}
++					at += 1 + cnt;
++				}
++			}
++		}
++	}
++	/*
+ 	 * fajita (ib2trunc=N): shorten the nested command buffers that CP_INDIRECT_BUFFER starts, by rewriting
+ 	 * the size field of the packet itself. Truncating the outer buffer at 11 dwords retires and at 15 does
+ 	 * not - the difference is one CP_INDIRECT_BUFFER that runs the window server's 196-dword binning pass -
