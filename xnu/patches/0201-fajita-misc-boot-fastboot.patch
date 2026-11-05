@@ -1,0 +1,119 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -331,8 +331,13 @@
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
++/*
++ * fajita: the extent of a named partition, without touching the root's geometry. ufs_find_partition() had the
++ * GPT walk and the assignment welded together, which is fine for "this is the root" and useless for writing
++ * into another partition.
++ */
+ static int
+-ufs_find_partition(const char *want)
++ufs_partition_extent(const char *want, uint64_t *out_first, uint64_t *out_nblocks)
+ {
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
+ 	int error = ufs_read_blocks(1, 1);
+@@ -377,8 +382,8 @@
+ 		if (last < first) {
+ 			return ENXIO;
+ 		}
+-		su.first_block = first;
+-		su.nblocks = last - first + 1;
++		*out_first = first;
++		*out_nblocks = last - first + 1;
+ 		return 0;
+ 	}
+ 	printf("SWEET UFS: no GPT partition named \"%s\"\n", want);
+@@ -386,6 +391,60 @@
+ }
+ 
+ static int
++ufs_find_partition(const char *want)
++{
++	uint64_t first = 0, nblocks = 0;
++	int error = ufs_partition_extent(want, &first, &nblocks);
++
++	if (error == 0) {
++		su.first_block = first;
++		su.nblocks = nblocks;
++	}
++	return error;
++}
++
++/*
++ * Write a small blob into a named partition: read the covering blocks, merge, write back, synchronise. Used
++ * for the "boot-fastboot" command in `misc`, which every AOSP bootloader reads before deciding what to start.
++ */
++int
++sweet_ufs_write_named(const char *name, uint64_t offset, const void *data, size_t len)
++{
++	uint64_t first = 0, nblocks = 0;
++	uint8_t *bounce = (uint8_t *)(su.dma + DMA_BOUNCE);
++	int error;
++
++	if (!su.ready || name == NULL || data == NULL || len == 0 || len > BOUNCE_SIZE) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	error = ufs_partition_extent(name, &first, &nblocks);
++	if (error == 0 && (offset + len) > nblocks * UFS_BLOCK) {
++		error = EINVAL;
++	}
++	if (error == 0) {
++		uint64_t lba = offset / UFS_BLOCK;
++		uint32_t skip = (uint32_t)(offset % UFS_BLOCK);
++		uint32_t blocks = (uint32_t)((skip + len + UFS_BLOCK - 1) / UFS_BLOCK);
++
++		error = ufs_read_blocks(first + lba, blocks);
++		if (error == 0) {
++			memcpy(bounce + skip, data, len);
++			error = ufs_write_blocks(first + lba, blocks, first, nblocks);
++		}
++		if (error == 0) {
++			error = ufs_sync_cache();
++		}
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error) {
++		printf("SWEET UFS: write to \"%s\" at %llu failed (%d)\n", name,
++		    (unsigned long long)offset, error);
++	}
++	return error;
++}
++
++static int
+ ufs_take_over_host(void)
+ {
+ 	uint32_t hce = ufs_rd(REG_HCE), hcs = ufs_rd(REG_HCS);
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -69,6 +69,27 @@
+ 	(void)msleep(NULL, NULL, PWAIT, "sweetreboot", &ts);
+ 
+ 	if (bootloader) {
++		/*
++		 * The AOSP way, and the one every Android bootloader reads: a command in the `misc` partition's
++		 * bootloader_message. "boot-fastboot" starts the bootloader's fastboot mode; unlike the IMEM word
++		 * (written by this port's shim and ignored here) and the PMIC spare, this is what `adb reboot
++		 * fastboot` itself relies on.
++		 */
++		{
++			extern int sweet_ufs_write_named(const char *name, uint64_t offset, const void *data, size_t len);
++			struct {
++				char command[32];
++				char status[32];
++				char recovery[768];
++				char stage[32];
++				char reserved[1184];
++			} msg = { { 0 } };
++
++			memcpy(msg.command, "boot-fastboot", sizeof("boot-fastboot"));
++			if (sweet_ufs_write_named("misc", 0, &msg, sizeof(msg)) == 0) {
++				printf("SWEET REBOOT: misc command \"boot-fastboot\" written\n");
++			}
++		}
+ 		/* qcom-pon first: ABL reads the PMIC's spare register, and the IMEM word alone was not enough */
+ 		if (sweet_pon_reboot_reason(2) == 0) {
+ 			printf("SWEET REBOOT: PON reboot reason 2 (bootloader) written\n");
