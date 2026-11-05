@@ -1,0 +1,134 @@
+--- /dev/null
++++ b/bsd/dev/sweet_reboot.c
+@@ -0,0 +1,103 @@
++/*
++ * fajita: reboot the machine on a timer, optionally into the bootloader.
++ *
++ *   sweetreboot=<seconds>       reboot after that many seconds (0 = off, the default)
++ *   sweetrebootto=<0|1>         0 = normal boot, 1 = bootloader (fastboot)
++ *
++ * Why it exists: after a userdata flash this phone's USB session dies, so `fastboot reboot` fails and the
++ * device has to be unplugged and re-plugged by hand before the next cycle. A boot that returns to fastboot
++ * on its own turns every experiment into flash, boot, wait - no cable work, no human in the loop.
++ *
++ * Fastboot is asked for the way this port's shim already does it: the SDM845 IMEM restart_reason word that
++ * Android's bootloader reads (0x77665500), written before the PSCI reset.
++ */
++#include <sys/param.h>
++#include <sys/kernel.h>
++#include <sys/proc.h>
++#include <sys/systm.h>
++#include <kern/clock.h>                 /* delay() */
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern int msleep(void *chan, lck_mtx_t *mtx, int pri, const char *wmsg, struct timespec *ts);
++
++#define SWEET_IMEM_PA            0x146bf000UL
++#define SWEET_IMEM_SIZE          0x1000
++#define SWEET_IMEM_REASON        0x65c           /* restart_reason, sdm845 IMEM 0x146bf000 + 0x65c */
++#define SWEET_RESTART_BOOTLOADER 0x77665500U
++#define PSCI_SYSTEM_RESET        0x84000009ULL
++
++/*
++ * PSCI SYSTEM_RESET through the secure monitor, the way this port's shim already reboots the phone.
++ * PEHaltRestart() is not usable here: it asks every CPU to stop and gives up with
++ * "Halt/Restart Timed Out @IOPPlatformExpert.cpp:804", which turns a requested reboot into a panic screen.
++ * The shim's SMC call resets the machine cleanly, and the SCM path (used for the GPU zap) proves SMC works
++ * from this kernel.
++ */
++static void __attribute__((noreturn))
++sweet_psci_reset(void)
++{
++	register uint64_t x0 __asm__("x0") = PSCI_SYSTEM_RESET;
++
++	__asm__ volatile("smc #0"
++	    : "+r"(x0)
++	    : : "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11",
++	        "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	for (;;) {
++		delay(1000);
++	}
++}
++
++static void
++sweet_reboot_thread(void *arg, __unused wait_result_t w)
++{
++	/* seconds << 1 | bootloader: the thread callback only carries one pointer */
++	uintptr_t v = (uintptr_t)arg;
++	unsigned seconds = (unsigned)(v >> 1);
++	bool bootloader = (v & 1u) != 0;
++
++	if (seconds > 7200) {
++		seconds = 7200;
++	}
++	printf("SWEET REBOOT: %u s to %s\n", seconds, bootloader ? "the bootloader" : "a normal reboot");
++
++	struct timespec ts = { .tv_sec = (time_t)seconds, .tv_nsec = 0 };
++	(void)msleep(NULL, NULL, PWAIT, "sweetreboot", &ts);
++
++	if (bootloader) {
++		vm_offset_t imem = ml_io_map(SWEET_IMEM_PA, SWEET_IMEM_SIZE);
++
++		if (imem != 0) {
++			*(volatile uint32_t *)(imem + SWEET_IMEM_REASON) = SWEET_RESTART_BOOTLOADER;
++			__asm__ volatile ("dmb sy" ::: "memory");
++			printf("SWEET REBOOT: restart_reason 0x%08x written, rebooting to fastboot\n",
++			    SWEET_RESTART_BOOTLOADER);
++		} else {
++			printf("SWEET REBOOT: IMEM map failed; plain reboot\n");
++		}
++	}
++	sweet_psci_reset();
++}
++
++void
++sweet_reboot_init(void)
++{
++	unsigned seconds = 0;
++	unsigned to = 0;
++	thread_t thread;
++	uintptr_t arg;
++
++	if (!PE_parse_boot_argn("sweetreboot", &seconds, sizeof(seconds)) || seconds == 0) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweetrebootto", &to, sizeof(to));
++
++	arg = ((uintptr_t)seconds << 1) | (to ? 1u : 0u);
++	if (kernel_thread_start(sweet_reboot_thread, (void *)arg, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("SWEET REBOOT: armed for %u s (%s)\n", seconds, to ? "bootloader" : "reboot");
++	}
++}
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_reboot.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@
+ extern void sweet_touch_init(void);
+ extern void sweet_gpu_probe(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_reboot_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -761,6 +762,7 @@
+ 	sweet_touch_init();
+ 	sweet_gpu_probe();
+ 	sweet_usb_probe();
++	sweet_reboot_init();
+ 	return 0;
+ }
+ 
