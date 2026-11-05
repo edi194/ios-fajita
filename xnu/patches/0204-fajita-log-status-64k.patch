@@ -1,0 +1,38 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -846,6 +846,7 @@
+  * read and never wraps: 32 bytes of header, then the last ~4 KiB of text.
+  */
+ #define SWEET_STATUS_BLOCK      8u
++#define SWEET_STATUS_BLOCKS     16u     /* 64 KiB: enough that the boot's own lines survive a busy start */
+ #define SWEET_STATUS_MAGIC      "SWEETST1" 
+ #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
+ #define SWEET_LOG_SECS          10u
+@@ -951,21 +952,23 @@
+ 				uint32_t version, size;
+ 				uint64_t total, seq;
+ 			} sh;
+-			uint32_t room = UFS_BLOCK - sizeof(sh);
++			uint32_t area = SWEET_STATUS_BLOCKS * UFS_BLOCK;
++			uint32_t room = area - sizeof(sh);
+ 			uint64_t from = total > room ? total - room : 0;
++			uint32_t blocks = area / UFS_BLOCK;
+ 
+ 			memcpy(sh.magic, SWEET_STATUS_MAGIC, 8);
+ 			sh.version = 1;
+-			sh.size = UFS_BLOCK;
++			sh.size = area;
+ 			sh.total = total;
+ 			sh.seq = seq;
+-			bzero(bounce, UFS_BLOCK);
++			bzero(bounce, area);
+ 			memcpy(bounce, &sh, sizeof(sh));
+ 			for (uint32_t i = 0; i < room; i++) {
+ 				((char *)bounce)[sizeof(sh) + i] =
+ 				    sweet_log_ring[(from + i) % SWEET_LOG_SIZE];
+ 			}
+-			(void)ufs_write_blocks(su.first_block + SWEET_STATUS_BLOCK, 1,
++			(void)ufs_write_blocks(su.first_block + SWEET_STATUS_BLOCK, blocks,
+ 			    su.first_block, su.nblocks);
+ 		}
+ 		if (!error) {
