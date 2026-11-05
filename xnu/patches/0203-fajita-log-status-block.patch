@@ -1,0 +1,47 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -839,6 +839,14 @@
+  * tools/sweet-log-pull.sh. Disabled with boot-arg sweetlog=0.
+  */
+ #define SWEET_LOG_SIZE          (4u << 20)
++/*
++ * fajita: one block with the newest tail of the log, written at every flush. The ring at the end of the
++ * partition stopped reflecting new boots - after a panic flush its header describes an older boot, the reader
++ * follows the header, and there is then no way to see a boot without a working reader. One block is trivial to
++ * read and never wraps: 32 bytes of header, then the last ~4 KiB of text.
++ */
++#define SWEET_STATUS_BLOCK      8u
++#define SWEET_STATUS_MAGIC      "SWEETST1" 
+ #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
+ #define SWEET_LOG_SECS          10u
+ 
+@@ -938,6 +946,29 @@
+ 			error = ufs_write_blocks(base, 1, su.first_block, su.nblocks);
+ 		}
+ 		if (!error) {
++			struct sweet_status_header {
++				char magic[8];
++				uint32_t version, size;
++				uint64_t total, seq;
++			} sh;
++			uint32_t room = UFS_BLOCK - sizeof(sh);
++			uint64_t from = total > room ? total - room : 0;
++
++			memcpy(sh.magic, SWEET_STATUS_MAGIC, 8);
++			sh.version = 1;
++			sh.size = UFS_BLOCK;
++			sh.total = total;
++			sh.seq = seq;
++			bzero(bounce, UFS_BLOCK);
++			memcpy(bounce, &sh, sizeof(sh));
++			for (uint32_t i = 0; i < room; i++) {
++				((char *)bounce)[sizeof(sh) + i] =
++				    sweet_log_ring[(from + i) % SWEET_LOG_SIZE];
++			}
++			(void)ufs_write_blocks(su.first_block + SWEET_STATUS_BLOCK, 1,
++			    su.first_block, su.nblocks);
++		}
++		if (!error) {
+ 			error = ufs_sync_cache();
+ 		}
+ 		lck_mtx_unlock(&sweet_ufs_lock);
