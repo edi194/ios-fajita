@@ -1,0 +1,160 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2149,6 +2149,44 @@
+ 	}
+ }
+ 
++/*
++ * fajita: cache maintenance on the CPU's own mapping of a buffer. The client maps its buffers cacheable and
++ * the GPU is not coherent (DT qcom,gsi-disable-io-coherency), so a buffer the CPU wrote has to be cleaned to
++ * the point of coherency before the CP reads it, and one the GPU wrote has to be invalidated before the CPU
++ * reads it. Doing it by kernel virtual address avoids phystokv() altogether: the old path took a physical
++ * address and panicked for anything below gPhysBase (patch 0194), which is why buffers down there were simply
++ * never cleaned.
++ */
++void
++sweet_gpu_flush_kva(void *kva, uint64_t size)
++{
++	uintptr_t p = (uintptr_t)kva & ~(uintptr_t)63;
++	uintptr_t end = (uintptr_t)kva + size;
++
++	if (kva == NULL || size == 0) {
++		return;
++	}
++	for (; p < end; p += 64) {
++		__asm__ volatile("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++void
++sweet_gpu_invalidate_kva(void *kva, uint64_t size)
++{
++	uintptr_t p = (uintptr_t)kva & ~(uintptr_t)63;
++	uintptr_t end = (uintptr_t)kva + size;
++
++	if (kva == NULL || size == 0) {
++		return;
++	}
++	for (; p < end; p += 64) {
++		__asm__ volatile("dc ivac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
+ bool
+ sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly)
+ {
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -46,6 +46,8 @@
+ bool sweet_gpu_iova_reserve(uint64_t iova, uint64_t size);
+ void sweet_gpu_iova_free(uint64_t iova, uint64_t size);
+ bool sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly);
++void sweet_gpu_flush_kva(void *kva, uint64_t size);
++void sweet_gpu_invalidate_kva(void *kva, uint64_t size);
+ void sweet_gpu_vm_unmap(uint64_t iova, uint64_t size);
+ void sweet_gpu_cache_sync(void *va, size_t len);
+ uint32_t sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count);
+@@ -397,31 +399,30 @@
+ 		return kIOReturnBadArgument;
+ 	}
+ 	/*
+-	 * The arena, not the VM: this port's free lists hold pages below gPhysBase and pmap panics
+-	 * on them (phys_to_kv_range). sweet_gpu_alloc_pages() hands out contiguous, zeroed arena
+-	 * memory above the base - the same memory the CP ring and the chardev BOs use.
++	 * fajita: IOKit owns these pages, not the arena. The arena is a reserved DRAM range, so pmap counts its
++	 * pages as managed; a physical descriptor over them makes IOKit build a device pager for the client's
++	 * mapping, and tearing that mapping down hands the pages back to the VM - while the arena goes on handing
++	 * the same pages to the next BO. Two live buffers then share memory, which is what killed the machine in
++	 * the middle of Metal's allocation churn (console168/169: about a thousand BOs in, no panic, straight to
++	 * the crash dump).
+ 	 *
+-	 * withPhysicalAddress() is IOMemoryDescriptor's static (OSPtr is a plain pointer here, so
+-	 * it returns IOMemoryDescriptor *); SweetSurface.cpp wraps the panel with the same call.
++	 * An IOBufferMemoryDescriptor has a pager that owns the pages and frees them exactly once. The GPU still
++	 * reaches them page by page through getPhysicalSegment(), the CPU through getBytesNoCopy() below, and
++	 * because that memory is cacheable the coherency is explicit (sweet_gpu_flush_kva / _invalidate_kva).
+ 	 */
+-	uint64_t pa = 0;
+-	void *akva = NULL;
+-	if (!sweet_gpu_alloc_pages(size, &pa, &akva)) {
++	IOBufferMemoryDescriptor *buf = IOBufferMemoryDescriptor::withOptions(
++	    kIODirectionInOut, size, PAGE_SIZE);
++	if (buf == NULL) {
+ 		return kIOReturnNoMemory;
+ 	}
+-	IOMemoryDescriptor *buf = IOMemoryDescriptor::withPhysicalAddress(
+-	    (IOPhysicalAddress)pa, (IOByteCount)size, kIODirectionInOut);
+-	if (buf == NULL) {
+-		sweet_gpu_free_pages(pa, size);
++	uint64_t pa = 0;
++	uint8_t *kva = (uint8_t *)buf->getBytesNoCopy();
++	if (kva == NULL) {
++		buf->release();
+ 		return kIOReturnNoMemory;
+ 	}
+-	uint8_t *kva = (uint8_t *)akva;
+-	/*
+-	 * Not bzero(): bzero uses dc zva (osfmk/arm64/bzero.s), and dc zva is not permitted on
+-	 * I/O mapped memory - the arena comes from ml_io_map, so it faults (unaligned kernel data
+-	 * abort). sweet_gpu_alloc_pages() already zeroed these pages with 32-bit stores, and
+-	 * uncached memory needs no cache maintenance.
+-	 */
++	/* normal cacheable memory, so dc zva (what bzero uses) is fine here */
++	bzero(kva, size);
+ 
+ 	IOLockLock(gAdrenoLock);
+ 	IOReturn ret = kIOReturnNoResources;
+@@ -532,6 +533,18 @@
+ 		} else if (g->lastFence != 0 && !sweet_gpu_fence_done((r->op & SWEET_MSM_PREP_WRITE) ? g->lastFence : g->lastWrite)) {
+ 			ret = kIOReturnBusy;
+ 		}
++		/*
++		 * MSM_PREP_WRITE: the CPU is about to write this buffer and the GPU will read it - clean it.
++		 * MSM_PREP_READ: the GPU wrote it and the CPU will read it - invalidate, or the reads see the cache
++		 * lines that predate the GPU's writes.
++		 */
++		if (ret == kIOReturnSuccess && g->kva != NULL && g->size != 0) {
++			if (r->op & SWEET_MSM_PREP_WRITE) {
++				sweet_gpu_flush_kva(g->kva, g->size);
++			} else {
++				sweet_gpu_invalidate_kva(g->kva, g->size);
++			}
++		}
+ 	}
+ 	IOLockUnlock(gAdrenoLock);
+ 	return ret;
+@@ -780,23 +793,16 @@
+ 		}
+ 	}
+ 	/*
+-	 * The client writes through a cacheable mapping (the map options it passes override whatever
+-	 * clientMemoryForType() asks for), so its stores may still be dirty in the CPU cache when the
+-	 * CP reads. Clean every buffer in this submission through the linear map - flush_dcache64()
+-	 * does that by physical address, which is why it works for a mapping we do not own.
++	 * Coherency: the only memory this kernel writes after the client prepared it is the command buffers, where
++	 * the relocation patch above stored addresses. Everything else was written by the client through
++	 * MSM_PREP_WRITE, which cleans the buffer as it hands it over, so cleaning all of them again here would only
++	 * cost time - and the old version could not clean the buffers below gPhysBase at all.
+ 	 */
+-	for (uint32_t i = 0; i < r->nr_bos; i++) {
+-		struct sweet_gem *g = objs[i];
+-		/*
+-		 * fajita: flush_dcache64(pa, len, TRUE) reaches the memory through phystokv(), and this kernel
+-		 * manages physical memory from 4 GiB up (mkadt --highmem), so a buffer that happens to sit below
+-		 * that base takes PhysToKV: illegal PA and panics the machine (0x8f714000 in console148). Those
+-		 * buffers are Device memory (nGnRE) - an unaligned 8-byte read from them already took an
+-		 * unaligned-abort panic - and device memory is uncached, so it never needs a clean. Only buffers
+-		 * in the linear-mapped range are cleaned.
+-		 */
+-		if (g->pa >= 0x100000000ull && g->size != 0) {
+-			flush_dcache64((addr64_t)g->pa, (unsigned)g->size, TRUE);
++	for (uint32_t i = 0; i < r->nr_cmds; i++) {
++		struct sweet_gem *cb = objs[cmds[i].submit_idx];
++
++		if (cb->kva != NULL) {
++			sweet_gpu_flush_kva(cb->kva + cmds[i].submit_offset, cmds[i].size);
+ 		}
+ 	}
+ 	/*
