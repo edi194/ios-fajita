@@ -1,0 +1,77 @@
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -140,3 +140,41 @@
+ 		printf("SWEET REBOOT: armed for %u s (%s)\n", seconds, to ? "bootloader" : "reboot");
+ 	}
+ }
++
++/*
++ * fajita: the APSS watchdog. Two boots have now died with no panic text at all - panic() calls
++ * sweet_early_panic() (which draws on the panel) and sweet_log_panic_flush() (which marks the ring with
++ * seq 0xffffffff), and neither left a trace - so the CPU never reached panic(): something reset the SoC
++ * underneath it. The bootloader arms the APSS watchdog (Linux's qcom-wdt exists for exactly this reason)
++ * and this kernel never pets it, so this reads it out first. sweetwdt=1 clears the enable bit; the default
++ * only reports, because a wrong write here would reboot the phone in a loop.
++ */
++#define SWEET_APSS_WDT_PA   0x17980000UL
++#define SWEET_WDT_EN        0x04u
++#define SWEET_WDT_BITE      0x24u
++
++void
++sweet_wdt_probe(void)
++{
++	int mode = 0;
++	vm_offset_t w;
++	uint32_t en, bite;
++
++	(void)PE_parse_boot_argn("sweetwdt", &mode, sizeof(mode));
++	w = ml_io_map(SWEET_APSS_WDT_PA, 0x1000);
++	if (w == 0) {
++		printf("SWEET WDT: map failed\n");
++		return;
++	}
++	en = *(volatile uint32_t *)(w + SWEET_WDT_EN);
++	bite = *(volatile uint32_t *)(w + SWEET_WDT_BITE);
++	printf("SWEET WDT: apss en %#x bite %#x (%s), mode %d\n", en, bite,
++	    (en & 1u) ? "ARMED" : "off", mode);
++
++	if (mode == 1 && (en & 1u)) {
++		*(volatile uint32_t *)(w + SWEET_WDT_EN) = 0;
++		__asm__ volatile("dsb sy" ::: "memory");
++		printf("SWEET WDT: enable cleared, reads back %#x\n",
++		    *(volatile uint32_t *)(w + SWEET_WDT_EN));
++	}
++}
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@
+ extern void sweet_touch_init(void);
+ extern void sweet_gpu_probe(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_wdt_probe(void);
+ extern void sweet_reboot_init(void);
+ 
+ #define REG_CAP         0x00
+@@ -821,6 +822,7 @@
+ 	sweet_touch_init();
+ 	sweet_gpu_probe();
+ 	sweet_usb_probe();
++	sweet_wdt_probe();
+ 	sweet_reboot_init();
+ 	return 0;
+ }
+@@ -1008,6 +1010,14 @@
+ 			return;
+ 		}
+ 		flushed = total;
++		/*
++		 * A boot that dies with no kernel message still has a clock: the flush counter, times ten seconds, is
++		 * how long it lived, and the last one of these in the status area is the answer.
++		 */
++		if ((seq % 6) == 0) {
++			printf("SWEET LOG: flush %llu, %llu bytes, about %llu s\n",
++			    seq, total, seq * SWEET_LOG_SECS);
++		}
+ 	}
+ }
+ 
