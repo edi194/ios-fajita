@@ -1,0 +1,73 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -890,6 +890,70 @@
+ 		}
+ 	}
+ 	/*
++	 * fajita (ib2bounce=1): point the first CP_INDIRECT_BUFFER at a copy of the nested buffer made in kernel
++	 * memory, byte for byte, keeping the packet's size. Two very different faults look the same from the fence:
++	 * the CP reading stale DRAM because the client's writes were still in its cache, and the CP reading garbage
++	 * because that BO's page table entry is wrong. The copy is printed against the dump of the same buffer, so
++	 * the log answers which one it is - identical content with a fence that still never arrives means the client
++	 * BO's mapping is at fault, different content means the client's data never reached memory.
++	 */
++	{
++		int b2 = 0;
++
++		if (PE_parse_boot_argn("ib2bounce", &b2, sizeof(b2)) && b2 != 0) {
++			bool done = false;
++
++			for (uint32_t i = 0; i < r->nr_cmds && !done; i++) {
++				struct sweet_gem *cb = objs[cmds[i].submit_idx];
++				volatile uint32_t *q = (volatile uint32_t *)(void *)(cb->kva + cmds[i].submit_offset);
++				uint32_t words = ibn[i];
++
++				for (uint32_t at = 0; at + 3 < words && !done;) {
++					uint32_t h = q[at];
++					uint32_t cnt;
++
++					if ((h & 0xf0000000u) == 0x40000000u) {
++						at += 1 + (h & 0x7fu);
++						continue;
++					}
++					if ((h & 0xf0000000u) != 0x70000000u) {
++						break;
++					}
++					cnt = h & 0x3fffu;
++					if (((h >> 16) & 0x7fu) == 0x3fu && cnt >= 3) {
++						uint64_t iova = (uint64_t)q[at + 1] | ((uint64_t)q[at + 2] << 32);
++						uint32_t dwords = q[at + 3];
++
++						for (uint32_t b = 0; b < r->nr_bos; b++) {
++							struct sweet_gem *g = objs[b];
++							uint64_t bva;
++
++							if (g->kva == NULL || iova < g->iova || iova >= g->iova + g->size) {
++								continue;
++							}
++							if ((uint64_t)dwords * 4 > g->size - (iova - g->iova)) {
++								break;
++							}
++							bva = sweet_gpu_bounce_ib(g->kva + (iova - g->iova), dwords);
++							if (bva != 0) {
++								IOLog("SWEET ADRENO: nested %#llx (%u dwords) bounced to %#llx\n",
++								    (unsigned long long)iova, dwords, (unsigned long long)bva);
++								q[at + 1] = (uint32_t)bva;
++								q[at + 2] = (uint32_t)(bva >> 32);
++								done = true;
++							}
++							break;
++						}
++					}
++					at += 1 + cnt;
++				}
++			}
++			if (!done) {
++				IOLog("SWEET ADRENO: ib2bounce: no nested buffer in this submission\n");
++			}
++		}
++	}
++	/*
+ 	 * fajita (ibounce=1): submit a copy of the command buffer from memory the driver owns. The same
+ 	 * dwords retire their fence when submitted that way from the bring-up test, so this separates
+ 	 * "the stream wedges the pipe" from "the CP does not read the client's memory as the CPU does".
