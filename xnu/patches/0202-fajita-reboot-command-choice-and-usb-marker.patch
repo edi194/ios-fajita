@@ -1,0 +1,38 @@
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -85,9 +85,20 @@
+ 				char reserved[1184];
+ 			} msg = { { 0 } };
+ 
+-			memcpy(msg.command, "boot-fastboot", sizeof("boot-fastboot"));
++			/*
++			 * Not every Android bootloader honours the same misc command: "boot-fastboot" and
++			 * "bootonce-bootloader" live in different branches of ABL. sweetrebootcmd=<name> chooses,
++			 * so the next attempt costs a boot and not a patch.
++			 */
++			char cmd[32] = { 0 };
++
++			(void)PE_parse_boot_argn("sweetrebootcmd", cmd, sizeof(cmd));
++			if (cmd[0] == 0) {
++				memcpy(cmd, "boot-fastboot", sizeof("boot-fastboot"));
++			}
++			memcpy(msg.command, cmd, strnlen(cmd, sizeof(msg.command) - 1));
+ 			if (sweet_ufs_write_named("misc", 0, &msg, sizeof(msg)) == 0) {
+-				printf("SWEET REBOOT: misc command \"boot-fastboot\" written\n");
++				printf("SWEET REBOOT: misc command \"%s\" written\n", msg.command);
+ 			}
+ 		}
+ 		/* qcom-pon first: ABL reads the PMIC's spare register, and the IMEM word alone was not enough */
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -146,8 +146,9 @@
+ 	uint32_t gdscr, cbcr[sizeof(usb_cbcr) / sizeof(usb_cbcr[0])];
+ 	bool clocks_on = true;
+ 
+-	/* sweetusb=0 off, 1 (default) report state only, 2 also start the USB device */
++	/* sweetusb=0 off, 1 (default) report state only, 2 also power the block and start the USB device */
+ 	PE_parse_boot_argn("sweetusb", &enabled, sizeof(enabled));
++	printf("SWEET USB: sweetusb=%d\n", enabled);
+ 	if (!enabled) {
+ 		return;
+ 	}
