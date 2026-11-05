@@ -1,0 +1,109 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -44,20 +44,31 @@
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+-#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 31: power on */
++#define GCC_USB30_PRIM_GDSCR    0x0f004         /* bit 0: SW_COLLAPSE (1 = off), bit 31: PWR_ON */
++#define GCC_USB30_PRIM_BCR      0x0f000         /* bit 0: block reset */
++#define GDSC_SW_COLLAPSE        (1u << 0)
++#define GDSC_PWR_ON             (1u << 31)
++#define BCR_BLK_ARES            (1u << 0)
+ #define CBCR_CLK_OFF            (1u << 31)
+ 
+ static const struct {
+ 	const char *name;
+ 	uint32_t    off;
+ } usb_cbcr[] = {
+-	{ "master", 0x0f010 },
+-	{ "sleep", 0x0f014 },
+-	{ "utmi", 0x0f018 },
++	/*
++	 * fajita (SDM845), from Linux drivers/clk/qcom/gcc-sdm845.c. The previous table was the SM7150
++	 * ("sweet") layout: master, sleep, mock-utmi and clkref all sit at different offsets there, which is
++	 * why this driver always found the controller unclocked and never touched it.
++	 */
++	{ "master", 0x0f00c },
++	{ "sleep", 0x0f010 },
++	{ "utmi", 0x0f014 },
++	{ "phy-aux", 0x0f04c },
++	{ "phy-com-aux", 0x0f050 },
+ 	{ "cfg-noc-axi", 0x0502c },
+ 	{ "aggre-axi", 0x8201c },
+ 	{ "ahb2phy", 0x6a004 },
+-	{ "clkref", 0x8c010 },
++	{ "clkref", 0x8c008 },
+ };
+ 
+ #define DWC3_PA                 0x0a600000
+@@ -73,6 +84,61 @@
+ 	return v;
+ }
+ 
++static void
++usb_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile ("dmb oshst" ::: "memory");
++}
++
++/*
++ * fajita: bring the controller up instead of assuming ABL left it up. GDSC usb30_prim first (clear
++ * SW_COLLAPSE, wait for PWR_ON), then the branch clocks (clear CLK_OFF), then the block reset, which must be
++ * released after the clocks run. Every step is logged, because "which one is still off" is the only question
++ * that matters when the controller refuses to appear.
++ */
++static bool
++sweet_usb_power_on(vm_offset_t gcc)
++{
++	uint32_t v;
++	int i;
++
++	v = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	printf("SWEET USB: power-up: GDSCR 0x%08x (%s)\n", v, (v & GDSC_PWR_ON) ? "on" : "off");
++	usb_wr(gcc, GCC_USB30_PRIM_GDSCR, v & ~GDSC_SW_COLLAPSE);
++	for (i = 0; i < 100; i++) {
++		if (usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & GDSC_PWR_ON) {
++			break;
++		}
++		delay(1000);
++	}
++	v = usb_rd(gcc, GCC_USB30_PRIM_GDSCR);
++	printf("SWEET USB: power-up: GDSC %s after %d ms (0x%08x)\n",
++	    (v & GDSC_PWR_ON) ? "ON" : "STILL OFF", i, v);
++
++	for (unsigned k = 0; k < sizeof(usb_cbcr) / sizeof(usb_cbcr[0]); k++) {
++		uint32_t before = usb_rd(gcc, usb_cbcr[k].off);
++
++		usb_wr(gcc, usb_cbcr[k].off, before & ~CBCR_CLK_OFF);
++		for (i = 0; i < 20; i++) {
++			if (!(usb_rd(gcc, usb_cbcr[k].off) & CBCR_CLK_OFF)) {
++				break;
++			}
++			delay(1000);
++		}
++		v = usb_rd(gcc, usb_cbcr[k].off);
++		printf("SWEET USB: power-up: clk %-12s 0x%08x -> 0x%08x (%s, %d ms)\n",
++		    usb_cbcr[k].name, before, v, (v & CBCR_CLK_OFF) ? "OFF" : "on", i);
++	}
++
++	usb_wr(gcc, GCC_USB30_PRIM_BCR, BCR_BLK_ARES);
++	delay(1000);
++	usb_wr(gcc, GCC_USB30_PRIM_BCR, 0);
++	delay(1000);
++	printf("SWEET USB: power-up: block reset released\n");
++	return (usb_rd(gcc, GCC_USB30_PRIM_GDSCR) & GDSC_PWR_ON) != 0;
++}
++
+ void
+ sweet_usb_probe(void)
+ {
+@@ -117,6 +183,7 @@
+ 	    usb_rd(dwc, 0xc404), usb_rd(dwc, 0xc400), usb_rd(dwc, 0xc408), usb_rd(dwc, 0xc40c),
+ 	    usb_rd(dwc, 0xc140));
+ 	if (enabled >= 2) {
++		sweet_usb_power_on(gcc);
+ 		sweet_usb_gadget_start(dwc);
+ 	}
+ 	if (cbcr[5] & CBCR_CLK_OFF) {
