@@ -1,0 +1,87 @@
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -83,6 +83,50 @@
+ 	return 0;
+ }
+ 
++/*
++ * fajita: qcom-pon's reboot reason. ABL decides where to boot from the PMIC's PON spare register, not from
++ * the IMEM word this port's shim writes (a reset after that word landed still started Android), so
++ * "reboot to fastboot" has to be asked for the way Linux's drivers/power/reset/qcom-pon.c does it:
++ * PON_SOFT_RB_SPARE (0x8f) set to the reason shifted left by two bits, pm8998's shift.
++ *
++ * SPMI encoding from Linux's spmi-pmic-arb.c: PMIC_ARB_OP_EXT_WRITEL is 0, so the command is
++ * (sid << 20) | (addr << 4) | byte-count-minus-one, and the byte itself goes to WDATA0 (offset 0x10).
++ */
++int
++sweet_pon_reboot_reason(unsigned reason)
++{
++	if (!sp_ready && sweet_spmi_init() != 0) {
++		return -1;
++	}
++
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid(0x008);            /* SID 0, peripheral 0x08: the PON block */
++	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		IOLockUnlock(sp_lock);
++		return -1;
++	}
++	unsigned off = 0x80u * apid;
++	*(volatile uint32_t *)(sp_obs + off + 0x10u) = (reason & 0x3fu) << 2;   /* PON_SOFT_RB_SPARE */
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(sp_obs + off) = (unsigned)(0x8fu << 4);          /* EXT_WRITEL, addr 0x8f, 1 byte */
++	__asm__ volatile("dsb osh" ::: "memory");
++
++	for (unsigned i = 0; i < 1000; ++i) {
++		uint32_t status = sp_rd(sp_obs, off + 0x08u);
++
++		if (status & 1u) {
++			int failed = (status & 0x0eu) != 0;
++
++			IOLockUnlock(sp_lock);
++			return failed ? -1 : 0;
++		}
++		delay(1);
++	}
++	sp_poisoned[apid] = true;
++	IOLockUnlock(sp_lock);
++	return -1;
++}
++
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -8,6 +8,8 @@
+ int sweet_spmi_init(void);
+ /* Thread context only; 0 success, -1 failure; *out unchanged on failure. */
+ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
++/* qcom-pon: write the reboot reason ABL reads (2 = bootloader, 1 = recovery). */
++int sweet_pon_reboot_reason(unsigned reason);
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -18,6 +18,7 @@
+ #include <kern/clock.h>                 /* delay() */
+ #include <kern/sched_prim.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_spmi.h"                 /* qcom-pon reboot reason */
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+@@ -68,6 +69,12 @@
+ 	(void)msleep(NULL, NULL, PWAIT, "sweetreboot", &ts);
+ 
+ 	if (bootloader) {
++		/* qcom-pon first: ABL reads the PMIC's spare register, and the IMEM word alone was not enough */
++		if (sweet_pon_reboot_reason(2) == 0) {
++			printf("SWEET REBOOT: PON reboot reason 2 (bootloader) written\n");
++		} else {
++			printf("SWEET REBOOT: PON write failed; falling back to the IMEM reason\n");
++		}
+ 		vm_offset_t imem = ml_io_map(SWEET_IMEM_PA, SWEET_IMEM_SIZE);
+ 
+ 		if (imem != 0) {
