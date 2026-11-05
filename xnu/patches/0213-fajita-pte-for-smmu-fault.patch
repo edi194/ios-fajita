@@ -1,0 +1,98 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1332,6 +1332,9 @@
+  * buffer; if RPTR caught up, the CP read everything and only the fence write is missing - which would be our
+  * scratch mapping, not the GPU. The fault registers say which packet or access it died on.
+  */
++/* defined with the page tables further down; used by the fault dump above them */
++uint64_t sweet_gpu_pte_read(uint64_t iova);
++
+ void
+ sweet_gpu_dump_cp_state(const char *why)
+ {
+@@ -1438,6 +1441,13 @@
+ 				    why, c, gpu_rd_quiet(b, GPU_SMMU_CB_SCTLR),
+ 				    gpu_rd_quiet(b, GPU_SMMU_CB_FSR), gpu_rd_quiet(b, GPU_SMMU_CB_FAR),
+ 				    gpu_rd_quiet(b, GPU_SMMU_CB_FSYNR0));
++				if (gpu_rd_quiet(b, GPU_SMMU_CB_FSR) != 0) {
++					uint64_t far = (uint32_t)gpu_rd_quiet(b, GPU_SMMU_CB_FAR);
++
++					printf("SWEET GPU: %s: smmu cb%u far %#llx pte %#llx\n", why, c,
++					    (unsigned long long)far,
++					    (unsigned long long)sweet_gpu_pte_read(far));
++				}
+ 			}
+ 		}
+ 	}
+@@ -2187,6 +2197,21 @@
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++/*
++ * fajita: what the page table says about one address. The SMMU reports the address it could not translate
++ * (CBFAR), and that address alone does not say whether the PTE is missing, was cleared, or points somewhere
++ * unexpected - which is exactly the difference between an unmapped BO and a BO that was unmapped while the CP
++ * still held it. It reads through gpu_l3_for(), so an address in a region that was never touched reports a
++ * fresh, empty table instead of failing.
++ */
++uint64_t
++sweet_gpu_pte_read(uint64_t iova)
++{
++	volatile uint64_t *l3 = gpu_l3_for(iova & ~0xfffull);
++
++	return l3 != NULL ? l3[(iova >> 12) & 0x1ff] : 0;
++}
++
+ bool
+ sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly)
+ {
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -46,6 +46,7 @@
+ bool sweet_gpu_iova_reserve(uint64_t iova, uint64_t size);
+ void sweet_gpu_iova_free(uint64_t iova, uint64_t size);
+ bool sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly);
++uint64_t sweet_gpu_pte_read(uint64_t iova);
+ void sweet_gpu_flush_kva(void *kva, uint64_t size);
+ void sweet_gpu_invalidate_kva(void *kva, uint64_t size);
+ void sweet_gpu_vm_unmap(uint64_t iova, uint64_t size);
+@@ -646,6 +647,39 @@
+ 			}
+ 			at += c->nr_relocs;
+ 		}
++		/*
++		 * fajita (iovacheck=1): the SMMU faulted on addresses inside client BOs while the IB itself was
++		 * translatable, so this is the ground truth before submitting: every BO's range, and whether its
++		 * pages really have PTEs. A hole here is the fault the timeout dump would otherwise only report
++		 * two seconds later.
++		 */
++		{
++			int check = 0;
++
++			if (PE_parse_boot_argn("iovacheck", &check, sizeof(check)) && check != 0) {
++				for (uint32_t i = 0; i < r->nr_bos; i++) {
++					struct sweet_gem *g = objs[i];
++					uint64_t holes = 0, first_hole = 0;
++
++					for (uint64_t o = 0; o < g->size; o += PAGE_SIZE) {
++						if (sweet_gpu_pte_read(g->iova + o) == 0) {
++							if (holes == 0) {
++								first_hole = g->iova + o;
++							}
++							holes++;
++						}
++					}
++					if (holes == 0) {
++						IOLog("SWEET ADRENO: bo %u iova %#llx size %llu ok\n", i,
++						    (unsigned long long)g->iova, (unsigned long long)g->size);
++					} else {
++						IOLog("SWEET ADRENO: bo %u iova %#llx size %llu HOLES %llu first %#llx\n", i,
++						    (unsigned long long)g->iova, (unsigned long long)g->size,
++						    (unsigned long long)holes, (unsigned long long)first_hole);
++					}
++				}
++			}
++		}
+ 		/* validated: patch, then submit */
+ 		at = 0;
+ 		for (uint32_t i = 0; i < r->nr_cmds; i++) {
