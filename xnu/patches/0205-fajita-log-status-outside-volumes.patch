@@ -1,0 +1,40 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -840,12 +840,17 @@
+  */
+ #define SWEET_LOG_SIZE          (4u << 20)
+ /*
+- * fajita: one block with the newest tail of the log, written at every flush. The ring at the end of the
+- * partition stopped reflecting new boots - after a panic flush its header describes an older boot, the reader
+- * follows the header, and there is then no way to see a boot without a working reader. One block is trivial to
+- * read and never wraps: 32 bytes of header, then the last ~4 KiB of text.
++ * fajita: the newest tail of the log also goes into a small fixed area that is written at every flush. The ring
++ * at the end of the partition stopped reflecting new boots - after a panic flush its header describes an older
++ * boot, the reader follows the header, and there is then no way to read a boot at all. A flat area never wraps:
++ * 32 bytes of header, then the tail as text.
++ *
++ * The area sits SWEET_STATUS_FROM_END blocks before the end of the partition: 8 MiB in from the last block and
++ * 4 MiB before the ring. It must never be near the start. The root HFS+ volume begins at block 0 and its
++ * allocation file occupies blocks 1..128, so a log write at block 8 clears allocation bits for blocks 32768 and
++ * up and hands live file system data to the allocator.
+  */
+-#define SWEET_STATUS_BLOCK      8u
++#define SWEET_STATUS_FROM_END   2048u
+ #define SWEET_STATUS_BLOCKS     16u     /* 64 KiB: enough that the boot's own lines survive a busy start */
+ #define SWEET_STATUS_MAGIC      "SWEETST1" 
+ #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
+@@ -968,8 +973,12 @@
+ 				((char *)bounce)[sizeof(sh) + i] =
+ 				    sweet_log_ring[(from + i) % SWEET_LOG_SIZE];
+ 			}
+-			(void)ufs_write_blocks(su.first_block + SWEET_STATUS_BLOCK, blocks,
+-			    su.first_block, su.nblocks);
++			if (su.nblocks > SWEET_STATUS_FROM_END &&
++			    blocks + SWEET_LOG_BLOCKS <= SWEET_STATUS_FROM_END) {
++				uint64_t at = su.first_block + su.nblocks - SWEET_STATUS_FROM_END;
++
++				(void)ufs_write_blocks(at, blocks, su.first_block, su.nblocks);
++			}
+ 		}
+ 		if (!error) {
+ 			error = ufs_sync_cache();
