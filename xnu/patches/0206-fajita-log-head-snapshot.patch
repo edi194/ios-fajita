@@ -1,0 +1,73 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -852,7 +852,8 @@
+  */
+ #define SWEET_STATUS_FROM_END   2048u
+ #define SWEET_STATUS_BLOCKS     16u     /* 64 KiB: enough that the boot's own lines survive a busy start */
+-#define SWEET_STATUS_MAGIC      "SWEETST1" 
++#define SWEET_STATUS_MAGIC      "SWEETST1"      /* the tail: what just happened */
++#define SWEET_STATUS_HEAD_MAGIC "SWEETSH1"      /* the head: what happened at boot */
+ #define SWEET_LOG_BLOCKS        (1 + SWEET_LOG_SIZE / UFS_BLOCK)
+ #define SWEET_LOG_SECS          10u
+ 
+@@ -959,25 +960,43 @@
+ 			} sh;
+ 			uint32_t area = SWEET_STATUS_BLOCKS * UFS_BLOCK;
+ 			uint32_t room = area - sizeof(sh);
+-			uint64_t from = total > room ? total - room : 0;
+ 			uint32_t blocks = area / UFS_BLOCK;
+ 
+-			memcpy(sh.magic, SWEET_STATUS_MAGIC, 8);
+-			sh.version = 1;
+-			sh.size = area;
+-			sh.total = total;
+-			sh.seq = seq;
+-			bzero(bounce, area);
+-			memcpy(bounce, &sh, sizeof(sh));
+-			for (uint32_t i = 0; i < room; i++) {
+-				((char *)bounce)[sizeof(sh) + i] =
+-				    sweet_log_ring[(from + i) % SWEET_LOG_SIZE];
+-			}
+-			if (su.nblocks > SWEET_STATUS_FROM_END &&
+-			    blocks + SWEET_LOG_BLOCKS <= SWEET_STATUS_FROM_END) {
+-				uint64_t at = su.first_block + su.nblocks - SWEET_STATUS_FROM_END;
+-
+-				(void)ufs_write_blocks(at, blocks, su.first_block, su.nblocks);
++			/*
++			 * Two areas, both fixed and both written on every flush: the tail (what just happened) and the
++			 * head (what happened at boot). The tail alone is not enough for that second question - a GPU
++			 * that logs every buffer object pushes the boot's own lines out of 64 KiB within seconds, and
++			 * the boot is exactly when the interesting answers are printed. The head stops changing once
++			 * the log is longer than the area, so it is only written while it is still filling.
++			 */
++			for (int part = 0; part < 2; part++) {
++				bool head = (part == 0);
++				uint64_t from_end = SWEET_STATUS_FROM_END + (head ? SWEET_STATUS_BLOCKS : 0);
++				uint64_t from = 0;
++
++				if (head) {
++					if (total > area) {
++						continue;
++					}
++				} else {
++					from = total > room ? total - room : 0;
++				}
++				if (su.nblocks <= from_end || blocks + SWEET_LOG_BLOCKS > from_end) {
++					continue;
++				}
++				memcpy(sh.magic, head ? SWEET_STATUS_HEAD_MAGIC : SWEET_STATUS_MAGIC, 8);
++				sh.version = 1;
++				sh.size = area;
++				sh.total = total;
++				sh.seq = seq;
++				bzero(bounce, area);
++				memcpy(bounce, &sh, sizeof(sh));
++				for (uint32_t i = 0; i < room; i++) {
++					((char *)bounce)[sizeof(sh) + i] =
++					    sweet_log_ring[(from + i) % SWEET_LOG_SIZE];
++				}
++				(void)ufs_write_blocks(su.first_block + su.nblocks - from_end,
++				    blocks, su.first_block, su.nblocks);
+ 			}
+ 		}
+ 		if (!error) {

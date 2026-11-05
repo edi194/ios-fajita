@@ -1,0 +1,125 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -206,6 +206,8 @@
+ #define GPU_SMMU_CB_MAIR0     0x038u
+ #define GPU_SMMU_CB_MAIR1     0x03cu
+ #define GPU_SMMU_CB_FSR       0x058u
++#define GPU_SMMU_CB_FAR       0x060u
++#define GPU_SMMU_CB_FSYNR0    0x068u
+ #define GPU_SMMU_CB_TLBIALL   0x618u
+ #define GPU_SMMU_CB_TLBSYNC   0x7f0u
+ #define GPU_SMMU_CB_TLBSTATUS 0x7f4u
+@@ -292,6 +294,13 @@
+ #define A6XX_CP_RB_RPTR        0x0806u
+ #define A6XX_CP_RB_WPTR        0x0807u
+ #define A6XX_CP_SQE_CNTL       0x0808u
++#define A6XX_CP_IB1_BASE        0x0928u
++#define A6XX_CP_IB1_BASE_HI     0x0929u
++#define A6XX_CP_IB1_REM_SIZE    0x092au
++#define A6XX_CP_IB2_BASE        0x092bu
++#define A6XX_CP_IB2_BASE_HI     0x092cu
++#define A6XX_CP_IB2_REM_SIZE    0x092du
++#define A6XX_RBBM_STATUS3       0x0213u
+ #define A6XX_CP_HW_FAULT       0x0821u
+ #define A6XX_CP_INTERRUPT_STATUS 0x0823u
+ #define A6XX_CP_STATUS_1       0x0825u
+@@ -1339,6 +1348,99 @@
+ 	    gpu_cp_rd(core, A6XX_CP_HW_FAULT), gpu_cp_rd(core, A6XX_CP_INTERRUPT_STATUS),
+ 	    gpu_cp_rd(core, A6XX_CP_PROTECT_STATUS), gpu_cp_rd(core, A6XX_RBBM_INT_0_STATUS),
+ 	    gpu_cp_rd(core, A6XX_CP_SQE_CNTL));
++
++	/*
++	 * The numbers above cannot tell "the CP never fetched the buffer" from "it fetched it and stopped in
++	 * the middle" - both look like a fence that never arrives. These can. REM_SIZE is the count of dwords
++	 * the CP still has to read in that buffer, so a non-zero value says exactly how far into IB1/IB2 it is,
++	 * and running out of one buffer and waiting in another looks different.
++	 *
++	 * RBBM_STATUS3 bit 24 is "the SMMU stalled on a fault": the one signal that separates a hardware
++	 * stall from a stream that merely takes forever.
++	 */
++	{
++		uint32_t ib1 = gpu_cp_rd(core, A6XX_CP_IB1_BASE);
++		uint32_t ib2 = gpu_cp_rd(core, A6XX_CP_IB2_BASE);
++
++		printf("SWEET GPU: %s: ib1 %#x%08x rem %u dwords, ib2 %#x%08x rem %u dwords, status3 %#x%s\n",
++		    why, gpu_cp_rd(core, A6XX_CP_IB1_BASE_HI), ib1,
++		    gpu_cp_rd(core, A6XX_CP_IB1_REM_SIZE), gpu_cp_rd(core, A6XX_CP_IB2_BASE_HI), ib2,
++		    gpu_cp_rd(core, A6XX_CP_IB2_REM_SIZE), gpu_cp_rd(core, A6XX_RBBM_STATUS3),
++		    (gpu_cp_rd(core, A6XX_RBBM_STATUS3) & (1u << 24)) ? " (smmu stalled on fault)" : "");
++	}
++	/* which blocks never went idle, by name: the raw mask means nothing without the bit map */
++	{
++		static const struct {
++			uint32_t bit;
++			const char *name;
++		} busy[] = {
++			{ 21, "hlsq" }, { 20, "vsc" }, { 19, "tpl1" }, { 18, "sp" }, { 17, "uche" },
++			{ 16, "vpc" }, { 15, "vfd" }, { 14, "tess" }, { 13, "pc_vsd" }, { 12, "pc_dcall" },
++			{ 11, "com_dcom" }, { 10, "lrz" }, { 9, "a2d" }, { 8, "ccu" }, { 7, "rb" },
++			{ 6, "ras" }, { 5, "tse" }, { 4, "vbif" }, { 3, "gfx_dbgc" }, { 2, "cp" },
++		};
++		uint32_t st = gpu_cp_rd(core, A6XX_RBBM_STATUS);
++		char names[128];
++		size_t at = 0;
++
++		names[0] = 0;
++		for (unsigned i = 0; i < sizeof(busy) / sizeof(busy[0]); i++) {
++			const char *p;
++
++			if ((st & (1u << busy[i].bit)) == 0) {
++				continue;
++			}
++			p = busy[i].name;
++			if (at + 1 < sizeof(names)) {
++				names[at++] = ' ';
++			}
++			while (*p != 0 && at + 1 < sizeof(names)) {
++				names[at++] = *p++;
++			}
++			names[at] = 0;
++		}
++		printf("SWEET GPU: %s: blocks still busy:%s\n", why, at != 0 ? names : " none");
++	}
++	/*
++	 * Is the 3D core even powered at this moment? The GMU owns the GX rail and can collapse it on its own
++	 * once it believes the GPU is idle, and this driver has no runtime power management between submissions.
++	 * A register write into a collapsed GX block does not fail - it hangs the bus, and the fence that follows
++	 * never comes back. That is indistinguishable from a bad stream until the rail state is read, which is
++	 * what this line is for.
++	 */
++	{
++		static vm_offset_t cc;
++
++		if (cc == 0) {
++			cc = ml_io_map(GPU_CC, 0x10000);
++		}
++		if (cc != 0) {
++			uint32_t gx = gpu_rd_quiet(cc, 0x100cu);
++			uint32_t cx = gpu_rd_quiet(cc, 0x106cu);
++
++			printf("SWEET GPU: %s: gpucc gx_gdscr %#x cx_gdscr %#x (%s)\n", why, gx, cx,
++			    (gx & (1u << 31)) ? "GX up" : "GX COLLAPSED");
++		}
++	}
++	/*
++	 * A translation fault here reads as zero data or a dropped write, so nothing else in the log would ever
++	 * show it. FSR is sticky until written, so a non-zero value in this dump belongs to this boot.
++	 */
++	{
++		vm_offset_t s = gpu_smmu;
++
++		if (s != 0) {
++			printf("SWEET GPU: %s: smmu sGFSR %#x\n", why, gpu_rd_quiet(s, GPU_SMMU_SGFSR));
++			for (unsigned c = 0; c < 2; c++) {
++				vm_offset_t b = s + GPU_SMMU_CB(c);
++
++				printf("SWEET GPU: %s: smmu cb%u sctlr %#x fsr %#x far %#x fsynr0 %#x\n",
++				    why, c, gpu_rd_quiet(b, GPU_SMMU_CB_SCTLR),
++				    gpu_rd_quiet(b, GPU_SMMU_CB_FSR), gpu_rd_quiet(b, GPU_SMMU_CB_FAR),
++				    gpu_rd_quiet(b, GPU_SMMU_CB_FSYNR0));
++			}
++		}
++	}
+ }
+ 
+ /* a6xx_cp_init: enable the SQE (this starts the engine) and let it configure the

@@ -1,0 +1,71 @@
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -828,6 +828,68 @@
+ 		}
+ 	}
+ 	/*
++	 * fajita (ib2nop=N): replace the nested command buffers that CP_INDIRECT_BUFFER starts with single-dword
++	 * CP_NOPs, without touching the packet's size field. Truncating such a buffer names its first state write
++	 * as the thing that wedges the pipe, but "that write is unacceptable to the hardware" and "the CP cannot
++	 * fetch this buffer at all" produce the same fence timeout, and the second one is far more likely here:
++	 * the fetch goes through the SMMU with an IOVA the drive only ever saw in a broken version. A buffer full
++	 * of NOPs is fetched by exactly the same path with nothing left inside it to go wrong, so its fence
++	 * separates the two cases. N is a dword count; N=1 means the whole buffer.
++	 */
++	{
++		int nop = 0;
++
++		if (PE_parse_boot_argn("ib2nop", &nop, sizeof(nop)) && nop > 0) {
++			for (uint32_t i = 0; i < r->nr_cmds; i++) {
++				struct sweet_gem *cb = objs[cmds[i].submit_idx];
++				volatile uint32_t *q = (volatile uint32_t *)(void *)(cb->kva + cmds[i].submit_offset);
++				uint32_t words = ibn[i];
++
++				for (uint32_t at = 0; at + 1 < words;) {
++					uint32_t h = q[at];
++					uint32_t cnt;
++
++					if ((h & 0xf0000000u) == 0x40000000u) {
++						at += 1 + (h & 0x7fu);
++						continue;
++					}
++					if ((h & 0xf0000000u) != 0x70000000u) {
++						break;
++					}
++					cnt = h & 0x3fffu;
++					if (((h >> 16) & 0x7fu) == 0x3fu && cnt >= 3 && at + 3 < words) {
++						uint64_t iova = (uint64_t)q[at + 1] | ((uint64_t)q[at + 2] << 32);
++						uint32_t dwords = q[at + 3];
++
++						for (uint32_t b = 0; b < r->nr_bos; b++) {
++							struct sweet_gem *g = objs[b];
++							uint32_t lim;
++
++							if (g->kva == NULL || iova < g->iova || iova >= g->iova + g->size) {
++								continue;
++							}
++							lim = (uint32_t)((g->size - (iova - g->iova)) / 4);
++							if (dwords < lim) {
++								lim = dwords;
++							}
++							if (nop != 1 && (uint32_t)nop < lim) {
++								lim = (uint32_t)nop;
++							}
++							for (uint32_t k = 0; k < lim; k++) {
++								((volatile uint32_t *)(void *)(g->kva + (iova - g->iova)))[k] =
++								    0x70108000u;      /* CP_NOP, one dword */
++							}
++							IOLog("SWEET ADRENO: nested %#llx: %u of %u dwords replaced with NOPs\n",
++							    (unsigned long long)iova, lim, dwords);
++							break;
++						}
++					}
++					at += 1 + cnt;
++				}
++			}
++		}
++	}
++	/*
+ 	 * fajita (ibounce=1): submit a copy of the command buffer from memory the driver owns. The same
+ 	 * dwords retire their fence when submitted that way from the bring-up test, so this separates
+ 	 * "the stream wedges the pipe" from "the CP does not read the client's memory as the CPU does".

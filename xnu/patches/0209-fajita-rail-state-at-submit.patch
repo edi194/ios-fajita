@@ -1,0 +1,69 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -2195,12 +2195,66 @@
+ 
+ /* One CP_INDIRECT_BUFFER per command buffer, then the CACHE_FLUSH_TS fence - Linux's
+  * a6xx_submit tail, which is what their submit path hands us. */
++/*
++ * The GMU owns the GX rail and collapses it on its own schedule once it decides the GPU is idle; this driver has
++ * no runtime power management, so nothing keeps the rail up between submissions. That matters because a register
++ * write into a collapsed 3D block does not fail - it hangs the bus, and the fence that follows never arrives,
++ * which from the outside is indistinguishable from a bad command stream. The kernel's own type 4 test writes real
++ * RB registers (0x8864, 0x8880) and passes, and it runs during boot, before the GMU has had a reason to sleep.
++ *
++ * So the first client submission reports what the rail actually is at that moment, before anything here touches
++ * it, and gpuwake=1 repeats the votes the boot used on every submission so the same boot can also prove it.
++ */
++static vm_offset_t hfi_gmu;
++
++static bool gpu_gx_rail_on(vm_offset_t gmu);
++static bool gpu_sptprac_on(vm_offset_t gmu);
++
++static void
++gpu_report_rail(const char *why)
++{
++	static vm_offset_t cc;
++	uint32_t gx = 0, cx = 0, ps = 0;
++
++	if (cc == 0) {
++		cc = ml_io_map(GPU_CC, 0x10000);
++	}
++	if (cc != 0) {
++		gx = gpu_rd_quiet(cc, 0x100cu);
++		cx = gpu_rd_quiet(cc, 0x106cu);
++	}
++	if (hfi_gmu != 0) {
++		ps = gpu_rd_quiet(hfi_gmu, GPU_GMU_RPMH_POWER_STATE);
++	}
++	printf("SWEET GPU: %s: gx_gdscr %#x cx_gdscr %#x rpmh_power_state %#x (%s)\n", why, gx, cx, ps,
++	    (gx & (1u << 31)) ? "GX up" : "GX COLLAPSED");
++}
++
+ uint32_t
+ sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count)
+ {
+ 	if (!gpu_live || ib_iova == NULL || ib_dwords == NULL || count == 0) {
+ 		return 0;
+ 	}
++	{
++		static int wake = -1;
++		static bool reported;
++
++		if (wake < 0) {
++			int v = 0;
++
++			PE_parse_boot_argn("gpuwake", &v, sizeof(v));
++			wake = (v != 0);
++		}
++		if (!reported) {
++			reported = true;
++			gpu_report_rail("first client submission");
++		}
++		if (wake && hfi_gmu != 0) {
++			(void)gpu_gx_rail_on(hfi_gmu);
++			(void)gpu_sptprac_on(hfi_gmu);
++		}
++	}
+ 	for (unsigned i = 0; i < count; i++) {
+ 		gpu_ring_emit(gpu_blob + GPU_CP_RING, gpu_pkt7(GPU_CP_INDIRECT_BUFFER_PFE, 3));
+ 		gpu_ring_emit(gpu_blob + GPU_CP_RING, (uint32_t)ib_iova[i]);
