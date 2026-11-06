@@ -12,7 +12,7 @@
 +	 * to the call that removed it.
 +	 */
 +	if (size >= 0x100000u) {
-+		IOLog("SWEET GPU: unmap %#llx+%llu\n", (unsigned long long)iova,
++		printf("SWEET GPU: unmap %#llx+%llu\n", (unsigned long long)iova,
 +		    (unsigned long long)size);
 +	}
  	for (uint64_t o = 0; o < size; o += 0x1000) {
