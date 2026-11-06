@@ -3975,3 +3975,1801 @@ move is to go back to an image whose journal was never initialised:
 So: keep writing files with the Linux `hfsplus` driver only on a volume whose journal is uninitialised,
 and never derive a working image from one that came back from iOS dirty - the readback → fsck route is
 a trap, not a shortcut.
+
+### 2026-10-29: next5 boots clean, SpringBoard gets a Metal device, and the page-table pool runs out
+
+`ios16-root-next5.img` (built on `base.img`, 12.2 GB sparse, flashed in 6m19s) is the first image with
+all three properties at once, confirmed in `sweetlog-panic5.txt`:
+
+- `Runtime corruption` **0**, `BlockMarkFreeInternal` **0** - the volume is healthy;
+- `SWEET BUNDLE: BGMTLDevice +load` in **backboardd (pid 57) and in SpringBoard (pid 27)**, each with a
+  real `-initWithAcceleratorPort:` port and a `BGMTLDevice` returned;
+- `Metal failed to build render pipeline` **0** and `CRASH backboardd` **0** - the 551 entry fixed it.
+
+QuartzCore now renders through our device - its surfaces come back as `fmt 0x62336138` (`b3a8`, the
+10-bit wide-colour layout, 2 planes, bpr 4544), so the XR stand-ins are being used as intended. Then
+the machine panicked in **our** code:
+
+```
+SWEET GPU: no page table for 0x88202000
+panic(cpu 6 caller ...): SWEET DIAG: mapGem page 86 of 256: iova 0x800a0000 pa 0x103c54000 ...
+```
+
+Two problems, both ours:
+
+1. `GPU_PTE_TABLES` was **64** (`0159`): 64 L3 tables × 2 MiB = 128 MiB mappable, while
+   `GPU_VA_BYTES` is 1 GiB and QuartzCore spreads buffers across all of it - the pool ran out at chunk
+   17 (`0x88202000 >> 21`). Now **512** tables covering every 2 MiB chunk of 1 GiB, and the
+   `sweetfw3` blob grows 256 KiB → 2 MiB in `tools/build-fajita.sh` (boot image 59.6 → 61.4 MB, still
+   inside the 64 MiB partition).
+2. `0163` turned a mapping failure into `panic()` for diagnosis. A client asking for more than we can
+   map has to get `kIOReturnNoSpace`; both panics are now `IOLog`s.
+
+Committed as `gpu: 512 page tables (the whole 1 GiB VA) and no panic when mapping fails`; the CI run
+builds the kernel, then the next `boot_a` is that kernel with `ARENA_MIB=40`, `metalplugin=1`, no
+`rootrw` and the sampler - the root image needs no change at all.
+
+### 2026-10-29: a diff flash is only valid before the next iOS boot (and DumpPanic had to go)
+
+`next6-diff.simg` (restored `DumpPanic.orig`, removed the `org.sweet.*` test daemons) was flashed over
+a device that had **already booted iOS twice since the full flash**, and the volume stopped mounting:
+
+```
+hfs_swap_HFSPlusBTInternalNode: catalog key #26 invalid length (0)
+hfs_mounthfsplus: cat_idlookup returned (5) getting rootfolder
+cannot mount root, errno = 19
+```
+
+The B-tree catalog was damaged, not merely dirty (`Runtime corruption` was 0 in those boots, so nothing
+had complained before). Cause: the diff is computed against the last image we flashed, and that is only
+what the partition holds **until the first boot afterwards**. iOS and HFS write to the volume even with a
+read-only root (volume header, journal bookkeeping, and anything launchd does), so a diff taken after a
+boot patches a catalog whose surrounding state has moved - the patch itself is faithful, the base is not.
+
+**Rule:** `sparsediff` + `fastboot flash userdata` is only safe immediately after a full flash of the
+same image, with no iOS boot in between. After any boot, a change needs a full flash (`img2simg` 2 min +
+flash 6 min) or a fresh readback of the partition to use as `OLD`.
+
+Same boot also explained the "userspace panic" from the previous attempt (see the photo): the reason
+string came from userspace, named `/usr/libexec/DumpPanic`, and the ring showed why it kept running:
+
+```
+SWEET GPU: bo: 16384 bytes do not fit the 40960 KiB arena (41943040 used)
+GPU TEST: FAIL
+exec bgmtl-adddev
+```
+
+That file is our old chardev test (replaced on Oct 27, original kept as `DumpPanic.orig`), it runs at
+every boot, and it filled the whole 40 MiB arena before the real clients got to it. `next6` restores the
+original `DumpPanic` and deletes the `org.sweet.gputest` / `org.sweet.iokittletest` daemons, so the arena
+belongs to backboardd and SpringBoard, which is what the Metal plugin path needs.
+
+### 2026-10-29 (late): the GPU chain works end to end; the black screen is SpringBoard, not Metal
+
+After `next6` (full flash) + `console115-ptes.img` the kernel side is clean: no `no page table`, no
+`mapGem ... failed`, no panics, `Runtime corruption` 0. The ring shows, in one boot:
+
+```
+IOK backboardd: matching IOAcceleratorES -> 1 found
+|backboardd| SWEET BUNDLE: -initWithAcceleratorPort: port 34055 -> BGMTLDevice
+SWEET ADRENO: submitqueue_new flags 0 prio 0
+SWEET SURF: backboardd create id 2 1125x2436 fmt 0x62336138 bpe 4 bpr 4544 planes 2 ...
+SWEET FB: display on
+SWEET FB: swap 1 layer 0 surface 2 1125x2436 fmt 0x62336138 ...
+SWEET FB: swap 3 / 4 / 5 ...
+```
+
+So the whole chain - Metal plugin, device, submitqueue, arena BOs, IOSurface composition, panel swap -
+works in backboardd. **Five swaps and then nothing**, even when the screen is touched.
+
+The sampler with `sweetsample=SpringBoard` (`console117-sbonly.img`) gives SpringBoard's main thread in
+one sample (boot span 3m19s):
+
+```
+SMP SpringBoard t0 pc 0x1f9fb1030 lr 0x1f9fc2b18 bt 0x1f9fc2db8 0x1f9fb1524 0x1c5667ad4 ...
+SMP SpringBoard t1..t3 pc 0x1f9fb14f0 lr 0x20953ac1c      (idle, mach_msg)
+SMP SpringBoard t4 pc 0x0
+```
+
+`t0` sits at 0x1f9fb1030, i.e. inside the same library that the idle threads wait in
+(0x1f9fb14f0), but with a 14-frame stack above it - a wait inside a framework call, not a dead
+spin. SpringBoard **never** matches `IOAcceleratorES` in this boot (`did SpringBoard reach the
+accelerator: nothing`), so the compositor never gets any content to composite: the four swaps are
+backboardd presenting empty layers. That is the black screen.
+
+What SpringBoard does do, per the IOKit trace, is repeat its device-tree probing:
+
+```
+IOK SpringBoard: path IODeviceTree:/product   -> IOPlatformDevice    (x13)
+IOK SpringBoard: path IODeviceTree:/arm-io    -> IOPlatformDevice    (x13)
+IOK SpringBoard: path IODeviceTree:/arm-io/pearl-sep -> none
+```
+
+`/product` and `/arm-io` looked up a dozen times each, then `/arm-io/pearl-sep` -> **none**. Pearl is
+Face ID/SEP; this port has no SEP at all (`init_data_protection: No SEP present on this device`). The
+shape is a retry loop around hardware-capability probing, and the main thread ends parked. So the UI is
+blocked on a *hardware/SEP-shaped* probe, not on GPU work - the same thing it would have hit before any
+of today's Metal changes.
+
+### 2026-10-29 (late 2): symbolicated - SpringBoard waits on backboardd through FrontBoard/BKS
+
+The host cannot guess the dyld shared cache slide (2710 modules cover the range densely, so 6562
+slide candidates "resolve" every address - the first attempt happily produced ConversationKit/WebCore
+frames with offsets larger than the modules). What pinned it:
+
+- the cache header gives `sharedRegionStart = 0x180000000`, `maxSlide = 0x55214000`, and
+  `image_text_info` (offset 136/count 144, 32 bytes each: uuid, loadAddress, textSegmentSize,
+  pathOffset) gives every module's range and path - the image list itself is at `0x270` (2710 entries);
+- the idle threads give a *known* pair: `pc 0x1f9fb14f0` in `libsystem_kernel.dylib` (`__psynch_cvwait`)
+  and `lr 0x20953ac1c` in `libsystem_pthread.dylib` (`_pthread_cond_wait`). Only four 16 KiB-aligned
+  slides satisfy that pair, and the largest one (`0x379a0000`) is exactly the slide the sampler printed
+  for SpringBoard - so the shared cache slide is the process slide here.
+
+With slide `0x379a0000` the t0 stack is coherent, every offset inside its own module:
+
+```
+pc    libsystem_kernel   +0x1030      bt07  FrontBoard        +0x37a4c
+lr    libsystem_kernel   +0x12b18     bt08  FrontBoard        +0x37db8
+bt01  libsystem_kernel   +0x1524      bt09  libdispatch       +0x64780
+bt02  BackBoardServices  +0x9ad4      bt10  libdispatch       +0x34ddc
+bt03  BackBoardServices  +0xc590      bt11  FrontBoard        +0x37d8c
+bt04  BackBoardServices  +0xd374      bt12  FrontBoard        +0x5c190
+bt05  BackBoardServices  +0x3b040     bt13  SpringBoard       +0x9b5c8
+bt06  BackBoardServices  +0x3a37c     bt14  dyld              +0x14344
+```
+
+So SpringBoard's `main` (bt13/bt14) calls FrontBoard -> BackBoardServices and blocks in a kernel wait
+(mach/semaphore) inside BKS: it is waiting for a reply from backboardd, not for the GPU. The ring also
+shows backboardd never called IOMFB selector **72** (`EnableNotifications`), i.e. it never subscribed to
+our vsync notifications, and it stops after 5 swaps. Both sides are idle - a userland handshake that
+never completes, most likely the display/render-server connect.
+
+`console118-pair.img` (same kernel, `sweetsample=SpringBoard,backboardd`) samples both processes in the
+same instant to show which side owes the reply.
+
+That paired sample (slide `0x134d0000` this boot, derived the same way) says it is **not** a SpringBoard
+-> backboardd reply that is missing:
+
+- **backboardd t0** waits in `libsystem_kernel +0x1030` called from **CoreFoundation**
+  `CFRunLoop` (+0x74148, +0x752e0, +0x79d20) and then its own `main` - i.e. backboardd is **idle in its
+  run loop, healthy**, waiting for events like any working window server;
+- **SpringBoard t0** waits in `libsystem_kernel +0x1ad0`, called from **`libsystem_platform +0x7140`**
+  (an `os_unfair_lock` wait), above that **CoreServices** (+0xb57b8, +0x1cbc0, +0xe2238, +0xbbb8,
+  +0xbb20) and **ControlCenterServices** (+0x9c64 ... +0x8b38) through **libdispatch**;
+- **SpringBoard t2** is an ordinary worker parked in `libdispatch`/`libxpc`/`Foundation`.
+
+So SpringBoard's main thread sits on a **lock inside CoreServices/ControlCenterServices** early in its
+launch (a different blockage than the previous boot's BackBoardServices/FrontBoard wait, i.e. the exact
+spot moves), while the window server is fine. No sandbox denial names SpringBoard, and SpringBoard never
+matches `IOAcceleratorES` in either boot - it never gets far enough to ask for a renderer.
+
+**Conclusion:** the GPU/Metal/panel chain is done as far as the kernel and one process can take it, and
+the black screen is a SpringBoard bring-up problem of this port (LaunchServices/CoreServices init,
+probably a missing or unresponsive service), not a GPU problem. That is where the next work has to go.
+
+### 2026-10-29 (late 3): named at last - SpringBoard waits on `lsd` through LaunchServices
+
+Symbol names came from `/System/Library/Caches/com.apple.dyld/dyld_shared_cache_arm64.symbols`
+(592 MB, a full `dyld_cache_header` whose local-symbol blob at `localSymbolsOffset` holds **8.7M**
+`nlist_64` entries plus 451 MB of strings, keyed by unslid address - no export-trie parsing needed):
+
+```
+SB t0 (main)  __os_unfair_lock_lock_slow
+              _LSContextInitCommon                     (libsystem_platform -> CoreServices)
+              _LSContextInitWithOptions
+              LaunchServices::Database::Context::_get
+              -[LSApplicationRecord _initWithNode:...]
+              -[LSApplicationRecord initWithBundleIdentifier:allowPlaceholder:error:]
+              -[CCSModuleRepository _queue_filterModuleMetadataByAssociatedBundleAvailability:]
+              (ControlCenterServices, via libdispatch)
+
+SB t2         __dispatch_mach_send_and_wait_for_reply   (a synchronous XPC wait)
+              -[NSXPCConnection _sendSelector:withProxy:arg1:]
+              __LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__
+              _LSCopyServerStore -> _LSContextInitCommon
+```
+
+So the main thread spins on the LaunchServices context lock, `t2` holds it while waiting for a
+**synchronous XPC reply from `lsd`** - and `lsd` never answers. ControlCenterServices is the caller that
+walks every module's bundle identifier, which is why the UI never gets past early `main`.
+
+`lsd` does start (`exec lsd`, AppleKeyStore selectors 0/7), and so do `distnoted`, `cfprefsd`,
+`containermanagerd`, `runningboardd`, `backboardd`, `mediaserverd`, `powerd`, `configd`. Sandbox denials
+are irrelevant here: `0050` only fails ops 4/5/6/0x43 (container paths, extension tokens) and its
+`SWEET Sandbox: <proc> op <n>` lines are first-use logging, not refusals.
+
+`console119-lsd.img` (same kernel, `sweetsample=lsd`) samples `lsd` itself to see what *it* is waiting on
+- the likely suspect being its database in `/private/var/...` on a **read-only root**, which is also why
+`rootrw=1` boots are worth re-testing once the chain is understood.
+
+### 2026-10-29 (late 4): root cause - `lsd` cannot finish first-boot seeding, so SpringBoard waits
+
+`console119-lsd.img` + the symbols file names every `lsd` thread, and the answer is not the GPU at all:
+
+```
+lsd t0 (main)  dispatch_sync_f_slow -> __DISPATCH_WAIT_FOR_QUEUE__        (a queue that never drains)
+               -[_LSInstallProgressService performJournalRecovery]
+               +[_LSInstallProgressService beginListening]
+               __LSServerCleanEphemeralMobileContainersForFirstBoot_block_invoke
+
+lsd t3         ___LAUNCH_SERVICES_CLIENTS_ARE_WAITING_FOR_THE_DATABASE_TO_FINISH_SEEDING__
+               -[LSDatabaseBlockingFetchClient getServerStoreBlockingWithCompletionHandler:]
+               <- this is the server end of the XPC SpringBoard is blocked on
+
+lsd t1         +[MIInstallationIdentity installationIdentityForBundle:settingIfNotSet:error:]
+               -[MIExecutableBundle installationIdentitySettingIfNotSet:withError:]
+               -[MIInstalledInfoGatherer _populatePlaceholderRecordValues:signingInfo:]
+
+lsd t2         -[_LSInstallProgressService restoreInactiveInstalls]      (dispatch_group_wait)
+```
+
+`t1` is in `InstalledContentLibrary` writing the installation identity for every bundle - the step that
+cannot complete when the root is mounted read-only, which is exactly how `next6` runs. The seeding never
+finishes, `LSDatabaseBlockingFetchClient` never answers, SpringBoard's LaunchServices context lock never
+clears, and the UI never starts. The GPU was never the blocker for the black screen.
+
+`console120-rw.img` is the same kernel with **`rootrw=1`** (writable root) and
+`sweetsample=SpringBoard,lsd` to test that: if `lsd` finishes seeding there, SpringBoard reaches its run
+loop and the Metal device finally has something to draw.
+
+Note the cost of that test: a writable root writes to the volume, so the block-diff shortcut is invalid
+again afterwards (see the rule above) - the next image change needs a full flash or a fresh readback.
+
+### 2026-10-29 (late 5): `rootrw=1` changes nothing - the chain ends in `libMobileGestalt`
+
+Same stacks with a writable root, so the read-only theory is dead. With the symbol cache
+(`~/bin/symcache.py`, built once from `~/ipsw-x/cache-symbols.bin`) every frame has a name:
+
+```
+SpringBoard t0   -[CCSModuleRepository _initWithDirectoryURLs:...]
+                 -> -[LSApplicationRecord initWithBundleIdentifier:allowPlaceholder:error:]
+                 -> LaunchServices::Database::Context::_get -> _LSContextInitCommon
+                 -> __os_unfair_lock_lock_slow                       (waits on the LS context lock)
+SpringBoard t1   _LSDBEnumeratorGetNextObject -> _LSContextInitCommon -> _LSCopyServerStore
+                 -> __LAUNCH_SERVICES_IS_RESEEDING_ITS_DATABASE_AND_MAY_BLOCK__
+                 -> -[NSXPCConnection _sendSelector:...] -> waits for lsd's reply
+lsd t0           __LSServerCleanEphemeralMobileContainersForFirstBoot -> dispatch_once
+                 -> +[_LSInstallProgressService beginListening]
+                 -> -[_LSInstallProgressService performJournalRecovery]
+                 -> dispatch_sync_f_slow -> __DISPATCH_WAIT_FOR_QUEUE__   (a queue that never drains)
+lsd t1           -[MIInstalledInfoGatherer _populatePlaceholderRecordValues:signingInfo:]
+                 -> -[MIExecutableBundle installationIdentitySettingIfNotSet:withError:]
+                 -> +[MIInstallationIdentity installationIdentityForBundle:settingIfNotSet:error:]
+                 -> _GenerateBuiltInAppInstallSessionID
+                 -> **libMobileGestalt** -> dispatch_semaphore_wait_slow     <- the chain ends here
+```
+
+So the single point that never answers is **`libMobileGestalt`**: while `lsd` computes installation
+identities for the first-boot journal recovery, the gestalt answer it waits on never arrives. Everything
+above it - the LaunchServices seeding, the LS context lock, SpringBoard's main thread - follows from that.
+
+The ring shows only two requests to our kernel's gestalt shim in the whole boot
+(`SWEET FB: MobileGestaltHelper sel 8` and `sel 28`), and an `exec MobileGestaltHelper` - so the question
+is what that process (or the gestalt cache file) is doing. `console121-mgh.img`
+(`sweetsample=MobileGestaltHelper`) samples it directly.
+
+That sample came back empty (sampler ran three times, matched nothing) because `MobileGestaltHelper` is
+short-lived - it starts, asks our `AppleCLCD` for the display size and dot pitch (selectors 8 and 28, the
+two lines above), and is gone again by the 90 s mark. No crash is logged.
+
+What *is* missing is the cache it is supposed to leave behind: the image has no
+`/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache` (the SystemGroup
+directory exists and is **empty**) and no `com.apple.MobileGestalt.plist` anywhere, so every
+`libMobileGestalt` client has to ask the helper on every answer. That is where the port stands: the GPU is
+done, and the UI waits on MobileGestalt.
+
+### 2026-10-30: without the Metal plugin SpringBoard comes up and draws - the plugin is what breaks it
+
+`console122-nometal.img` (`sweetaccel=0`, no `metalplugin` - no `IOAcceleratorES` service at all) gave a
+**healthy SpringBoard**: 12 threads, all samples in ordinary waits, and it actually creates surfaces
+(`SWEET SURF: SpringBoard create id 4..9`, 272x184 / 312x202 / 230x186 / 105x144, `'LA08'` and BGRA), with
+`SWEET FB: display on`. No panics, no corruption, `CRASH SpringBoard` 0. So the compositor/panel path
+works and the UI bring-up only fails **when the accelerator service/plugin is in play** - which is why the
+LaunchServices/MobileGestalt chains above are a symptom, not the cause.
+
+That test changed two things at once, so `console123-stub.img` keeps `IOAcceleratorES` published but
+leaves the plugin as the declining `SweetMetalProbe` (`metalplugin` absent, `sweetaccel` default):
+UI up -> the service is harmless and `BGMTLDevice` is the trigger; UI stuck -> the mere presence of the
+service is enough and the question moves to what CA does with it.
+
+What the plugin does that the stub does not, all inside **backboardd**: `-initWithAcceleratorPort:` ->
+`rwa_device_open` -> `/dev/sweetgpu` open, submitqueue_new, arena BOs, `rwa_texture_from_surface` for
+every CA IOSurface, and QuartzCore's `default.metallib` AIR. Any of those holding an IOKit lock long
+enough would explain a MobileGestaltHelper that never returns (it queries `AppleCLCD` selectors 8 and 28
+for display size and dot pitch), and with it `libMobileGestalt`, `lsd`, LaunchServices and SpringBoard.
+
+### 2026-10-30: MILESTONE - the UI is on screen (CPU rendering); only `BGMTLDevice` breaks it
+
+`console123-stub.img` (accelerator service published, plugin = declining `SweetMetalProbe`) **booted to a
+working SpringBoard**: the screen shows the home screen, SpringBoard has 12 threads all in ordinary waits,
+and the ring shows the whole path:
+
+```
+IOK SpringBoard: matching1 AGXAccelerator -> none
+IOK SpringBoard: matching  IOAcceleratorES -> 1 found      <- CA finds our accelerator
+... plugin declines, so CA falls back to CPU rendering ...
+SWEET SURF: SpringBoard create id 4 272x184 fmt 'BGRA' ...
+SWEET SURF: SpringBoard create id 5..9  fmt 'LA08' ...
+SWEET FB: display on
+```
+
+So: **"without Metal" == the accelerator service alone is harmless, and `BGMTLDevice` (the real plugin) is
+what stops the boot.** Everything below the plugin - IOSurface, composition, panel swaps, the framebuffer -
+works, and our kernel's GPU/Metal work is verified from the earlier boots.
+
+Working baseline to return to at any time: `console123-stub.img` on `boot_a` + `next6` on `userdata`.
+(`console122-nometal.img` = the same UI with `sweetaccel=0`.)
+
+**Most likely mechanism**: with the real plugin, backboardd's `-initWithAcceleratorPort:` runs
+`rwa_device_open` + `submitqueue_new` + arena BOs + `rwa_texture_from_surface` for every CA surface + the
+QuartzCore AIR, and `MobileGestaltHelper` (which asks `AppleCLCD` for selectors 8 and 28) never gets its
+answer - so `libMobileGestalt`, `lsd`, LaunchServices and SpringBoard's early init all stall. That is a
+lock held too long in our GPU path, not a missing feature.
+
+**Next experiment (userland only, no kernel change)**: make the device lazy - patch `bgmtl.m` so
+`-initWithAcceleratorPort:` does *not* call `rwa_device_open`, and instead open on first use through the
+existing `-rwa` accessor. All GPU work then happens after boot settles, which should keep
+MobileGestaltHelper out of the window where our plugin holds the IOKit lock. If that boots with a Metal
+device, the UI gets GPU acceleration with no further kernel work.
+
+That change is implemented (`Chlorophyll/src/bgmtl.m`, original kept as `bgmtl.m.orig-lazy`; a `BOOL
+_lazyOpen` ivar, `-initWithAcceleratorPort:` only marks it, `-rwa` opens and logs
+`rwa_device_open (lazy)`, and `-name` / the render+compute pipeline paths go through `[self rwa]`). The
+bundle was rebuilt (the strings `GPU opens on first use` and `rwa_device_open (lazy)` are in it) and
+installed into `ios16-root-next7.img` (fsck OK), flashed with `boot_a` = `console124-lazymetal.img`
+(kernel unchanged, `metalplugin=1`, `sweetsample=SpringBoard,lsd`). If it still stalls, put
+`console123-stub.img` back - that is the known-good UI boot.
+
+### 2026-10-30 (late): lazy open does not help; the difference is *when* the GPU appears
+
+`console124-lazymetal.img` + `next7` (bundle with the lazy open) booted, and the lazy path worked
+mechanically - `device created, GPU opens on first use` at plugin init, then `rwa_device_open (lazy):
+FD630`, submitqueue, arena BOs, QuartzCore AIR, blits - but **the screen stayed black** and the stacks
+are the same as before:
+
+```
+lsd t0   -[_LSInstallProgressService performJournalRecovery] -> dispatch_sync -> WAIT_FOR_QUEUE
+lsd t1   MIInstallationIdentity -> _GenerateBuiltInAppInstallSessionID
+         -> libMobileGestalt -> dispatch_semaphore_wait_slow
+SB  t0   CCSModuleRepository -> LSApplicationRecord -> _LSContextInitCommon -> os_unfair_lock
+SB  t1   _LSCopyServerStore -> NSXPC sync -> waits for lsd
+```
+
+The working boot (stub, CPU rendering) differs in exactly one way: **`lsd` had already finished**
+`performJournalRecovery` (its main thread was in the normal loop and t1 was idle). So the plugin does not
+break a lock - it stops `lsd`'s first-boot seeding from completing, and SpringBoard waits on the LS
+context lock that seeding holds.
+
+Two hypotheses were eliminated with the ring: `MobileGestaltHelper` answers the framebuffer selectors
+8/28 *before* the plugin loads in both boots, and neither a jetsam nor a helper crash appears (the only
+difference in crash lists is `PosterBoard`, which crashes in the *working* boot because it cannot get a
+Metal device). Our `AppleCLCD` getters for 8/28 do not take `fLock`, so the framebuffer lock is not it
+either.
+
+**Practical idea worth trying next (userland only)**: a warm-up guard in the bundle - return nil from
+`-initWithAcceleratorPort:` while `mach_absolute_time()` says the machine is younger than ~120 s. Then
+CoreAnimation gets no device during boot (the CPU renderer that we know works, and `lsd` seeds normally),
+while any client that asks later - our test tool, an app - gets the real device. That both confirms the
+timing theory and gives a bootable system that still has Metal for testing.
+
+Implemented as such (`clock_gettime(CLOCK_MONOTONIC)` < 120 s -> `BG_LOG("declining: system is %ld s old
+(warm-up guard)")` and `return nil`, otherwise the lazy device), rebuilt into `SweetBGMTL.bundle`
+(strings `warm-up guard` and `declining: system is %ld s old` verified), installed into
+`ios16-root-next8.img` (fsck OK, `next8.simg` 12.16 GB) and flashed with `boot_a` =
+`console125-guard.img`. Expected log on a good boot: the guard line from backboardd during CA setup, no
+`rwa_device_open`, `SWEET SURF: SpringBoard create` and a visible home screen; a client asking after two
+minutes should get `rwa_device_open (lazy): FD630`.
+
+### 2026-10-30: warm-up guard works - UI on screen AND a real Metal device in SpringBoard
+
+`next8` + `console125-guard.img` booted to a **visible, updating home screen** with no panics, and the ring
+shows exactly the intended sequence:
+
+```
+|backboardd| declining: system is 16 s old (warm-up guard)      <- CA gets no device during boot
+|SpringBoard| SWEET BUNDLE: BGMTLDevice +load in SpringBoard pid 27
+|SpringBoard| device created at 847 s, GPU opens on first use
+|SpringBoard| rwa_device_open (lazy): FD630                    <- the GPU really opens later
+SWEET ADRENO: submitqueue_new flags 0 prio 0                   (SpringBoard)
+SWEET SURF: SpringBoard create id 10..15 1125x2436 fmt 'b3a8' planes 2   <- GPU-style surfaces
+SWEET FB: swap 10 .. swap 33 ...                               <- the panel keeps being updated
+```
+
+So: the boot-time stall was a *timing* problem after all. Declining the device for the first two minutes
+lets `lsd` finish its first-boot LaunchServices seeding, SpringBoard reaches its run loop, and CA queries
+again later (847 s here, i.e. on user interaction) and gets a working device - `rwa_device_open: FD630`,
+submitqueues, 10-bit surfaces.
+
+What is still CPU: backboardd declined at 16 s and keeps compositing with the CPU renderer (its panel
+surfaces are `'BGRA'` 8-bit). The next lever for GPU compositing is to make backboardd re-query after the
+guard - the obvious way is a launchd job that runs `launchctl kickstart -k system/com.apple.backboardd`
+at ~150 s, so it restarts after the guard has opened and picks the GPU renderer (brief flicker expected).
+
+Artifacts: `~/ipsw-x/ios16-root-next8.img` (`next8.simg`), `boot_a` = `console125-guard.img`
+(sha256 `e65c9c2e…`). This is now the best-known configuration - UI up *and* Metal available.
+
+### 2026-10-30: next9 - restart backboardd after the guard (GPU compositing)
+
+`ios16-root-next9.img` is `next8` plus `System/Library/LaunchDaemons/org.sweet.fbkick.plist`, whose
+program is `/bin/sh -c "sleep 150; /bin/launchctl kickstart -k system/com.apple.backboardd"`. After the
+guard window the window server comes back and should pick CoreAnimation's Metal renderer instead of the
+CPU one it chose at boot (the guard logged `declining: system is 16 s old` in backboardd). Expected on a
+good boot: a brief flicker at ~150 s, then `rwa_device_open (lazy)` from **backboardd**, `SWEET SURF:
+backboardd create ... 'b3a8'`, and the panel swaps carrying 10-bit surfaces. `boot_a` stays
+`console125-guard.img`.
+
+**Operational lesson (cost us an hour):** `C:` filled to **0 bytes** and everything looked like a WSL
+fault - `Wsl/Service/CreateInstance/E_FAIL`, `WSL_E_DISK_CORRUPTED`, `img2simg: file_write: write: Bad
+address` (EFAULT) and `cp: Input/output error` on the drvfs copy. Always check `Get-PSDrive C` first when
+WSL or a copy starts failing; keeping several 12 GB sparse images in `fajita-flash` is what filled it
+(now cleaned: `next8.simg` + `next9.simg` only). The Linux side keeps only `ios16-root-gpu.base.img`,
+`next8.img` and `next9.img` (811 GB free).
+
+### 2026-10-30: the launchd restart job cannot use a shell - this image has no /bin/sh
+
+`next9` booted fine (UI up, `declining: system is 17 s old`, SpringBoard later got the device at 847 s and
+opened `FD630`), but our `org.sweet.fbkick` job never ran and the ring has **no trace of it at all**.
+Reason: the image has **no `/bin/sh`, no `/usr/bin/launchctl` and no `sleep`** - `/bin` holds only `df`
+and `ps`, `/usr/bin` a short list (`afktool`, `sysdiagnose`, `tailspin`, ...). launchd could not exec the
+program, and backboardd stayed on the CPU renderer (`SWEET SURF: backboardd create ... 'BGRA'`).
+
+The job is now a real binary: `tools/sweet-fbkick.c` (built by the recipe in
+`tools/build-next10.sh` with `clang --target=arm64-apple-ios16.0 -fuse-ld=lld -Wl,-adhoc_codesign`),
+installed as `/usr/local/bin/sweet-fbkick` with a launchd job that runs it with the argument `150`; it
+sleeps, looks backboardd up in `sysctl KERN_PROC_ALL` and `SIGKILL`s it, so launchd starts a fresh window
+server after the guard has expired. It logs `SWEET FBKICK: ...` to `/dev/console`.
+`ios16-root-next10.img` / `next10.simg` (sha256 `aa419c3a…`) carries both, fsck OK; `boot_a` unchanged
+(`console125-guard.img`). Expected: UI at ~40 s, a flicker at ~150 s, then `SWEET FBKICK: killing
+backboardd pid ...`, a new `exec backboardd`, `rwa_device_open (lazy)` **from backboardd** and
+`SWEET SURF: backboardd create ... 'b3a8'`.
+
+Result: **black screen**. What the ring actually shows:
+
+```
+|backboardd| declining: system is 17 s old (warm-up guard)     (boot, CPU renderer)
+|backboardd| device created at 210 s, GPU opens on first use
+|backboardd| rwa_device_open (lazy): FD630                    <- the window server DID get the GPU
+SWEET SURF: backboardd create id 2/3 1125x2436 fmt 0x62336138 ('b3a8') planes 2
+SWEET FB: swap 1 .. swap 7 ...                                <- then swaps stop
+```
+
+So GPU compositing works as far as producing frames, but **our present path cannot show `'b3a8'`
+(10-bit, 2-plane) content**: `AppleCLCD::swap` copies rows only when `bytesPerElement == 4` and
+`elementWidth/Height == 1`, and even then it would copy raw 10-bit words into the 8-bit BGRA panel. The
+display stays black and the compositor stops swapping after a handful of frames.
+
+`SWEET FBKICK` never appears in the ring either - the launchd job still did not run (the restart at 210 s
+came from CoreAnimation re-querying on its own, not from our helper). Worth checking whether launchd in
+this port loads jobs whose program lives in `/usr/local/bin` at all.
+
+**Next step for GPU compositing** (kernel, one patch + CI): teach `AppleCLCD::swap` to convert the
+`'b3a8'` 10-bit layout to the panel's 8-bit BGRA (per-pixel: `r = (v >> 20) & 0x3ff`, `g = (v >> 10) &
+0x3ff`, `b = v & 0x3ff`, then `>> 2`), and to use plane 0 when `planeCount == 2`. The alternative is to
+make CoreAnimation pick 8-bit `'BGRA'` surfaces even with the GPU renderer (a display-capability property
+in our IOMFB), which would keep the existing copy path.
+
+The known-good configuration was restored afterwards (`next8` + `console125-guard.img`): UI up with the
+CPU compositor and a live Metal device in SpringBoard.
+
+### 2026-10-31: what HakiOS (the sibling port) gives us, and the two fixes it points at
+
+`github.com/oosexgang/hakios-xnu-kernel` (XNU on a POCO X5 Pro, Adreno 642L; 2k stars, active) and
+`github.com/oosexgang/hakios-metal` were read on 2026-10-31. What matters for this port:
+
+- **Their UI is drawn by the Adreno through OpenGL ES (Mesa), not Metal.** Metal in their port is
+  "partly: a device that Metal loads; buffers and libraries; nothing drawn" - the same place we are, and
+  they say the remaining wall for CoreAnimation is a `.metallib` that their image lacks. **We are past
+  that wall** (our QuartzCore `default.metallib` loads). So: finishing Metal is our shortest path, with
+  GLES as the plan B they already proved.
+- **They keep `/private/var` on its own HFS+ volume** (`tools/userdata-carve.py`, `tools/mkdatavol.py`,
+  a `darwin` partition, journal replay, `/private/var` kept across starts). Our missing/writable
+  container tree is exactly what stalls `lsd` (`MIInstallationIdentity -> libMobileGestalt`) at boot and
+  what the 120 s warm-up guard works around.
+- Their `docs/metal-plan.md` lists the same Metal device requirements we found (`MTLDevice` +
+  `MTLDeviceSPI`, `-setCompletionQueue:`, `-setGPUPriority:`, `CIMetalDeviceGetLimits`), and a cleaner
+  switch than our guard: `metal=N` (1 = test only, 2 = all but the window server, 3 = everyone) plus a
+  `.clients` file beside the bundle.
+- `hakios-metal` (C++, 5 commits) brings a checked `.metallib` reader (thin + universal, every offset)
+  and blits through `CP_MEMCPY`/`CP_MEM_WRITE` with a fake-GPU packet interpreter for tests - useful
+  pieces, but their shader path is behind ours (AIR -> NIR -> ir3 is not wired to their device).
+
+**Work started from this:**
+
+1. `0176-fajita-present-10bit-surfaces.patch` - the panel fix: `AppleCLCD::swap` converts `'b3a8'`
+   (30-bit colour, alpha plane) to 8-bit BGRA instead of copying the words raw, which is why the screen
+   goes black as soon as CoreAnimation's Metal renderer takes over. Generated from `xnu-clean` + `0167`
+   + `0175`, dry-run clean, `check-hunk-counts` 176/176. CI builds it.
+2. `ios16-root-next11.img` - the image-side half of the boot fix: the
+   `systemgroup.com.apple.mobilegestaltcache` container tree (plus `mobile/Library/{Caches,Preferences}`,
+   `root/Library/Caches`, `tmp`, `run`, `log`) so `lsd`/MobileGestalt have somewhere to write, and the
+   bundle rebuilt **without the warm-up guard** (lazy open only). fsck OK; `next11.simg` is sparsified
+   for a full flash.
+3. The boot image for that test is `metalplugin=1` **with `rootrw=1`** (the writes need it) and the
+   sampler on `SpringBoard,lsd,backboardd`.
+
+If it boots with a visible UI and correct colours, the guard and the black screen are both gone and the
+GPU compositor is real. If it does not, `console123-stub.img` is still the stable UI fallback.
+
+### 2026-10-31: flash folder reorganised, images verified
+
+`%USERPROFILE%\fajita-flash` now holds only what is needed (134 obsolete `console*.img` deleted, `C:`
+36 GB free) and a `README.txt` with the recipes:
+
+| file | sha256 (16) | what |
+|---|---|---|
+| `next11.simg` | `f7dc9716cc7ff8e4` | 16 GiB sparse, root with the MobileGestalt `/private/var` tree and the bundle **without** the guard |
+| `next8.simg` | `259cf6dd81113a44` | the known-good UI root (bundle with the 120 s guard) - fallback |
+| `console126-10bit.img` | `6a23596bb25932e5` | `boot_a` for `next11`: kernel with `0176` (10-bit `'b3a8'` -> BGRA8), `metalplugin=1`, `rootrw=1`, sampler |
+| `console123-stub.img` | `670523a5950e0068` | `boot_a` for the stable UI (declining stub, CPU compositor) |
+| `console125-guard.img` | `e65c9c2e6190fe73` | the guard-era boot image, kept for comparison |
+| `orangefox-fajita.img`, `twrp-fajita.img`, `fajita.adt` | | recovery for log pulls, ADT for the build script |
+
+Both sparse images were checked (magic `0xed26ff3a`, block 4096, 4194304 blocks = 16 GiB). On the Linux
+side only `ios16-root-gpu.base.img`, `ios16-root-next8.img`, `ios16-root-next11.img`,
+`ios16-root-next11.simg` and the symbol cache (`cache-symbols.bin`, `cache-main.bin`) are kept;
+816 GB free.
+
+The `next11` + `console126` flash was interrupted by a server restart before it could finish, so the
+phone's `userdata` is in an unknown state - the test has to be flashed again from scratch.
+
+**Order matters when flashing:** this device's USB session dies right after the ~6.5 minute `userdata`
+write (`AdbWriteEndpointSync failed: Urządzenie nie rozpoznaje polecenia. (22)`), so a script that flashes
+`userdata` first and `boot_a` second leaves a new root under an old kernel - which happened three times.
+`~/AppData/Local/Temp/opencode/flash-pair.sh ROOT.simg BOOT.img` now flashes **`boot_a` first** (2 s),
+then the root, with retries; `flash-boota-only.sh BOOT.img` fixes the state after a dropped session.
+
+### 2026-10-31: the container tree alone does not unblock `lsd`, and a rebuilt cmdline is a trap
+
+Two results from the `next11` root (`/private/var` container tree, bundle **without** the guard):
+
+1. **The directories are not the fix.** `lsd` stalls in exactly the same place
+   (`-[_LSInstallProgressService performJournalRecovery]` -> `dispatch_sync` -> `DISPATCH_WAIT_FOR_QUEUE`,
+   its worker in `MIInstallationIdentity -> libMobileGestalt -> dispatch_semaphore_wait`), SpringBoard's
+   main thread on the LS context lock, so nothing is drawn. Creating
+   `systemgroup.com.apple.mobilegestaltcache` and the `mobile/Library` caches is necessary at best, not
+   sufficient - the answer has to come from a *real* data volume (HakiOS's `darwin` volume) or from a
+   MobileGestalt cache that actually holds answers.
+2. **A rebuilt command line must keep `adreno=9`.** After `/tmp` was wiped, the baseline was re-typed from
+   `tools/build-fajita.sh`'s default, which does **not** carry the GPU bring-up flags. The result was
+   spectacular and misleading: `|backboardd| rwa_device_open (lazy): there is no GPU here: no msm device
+   to open`, then **92** backboardd crashes (`sig 11 ... far 0x8`) in a loop, no display, no swaps. With
+   `adreno=9 zap=1 gpuhold=1` back, the plugin opens `FD630` and backboardd swaps `'b3a8'` frames again.
+   The full baseline lives in `tools/build-fajita.sh` line 51; every extra flag is appended to it, never
+   retyped.
+
+Also learned: with no GPU the plugin must **decline** (`-initWithAcceleratorPort:` returning nil) instead
+of handing CoreAnimation a device that cannot open the GPU - that is what turned a missing boot argument
+into a crash loop. `bgmtl_gpu_state()` answers that question without opening anything, and the bundle
+should use it at init.
+
+**The 120 s guard is a race, and lost one:** `console127` + `next8` (guard bundle, 10-bit kernel) booted
+with no `declining` line at all - CA asked at **162 s** on that slow boot, got the device, took the Metal
+renderer, `lsd` stalled in `performJournalRecovery`/`libMobileGestalt` exactly as before, and the screen
+was black with six `'b3a8'` swaps and zero crashes. In a boot that stays on the CPU renderer the same
+`lsd` finishes its seeding in ~90-250 s, so the guard has to outlast that: `next12` is `next8` with the
+guard at **300 s** (`ios16-root-next12.simg`, sha256 `fbde9843…`), to be flashed with
+`console127-gpu10bit.img` (`adreno=9` + the `0176` conversion). With the GPU handed out after the seeding
+is complete, the remaining question is whether the converted frames stay visible - and whether SpringBoard
+still dies once it has a device (`sig 11 far 0xc` seen earlier).
+
+### 2026-10-31/11-01: a time guard cannot win - the plugin now declines for the window server by name
+
+Three boots measured when CoreAnimation first asks for a device: **16 s**, **162 s**, **360 s**. Any fixed
+guard is therefore a lottery: if the guard has expired, CA takes the Metal renderer and `lsd` stalls in
+MobileGestalt (black screen, boot logo); if not, the CPU renderer gives a working UI. `console128` (guard
+300 s, read-only root) still lost, because CA asked at 360 s.
+
+So the bundle now gates by **process name**, which is deterministic (HakiOS's `metal=N` idea):
+`-initWithAcceleratorPort:` returns nil for `backboardd` and `SpringBoard` (they are where CoreAnimation
+lives) and hands the real device to everybody else; `SWEET_CA_GPU=1` in the environment lifts the gate for
+a test. Note the SDK has no `libproc.h`, so the file declares `proc_name()` itself.
+
+`ios16-root-next13.img` = `next8` + that bundle, verified inside the image (binary 165 616 B, strings
+`declining for the window server` and `SWEET_CA_GPU` present), `boot_a` = `console128-ro10bit.img`
+(read-only root, `adreno=9`, `0176` 10-bit conversion). Expected: **UI always**, Metal available to other
+clients, no crash loops. GPU *compositing* stays blocked on the `lsd`/MobileGestalt stall, which needs a
+real data volume (the HakiOS `darwin` volume or a MobileGestalt cache with answers) - that is the next
+project, and it no longer costs a black screen to investigate.
+
+### Disk hygiene: the WSL virtual disk was 282 GB for a 118 GB filesystem
+
+Repeated 17 GiB images had grown `C:\Users\misia\AppData\Local\wsl\{4dd8b08d-…}\ext4.vhdx` to 282 GB,
+and at one point `C:` had **0 bytes free**, which is what made WSL fail with `E_FAIL`/`E_DISK_CORRUPTED`,
+`img2simg` die with `EFAULT` and copies end in `Input/output error`. Fixed by: deleting the superseded
+images inside WSL, `sudo fstrim -av` (831 GiB discarded), then compacting the VHDX with diskpart from an
+elevated shell (`C:\Users\misia\fajita-flash\compact-wsl.ps1` + `compact-wsl-diskpart.txt`, since
+`Optimize-VHD` needs Hyper-V which this machine lacks). Result: **C: 197 GB free**, WSL filesystem 118 GB.
+
+Also: this host has 7.4 GB of RAM and was down to **0.8 GB free**, which alone makes WSL time out
+(`WSAETIMEDOUT`) and builds fail - worth closing applications before a build or a flash.
+
+### 2026-11-02: HakiOS's Metal guide, and what it changes
+
+Read `https://hackios-web.vercel.app/en/guide/metal` (same material as `docs/metal-plan.md`). Two facts:
+
+- **Their SpringBoard does not draw through Metal either.** "the system drawing its UI through Metal -
+  **not yet**: it draws through OpenGL ES today". Their visible acceleration is Mesa's freedreno GLES.
+  Their Metal work has queues, buffers, blits and `.metallib` reading but **no shaders, pipelines or
+  textures yet**, so it cannot composite anything.
+- **Their warning is our measurement**: "a Metal device that cannot draw yet makes the window server ask
+  for it, fail, and restart in a loop. Until shaders work, keep `metal=` at 1 or 2", where `metal=2` is
+  every process *except the window server*. Our process-name gate in the bundle is the same policy - so
+  our approach is validated by them, and the "device without a GPU causes a 92-crash loop" incident is
+  exactly the failure they warn about.
+
+So our Metal path is **ahead of theirs** (we load QuartzCore's `default.metallib`, compile AIR through
+`libbgair`, blit, and CoreAnimation has taken our device and composited), and the remaining blocker is not
+Metal features but the **boot-time interaction**: with `IOAcceleratorES` published at boot, `lsd` stalls
+in MobileGestalt; with the service absent (`sweetaccel=0`) the UI comes up. The GLES route they took is
+*not* a shortcut here: our `mesa-25.0.7/build-ios` was configured with **`egl = disabled` and
+`platforms = []`**, so enabling GLES would mean building EGL+GLES for Darwin plus an EGL platform for our
+window system - a project of its own.
+
+**Working baseline after this round:** `next13` root (bundle with the process-name gate) + `boot_a` =
+`console129-noaccel.img` (read-only root, `adreno=9`, kernel `0176`, **`sweetaccel=0`**): SpringBoard up,
+CPU compositor, no accelerator service. `next13` also still contains the gate for when the service exists.
+
+**Next experiment (kernel, ~30 lines + CI):** publish the accelerator service *late* instead of never -
+a boot argument (`metalplugin_delay=N`, default 0) that registers `IOAcceleratorES` only after N seconds,
+so `lsd` finishes its seeding in the window where the service does not exist, and Metal is available to
+clients afterwards (the bundle's gate keeps the window server on the CPU renderer). That keeps the UI and
+makes `bgmtl-adddev`/apps able to use the GPU from a normal boot.
+
+Implemented as `0177-fajita-metal-plugin-delay.patch` (boot arg **`metalplugindelay`**, a
+`IOTimerEventSource` that calls a new `sweet_publish_accel()` helper after N seconds; generated from
+`xnu-clean` + `0167` + `0175`, dry-run clean, `check-hunk-counts` 177/177, CI builds it). The boot image
+for the test is `console130-delayed.img`: read-only root, `adreno=9 zap=1 gpuhold=1 metalplugin=1
+metalplugindelay=90`, sampler `SpringBoard,lsd,backboardd`. Expected on the phone: the UI up (the first
+90 s have no accelerator service, so `lsd` seeds), then `SWEET FB: accelerator publication delayed by 90 s`
+followed by `IOAcceleratorES published ... SweetBGMTL`, and from then on `bgmtl-adddev` / apps can open
+the GPU while SpringBoard stays on the CPU renderer (the bundle's gate).
+
+**Result: exactly that, and it is the first fully controlled boot of the whole project so far.**
+
+```
+132:  SWEET FB: accelerator publication delayed by 90 s
+1373: IOK backboardd: matching IOAcceleratorES -> 0 found      <- no service during the seeding window
+...   SWEET SURF: SpringBoard create id 4..11 (272x184 'BGRA', 'LA08' icons), 16 swaps, display on
+2622: SWEET FB: IOAcceleratorES published, MetalPluginName SweetBGMTL class BGMTLDevice (properties set: yes)
+2623: SWEET FB: accelerator published after the metalplugindelay window
+```
+
+SpringBoard healthy (13 threads, all in ordinary waits), **no crashes**, `Runtime corruption` 0. The UI
+works *and* the accelerator exists from 90 s on. Two consequences:
+
+- **the boot stall is confirmed to be the service's existence during `lsd`'s seeding window**, not the
+  plugin, not the GPU, not the compositor - the kernel now controls when that window closes;
+- **CoreAnimation does not re-query after the publication** (no `SWEET BUNDLE`/`declining` lines after
+  2622), so the window server stays on the CPU renderer for the rest of the session - which is the
+  arrangement HakiOS recommends and what we want while the GPU path is unproven.
+
+**Working configuration now:** `next13` root + `console130-delayed.img` (`metalplugindelay=90`):
+UI up, accelerator published after the seeding window, Metal available to any client that asks later.
+
+**Next step for actual GPU compositing:** make backboardd re-initialise CoreAnimation *after* the
+publication - a launchd job that runs `/usr/local/bin/sweet-fbkick 120` (built earlier: sleeps, finds
+backboardd, `SIGKILL`s it, launchd restarts it). The `next10` attempt never ran, but the older
+`org.sweet.gputest.plist` in the same directory *did* run, so the difference between the two plists is
+what to find (it is the one unknown left in the launchd path).
+
+### 2026-11-02 (late): GPU use by backboardd stalls `lsd` too - the service was only the first symptom
+
+`next14` = `next8` + the bundle gating **only SpringBoard** + `sweet-fbkick` installed as
+`/usr/local/bin/sweetgputest` + a launchd job for it, flashed with `console130-delayed.img`
+(`metalplugindelay=90`). Result: black screen, and the ring explains both halves:
+
+- **the helper never ran** (`SWEET FBKICK` absent) even though the plist has the shape of the job that
+  used to work, so launchd starting our jobs in these images is unproven - and we do not need it:
+- **backboardd took the GPU on its own** after the 90 s publication (`device created`, then
+  `rwa_device_open (lazy): FD630`, `SWEET SURF: backboardd create id 2/3 ... 'b3a8'`, **6 swaps**), again
+  with no crashes - but **SpringBoard stalled in the LaunchServices chain exactly as before**, so there
+  was no content to composite and the panel stayed black.
+
+So the trigger is not the service's *existence* (that only stops `lsd` when it happens during boot) but
+**actual GPU use by the window server**: as soon as backboardd composites through Metal, `lsd`'s seeding
+stalls in `libMobileGestalt` again. That is the same wall, one step later, and it is structural: this port
+has no real `/private/var`, so MobileGestalt has nowhere to answer from while the GPU is busy.
+
+**Current best configuration (restored, `boot_a` 14:19):** `next14` root + `console129-noaccel.img`
+(`sweetaccel=0`) - UI up on the CPU compositor, no accelerator service. The `metalplugindelay` /
+gate machinery is in place and proven individually; the GPU compositor itself works mechanically (frames
+and swaps were produced) and is only blocked by the `lsd`/MobileGestalt stall.
+
+**The one remaining structural fix:** give iOS a real data volume - the HakiOS approach
+(`tools/userdata-carve.py` + `tools/mkdatavol.py` on their side; for us: a second HFS+ volume inside the
+free space of `userdata`, mounted at `/private/var`), so LaunchServices/MobileGestalt can seed and answer
+while the GPU is in use. Everything today points at that as the next project.
+
+### Design note for that volume (much cheaper than it first looked)
+
+`sweet_ufs.c` keeps **one** global context (`su`: registers, DMA bounce buffer, `first_block`/`nblocks`,
+`bmajor`/`cmajor`, `ready`) and `sweet_ufs_init()` does the whole job: DT node, `ml_io_map` of the
+registers, contiguous DMA, host takeover, `ufs_find_partition("userdata")`, `bdevsw_add` + `cdevsw_add_with_bdev`,
+`devfs_make_node("ufsroot0"/"rufsroot0")`.
+
+So the kernel side needs **only a second device**, not a second mount: turn `su` into an array of two
+contexts (the bounce buffer and the lock can stay shared), let the second one take `first_block`/`nblocks`
+from a boot argument instead of the partition table (e.g. `sweetvar=<first_4k_block>:<count_4k_blocks>`
+relative to the partition), and register `ufsvar0`/`rufsvar0`. About 100 lines, and none of it touches the
+root device's path, which is the risky part.
+
+**Then let iOS mount it**, which avoids writing kernel mount code altogether: iOS's `mount-phase-1` already
+runs `/sbin/mount` (our logs show it looking for a data volume and reporting "data volume missing"), so an
+`/etc/fstab` line pointing `/dev/ufsvar0` at `/private/var` may be all it takes - and the log will say
+whether it worked (`exec mount_hfs` with that device). Only if iOS refuses would a `vfs_mount()` in
+`bsd_init` be needed.
+
+The image is then `root (16 GiB) + var (8 GiB)` written as one `userdata` image, with the var volume at a
+fixed 16 GiB offset (block 4194304 in 4 KiB units).
+
+### 2026-11-02 (night): the real cause is the sandbox stand-in, not the disk
+
+`next15` (writable root **and** the `/private/var` container tree) booted with `metalplugindelay=90`: the
+HFS writes went through (8 × `hfs: set hardlink bit`), backboardd opened the GPU (`FD630`, six `'b3a8'`
+swaps, no crashes) and SpringBoard still stalled in the LaunchServices chain with **zero surfaces** - so
+neither writability nor a var volume is the missing piece. **The data-volume project is therefore shelved**
+(it is HakiOS's answer to persistence, not to this).
+
+What the ring does show, and it fits every observation so far:
+
+```
+1316: exec MobileGestaltHelper                     <- started ONCE, early, and answered
+1479: SWEET FB: MobileGestaltHelper sel 8 / sel 28 -> answered
+1829: |backboardd| rwa_device_open (lazy): FD630    <- GPU in use
+      ... no further MobileGestaltHelper ever
+      lsd t1 -> libMobileGestalt -> dispatch_semaphore_wait   (waiting for an answer that never comes)
+SWEET Sandbox: launchd op 4                         <- launchd asks for a container path, we answer ENOENT
+```
+
+`libMobileGestalt`'s strings contain `systemgroup.com.apple.mobilegestaltcache`, that
+`…/Library/Caches/com.apple.MobileGestalt.plist` path, **`Failed to look up system group …`** and
+`MobileGestaltHelper`. Our sandbox stand-in (`0050`) returns **ENOENT** for the container operations
+(op 4, 0x43), so the lookup fails and MobileGestalt goes to the helper - and the helper is not started
+again (launchd itself is fine: it exec'd **527** processes in that boot, so this is not the launchd
+unreliability that killed our own jobs).
+
+So the wall is: **implement the container-path lookup in the sandbox stand-in**, returning the
+system-group path (e.g. `/private/var/containers/Shared/SystemGroup/<group>`) instead of ENOENT. The
+argument layout of those operations is in no open header, so `0178-fajita-sandbox-container-abi.patch`
+logs sixteen words of the user block for op 4/0x43 (and keeps ENOENT); one boot of that kernel gives the
+layout, and the next patch writes the path back with `copyout`.
+
+Order from here: (1) read the ABI from the `0178` boot; (2) implement the lookup + `copyout`; (3) retest
+the GPU path (`metalplugindelay=90`, gate allowing backboardd) - if MobileGestalt answers, `lsd` finishes
+its seeding with the GPU in use and the compositor's frames should finally reach the panel.
+
+**The ABI, read off the `0178` boot** (10 096 calls, the block identical in shape every time):
+
+```
+arg = base of the block (on the caller's stack)
+w0  = a counter (1, 2, 3, ... one per call)
+w1  = 0
+w2  = arg + 0x60      <- a buffer
+w3  = 0x400 (1024)    <- that buffer's size
+w4  = 0
+w5, w6 = two more pointers (w6 = w5 - 8)
+w7  = another pointer near arg + 0x2e0
+w8  = a constant (0x1e70cd54c, a shared-cache address, same in every process)
+w9..w11 = per-caller values, w12..w15 = 0
+```
+
+So the shape is "an out buffer plus a few pointers", which fits `container_path_for_audit_token`: one of
+`w2`/`w5`/`w7` is the group name to look up and one the buffer the path is written into. `0179` logs the
+strings behind all three (`SWEET SANDBOX STR: ... w2='...' w5='...' w7='...'`), which is the one fact needed
+to implement it: then `copyout("/private/var/containers/Shared/SystemGroup/<group>")` into the right
+buffer and return 0 instead of ENOENT.
+
+### 2026-11-03: the data volume, built (0180 + next16)
+
+The sandbox trace then closed that line too: the gestalt group name appears **nowhere** in 10 096
+container-op calls, there are **no** `0x43` calls, and `w7` holds *file* names (`w7='.GlobalPreferences.plist'`,
+218 times, mostly from `cfprefsd`) - so the system-group lookup does not go through the sandbox policy
+syscall at all: it goes `libsystem_containermanager` -> XPC -> **containermanagerd**, which has no container
+database in this port. That is the real reason for "Failed to look up system group", and it is why the data
+volume is the right project after all (iOS builds that database itself on a real `/private/var`).
+
+Built today:
+
+- **`0180-fajita-data-volume-device.patch`** - `sweetvar=<first>:<count>` (4 KiB blocks from the start of
+  the partition) makes that region a second block device `/dev/ufsvar0` (+ `/dev/rufsvar0`), sharing the
+  controller (registers, DMA, cache, lock) with the root. The root path is untouched: only the region and
+  the node differ, chosen in `strategy`/`ioctl`/`psize` by `buf_device(bp)` through `sweet_ufs_volume()`.
+  CI run `41507846779`, hunk counts 180/180.
+- **`ios16-root-next16.img`** (24 GiB) = the `next15` root (16 GiB) + a **fresh 8 GiB HFS+ volume**
+  (`mkfs.hfsplus -v iOSData`, not journaled: iOS journals it itself) appended at 16 GiB, and
+  **`/etc/fstab`** = `/dev/ufsvar0 /private/var hfs rw,nosuid,nodev 0 2` so iOS's own `mount-phase-1`
+  mounts it. Verified by reading both volume headers out of the file: root `0x4858` 16 GiB,
+  var `0x482b` 8 GiB with 2 090 174 free blocks. `next16.simg` 12.16 GB (sha `02adea04…`), flash time
+  unchanged because the volume is empty.
+- `boot_a` = **`console134-var.img`**: `sweetvar=4194304:2097152` (offset 16 GiB, 8 GiB), `adreno=9`,
+  `sweetaccel=0` (no accelerator, the UI configuration that works), sampler on.
+
+Expected on the phone: `SWEET UFS: var volume at block 0x400000, 8192 MiB`, then `exec mount` ->
+`exec mount_hfs` for `/dev/ufsvar0` and `hfs: mounted` on `/private/var`; iOS should then create its
+container tree there by itself. If that works, the next boot is the GPU one (`metalplugindelay=90`, gate
+allowing backboardd) and the `lsd` stall should be gone because containermanagerd finally has its database.
+
+Note: `fsck.hfsplus` **segfaults** on the 24 GiB composed file (the root volume claims 16 GiB and the tool
+does not expect the extra tail); verify by reading the two volume headers instead, as above.
+
+**Result of the first boot (`next16` + `console134-var.img`): a panic, but a very informative one.** The
+device came up as designed and iOS *tried* to mount the new volume:
+
+```
+SWEET UFS: var volume at block 0x586f40, 8192 MiB        <- /dev/ufsvar0 exists (offset is absolute)
+exec mount_hfs  (for /dev/ufsvar0, from /etc/fstab)      <- fstab works, iOS picks it up
+GetMasterBlock: Error 22 from read; amount=-1, wanted=512
+hfs_ValidateHFSPlusVolumeHeader: unknown Volume Signature : ffff
+hfs_mount: hfs_mountfs returned error=22 for device ufsvar0
+mount: /private/var failed with 1
+panic(...): mount[7] exited -- no exit reason available -- (signal 0, exit status 1)
+```
+
+So two separate things: **the block device answers with EINVAL** (the header read returns `0xff` filler), and
+this port **panics when a boot task exits non-zero** - which is why a failed mount shows as a panic instead of
+a normal "mount failed" (worth making non-fatal later, it costs a boot every time).
+
+`EINVAL` looked like it came from the size guard in the strategy (`off > part_bytes || count > part_bytes - off`),
+and the first guess was that `sweet_ufs_volume()` returned zero `nblocks` for that device: the
+`/dev/rufsvar0` char node gets a *different* (c)major from `cdevsw_add_with_bdev`, so
+`major(dev) == su_var.bmajor` only matches the block node, and reads arriving through the other path silently
+fell back to the root's numbers. Reading the code for `0181` found the actual defect and one more:
+
+1. **`ufs_write_blocks()` guarded the range against the root region only** (`lba - su.first_block >=
+   su.nblocks`, `count > su.nblocks - ...`), so *every* write to the data volume was refused with `EPERM`.
+   The region now travels with the request: `ufs_write_blocks(lba, count, first, nblocks)`; the two log-writer
+   call sites pass the root's region explicitly.
+2. **`sweet_ufs_volume()` did not match `su_var.cmajor`** (real, as guessed).
+3. No log existed on that path at all, so a failure cost a boot. The first eight data-volume requests now
+   print one line each, success or failure:
+   `SWEET UFS: var read blk 0 count 512 dev 0x… region 0x400000+2097152 -> 0`
+   (an absent line is itself informative: the request never reached the driver, so the fault is in devfs/BIO).
+4. Independent of the volume: **`proc_handle_critical_exit()` panicked on every critical boot task**, so a
+   `mount` with a bad fstab line cost a whole boot. It now panics only for `initproc`; anything else prints
+   `SWEET: mount[7] exited with status 1 (signal 0); not panicking` and the machine keeps running.
+
+`userdata` was restored to `next15` and `boot_a` to `console133-sanstr.img` (UI works; the second restore
+attempt died at `userdata` 14/16 - USB drops after ~6 min - and was repeated in full, 16/16).
+`next16.img`, `ios16-var.img` and the fstab are kept unchanged: the next attempt is a new `boot_a` only.
+
+Patch `0181-fajita-var-volume-fixes.patch` verified as `xnu-clean` + `0180` + `0181` reproduces the working
+tree byte for byte (both files identical), 181/181 patch files pass `check-hunk-counts.py`, commit `439b562`,
+CI run `41515500609` = success, kernel contains `sweetvar`, `ufsvar0`, `var %s blk`, `not panicking`,
+`refusing write of`. Boot image: `console135-var.img` (`sweetvar=4194304:2097152`, `adreno=9`,
+`sweetaccel=0`, sha `daf2ff24…`, slack 5 656 576 bytes). Next: `boot_a` ← `console135-var.img`, then
+`userdata` ← `next16.simg` (unchanged), and read the ring for `SWEET UFS: var read blk …` -> `hfs: mounted`.
+
+### 2026-11-04: the data volume MOUNTS - and what it then needs is its contents
+
+`0181` was correct. The second boot with `next16` + `console135-var.img` mounted the data volume:
+
+```
+SWEET UFS: var volume at block 0x586f40, 8192 MiB
+SWEET UFS: var read blk 0 count 4096 dev 0x2000000 region 0x586f40+2097152 -> 0   (8 lines, all -> 0)
+hfs: mounted iOSData on device ufsvar0
+/dev/ufsvar0 on /private/var (hfs, local, nodev, nosuid, noatime)
+```
+
+So `sweetvar` + `/etc/fstab` + iOS's own `mount-phase-1` all work, and reads through the second region are
+clean. Two details: `GetMasterBlock: Error 22 from read; amount=-1, wanted=512` still appears twice *before*
+the mount - that is the 512-byte `read()` path (`physio`), not the strategy (no `SWEET UFS: var` line for it);
+HFS then retries with 4096-byte buffers and succeeds. Worth fixing eventually, not blocking.
+
+The boot after the mount then died on the **keybag**, not on the volume:
+
+```
+BindFS bindfs_mount: lookup of /private/var/hardware/Pearl/... failed error: 2      (data volume is empty)
+MKB_INIT: Could not open /private/var/keybags/systembag.kb: No such file or directory
+MKB_INIT: Unable to load keybag with No Crypto: -7
+MKB_INIT: Can't load the keybag. tears in rain... Time to die
+MKB_INIT: FATAL KEYBAG ERROR: kb_load / REBOOTING INTO RECOVERY MODE.
+```
+
+The empty HFS+ was mounted *over* the working `/private/var` (which is on the root volume and holds
+`keybags/systembag.kb`, `containers/`, `db/`, `preferences/`, `mobile/` - 497 MB, 3885 files, 5751 dirs,
+1 symlink, no devices). The panic on the phone's screen (`Wdt/Boot Timeout`) is the *follow-up* boot into
+recovery, not the cause; `0181` did its job - the failed boot task no longer panics by itself.
+
+Therefore `next17`: the same root + an 8 GiB HFS+ data volume **pre-filled** with the root's `/private/var`
+contents (`rsync -aH --numeric-ids`, copied with the volume mounted on Linux, which writes HFS+ correctly for
+files, dirs, symlinks, mknod, owner and mode - verified by remounting; xattrs are the one thing untested).
+The volume root *is* `/private/var`, so the contents (not a `private/var` subtree) go into it.
+Kernel unchanged (`console135-var.img`, 0181) - this is an image-only change.
+
+Why this should also fix the gestalt stall: `containers/` on that volume already carries
+`systemgroup.com.apple.mobilegestaltcache`, and with a real mounted data volume `containermanagerd` gets the
+container tree it has been missing, which is what `libMobileGestalt` was waiting on.
+
+**Result of `next17` + `console135-var.img`: the UI comes up on a real data volume.** The second boot with the
+seeded volume went through the *whole* boot chain:
+
+```
+/dev/ufsvar0 on /private/var (hfs, local, nodev, nosuid, noatime)
+MKB_INIT: System Keybag loaded                       <- from the volume, no more "No such file"
+boot tasks: init-with-data-volume, usermanagerd, dirs_cleaner, auearlyboot, tzinit, finish-restore,
+            sysstatuscheck, prng_seedctl, launchd_cache_loader      <- all of them
+exec containermanagerd / exec MobileGestaltHelper    <- and the helper ANSWERED (sel 8, sel 28)
+6 icon surfaces (272x184, 312x202, 230x186, 105x144, 102x144, 360x246) + 16 swaps of 1125x2436 BGRA8
+```
+
+`SWEET FB: display on` twice, 16 full-panel swaps, no crash in SpringBoard or backboardd, and the user
+confirms **the SpringBoard home screen displayed normally**. So the data-volume project is done: `/private/var`
+is a real, mounted, seeded HFS+ volume, the keybag loads from it, and iOS boots to the UI on it.
+
+Two side notes from that boot:
+
+- SpringBoard's main thread sat in `_LSContextInitCommon` -> `LaunchServices::Database::Context::_get` ->
+  `os_unfair_lock_lock_slow`, entered from `-[CCSModuleRepository
+  _queue_filterModuleMetadataByAssociatedBundleAvailability:]`, i.e. **LaunchServices database init**, not the
+  GPU - and it did not stop the home screen from drawing. `op 4` container lookups from SpringBoard repeated
+  618 times with identical arguments (a retry loop our sandbox stand-in answers ENOENT).
+- The ring (4 MB) was completely filled by the `0178`/`0179` sandbox ABI logging: `cfprefsd op 4` alone
+  produced **20 976 lines**. Any future log is useless unless that logging is gated behind a boot argument.
+
+Next: `console136-gpu.img` = same kernel, `metalplugindelay=90`, accelerator enabled (no `sweetaccel=0`),
+`boot_a` only - the first test of "GPU compositing with a real data volume" (that combination is the one the
+notes said was structurally missing).
+
+**That boot (`console136` + `next17`) died on a dirty non-journaled volume** - not on the GPU:
+
+```
+mount-phase-2: exec mount_hfs for /dev/ufsvar0
+  GetMasterBlock: Error 22 (twice, the 512-byte path, same as the successful boot)
+  SWEET UFS: var read blk 0 count 4096 -> 0          <- the driver answered correctly
+  hfs_mounthfsplus: cannot mount dirty non-journaled volumes
+  hfs_mountfs: encountered failure 22 / mount: /private/var failed with 1
+  SWEET: mount[7] exited with status 1 (signal 0); not panicking      <- 0181 did its job
+  launchd: Emergency: Boot task failed: mount-phase-2 -> userspace panic (panic in 3 seconds)
+```
+
+The volume was created with plain `mkfs.hfsplus` (**no journal**), the previous boot had it mounted read-write
+and was ended by a fastboot reset, so HFS+ refused to mount it at all. The root volume never has this problem
+because it is journaled (`hfs: Initializing the journal`). Note the two-layer protection needed: our kernel
+no longer panics on a failed boot task, but **launchd itself requests the panic** (`userspace panic: boot task
+failure`), so a boot task that must succeed has to be made to succeed - there is no "survive it" option.
+
+`next18` therefore uses `mkfs.hfsplus -J` (journaled) and the same seeded `/private/var`; `console137-gpu.img`
+is the same GPU command line on the `0182` kernel, so the next log is readable. Patch `0182` (commit `7e37335`,
+CI run `41531931405`) puts the sandbox op 4 / 0x43 logging behind `sweetsboxlog=1` (off by default) - cfprefsd
+alone calls it ~21 000 times per boot and that filled the entire 4 MB ring.
+
+### 2026-11-04 (even later): GPU COMPOSITING, on a journaled data volume
+
+`next18` + `console137-gpu.img` (`metalplugindelay=90`, accelerator on): the journaled volume mounted
+(`/dev/ufsvar0 on /private/var (hfs, local, nodev, nosuid, journaled, noatime)`, `hfs: mounted iOSData`), the
+UI came up, and the log showed what the whole GPU chain was missing:
+
+```
+IOK backboardd: matching IOProviderClass=IOAcceleratorES -> 0 found    (x14, during startup)
+SWEET FB: IOAcceleratorES published, MetalPluginName SweetMetalProbe class SweetMetalDevice
+SWEET METAL: -initWithAcceleratorPort:66051 called, declining (nil)      <- and the stub always declines
+```
+
+`SweetMetalProbe` is the stub bundle from `tools/metal-probe/sweet_metal_probe.m`; it exists to prove discovery
+and it returns nil on purpose. `SweetFramebuffer.cpp` picks the plugin with a boot argument:
+
+```c
+PE_parse_boot_argn("metalplugin", &realPlugin, sizeof(realPlugin));
+pluginName  = realPlugin ? "SweetBGMTL" : "SweetMetalProbe";
+pluginClass = realPlugin ? "BGMTLDevice" : "SweetMetalDevice";
+```
+
+So the fix was one boot argument: **`metalplugin=1`** (`console138-bgmtl.img`), which publishes the real
+Chlorophyll bundle that is already in the image at `/System/Library/Extensions/SweetBGMTL.bundle`. Result:
+
+```
+|backboardd| SWEET BUNDLE: -initWithAcceleratorPort: port 34171 in pid 57 -> BGMTLDevice   <- GPU
+|SpringBoard| SWEET BUNDLE: -initWithAcceleratorPort: port 55043 in pid 27 -> nil          <- gate
+SWEET ADRENO: submitqueue_new / SWEET GPU: arena 4194304 bytes ...
+surfaces: 15 x fmt 0x62336138 ('b3a8', 10-bit, bpr 4544), 2 x '_RB4', 1 x BGRA8, 5 x LA08
+SWEET FB: swap 1..57  (full-panel 1125x2436)
+CRASH backboardd: 0   CRASH SpringBoard: 0
+```
+
+And the wall that has held this port for days is **gone**: SpringBoard's main thread is back in
+`CFRunLoopRun -> -[UIApplication _run]` (a normal event loop, not `_LSContextInitCommon` /
+`os_unfair_lock_lock_slow`), and `lsd` sits in `_runServerMainLoop` serving requests instead of stalling. The
+notes' hypothesis was right - the window server stalled in `libMobileGestalt` because this port had no real
+`/private/var` to answer from; with the seeded, journaled data volume it does.
+
+Current best configuration (on the phone): `next18` root/data + `boot_a` = `console138-bgmtl.img`
+(`adreno=9`, `metalplugin=1`, `metalplugindelay=90`, `sweetvar=4194304:2097152`). The gate in
+`SweetBGMTL.bundle` still keeps **SpringBoard** off the GPU (CPU renderer for its own Metal use) while
+**backboardd** composites the panel through the GPU; `SWEET_CA_GPU=1` lifts it if a test needs SpringBoard on
+Metal too. `console138` is a 2-second `boot_a` change - no image rebuild.
+
+### 2026-11-04 (morning): the GPU is a CP, not a 3D engine - the missing piece named
+
+The screen is black with `metalplugin=1`, and `0183` (commit `5f7fd1d`, CI run `41598489799`,
+`console139-cpdump.img`, sha `4a82aafc…`) produced exactly the register dump needed to say why:
+
+```
+SWEET GPU: client fence timeout: rptr 318 wptr 318 rbbm_status 0x800005 cp_status1 0x8100471e
+           hw_fault 0 irq 0x1 protect 0 rbbm_irq 0 sqe_cntl 0x1
+```
+
+`rptr == wptr` (the CP read the whole ring), `hw_fault 0`, `protect 0`: **the CP is not the problem and the
+command stream is not malformed**. The fence sits at the tail of the IB, so it cannot retire while the 3D
+pipe that the IB feeds has not drained - i.e. the first real draw wedges the 3D blocks. Our own in-kernel
+tests (CP IB, BO, fill, indirect, ABI) retire their fences because they never touch 3D.
+
+The reason is written in the driver itself:
+
+```c
+/* The subset of Linux's a6xx hw_init a NOP test needs (Bergamota's version). */
+gpu_cp_hw_init(vm_offset_t core)
+```
+
+`gpu_cp_hw_init()` programs only `*_ADDR_MODE_CNTL` for CP/VSC/GRAS/RB/PC/HLSQ/VFD/VPC/UCHE/SP/TPL1 plus
+`PC_DBG_ECO_CNTL`. There is **no 3D block initialisation at all** (no `GRAS_*`, `VPC_*`, `VFD_*`, `RB_*`,
+`SP_*`, `TPL1_*`, `HLSQ_*` init table, no `CP_PROTECT` ranges for the draw path). Adreno 630 was brought up
+far enough for the CP to fetch, execute and write back through the SMMU - which is what every previous GPU
+test measured - and no further. Draws therefore hang the pipe with no fault bit anywhere.
+
+**Next work item: port `a6xx_hw_init()` (Linux `drivers/gpu/drm/msm/adreno/a6xx_gpu.c`) for a630** into
+`sweet_gpu.c`, together with the `a6xx_protect` ranges the draw path needs, then re-run `console138`'s stream
+(`metalplugin=1`) and watch for the fence to retire and the panel to show content. This is mechanical
+(a register table plus ordering) but it is the real gate to a GPU-composited UI; nothing else observed in
+this port blocks it any more: the data volume, the keybag, the bundle hand-off, the 10-bit presentation path
+(`0176`) and the CA/window-server handshake all work.
+
+**That estimate was too pessimistic - the driver already ports most of `hw_init`.** Comparing
+`gpu_cp_hw_init()` with Linux v6.1 line by line (fetched to `~/ref/linux/a6xx_gpu.c`, register offsets
+resolved from `~/ref/linux/a6xx.xml`, envytools) shows it already has: the ADDR_MODE set, VBIF QOS,
+`VBIF_GATE_OFF_WRREQ_EN` (a630 = 9), the UCHE range/trap/write-through/GMEM values, `UCHE_FILTER_CNTL`,
+`UCHE_CACHE_WAYS`, both `CP_ROQ_THRESHOLDS`, `CP_MEM_POOL_SIZE`, `PC_DBG_ECO_CNTL`, `CP_AHB_CNTL`,
+`RBBM_INTERFACE_HANG_INT_CNTL`, `CP_RB_*`, `SQE_INSTR_BASE` - everything a NOP test and a plain IB need.
+It deliberately skips the secure-world registers (`RBBM_SECVID_*`), hardware clock gating, the perf counters
+and `CP_PROTECT` (unprogrammed protect = nothing blocked, which is why no fault bit ever appeared).
+
+The one **functional** omission is `a6xx_set_ubwc_config()`: `RB_NC_MODE_CNTL`, `SP_NC_MODE_CNTL`,
+`TPL1_NC_MODE_CNTL` and `UCHE_MODE_CNTL`, i.e. how many address bits the UBWC compression tags take. For
+a630 (`lower_bit = 2`, no AMSBC, no RGB565 predictor) that is 0x4 / 0x4 / 0x4 / 0x400000. CoreAnimation's
+10-bit swap chain is a UBWC surface, so render/texture/UCHE disagreeing about its layout is a very good
+candidate for "CP fine, pipe wedged": patch `0184` writes them and reads them back into the stage-7 log.
+
+**`0184` did not change the hang** (`console140-ubwc.img`, sha `de2d9747…`): the readback is right
+(`SWEET GPU: ubwc: rb_nc 0x4 sp_nc 0x4 tpl1_nc 0x4 uche_mode 0x400000`) and the wedge is bit-for-bit the
+same - `rptr 318 wptr 318`, `cp_status1 0x8100471e`, `rbbm_status 0x800005`, `hw_fault 0`, no fence
+retired, 2 submits, 6 timeouts. So the kernel-side configuration is no longer the suspect; the command
+stream the userspace driver sends is.
+
+**The stream itself is well-formed.** Checking the eight logged dwords against freedreno's packet rules
+(`src/freedreno/common/freedreno_pm4.h`, fetched to `~/ref/freedreno/`) with the parity bits:
+`0x40886401` is a valid type-4 register write to `0x8864` with one value (parity of register and count both
+match), `0x48888802` a two-value write to `0x8888`, and so on - type-4 writes to CP/RB/GRAS registers, which
+is what a real draw-state sequence looks like. So the packets are not garbage; the stream is asking for
+something the pipe cannot do. Patch `0185` dumps the first two client command buffers in full (up to 384
+dwords each) and `~/AppData/.../pm4decode.py` decodes them with the type-4/type-7 rules and the CP opcode
+names from `adreno_pm4.xml`.
+
+**`console141-ibdump.img` decoded: the wedge happens on state, not on a draw.** That boot is also the first
+one where the user saw the home screen while the accelerator was published - because the publication is at 90 s
+and backboardd never re-queries, so CoreAnimation stayed on the CPU renderer (panel surface is BGRA8
+`0x42475241`, not `'b3a8'`). The full 143-dword buffer decodes as **nothing but type-4 register writes**, in
+19 repetitions of the same seven registers:
+
+```
+0x8864 RB_ALPHA_CONTROL   0x8880 RB_STENCIL_CONTROL   0x8871 RB_DEPTH_CNTL
+0x8888 RB_STENCILMASK (2) 0x8878 RB_Z_BOUNDS_MIN (2)  0x8114, 0x8115 - not named in a6xx.xml
+```
+
+No `CP_SET_DRAW_STATE`, no `CP_LOAD_STATE6_*`, no draw packet: the buffer only writes render-backend state.
+So the pipe is wedged by a *register write*, and the two offsets with no a6xx name are the obvious suspects -
+except that the driver itself writes and reads back `RB_NC_MODE_CNTL` fine, so "the block is unreachable" is
+already ruled out. What has never been tested is the packet *form*: every kernel test uses type 7, and the
+whole client stream is type 4. Patch `0186` submits three one-write buffers, each with its own fence -
+`RB_ALPHA_CONTROL`, `RB_STENCIL_CONTROL = 0x49705` (the client's own value) and finally the unnamed `0x8115`,
+which goes last because a wedge leaves the CP unusable for the rest of that boot.
+
+**`0186` clears the packet form, the registers and the cache** (`console142-pkt4.img`, sha `adf887a8…`):
+
+```
+pkt4 test: write 0 to RB_ALPHA_CONTROL (a real register): ring drained, fence 2 retired
+pkt4 test: write 0x49705 to RB_STENCIL_CONTROL (a real register): ring drained, fence 3 retired
+pkt4 test: write 0 to unnamed 0x8115 (a hole in a6xx.xml): ring drained, fence 4 retired
+pkt4 test: PASSED - type 4 register writes execute
+```
+
+Type 4 executes, a real RB register takes the client's exact value, and even the unnamed offset does not
+wedge anything - with `sweetaccel=0`, so the UI stayed on the CPU and the phone was usable. The client BOs
+are already cleaned to the point of coherency before every submit (`flush_dcache64` over the linear map in
+`submitCall`), so stale data is not it either. What is left is **this particular sequence of 136 dwords**.
+
+Hence `0187`: the window server's first command buffer, captured from the ring, is now `client_replay[]` in
+the kernel and replayed through the same submit path, with the length taken from the boot argument
+`replay=N`. A truncation that retires and a longer one that hangs bracket the offending packet, and each
+bisection step is a 2-second `boot_a` flash rather than a CI run. The replay is opt-in (no `replay=` means
+no test).
+
+**`0187`: the content is innocent.** `console143-replay136.img` with `replay=136`:
+
+```
+replay test: 136 of 136 dwords: ring drained, fence 5 retired
+replay test: PASSED - the client stream executes
+```
+
+The exact same bytes, through the same `sweet_gpu_submit()` path, retire their fence when they live in the
+driver's own blob and never retire when they live in the client's buffer. So the stream is fine, the CP is
+fine, type 4 is fine - the difference is **the memory the command buffer sits in**: either the CP does not
+read those pages the way the CPU does (the cache clean runs as `flush_dcache64(pa, size, TRUE)` over the
+linear map, which silently does nothing if that physical range is not reachable that way) or the mapping the
+BO was given is not what the driver believes.
+
+`0188` therefore adds `ibounce=1`: the first command buffer is copied into the blob page that just proved it
+executes and that address is submitted instead. A retiring fence (and content on the panel, with
+`metalplugin=1`) confirms the client BO memory is the whole problem; a fence that still never retires puts
+the difference back in the submit record.
+
+**`0188` panicked in the new code, and that panic was worth having** (`console144-ibounce.img`, sha `9dd8439b…`,
+black screen then `Unaligned kernel data abort`, `far 0xffffffe5105ed421c`). Symbolising the frames against the
+CI kernel's symbol table (`llvm-nm -n xnu/out/kernel.development.sweet`, addresses rebased from the panic's
+`Kernel text base 0xfffffff007004000` to the image's `0xfffffe0007004000`):
+
+```
+lr 0xfffffff0074f96a8 (text+0x4f56a8) -> _sweet_gpu_bounce_ib + 0x40
+pc 0xfffffff0074b4f0c (text+0x4b0f0c) -> inside the memcpy it called
+```
+
+So `memcpy` from the client's buffer took an unaligned 8-byte load on an address that is only 4-byte
+aligned: **the client's command buffers are mapped as Device memory (nGnRE), where such an access faults**.
+`0189` copies a byte at a time instead. That also retires one theory for good - device memory is uncached, so
+"the CP reads stale DRAM" cannot be the explanation; the CP reads exactly what the CPU wrote.
+
+**`0189` then exposed a bug in my own instrumentation, and that changes the picture.**
+`console145-ibounce2.img` bounced correctly (`bounced 143 dwords, first 0x70e30001 last 0x1`,
+`ib 0 bounced: 0x86630000 -> 0x80001000`) and the fence still never came back. But `first 0x70e30001` is a
+type-7 `CP_SET_MODE` packet, not the type-4 stream decoded before - because the 0185 dump read `cb->kva`, the
+*start of the buffer object*, while the command buffer starts at `submit_offset`, **0x8000 bytes further in**.
+So the "19 repetitions of RB state writes, no draws" description above is the BOB's first page, **not** the
+submitted stream; treat it as discarded. What is true: the real stream begins with `CP_SET_MODE`, and the CP
+drains the ring (`rptr == wptr`), raises no fault, and never writes the fence - with the IB at the client's
+address or at the driver's known-good `0x80001000`.
+
+`0190` fixes the dump to start at the submitted address and adds `setmode=<value>`, which submits a single
+`CP_SET_MODE` packet. That packet matters beyond itself: `CP_SET_MODE(1)` is what makes `CP_SET_DRAW_STATE`
+groups with `ENABLE_MASK & 0x6` execute immediately, and a draw stream is mostly draw-state groups - so if the
+very first packet is not something the CP tolerates here, the black screen is explained at packet one.
+
+**`0190` answers both, and the answer is tiling** (`console146-setmode.img`, sha `bb49c95a…`):
+`setmode test: CP_SET_MODE 1: ring drained, fence 5 retired / PASSED` - the first packet is fine. And the real
+command buffer (now dumped from `submit_offset`, not from the BO start) decodes as a **binning stream**:
+
+```
+0:     CP_SET_MODE 1
+2-6:   CP_EVENT_WRITE 0x19 / 0x18 / 0x31
+11:    CP_INDIRECT_BUFFER -> 0x8736a600 (0xc4 dwords)      <- the binning pass' own buffer
+18-26: CP_SET_AMBLE … x3                                   <- GMEM tiling
+52-60: CP_SET_MARKER 1 / CP_SKIP_IB2_ENABLE_GLOBAL / CP_VIZ_QUERY / CP_SET_VISIBILITY_OVERRIDE 1
+102:   CP_REG_WRITE [0x2, 0x8801, 0x10]
+```
+
+That is a two-pass, GMEM-tiled render: the CP is asked to bin into tiler memory, and this port never brought
+the tiler up (nothing in `hw_init` validates GMEM, and every test so far was a flat IB). The ring drains and no
+fault is raised because the CP is waiting on a pass that cannot complete.
+
+The knob exists in the userspace driver: Mesa's freedreno debug table has `FD_MESA_DEBUG=sysmem`
+("Use sysmem only rendering (no tiling)") and `nobin` ("Disable hw binning"). `bgmtl_inject.m` already uses
+exactly that mechanism for other A/B switches (`/private/var/tmp/bgmtl-bb.inorder` ->
+`setenv("FD_MESA_DEBUG","inorder")`), so setting `sysmem` the same way - or unconditionally in
+`SweetBGMTL.bundle`'s `+load` before the device is created - makes CoreAnimation emit a flat, sysmem command
+stream that this port can execute. That is a root-image change (bundle), not a kernel one.
+
+**`next19` (bundle sets `FD_MESA_DEBUG=sysmem`) removes the hangs entirely - and the screen is still black
+because nothing is drawn.** `next19` = `next15` root with the rebuilt bundle (165,704 B, `+load` sets
+`FD_MESA_DEBUG=sysmem` before any device exists) + the same journaled, seeded data volume; flashed with
+`console146-setmode.img`. Result:
+
+```
+|backboardd| freedreno: FD_MESA_DEBUG=sysmem (sysmem rendering, no tiler)
+|backboardd| SWEET BUNDLE: -initWithAcceleratorPort: -> BGMTLDevice
+|backboardd| device created, GPU opens on first use
+SWEET SURF: backboardd create 1125x2436 fmt 0x62336138 ('b3a8') planes 2 … (x8)
+SWEET FB: display on, 6 swaps
+submits: 0      fence timeouts: 0      rwa_device_open: never
+```
+
+So the binning stream was indeed the reason every earlier GPU boot hung: with sysmem there are **no submits and
+no timeouts at all**. What remains is the opposite problem: the window server holds a device, allocates 10-bit
+surfaces candidates and swaps them, but never submits a single command buffer - `rwa_device_open (lazy)` never
+appears, i.e. the GPU is never opened on first use. The panel therefore shows the cleared buffers. Nothing
+crashes, `lsd` is fine, the boot chain is complete.
+
+Next question is therefore not about the CP any more but about why CoreAnimation's renderer does no work with
+this device under sysmem: candidates are a capability check that fails silently at render time, or a renderer
+that stays on the CPU compositor while the surface set was already chosen from the device's description.
+Note also that `metalplugindelay=90` was still in that command line, so the device appeared only late in the
+boot; a boot with the publication at startup (`metalplugindelay` absent) is worth one 2-second flash before
+changing anything else.
+
+Useful state: the phone currently runs `next19` (root + journaled data volume), which is a perfectly good
+CPU-UI image too - `boot_a` = `console137-gpu.img` or `console142-pkt4.img` gives the visible home screen with
+`FD_MESA_DEBUG=sysmem` doing nothing harmful.
+
+**`console147-nowait.img` (publication at startup, no `metalplugindelay`): same outcome, and it pinpoints the
+remaining gap.** The accelerator is published at line 132 (before the UI), backboardd gets the device
+(`-> BGMTLDevice`), `FD_MESA_DEBUG=sysmem` is set, the GPU is opened (`rwa_device_open` once) - and yet:
+
+```
+selectors seen: 0x43 x270, 0x42 x144, 0x40 x18, 0x4a x3, 0x70 x1, 0x71 x5, 0x09, 0x4b
+GEM_SUBMIT (0x46): 0                 <- never submitted
+fence timeouts: 0    swaps: 4        <- 'b3a8' surfaces swapped, contents empty
+```
+
+So CoreAnimation allocates, queries, creates a submitqueue, maps an IOSurface as a BO - and never asks the
+kernel to execute a command buffer. `sysmem` removed every hang; what is left is that **Mesa's flush never
+reaches `SWEET_GPU_SEL_GEM_SUBMIT`**, i.e. the userspace Metal path (`SweetBGMTL.bundle` ->
+`libbgair` -> freedreno `fd_batch_flush`) produces no submission for CoreAnimation's commands. That is a
+userspace-driver completeness problem, not a kernel one, and it is where the next work starts: instrument
+`bgmtl`'s command buffer/queue path (does `commit` run? does the batch reach `fd_batch_flush`? does the
+context exist?) rather than the CP.
+
+Snapshot for the next session: kernel patches 0001-0190 (last commit `f7604a0` for `0190`), last CI run
+`41624953280`; images `next19.simg` (bundle with sysmem, journaled seeded data volume) and
+`console147-nowait.img` / `console146-setmode.img` (GPU boots) or `console142-pkt4.img` (CPU-UI safe boot).
+
+### 2026-11-04 (afternoon): the black screen is a TWO-PLANE surface, and it is in the userspace import
+
+The tracer in `SweetBGMTL.bundle` (`BGMTL_TRACE=1` or **`/private/var/tmp/bgmtl.trace`**, one line per command
+buffer / render pass / pipeline / commit) was turned on by putting that file on the data volume (`next20`), and
+it named the failure in one line - `backboardd`:
+
+```
+supportsFamily 1001 -> 1   1002 -> 1   1003 -> 1   1004/1005/1006 -> 0
+render pipeline: vertex std_vert1_lph fragment display_overdrive_lut_gen_lph      (38 pipelines built)
+render pass: color0 776x24 fmt 115 load 1 store 1                                  (18 passes)
+commit: <none at all>
+texture refused: the kernel would not describe IOSurface 2 (error 0, planes 2, 4544 bytes a row):
+                 it knows nothing of an ID that was never made shareable
+```
+
+So CoreAnimation accepts the device, builds pipelines and opens render passes - then every texture import is
+refused. The message comes from `air_metal.c` in Chlorophyll:
+
+```c
+sr = sweet_drm_surface_bo(-1, &sb);            /* ioctl 0x71, SWEET_GPU_SEL_SURFACE_BO */
+if (sr != 0 || sb.planes > 1 || sb.bytes_per_row == 0) -> "texture refused"
+```
+
+`error 0`, `4544 bytes a row` - the kernel describes the surface correctly; what fails is **`planes > 1`**. The
+drawable is a two-plane 10-bit `'b3a8'` IOSurface (`SWEET SURF: … fmt 0x62336138 … planes 2`), and the import
+path maps a single plane only. With no texture the render pass has no target, nothing is recorded, `commit`
+never happens - and that is the entire black screen (0 submits, 0 timeouts, `rwa_device_open` once).
+
+Why the drawable is 10-bit at all: CoreAnimation takes it from the display, and this display advertises 10-bit.
+The injector (`bgmtl_inject.m`) sets `CAEnableFramebufferCompression` / `CAEnableIOSurfaceCompression` /
+`CAEnableDeepFramebuffer` to false for backboardd, which is why the CPU-UI boots get a BGRA8 drawable; a process
+that reaches Metal through `SweetBGMTL.bundle` never ran that code. `next21` sets the same three preferences in
+the bundle's `+load` (with `#include <CoreFoundation/CoreFoundation.h>`), so the drawable should come out as a
+single-plane 8-bit BGRA surface - the format the import path supports and the one `0176` already presents.
+
+Two ways forward if that does not land: teach `air_metal.c` to import two-plane surfaces (plane 0 as the BO and
+plane 1 as its own), or keep the deep framebuffer and present it through `0176`'s conversion. The cheap and
+correct first move is the 8-bit drawable.
+
+**The 8-bit drawable has to be asked for before the process starts.** `next21` (the same three preferences set
+from the bundle's `+load`) changed nothing: the drawable is still `planes 2`, 4544 bytes a row, and every texture
+import is still refused. The preferences are consulted when CoreAnimation sets the display up, which happens
+before Metal discovers the plugin - so a `+load` in the bundle is too late. `next22` writes the same three keys
+as real plists into the data volume's `/preferences/` for `com.apple.backboardd`, `backboardd` and
+`com.apple.CoreAnimation` (a name guess covered three ways, since the domain CFPreferences uses for a daemon is
+not documented here), so the values exist when backboardd starts.
+
+Note the display itself is not the source of the 10-bit format: `SweetFramebuffer.cpp` creates its surface as
+`SWEET_FB_FORMAT_BGRA` (`0x42475241`) unconditionally. The deep drawable is CoreAnimation's own choice once it
+has a Metal device, which is also why the CPU-compositor boots look normal with the same kernel.
+
+### 2026-11-04 (evening): the Metal path is complete end to end - the 3D pipe is what is left
+
+`next22` (the same CA keys as real plists in the data volume's `/preferences/` for `com.apple.backboardd`,
+`backboardd` and `com.apple.CoreAnimation`) is the first boot in which this port **executes the window server's
+Metal work**:
+
+```
+|backboardd| freedreno: drawable = 8-bit BGRA (deep framebuffer and compression off)
+SWEET SURF: backboardd create id 2 1125x2436 fmt 0x42475241 (BGRA8) bpr 4608 planes 0
+render passes: 11     commits: 5 (3, 4, 2, 3, 3 recorded commands)     submits: 5
+SWEET ADRENO: submit 26 bos 6 cmds, ib 0x8072c000 72 dwords, fence 7      (then 22 bos, 18 bos, 225 dwords…)
+texture refused: 1  (and no longer "planes 2": the one left is the documented per-boot allocation limit)
+```
+
+So the preferences had to exist **before backboardd started** - a `+load` in the bundle is too late, `next21`
+proved that. With the drawable single-plane the import succeeds, the render pass gets its target, the command
+buffer is committed and the kernel receives an IB with real draw work.
+
+The remaining wall is the 3D pipe itself: `client fence timeout: rptr 365 wptr 365 … hw_fault 0` - the CP reads
+the whole stream, raises no fault, and the fence never comes back, exactly as when a wedge blocks the pipe.
+Decoding the first 72-dword buffer shows the shape of the work (`CP_SET_MODE 0`, three `CP_EVENT_WRITE`s, a
+`CP_SET_AMBLE` triple, three nested `CP_INDIRECT_BUFFER`s of 196/58/77 dwords and a `CACHE_FLUSH_TS` tail) -
+so **`FD_MESA_DEBUG=sysmem` did not remove the binning pass** in this Mesa build, and the tiler is still part of
+the stream.
+
+What that means for the next session: the kernel has every layer above the 3D blocks working (data volume,
+keybag, SMMU, CP, fences, IOSurface import, presentation of 10-bit and 8-bit surfaces), and the last piece is
+the Adreno 3D pipeline: the tiler/GMEM path (`CP_SET_AMBLE`, binning IB) or, with binning genuinely off, the
+draw-state and ISA a630 expects. That is a project of its own, not a one-line fix, and it is the honest state
+of "GPU UI" on this port.
+
+**`FD_MESA_DEBUG=nobin,sysmem` changes nothing** (`gpu23.simg`, the flag is logged, the decoded buffer is the
+same 72 dwords with the same three `CP_SET_AMBLE`s). So in this `libbgair` build the binning decision does not
+come from the debug options - it comes from what the screen/device reports about tiled rendering - and turning
+it off has to be done where the batch is chosen, not through the environment. Everything above the 3D blocks
+keeps working in that boot: BGRA8 drawable, 12 render passes, 6 commits, 6 submits, 1 texture refusal (the
+documented per-boot allocation limit), 22 swaps, and the CP reading the whole ring with no fault while the
+fence never retires.
+
+State of the phone at the end of this session: `boot_a` = `console142-pkt4.img` (accelerator off, visible
+home screen on the CPU compositor), `userdata` = the `gpu23` image (root with the sysmem/nobin bundle and the
+CA preference plists, journaled seeded data volume with `/tmp/bgmtl.trace`). To go back to GPU experiments:
+`boot_a` = `console147-nowait.img` (2-second flash) - the image already contains everything else.
+
+Lessons worth keeping: (1) the drawable format is decided before Metal discovers the plugin, so CA preferences
+must be on disk (data volume `/preferences/<domain>.plist`), not set from `+load`; (2) the tracer behind
+`/private/var/tmp/bgmtl.trace` is the fastest way to see how far CoreAnimation gets - `supportsFamily`,
+`render pipeline`, `render pass`, `commit: N`, `texture refused` name the failing layer in one boot;
+(3) `rptr == wptr` with `hw_fault 0` and a fence that never comes back means the CP is fine and the pipe it
+feeds is not, which is a 3D problem, never a packet problem.
+
+### 2026-11-05: two real port bugs fixed, and the binning pass named as the wedge
+
+Three GPU boots panicked in `phys_to_kv_range` before any measurement could be taken. Symbolising the panic
+frames against the CI kernel (`llvm-nm -n`, link-time addresses `0xfffffe0007xxxxxx` as printed on screen - do
+not add the runtime base to them) gave the chain:
+
+```
+mach_msg2_trap -> ipc_kmsg_send -> is_io_connect_map_memory_into_task
+ -> IOMemoryMap::copyCompatible -> vm_object_change_wimg_mode
+  -> pmap_set_cache_attributes_internal -> flush_dcache(pa, len, phys=TRUE) -> phystokv_range -> PANIC
+```
+
+That is: mapping an IOSurface's memory into a process with different cache attributes makes XNU clean the
+pages by physical address, and this kernel manages physical memory from 4 GiB up (`mkadt --highmem`), so a page
+allocated low has no linear alias and `phystokv_range()` panics on it. Two fixes, both now in the tree:
+
+- `0193` - `IOFlushProcessorCache()` passed the caller's kernel address to `flush_dcache64(..., FALSE)`, which
+  treats it as a physmap address; it now walks `kvtophys()` page by page.
+- `0194` - `flush_dcache()` and `clean_dcache()` skip pages below `gPhysBase` instead of translating them
+  (there is no linear alias, so nothing is lost).
+
+With those in place the bisection could finally run, and it answered the question:
+
+```
+ibtrunc=11  -> wait fence 7 ... -> 0        (kIOReturnSuccess; 32 submits, 33 commits, 0 timeouts)
+ibtrunc=15  -> wait fence 7 ... -> 0xe00002d6 (kIOReturnTimeout, 17 timeouts)
+```
+
+Eleven dwords end just before the first `CP_INDIRECT_BUFFER`; fifteen include it. That packet starts the
+window server's **196-dword binning pass**, so **the binning pass is what wedges the 3D pipe** - not the outer
+stream, not the first packets, not CP_SET_MODE. Everything above it works: CoreAnimation records, commits,
+the kernel submits 32 IBs, the CP executes them and the fences come back.
+
+`0195` adds `ib2trunc=N`, which rewrites the size field of a `CP_INDIRECT_BUFFER` at submit time, so the next
+steps bisect *inside* that 196-dword buffer (N = 100, 50, 24, …) with a 2-second `boot_a` flash each. The
+target is the packet in the binning pass that stops the pipe: the tiler's `CP_SET_AMBLE`/visibility setup, a
+`CP_SET_DRAW_STATE` group, or a draw.
+
+Two instrumentation mistakes worth not repeating (both cost a boot):
+
+- the ring is **circular**: `dd` of `/dev/block/sda17` gives a raw image that contains the current boot *and*
+  the tail of the previous one, so reading it linearly mixes boots. Always decode it with
+  `tools/sweet-log.py` - `pull-sb.sh` now does that automatically and writes the `.raw` image next to the log.
+- the `CP_INDIRECT_BUFFER` packet is header + **three** payload dwords (addr lo, addr hi, size). Reading the
+  size at `at + 4` patched the *next* packet's header instead (the log showed `truncated 1881571328 -> 100`,
+  i.e. a type-7 header used as a size) and turned the measurement into noise. The size is at `at + 3`.
+
+**The bisection ends at one register write.** With `ib2trunc` cutting *inside* the nested buffer (packet-aligned,
+2 dwords per packet), the fence stops retiring even at two dwords:
+
+```
+196 -> timeout, 100 -> timeout, 50 -> timeout, 24 -> timeout, 12 -> timeout, 2 -> timeout
+```
+
+Those two dwords are `0x408e0401 0x04100000`: a type-4 write of **0x04100000 to 0x8e04**, which a6xx.xml names
+**`RB_DBG_ECO_CNTL`** (an errata/Eco control register). The value is the *standard* a630 one from Mesa's own
+table (`freedreno_devices.py`), and the same form of write to registers this port initialises retires, so the
+write itself is the last thing between this port and a rendered frame.
+
+`ibskip=<reg>` (patch `0197`) turns a type-4 write to a chosen register into a `CP_NOP` at submit time, so the
+question can be asked without rebuilding anything. CI was blocked at the time by an external outage
+(`bearssl.org` answering 502 twice in a row), so the same experiment was done in userspace instead: Mesa's
+`fd6_emit.cc:903` now skips `WRITE(REG_A6XX_RB_DBG_ECO_CNTL, …)` unless `BGMTL_RB_ECO` is set - and that
+write is the **first packet of every state group** freedreno emits, which is exactly what the dump showed.
+
+Images: `next24` = the root with a rebuilt `libbgair` (binning disabled, always sysmem - `CP_SET_AMBLE` is
+gone from the stream, confirming the Mesa patch works) + the data volume with the CA plists and the tracer;
+`next25` = the same with the `RB_DBG_ECO_CNTL` write skipped.
+
+**`next25`: the write really was the first blocker, and the next one is one packet further.**
+`nested ib … 194 dwords` (was 196), and the buffer now begins with `0x48ae0401 0x00000008`, i.e.
+**`SP_FLOAT_CNTL (0xae04) = 8`**. Fences still time out (40 of them, 8 submits), so the state writes freedreno
+emits for a draw wedge this pipe one after another: `RB_DBG_ECO_CNTL` first, `SP_FLOAT_CNTL` next. Both are
+"enable a feature" registers in the 3D blocks that this port never initialised (its `hw_init` only writes the
+`*_ADDR_MODE_CNTL` of those blocks plus a handful of CP/UCHE registers).
+
+That pattern - each successive first write hanging - is the signature of blocks whose *control* state was never
+brought up, not of one bad register. The instrument to keep going is `ibskip`, which filters one register per
+2-second `boot_a` flash instead of a 25-minute image rebuild; it is committed as `0197` and was blocked only by
+the external `bearssl.org` outage during CI.
+
+Useful tool: `~/AppData/.../sym-kernel2.sh` symbolises a panic `pc`/`lr` against the current CI kernel
+(image base `0xfffffe0007004000`, runtime base from the panic screen).
+
+Meanwhile `console137-gpu.img` is the working UI (accelerator published but the `SweetMetalProbe` stub
+declines, so CoreAnimation stays on the CPU compositor) on the same `next18` volume - use it whenever a
+usable phone is wanted between GPU experiments.
+
+### 2026-10-30: the guard only postpones it - a stable UI needs the stub until b3a8 is presentable
+
+The restored boot shows the real shape of the problem: the guard delays the GPU, it does not keep it away.
+
+```
+|backboardd| device created at 247 s … rwa_device_open (lazy): FD630
+|SpringBoard| device created at 1079 s … rwa_device_open (lazy): FD630
+SWEET FB: swap … fmt 0x62336138 ('b3a8')            <- 10-bit surfaces reach the panel
+CRASH SpringBoard[27] sig 11 code 0x100000001 far 0xc   <- and SpringBoard dies once it has the device
+```
+
+So after a few minutes CoreAnimation re-queries on its own (247 s for backboardd, 1079 s for SpringBoard),
+the panel gets `'b3a8'` surfaces that our present path cannot draw, and SpringBoard crashes with a null-ish
+fault (`far 0xc`) inside the GPU path. A stable UI therefore needs the **stub plugin**
+(`console123-stub.img`, no device at all, CPU compositor, verified twice with a visible home screen and no
+SpringBoard crashes) until two things are fixed:
+
+1. `AppleCLCD::swap` must present `'b3a8'` (10-bit, 2-plane) surfaces - convert per pixel to 8-bit BGRA
+   and read plane 0 when `planeCount == 2`;
+2. the device must survive real CA workloads in SpringBoard (the `sig 11, far 0xc` crash), which is the
+   next debugging round once the frames are visible.
+
+`boot_a` is back on `console123-stub.img` (last flash 21:45), `userdata` = `next8`, so the phone boots a
+working UI. `next9`/`next10` stay on disk as the two restart-helper attempts (`next10` has the binary
+`/usr/local/bin/sweet-fbkick`; neither job was ever started by launchd in this port).
+
+### Older plan (superseded, kept for the record): make MobileGestalt answer without the helper
+
+Candidates, cheapest first:
+
+1. create the `systemgroup.com.apple.mobilegestaltcache` group in the image with a valid
+   `com.apple.MobileGestalt.plist` (`CacheVersion`/`CacheExtra`/`CacheData`) so `MGCopyAnswer` answers
+   from disk - an offline image change, so a full flash;
+2. find out why the helper does not leave the cache: sample it earlier than 90 s (the sampler's first
+   dump is fixed at 90 s) or trace its exec/exit in the ring;
+3. last resort: stub `MGCopyAnswer` for the processes in the chain (a dyld-injected shim in `lsd`), which
+   is userland surgery compared to everything above.
+
+### 2026-10-29: END-OF-SESSION STATE (read this first)
+
+**GPU work is done and verified; the black screen is a MobileGestalt/LaunchServices problem of the port.**
+
+Verified on the phone today, in one boot, with `Runtime corruption 0`, no panics and no kernel errors:
+
+- `metalplugin=1` -> Metal loads `SweetBGMTL.bundle` in **backboardd** *and* **SpringBoard**
+  (`SWEET BUNDLE: -initWithAcceleratorPort: -> BGMTLDevice`), the device opens `/dev/sweetgpu`, makes a
+  submitqueue, allocates arena BOs, loads QuartzCore's own AIR, creates 1125x2436 surfaces (`'b3a8'`,
+  10-bit, 2 planes) and backboardd swaps them to the panel (`SWEET FB: swap ...`);
+- `512` page tables (2 MiB `sweetfw3` blob) cover the whole 1 GiB GPU VA - no more `no page table`;
+- pixel format **551** (`RGB10A8_2P_XR10_sRGB`) is served by `libbgair`, so QuartzCore's deep-colour
+  pipeline builds and backboardd no longer aborts (`Metal failed to build render pipeline` = 0).
+
+The UI never draws because **`libMobileGestalt` never answers**: `lsd` blocks in
+`MIInstallationIdentity -> _GenerateBuiltInAppInstallSessionID -> libMobileGestalt ->
+dispatch_semaphore_wait`, so its first-boot seeding never finishes, `LSDatabaseBlockingFetchClient`
+never replies to SpringBoard's `_LSCopyServerStore`, and SpringBoard's main thread sits on the
+LaunchServices context lock inside `CCSModuleRepository` -> `LSApplicationRecord`. The gestalt cache
+group (`/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache`) is
+**missing** from the image, so no client can answer from disk. `rootrw=1` changes nothing.
+
+**Artifacts**
+
+| what | where |
+|---|---|
+| root image (current, healthy, journal uninitialised) | `~/ipsw-x/ios16-root-next6.img` (+ `.simg`) |
+| last flashed boot image | `%USERPROFILE%\fajita-flash\console121-mgh.img` (sampler name did not match) |
+| pair sampler (SpringBoard+backboardd) | `console118-pair.img` |
+| `lsd` sampler | `console119-lsd.img` |
+| writable-root test | `console120-rw.img` |
+| kernel artifact | `xnu/out/kernel.development.sweet` (CI run `40931856828`, commit `7f373a5`) |
+
+**Tooling added today**: `tools/mk-bgmtl-inject.sh` (plan-B dylib), `tools/metal-probe/bgmtl_bundle_log.m`
+(bundle `+load`/port logging), `~/bin/symcache.py` (dyld-cache symbolication: `symcache.py SLIDE 0xADDR`,
+built from `~/ipsw-x/cache-symbols.bin`, cached pickle in `~/.cache/symcache.pkl`).
+
+**How to continue**: create the gestalt cache group in `next6`, `fsck -fy`, `img2simg`, full
+`fastboot flash userdata` (a diff is not valid - the volume was written by the `rootrw=1` boot), boot
+`console118-pair.img`, and watch for `exec SpringBoard` -> `IOK SpringBoard: matching ... IOAcceleratorES`
+-> the first `SWEET SURF: SpringBoard create`. That last line is the signal that the UI is drawing
+through our GPU.
+
+### Next moves (in order)
+
+1. Find what SpringBoard blocks on: the paired sample shows an `os_unfair_lock` wait inside
+   CoreServices/ControlCenterServices, so the useful tool is a dump of *all* SpringBoard threads plus
+   the lock holder - or, cheaper, check whether the services SpringBoard waits for during
+   LaunchServices init (`lsd`, `distnoted`, `cfprefsd`, `containermanagerd`) actually answer: their
+   kernel traces and `exec` lines are in the same ring.
+2. Confirm independence from the GPU with one boot of `metalplugin=0` (SweetMetalProbe stub): the same
+   black screen and the same stuck SpringBoard there means today's Metal work is not implicated.
+3. Keep `boot_a` = `console118-pair.img` (SpringBoard+backboardd sampler) for this investigation; the
+   root image (`next6`) needs no change for any of it.
+4. Housekeeping: `sweetsample` with four names dumped only `launchd` and stopped after two samples;
+   with one or two names it works. Treat the sampler as reliable for two names at a time.
+
+## 2026-11-05 — readable logs, USB root cause, a damaged allocation bitmap, and what the GPU dump now says
+
+### Log channels (this is why several earlier conclusions were wrong)
+
+The ring at the end of `userdata` **stopped describing new boots**: after a panic flush its header
+belongs to an older boot and `tools/sweet-log.py` follows the header, so three experimental boots
+appeared to produce "no log" while the phone was demonstrably running them. Three channels now exist,
+all read through OrangeFox with `pull-sb.sh` (which uses `adb exec-out`, not `adb shell` — the pty
+rewrites `\n` as `\r\n` and silently corrupts binary dumps; this also invalidated earlier pulls):
+
+| channel | where | written | patch |
+|---|---|---|---|
+| ring | last 1025 blocks of `userdata` | every flush | 0047 |
+| head area (16 blocks, 64 KiB) | 2064 blocks before the end | while it is still filling | 0206 |
+| tail area (16 blocks, 64 KiB) | 2048 blocks before the end | every flush | 0205 |
+
+The head area exists because the tail alone does not answer boot questions: the GPU logs every buffer
+object, which fills 64 KiB within seconds, and the lines printed while the machine comes up are gone
+before the first write.
+
+### The status area was inside the root volume (found and repaired)
+
+0203/0204 put the status area at **block 8 of the partition**, which is inside the root HFS+ volume:
+its allocation file occupies blocks 1..128. One boot of that kernel (19:22) replaced 4 KiB of the
+allocation bitmap with log text, marking blocks 32768..65535 free while they hold live data.
+
+Repaired and proven, not assumed: the whole bitmap (blocks 1..128) was dumped from the phone and
+compared with `gpu25.simg` — **only block 8 differed**, so nothing legitimate had touched it. Block 8 was
+restored from the image and the full 128 blocks then compared byte for byte: identical. 0205 moved the
+area to 8 MiB before the end of the partition, outside both volumes and 4 MiB before the ring.
+
+### USB: the driver was programmed with another SoC's clock table
+
+The CBCR table was SM7150's (`master 0xf010`, `sleep 0xf014`, `utmi 0xf018`, `clkref 0x8c010`); SDM845
+uses `0xf00c`, `0xf010`, `0xf014`, `0x8c008`, and fajita is **USB2-only** (`usb_1_hsphy`, no QMP). The
+power-up path is gated behind `sweetusb=2`, and the boot that carried it printed only the read-only
+report — with a 4 KiB tail there was no way to tell "the argument never arrived" from "it arrived and the
+power-up was skipped". Patch 0202 added `SWEET USB: sweetusb=%d` as the first line of the probe, and the
+head area (0206) is what makes those boot-time lines readable at all. **Unverified until the next boot**: whether the marker
+and the per-clock results appear.
+
+### Reboot to fastboot: four mechanisms, all ignored
+
+IMEM `restart_reason` (write confirmed), PON `SOFT_RB_SPARE`, `misc`/`boot-fastboot`,
+`misc`/`bootonce-bootloader` (patch 0202 makes the command selectable with `sweetrebootcmd=`). None of
+them produced fastboot; 18:43:49 confirmed the phone was not in fastboot after
+`bootonce-bootloader`. Soft reboot into fastboot is out of reach for a patch — it needs the hardware rig,
+or it stops mattering once USB works.
+
+### GPU: what the log actually shows
+
+- The kernel's own `CP_INDIRECT_BUFFER` test **passes** (`cp indirect submission: ring idle`), so nested
+  buffers are fetched and executed — the fault is in what the client's buffer asks for.
+- The window server's 194-dword pass starts with type-4 writes to `SP_FLOAT_CNTL` (0xae04 = 8),
+  `SP_??` (0xae00), `0xae0f`, `TPL1` (0xb605/0xb600), `HLSQ` (0xbe00/0xbe01), `VPC` (0x9600) — the 3D
+  blocks, not the CP/UCHE registers that the kernel writes and that do retire.
+- That pattern, plus "the kernel's own type-4 writes retire", points at the **GX rail**: the GMU owns it
+  and can collapse it when it believes the GPU is idle, this driver has no runtime power management, and
+  a register write into a collapsed block hangs the bus instead of failing.
+- Patch 0207 adds `ib2nop=N` (the nested buffer's dwords become `CP_NOP`s, size untouched): if a buffer
+  of NOPs also times out, the fetch is at fault; if it retires, the writes are.
+- Patch 0208 makes the timeout dump answer "where and why": IB1/IB2 base and remaining dwords,
+  `RBBM_STATUS3` bit 24 (SMMU stalled on fault), sticky `FSR`/`FAR`/`FSYNR0` for both context banks, the
+  names of the blocks that never went idle, and GPUCC's GX GDSCR (`GX up` / `GX COLLAPSED`).
+
+Guesses are marked as such: the GX-collapse explanation is a hypothesis that 0208's `gx_gdscr` line tests
+directly, and the alternative (a state write the hardware refuses) is what 0207 tests.
+
+### Commits and CI
+
+| patch | commit | CI |
+|---|---|---|
+| 0202 (misc command choice, `sweetusb` marker) | `ee33607` | `42075916795` success |
+| 0203 (status block, **wrong location**) | `1b27da5` | `42077720024` success |
+| 0204 (status block 64 KiB, same wrong location) | `1360f5c` | cancelled by 0205's push |
+| 0205 (status area out of the volumes) | `0ae4181` | `42085253608` |
+| 0206/0207/0208 (head area, `ib2nop`, fault dump) | this push | pending |
+
+### Next boot should carry
+
+`sweetusb=2 ib2nop=1` — one boot answers three questions from the head and tail areas: did the SDM845
+clock table power the block up (marker + per-clock lines), did a nested buffer of NOPs retire (fetch vs
+writes), and if it did not, what the new dump says about IB2's remaining size, SMMU FSR and the GX rail.
+
+### Still open
+
+- USB gadget/ECM and UDP logging (`tools/sweet-usbnet.sh`) once the block powers up — that is what removes
+  the need for a manual fastboot to read a log.
+- `MSM_PARAM_GMEM_SIZE`/`GMEM_BASE` values are not in any log yet; the review of 2026-11-05 says a630 must
+  report 1 MiB / `0x100000` (used by binning layout).
+- No `arena: ... do not fit` line has been seen, but the arena is 40 MiB (`0x102528000`) and Mesa's VSC
+  buffers are large, so watch for it.
+- `gpu_ring_wait_idle` treats `RPTR == WPTR` as completion; on a6xx the CP advances RPTR when it prefetches,
+  not when it finishes, so the authority is the fence value in scratch (kept for later; the fence path is
+  the one being tested).
+
+### Update 19:50 — what the last dump was actually saying, and two corrections
+
+The dump from the 19:22 boot (`sweetlog-st.txt`, line 7928) reads:
+
+```
+client fence timeout: rptr 365 wptr 365 rbbm_status 0x800005 cp_status1 0x8100471e
+                      hw_fault 0 irq 0x1 protect 0 rbbm_irq 0 sqe_cntl 0x1
+```
+
+`0x800005` is `GPU_BUSY_IGN_AHB` (bit 23) + `CP_BUSY` (2) + **`CP_AHB_BUSY_CX_MASTER` (0)**. No 3D block
+busy bit is set, `hw_fault` is 0 and `protect` is 0. That is not a register the hardware refuses (that would
+raise a fault or a protection status) and not a block stuck in a draw: it is the CP's AHB master holding a
+transaction that never completes. A write into a block whose clock or rail is off hangs exactly like this.
+
+Two corrections to earlier reasoning:
+
+- 0187 replayed the **outer** buffer (136 dwords, all type-4 writes to RB registers 0x8864/0x8880/0x8115/
+  0x8871/0x8114/0x8888/0x8878), **not** the nested one. So "the same dwords work from kernel memory" was
+  never evidence about the nested state buffer; it does show that RB-class writes retire while the boot's own
+  power sequencing is still in place.
+- `MSM_PARAM_GMEM_SIZE` and `GMEM_BASE` are `0x100000` each in `sweet_gpu_param()` (checked in the source, not
+  in a log), which is what the 2026-11-05 review expects for a630. That item is closed without a boot.
+
+Patches added on top of the batch: **0209** (report the GX rail state at the first client submission, and
+`gpuwake=1` repeats the boot's rail votes on every submission) and **0210** (`ib2bounce=1` copies the first
+nested buffer into kernel memory and repoints `CP_INDIRECT_BUFFER` at the copy). CI: 0206–0209 =
+`42086629827` success; 0210 = `42087888785`.
+
+## 2026-11-05 21:00 — decision asked for: custom UEFI instead of ABL→shim→XNU?
+
+The question (user): "wouldn't it be better to make our own UEFI that then boots XNU?"
+
+**Answer recorded: not now, and not "our own" — if it happens, it is EDK2.**
+
+- EDK2 for SDM845 exists (`edk2-porting/edk2-msm`, the Renegade project) and **fajita is a first-class
+  target**: release asset `boot-fajita.img`, support matrix says USB / UFS / display / buttons = Y, GPU =
+  partial (framebuffer only). It can be tried without flashing anything: `fastboot boot boot-fajita.img`.
+- What it would buy: a bootloader we control, i.e. after any reset we land in UEFI (with USB) instead of
+  needing the user to hold Power+VolDown; a log channel that does not need OrangeFox; and a clean handoff
+  (DTB, memory map, clocks, watchdog) instead of ABL's leftovers.
+- What it would not buy: **the GPU**. XNU still has to own GMU/SMMU/CP/zap, and the a630 in EDK2 is a
+  framebuffer. The blocker for "usable UI" is unchanged.
+- Cost: adopting EDK2 is weeks of on-device work because something has to load a Mach-O kernel with boot
+  args and a memory map — that is exactly what our shim already does, so the work would be a port of the
+  shim into an EFI application, plus debugging with no console at first. Not brickable (9008/Sahara).
+- Cheaper 80%: ABL always boots `boot_a`, i.e. **our shim**, on every reset. A "tool mode" in the shim —
+  read a flag from UFS, and instead of starting XNU, serve the status areas over USB and accept a new boot
+  image — gives the same autonomy and the same post-crash log for hundreds of lines instead of thousands.
+
+Rule for later: if the GPU work turns out to be blocked by ABL-leftover state, or if boot iterations become
+the bottleneck, revisit EDK2-fajita — adopting the existing image, not writing a firmware from scratch.
+
+### Where the silent resets stand (work in progress)
+
+Two boots (console168, console169) ended in the Qualcomm crash dump with **no kernel trace**: `panic()`
+calls `sweet_early_panic()` (which draws the text on the panel) and `sweet_log_panic_flush()` (which marks
+the ring `seq 0xffffffff`), and neither happened — so the CPU never reached `panic()`. Both boots got as far
+as backboardd creating Metal pipelines and BOs (arena to `0xfd0000`) and then stopped during the burst of
+`exec`/`SWEET AKS` lines, about four minutes in. Neither reached a client submission, so `0209`'s rail report
+and `0210`'s bounce have **not been exercised yet**.
+
+Patch `0211` adds `sweet_wdt_probe()` (reads APCS WDT at `0x17980000`: enable `+0x4`, bite time `+0x24`,
+prints `ARMED`/`off`; `sweetwdt=1` clears enable) and a log milestone every six flushes, so the last
+`SWEET LOG: flush N, M bytes, about T s` line in the status area says how long the boot lived.
+
+## 2026-11-05 21:30 — the silent resets are the GPU client's buffer memory, and why
+
+Bisection with boots that needed no new kernel:
+
+| boot | cmdline | result |
+|---|---|---|
+| console170 | `adreno=0 metalplugin=0` | iOS booted normally, ran (CPU-composited UI) |
+| console171 | `adreno=9 metalplugin=0` | **reached SpringBoard**, touch worked (`raw max x=595 y=2324`), no GPU client at all |
+| console168/169 | `adreno=9 metalplugin=1` | died ~4 min in, no panic text, Qualcomm crash dump |
+
+So the GPU bring-up (GMU, SMMU, zap, CP held up) is **innocent**; what kills the machine is the userspace
+MSM path. Those boots never even reached a submission (`0209`'s rail report never printed), so the killer is
+BO allocation/mapping, not the command stream.
+
+The mechanism (theory, now patched): `gemNew()` wrapped arena memory in
+`IOMemoryDescriptor::withPhysicalAddress()`. The arena is reserved DRAM, so pmap counts its pages as
+managed — IOKit warned about exactly this, 30+ times per boot (`IOMemoryDescriptor physical with managed
+page 0x...`). Mapping such a descriptor into the client makes IOKit build a device pager over those pages;
+when the client frees a BO and the mapping is torn down, the pager hands the pages back to the VM, while the
+arena keeps handing the same pages to the next BO. Two live buffers share physical memory, the GPU writes
+into whatever the VM gave those pages to next, and the machine dies without a panic after enough churn
+(~1000 BOs). It also means nothing drawn through this path could be trusted.
+
+Patch `0212` fixes both halves:
+- `gemNew()` allocates each BO as an `IOBufferMemoryDescriptor` — its pager owns the pages and frees them
+  once; the GPU still walks them with `getPhysicalSegment()`, the CPU uses `getBytesNoCopy()`.
+- Coherency is explicit and **by kernel VA** (`sweet_gpu_flush_kva` = `dc civac`, `sweet_gpu_invalidate_kva`
+  = `dc ivac`), so no `phystokv()` and no panic for pages below `gPhysBase` — which is why buffers down
+  there were previously never cleaned at all (patch 0194 skipped them).
+- The cleaning moved to the msm ABI's own points: `MSM_PREP_WRITE` cleans, `MSM_PREP_READ` invalidates, and
+  `submit()` only cleans the command buffers it patched.
+
+Still unverified: whether the `0209` rail report and the `0210` bounce behave as expected now that a client
+can survive long enough to submit. The first boot with `0212` should answer that (watch for
+`first client submission: gx_gdscr ...` and for fences that retire).
+
+### CI note
+
+`macos-14` stopped handing out runners at 19:45 (job cancelled within seconds, `runner_name` empty, three
+runs in a row, repo public, Actions enabled, no other workflow). The workflow now asks for `macos-13`
+(also Xcode 15.x, so the iig IORPC ABI is unchanged); that run queued normally.
+
+## 2026-11-05 22:40 — the crash is fixed and the GPU finally talks: SMMU faults on the nested buffer
+
+`console172` (0211 + 0212, `metalplugin=1`, clean) is the first boot that both survived and submitted work:
+
+- `SWEET WDT: apss en 0 bite 0 (off)` — the APSS watchdog **was never armed**, so the silent resets were
+  never a watchdog. That hypothesis is closed.
+- the log reached `flush 48, 756102 bytes, about 480 s` — at least eight minutes, no crash dump; the machine
+  was still alive when it was rebooted by hand.
+- **`SWEET GPU: first client submission: gx_gdscr 0xf8222000 cx_gdscr 0xf8222000 rpmh_power_state 0xf
+  (GX up)`** — 0209 answered: the GX rail was up, so the rail is not the reason the pipe stalls.
+- backboardd submitted frames (`submit 26 bos 6 cmds, ib 0x8072c000 72 dwords, fence 7`), waited 2 s ×2,
+  logged `command buffer failed`, and tried the next one — userspace survives a timeout now instead of the
+  machine dying.
+
+The timeout dump is the first one with all the new fields, and it is unambiguous:
+
+```
+client fence timeout: rptr 365 wptr 365 rbbm_status 0x800005 cp_status1 0x8100471e hw_fault 0 irq 0x1
+client fence timeout: ib1 080764000 rem 24 dwords, ib2 080725600 rem 0 dwords, status3 0
+client fence timeout: blocks still busy: cp
+client fence timeout: gpucc gx_gdscr 0xf8222000 cx_gdscr 0xf8222000 (GX up)
+client fence timeout: smmu sGFSR 0
+client fence timeout: smmu cb0 sctlr 0xc01067 fsr 0x400 far 0 fsynr0 0
+client fence timeout: smmu cb1 sctlr 0xc01067 fsr 0x402 far 0x80725600 fsynr0 0x3
+```
+
+- `ib1 rem 24 dwords` and `ib2 rem 0` say the CP is stuck **inside IB1**, before it ever enters IB2.
+- `blocks busy: cp` with `hw_fault 0` and `status3 0` says no 3D block is stuck and the SMMU is not stalling
+  on a fault - the CP is waiting for a fetch that never completes.
+- **`smmu cb1 fsr 0x402 far 0x80725600`** names the address: 0x80725600 is exactly the target of the
+  `CP_INDIRECT_BUFFER` at dword 8 of the outer buffer (194 dwords). The CP cannot translate the nested
+  buffer's IOVA.
+
+So the wedge is a **stage-1 translation fault on a client BO's IOVA**, not a register the hardware refuses and
+not the power rail. `ib2bounce=1` (patch 0210) is the test that separates "that IOVA is mapped wrongly" from
+"the content of the buffer wedges the pipe": it repoints the same packet at a copy in kernel memory
+(0x80001000, an address the CP has fetched successfully since the first boot test).
+
+`console173` = 0212 + `ib2bounce=1`, flashed 22:41:45. If its fences retire, the next job is the client BO
+mapping in `sweet_gpu_vm_map` / `mapGem` (PTE attributes, coverage of multi-page BOs, TLB invalidation), not
+the command stream.
+
+## 2026-11-06 06:50 — the page really loses its PTE while the CP is in the BO
+
+`console174` = 0213 + `iovacheck=1`, `metalplugin=1`, no bounce. Nine submissions (fences 7..15), **every fence
+timed out**, boot survived (about 420 s) and backboardd later crashed on its own (sig 11, `far 0x8`) after
+printing `rwa_device_open (lazy): there is no GPU here: no msm device to open` — a separate, userspace-side
+symptom to keep in mind.
+
+The two readouts together are decisive:
+
+```
+iovacheck: bo 9 iova 0x80724000 size 4194304 ok        (all 26 BOs ok, every page mapped)
+timeout:   smmu cb1 far 0x80725600 pte 0
+timeout:   ib1 0x80764000 rem 24 dwords, ib2 0x80725600 rem 0
+```
+
+0x80725600 and 0x80764000 are **inside the same BO** (0x80724000..0x80764000). At submit time every page of it
+had a PTE; two seconds later the page holding the nested buffer has none, while the CP is still inside the same
+BO. So the mapping is not wrong — it is **removed while the GPU is using it**.
+
+Only `sweet_gpu_vm_unmap()` writes a zero PTE. Its callers are `releaseGem` (guarded by `lastFence`, and it
+leaks instead of unmapping when the fence never completes), the `SET_IOVA` remap (refused once `submitted` is
+set), `clientClose`, and the `gemNew` failure path. One of them is running when it should not.
+
+`0214` makes that visible: `sweet_gpu_vm_unmap()` logs every range of 1 MiB or more with address and size, and
+`iovacheck=1` also prints each BO's first PTE, so the log will say which call removed the page and what the
+entry looked like before it went. Next boot: `metalplugin=1 iovacheck=1`, then grep `unmap 0x` against
+`smmu cb1 far`.
+
+Also noted for later: `sweet_gpu_vm_map()` calls `gpu_tlb_invalidate()` per page, so mapping the 4/11/12 MiB BOs
+costs thousands of full TLB invalidations per boot — one of the reasons the boot takes minutes. That is a
+performance fix, not a correctness one; it belongs after the pipeline runs.
+
+CI: macos-15 gives runners reliably (`42110525340`, `42116600954` success). macos-14 hands out nothing and
+macos-13 queues forever, both of which are why 0211/0212 waited; the workflow now asks for macos-15 and each
+commit has its own concurrency group.
