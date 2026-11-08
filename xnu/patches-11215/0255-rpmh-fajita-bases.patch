@@ -1,0 +1,32 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -9,6 +9,7 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
+ #include "sweet_board.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -114,6 +115,21 @@
+ rh_map(void)
+ {
+ 	rh_be = sweet_board_beryllium();
++	/*
++	 * fajita is the other SDM845 board in this tree, and SDM845 keeps the apps RSC and its TCS at the same
++	 * addresses on both phones (0x179e0000 / 0x179e0d00, mailbox@179e0000 in the vendor dts) with the fixed
++	 * cmd-db locator. Only sweet_board_beryllium() selects that branch, so fajita would otherwise be driven
++	 * with the SM7150 addresses - and a TCS write at the wrong base hangs the bus and freezes the SoC, which
++	 * is exactly how the first boot with ldoa28 enabled died. sweetts=1 is what selects the fajita touch
++	 * path, so it selects the matching RPMh geometry here too; beryllium itself is unaffected.
++	 */
++	if (!rh_be) {
++		int fajita = 0;
++
++		if (PE_parse_boot_argn("sweetts", &fajita, sizeof(fajita)) && fajita != 0) {
++			rh_be = true;
++		}
++	}
+ 	if (!rh_rsc) {
+ 		rh_rsc = ml_io_map(rh_be ? RH_BE_RSC_PA : RH_RSC_PA, 0x100);
+ 	}
