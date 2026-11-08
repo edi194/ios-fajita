@@ -278,6 +278,23 @@ jobs:
           path: buildtree.tgz
           retention-days: 7
 
+      - name: Keep the patched device drivers
+        # fajita port: sweet_touch.c and friends only exist after the whole patch chain has been applied, and
+        # the port needs their exact text to write a patch that applies in this tree.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: patched-drivers
+          path: |
+            dxb/xnu/bsd/dev/sweet_touch.c
+            dxb/xnu/bsd/dev/sweet_keys.c
+            dxb/xnu/bsd/dev/sweet_hid.c
+            dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp
+            dxb/xnu/bsd/dev/sweet_surface.c
+            dxb/xnu/bsd/dev/sweet_battery.c
+          retention-days: 7
+          if-no-files-found: warn
+
       - name: Inspect closed KDK support libs
         if: always()
         run: |
