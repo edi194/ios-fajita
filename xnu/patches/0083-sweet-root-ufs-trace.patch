@@ -1,0 +1,55 @@
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -678,6 +678,9 @@
+ 
+ 	int xchar, dchar;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	IOLog("SWEET: IOFindBSDRoot entered (attempt %d)\n", mountAttempts + 1);
++#endif
+ 	// stall here for anyone matching on the IOBSD resource to finish (filesystems)
+ 	matching = IOService::serviceMatching(gIOResourcesKey);
+ 	assert(matching);
+@@ -691,6 +694,9 @@
+ 	matching->release();
+ 	matching = NULL;
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	IOLog("SWEET: IOBSD resource wait done\n");
++#endif
+ 	if (mountAttempts++) {
+ 		IOLog("mount(%d) failed\n", mountAttempts);
+ 		IOSleep( 5 * 1000 );
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -607,7 +607,11 @@
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
+ 
++	printf("SWEET UFS: init, regs 0x%lx+0x%lx\n", (unsigned long)reg[0], (unsigned long)reg[1]);
+ 	su.regs = ml_io_map(reg[0], reg[1]);
++	printf("SWEET UFS: hce 0x%x hcs 0x%x cap 0x%x ver 0x%x is 0x%x utrlba 0x%x:%x dbr 0x%x rsr 0x%x\n",
++	    ufs_rd(REG_HCE), ufs_rd(REG_HCS), ufs_rd(REG_CAP), ufs_rd(0x08), ufs_rd(REG_IS),
++	    ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA), ufs_rd(REG_UTRLDBR), ufs_rd(REG_UTRLRSR));
+ 	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+ 	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
+ 		printf("SWEET UFS: no contiguous DMA memory\n");
+@@ -618,6 +622,7 @@
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
++	printf("SWEET UFS: DMA 0x%llx (+0x%x)\n", su.dma_pa, (unsigned)DMA_SIZE);
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
+@@ -626,8 +631,10 @@
+ 	if (!error) {
+ 		static const uint8_t tur[6] = { 0x00 };
+ 		/* The first command after the bootloader may report a unit attention. */
++		printf("SWEET UFS: host taken over, TEST UNIT READY\n");
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		}
++		printf("SWEET UFS: TUR %d\n", error);
+ 	}
+ 	if (!error) {
+ 		error = ufs_find_partition(want);

@@ -1,0 +1,22 @@
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index d41623d05fb5609bf6280ce9f5aaa21fe706ede4..79c3da6611463a4438e5f20a8e1fb5743ab8a47b 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2048,6 +2048,17 @@ proc_prepareexit(proc_t p, int rv, boolean_t perf_notify)
+ 	task_t task = proc_task(p);
+ 
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * sweet: 12377 panics for a dying initproc here, before the SWEET crash report further down (0043) ever runs:
++	 * print launchd's registers/backtrace/slide first (iOS 26 launchd SIGSEGV with no report).
++	 */
++	if (p == initproc && p == current_proc()) {
++		extern void sweet_crash_log(const char *, int, int, uint64_t, uint64_t);
++		sweet_crash_log(p->p_comm, proc_getpid(p), WTERMSIG(rv),
++		    ((uint64_t)ut->uu_exception << 32) | (uint32_t)ut->uu_code, ut->uu_subcode);
++	}
++#endif
+ 	if (p->p_crash_behavior != 0 || p == initproc) {
+ 		proc_handle_critical_exit(p, rv);
+ 	}

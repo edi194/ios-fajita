@@ -1,0 +1,42 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -664,6 +664,9 @@
+ }
+ 
+ static unsigned nvt_max = TOUCH_MAX;
++/* boot-arg sweettouchlog=1: one line per NT36672A frame read (debug the home swipe) */
++static unsigned touch_trace;
++static char touch_trace_why;    /* 'e' IRQ edge, 'a' periodic read while touched */
+ 
+ /* One frame lists every active contact; slots missing from it are released. */
+ static int
+@@ -699,6 +702,13 @@
+ 		mask |= 1u << (slot - 1);
+ 		x[slot - 1] = (int)px;
+ 		y[slot - 1] = (int)py;
++	}
++	if (touch_trace) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		printf("TT %llu %c m=%x %d,%d | %02x %02x %02x %02x %02x %02x | %02x %02x %02x\n",
++		    ns / 1000000ull, touch_trace_why, mask, x[0], y[0],
++		    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]);
+ 	}
+ 	touch_report(mask, x, y);
+ 	return 0;
+@@ -940,6 +950,7 @@
+ 		    ++since_read * touch_poll_ms >= 8);
+ 		if (!st.irq_hint || active_due || pending || periodic) {
+ 			since_read = 0;
++			touch_trace_why = pending ? 'e' : 'a';
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
+ 			    st.kind == TOUCH_NVT ? touch_novatek() : touch_focaltech();
+ 			if (err) {
+@@ -1000,6 +1011,7 @@
+ 		touch_poll_ms = 10;
+ 	}
+ 	(void)PE_parse_boot_argn("sweettouchbb", &bb_half_us, sizeof(bb_half_us));
++	(void)PE_parse_boot_argn("sweettouchlog", &touch_trace, sizeof(touch_trace));
+ 	if (bb_half_us < 2 || bb_half_us > 10) {
+ 		bb_half_us = 5;
+ 	}

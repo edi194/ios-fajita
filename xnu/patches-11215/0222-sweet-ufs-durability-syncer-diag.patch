@@ -1,0 +1,741 @@
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+index 3bd75a6..8228f52 100644
+--- a/bsd/dev/sweet_reboot.c
++++ b/bsd/dev/sweet_reboot.c
+@@ -49,6 +49,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void delay(int usec);
++extern int sweet_ufs_flush_final(void);      /* bsd/dev/sweet_ufs.c: SYNCHRONIZE CACHE (patch 0221) */
+ 
+ #define SR_PSHOLD_PA     0x0c264000u
+ #define SR_IMEM_PA       0x146bf000u
+@@ -211,6 +212,14 @@ sweet_reboot_restart(int panic_restart)
+ {
+ 	int mode;
+ 
++	/*
++	 * Before anything else, make sure the UFS write cache holds nothing the file system already
++	 * completed: the reset below can power-cycle the device. Does not wait for dirty file pages
++	 * (reboot_kernel() synced and unmounted before getting here; the periodic syncer bounds the
++	 * rest), only for what the device has acknowledged.
++	 */
++	int flush = sweet_ufs_flush_final();
++	printf("SWEET REBOOT: UFS cache flush -> %d%s\n", flush, flush == EBUSY ? " (busy, skipped)" : "");
+ 	if (!sr_ready) {
+ 		return -1;
+ 	}
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index c79b7d4..27caa07 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -14,6 +14,16 @@
+  * a 1 MiB bounce buffer); the host is not cache coherent, so caches are
+  * cleaned/invalidated around each command.
+  *
++ * Durability (patch 0221): the HFS root is not journaled and, being the root, has no HFS syncer
++ * thread, so nothing in the kernel ever pushed dirty file data or B-tree nodes to the device
++ * until a userland sync() or the shutdown path. sweet_ufs_syncer_thread() now does a
++ * synchronous VFS sync of every writable mount plus SYNCHRONIZE CACHE every ufssyncsecs
++ * seconds (default 5, 0 = off), SYNCHRONIZE CACHE is also issued from sweet_reboot_restart()
++ * right before the reset, failed commands are retried (UNIT ATTENTION, BUSY, timeouts) and
++ * everything is counted in sysctl kern.sweet_ufs.*. Boot-args: ufsverify=1|2 (read back every
++ * write; 2 = after SYNCHRONIZE CACHE, with a FUA read), ufsfua=1|2 (FUA for B_FUA buffers /
++ * for every write), ufssyncsecs=N, ufsretries=N.
++ *
+  * Writes are refused unless boot-arg ufsrw=1 is set. Every write is checked
+  * against the partition bounds again right before it is issued, so nothing
+  * outside the named partition can be written.
+@@ -27,6 +37,9 @@
+ #include <sys/errno.h>
+ #include <sys/proc.h>
+ #include <sys/uio.h>
++#include <sys/mount.h>
++#include <sys/vnode.h>
++#include <sys/sysctl.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <kern/locks.h>
+ #include <kern/clock.h>
+@@ -52,6 +65,7 @@ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
+ static void sweet_ufs_selftest_start(void);
++static void sweet_ufs_syncer_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_reboot_init(void);
+@@ -105,6 +119,9 @@ struct ucd {
+ #define DMA_UCD         0x1000                  /* 128 byte aligned */
+ #define DMA_BOUNCE      0x4000
+ #define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
++#define DMA_VERIFY      (DMA_BOUNCE + BOUNCE_SIZE)      /* second 1 MiB, only with ufsverify */
++#define UFS_RETRIES     3u
++#define UFS_SYNC_SECS   5u
+ 
+ static struct {
+ 	vm_offset_t regs;
+@@ -121,8 +138,41 @@ static struct {
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
++	uint32_t dma_size;                      /* bytes allocated at su.dma */
++	uint32_t verify;                        /* ufsverify: 0 off, 1 read back, 2 flush + FUA read back */
++	uint32_t fua;                           /* ufsfua: 0 none, 1 B_FUA buffers, 2 every write */
++	uint32_t retries;                       /* ufsretries */
++	uint32_t syncsecs;                      /* ufssyncsecs */
++	bool dirty;                             /* writes completed since the last SYNCHRONIZE CACHE */
+ } su;
+ 
++/*
++ * Counters, exported as sysctl kern.sweet_ufs.* (read-only). All but the strategy ones are updated
++ * under sweet_ufs_lock; the sysctl reads are unlocked and may be a little stale.
++ */
++static struct {
++	uint64_t reads, read_blocks;            /* READ(10) commands that completed ok */
++	uint64_t writes, write_blocks;          /* WRITE(10) commands that completed ok */
++	uint64_t flushes;                       /* SYNCHRONIZE CACHE ok */
++	uint64_t flush_errors;
++	uint64_t errors;                        /* commands that failed for good (after retries) */
++	uint64_t cmd_failures;                  /* every failed attempt, retried or not */
++	uint64_t timeouts;                      /* attempts that hit the 5 s timeout */
++	uint64_t retries;                       /* attempts repeated */
++	uint64_t is_errors;                     /* host interrupt status with an error bit set */
++	uint64_t resid_nonzero;                 /* response UPIU residual count != 0 on a good command */
++	uint64_t strat_reads, strat_writes;     /* BSD strategy calls */
++	uint64_t strat_errors;
++	uint64_t strat_rmw;                     /* partial-block writes (read-modify-write) */
++	uint64_t strat_fua;                     /* writes issued with FUA */
++	uint64_t verify_ok, verify_bad, verify_io_errors;
++	uint64_t syncer_runs, syncer_errors, ioctl_syncs, user_flushes;
++	uint64_t final_flushes, final_flush_skipped;
++	uint32_t last_ocs, last_upiu, last_resp, last_status, last_sense;   /* last failed attempt */
++	uint32_t last_is, last_hcs;
++	uint32_t last_cdb;                      /* opcode of the last failed attempt */
++} ss;
++
+ static LCK_GRP_DECLARE(sweet_ufs_grp, "sweet_ufs");
+ static LCK_MTX_DECLARE(sweet_ufs_lock, &sweet_ufs_grp);
+ 
+@@ -161,18 +211,37 @@ dma_clean(uint32_t off, uint32_t len)
+ 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+ }
+ 
++/* Response UPIU: byte 1 flags, 6 response, 7 SCSI status, 12..15 residual, 32.. data (sense). */
++/* IS bits that mean trouble: UE 2, ULLS 7 (link lost), DFES 11, UTPES 12, HCFES 16, SBFES 17, CEFES 18 */
++#define UFS_IS_ERR_MASK (0x4u | 0x80u | 0x800u | 0x1000u | 0x10000u | 0x20000u | 0x40000u)
++#define SCSI_CHECK_CONDITION    0x02
++#define SCSI_BUSY               0x08
++#define SCSI_TASK_SET_FULL      0x28
++#define UFS_FAIL_LOG_MAX        64u
++
++static uint32_t ufs_fail_logged;
++
++static inline uint32_t
++be32(const uint8_t *p)
++{
++	return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
++}
++
+ /*
+- * One SCSI command in slot 0, data (if any) to/from the bounce buffer
+- * (to the device when write is set). Returns 0 or an errno.
++ * One attempt of one SCSI command in slot 0, data (if any) to/from the DMA window at data_off
++ * (to the device when write is set). Returns 0 or an errno; *retry says whether repeating the
++ * command can help (transient device condition, timeout): every command we issue is idempotent.
+  */
+ static int
+-ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++ufs_scsi_once(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write, uint32_t data_off,
++    bool *retry)
+ {
+ 	struct utrd *utrd = (struct utrd *)(su.dma + DMA_UTRL);
+ 	struct ucd *ucd = (struct ucd *)(su.dma + DMA_UCD);
+-	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + DMA_BOUNCE;
++	uint64_t ucd_pa = su.dma_pa + DMA_UCD, bounce_pa = su.dma_pa + data_off;
+ 
+ 	assert(len <= BOUNCE_SIZE);
++	*retry = false;
+ 	bzero(utrd, sizeof(*utrd));
+ 	bzero(ucd, sizeof(*ucd));
+ 
+@@ -217,9 +286,9 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	}
+ 	if (len) {
+ 		if (su.cache && write) {
+-			dma_clean(DMA_BOUNCE, len);
++			dma_clean(data_off, len);
+ 		} else {
+-			dma_sync(DMA_BOUNCE, len);
++			dma_sync(data_off, len);
+ 		}
+ 	}
+ 	__builtin_arm_dsb(0xf);
+@@ -240,7 +309,28 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		uint64_t now = mach_absolute_time();
+ 		if (now > deadline) {
+ 			ufs_wr(REG_UTRLCLR, ~1u);
+-			printf("SWEET UFS: command 0x%02x timed out\n", cdb[0]);
++			/*
++			 * The host retires the slot on its own, but the device may still own the data
++			 * window until it does: give it a bounded moment before the buffer is reused
++			 * (a late DMA into a reused bounce buffer shows up as foreign data in a file).
++			 */
++			for (int i = 0; i < 100 && (ufs_rd(REG_UTRLDBR) & 1); i++) {
++				delay(1000);
++			}
++			uint32_t is = ufs_rd(REG_IS);
++			ufs_wr(REG_IS, is);
++			ss.timeouts++;
++			ss.cmd_failures++;
++			ss.last_cdb = cdb[0];
++			ss.last_ocs = 0xff;
++			ss.last_is = is;
++			ss.last_hcs = ufs_rd(REG_HCS);
++			if (is & UFS_IS_ERR_MASK) {
++				ss.is_errors++;
++			}
++			printf("SWEET UFS: command 0x%02x timed out (is 0x%x hcs 0x%x dbr 0x%x)\n",
++			    cdb[0], is, ss.last_hcs, ufs_rd(REG_UTRLDBR));
++			*retry = true;
+ 			return ETIMEDOUT;
+ 		}
+ 		if (sleepable && now >= spin_until) {
+@@ -255,7 +345,8 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		}
+ 	}
+ 	__builtin_arm_dsb(0xf);
+-	ufs_wr(REG_IS, ufs_rd(REG_IS));         /* acknowledge completion status */
++	uint32_t is = ufs_rd(REG_IS);
++	ufs_wr(REG_IS, is);                     /* acknowledge completion status */
+ 
+ 	dma_sync(DMA_UTRL, sizeof(*utrd));
+ 	if (su.cache) {
+@@ -264,31 +355,161 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 		dma_sync(DMA_UCD, sizeof(*ucd));
+ 	}
+ 	if (len && !(su.cache && write)) {
+-		dma_sync(DMA_BOUNCE, len);
++		dma_sync(data_off, len);
+ 	}
+ 
+ 	uint32_t ocs = utrd->dw2 & 0xff;
++	if (is & UFS_IS_ERR_MASK) {
++		ss.is_errors++;
++		ss.last_is = is;
++		ss.last_hcs = ufs_rd(REG_HCS);
++		if (ufs_fail_logged++ < UFS_FAIL_LOG_MAX) {
++			printf("SWEET UFS: command 0x%02x completed with error status is 0x%x hcs 0x%x\n",
++			    cdb[0], is, ss.last_hcs);
++		}
++	}
+ 	if (ocs || ucd->resp[0] != 0x21 || ucd->resp[6] || ucd->resp[7]) {
+-		printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x\n",
+-		    cdb[0], ocs, ucd->resp[0], ucd->resp[6], ucd->resp[7]);
++		/* Sense data follows the 32 byte header: u16 length, then fixed-format sense. */
++		uint32_t sense = 0;
++		unsigned slen = (unsigned)(ucd->resp[32] << 8 | ucd->resp[33]);
++		if (ucd->resp[7] == SCSI_CHECK_CONDITION && slen >= 14) {
++			sense = (uint32_t)(ucd->resp[34 + 2] & 0xf) << 16 | (uint32_t)ucd->resp[34 + 12] << 8 |
++			    ucd->resp[34 + 13];
++		}
++		ss.cmd_failures++;
++		ss.last_cdb = cdb[0];
++		ss.last_ocs = ocs;
++		ss.last_upiu = ucd->resp[0];
++		ss.last_resp = ucd->resp[6];
++		ss.last_status = ucd->resp[7];
++		ss.last_sense = sense;
++		if (ufs_fail_logged++ < UFS_FAIL_LOG_MAX) {
++			printf("SWEET UFS: command 0x%02x failed: ocs 0x%x upiu 0x%x response 0x%x status 0x%x "
++			    "sense key 0x%x asc 0x%02x ascq 0x%02x\n", cdb[0], ocs, ucd->resp[0], ucd->resp[6],
++			    ucd->resp[7], sense >> 16, (sense >> 8) & 0xff, sense & 0xff);
++		}
++		/*
++		 * Transient: UNIT ATTENTION (6) / NOT READY (2) after a link or power event, BUSY and
++		 * TASK SET FULL, and a failed transfer (OCS 5 communication failure, 7 fatal) on an
++		 * otherwise healthy link. A dropped write here used to come back to HFS as EIO, and a
++		 * dropped B-tree node write is a corrupt catalog.
++		 */
++		if (ocs == 0 && ucd->resp[0] == 0x21 && ucd->resp[6] == 0) {
++			uint32_t key = sense >> 16;
++			*retry = ucd->resp[7] == SCSI_BUSY || ucd->resp[7] == SCSI_TASK_SET_FULL ||
++			    (ucd->resp[7] == SCSI_CHECK_CONDITION && (key == 6 || key == 2 || key == 0xb));
++		} else {
++			*retry = (ocs == 5 || ocs == 7 || ocs == 6);
++		}
+ 		return EIO;
+ 	}
++	if (len && be32(&ucd->resp[12])) {
++		/* Counted, not failed: nothing says the host reports this reliably on this part. */
++		ss.resid_nonzero++;
++		if (ufs_fail_logged++ < UFS_FAIL_LOG_MAX) {
++			printf("SWEET UFS: command 0x%02x residual %u of %u bytes\n", cdb[0],
++			    be32(&ucd->resp[12]), len);
++		}
++	}
+ 	return 0;
+ }
+ 
+-/* READ(10) of count device blocks at lba into the bounce buffer. */
++/* ufs_scsi_once with retries (ufsretries, default 3), data window at data_off. */
+ static int
+-ufs_read_blocks(uint64_t lba, uint32_t count)
++ufs_scsi_at(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write, uint32_t data_off)
++{
++	int error;
++	for (uint32_t attempt = 0;; attempt++) {
++		bool retry;
++		error = ufs_scsi_once(cdb, cdb_len, len, write, data_off, &retry);
++		if (!error) {
++			return 0;
++		}
++		if (!retry || attempt >= su.retries) {
++			break;
++		}
++		ss.retries++;
++		delay(1000 * (1 + (int)attempt));
++	}
++	ss.errors++;
++	return error;
++}
++
++static int
++ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
++{
++	return ufs_scsi_at(cdb, cdb_len, len, write, DMA_BOUNCE);
++}
++
++/* READ(10) of count device blocks at lba into the data window at data_off; fua reads the medium. */
++static int
++ufs_read_at(uint64_t lba, uint32_t count, uint32_t data_off, bool fua)
+ {
+ 	if (lba > UINT32_MAX || count > BOUNCE_SIZE / UFS_BLOCK) {
+ 		return EINVAL;
+ 	}
+ 	uint8_t cdb[10] = {
+-		0x28, 0,
++		0x28, (uint8_t)(fua ? 0x08 : 0),
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+ 		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+ 	};
+-	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, false);
++	int error = ufs_scsi_at(cdb, sizeof(cdb), count * UFS_BLOCK, false, data_off);
++	if (!error) {
++		ss.reads++;
++		ss.read_blocks += count;
++	}
++	return error;
++}
++
++/* READ(10) of count device blocks at lba into the bounce buffer. */
++static int
++ufs_read_blocks(uint64_t lba, uint32_t count)
++{
++	return ufs_read_at(lba, count, DMA_BOUNCE, false);
++}
++
++static int ufs_sync_cache(void);
++
++/*
++ * ufsverify: compare what the device returns with what was just written (still in the bounce
++ * buffer). 1: plain read back (catches DMA/cache/LBA faults, can be served from the device's own
++ * write cache). 2: SYNCHRONIZE CACHE first, then a FUA read that has to come from the medium.
++ * A mismatch is reported and returned as EIO so the file system sees it.
++ */
++static int
++ufs_verify_write(uint64_t lba, uint32_t count)
++{
++	const uint8_t *want = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	const uint8_t *got = (const uint8_t *)(su.dma + DMA_VERIFY);
++	uint32_t bytes = count * UFS_BLOCK;
++
++	if (su.verify >= 2 && ufs_sync_cache()) {
++		ss.verify_io_errors++;
++		return EIO;
++	}
++	if (ufs_read_at(lba, count, DMA_VERIFY, su.verify >= 2)) {
++		ss.verify_io_errors++;
++		return EIO;
++	}
++	if (memcmp(want, got, bytes) == 0) {
++		ss.verify_ok++;
++		return 0;
++	}
++	uint32_t i = 0;
++	while (want[i] == got[i]) {
++		i++;
++	}
++	uint32_t blk = i / UFS_BLOCK, zero = 1, diff = 0;
++	for (uint32_t k = blk * UFS_BLOCK; k < (blk + 1) * UFS_BLOCK; k++) {
++		zero &= (got[k] == 0);
++		diff += (got[k] != want[k]);
++	}
++	if (ss.verify_bad++ < 16) {
++		printf("SWEET UFS VERIFY: MISMATCH lba 0x%llx +%u blocks (of %u): first diff at byte %u "
++		    "(block %u, %u bytes differ, readback %s), want 0x%02x got 0x%02x\n",
++		    lba, blk, count, i, blk, diff, zero ? "ALL ZERO" : "not zero", want[i], got[i]);
++	}
++	return EIO;
+ }
+ 
+ /*
+@@ -296,7 +517,7 @@ ufs_read_blocks(uint64_t lba, uint32_t count)
+  * must lie inside the partition: this is the only place data goes out.
+  */
+ static int
+-ufs_write_blocks(uint64_t lba, uint32_t count)
++ufs_write_blocks_ex(uint64_t lba, uint32_t count, bool fua)
+ {
+ 	if (!su.writable || !su.nblocks || count == 0 || count > BOUNCE_SIZE / UFS_BLOCK ||
+ 	    lba < su.first_block || lba - su.first_block >= su.nblocks ||
+@@ -304,19 +525,48 @@ ufs_write_blocks(uint64_t lba, uint32_t count)
+ 		printf("SWEET UFS: refusing write of %u blocks at 0x%llx\n", count, lba);
+ 		return EPERM;
+ 	}
++	fua = fua || su.fua == 2;
+ 	uint8_t cdb[10] = {
+-		0x2a, 0,
++		0x2a, (uint8_t)(fua ? 0x08 : 0),
+ 		(uint8_t)(lba >> 24), (uint8_t)(lba >> 16), (uint8_t)(lba >> 8), (uint8_t)lba,
+ 		0, (uint8_t)(count >> 8), (uint8_t)count, 0
+ 	};
+-	return ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
++	int error = ufs_scsi(cdb, sizeof(cdb), count * UFS_BLOCK, true);
++	if (error) {
++		return error;
++	}
++	ss.writes++;
++	ss.write_blocks += count;
++	if (fua) {
++		ss.strat_fua++;
++	} else {
++		su.dirty = true;
++	}
++	if (su.verify && su.dma_size >= DMA_VERIFY + BOUNCE_SIZE) {
++		error = ufs_verify_write(lba, count);
++	}
++	return error;
++}
++
++static int
++ufs_write_blocks(uint64_t lba, uint32_t count)
++{
++	return ufs_write_blocks_ex(lba, count, false);
+ }
+ 
++/* SYNCHRONIZE CACHE(10), whole LUN: everything completed so far is on the medium afterwards. */
+ static int
+ ufs_sync_cache(void)
+ {
+-	static const uint8_t cdb[10] = { 0x35 };       /* SYNCHRONIZE CACHE(10), whole LUN */
+-	return ufs_scsi(cdb, sizeof(cdb), 0, false);
++	static const uint8_t cdb[10] = { 0x35 };
++	int error = ufs_scsi(cdb, sizeof(cdb), 0, false);
++	if (error) {
++		ss.flush_errors++;
++	} else {
++		ss.flushes++;
++		su.dirty = false;
++	}
++	return error;
+ }
+ 
+ static int
+@@ -386,7 +636,7 @@ ufs_take_over_host(void)
+ 		return EBUSY;
+ 	}
+ 	/* With RAM above 4 GiB (mkadt.py --highmem) the DMA memory can be there too. */
+-	if (((su.dma_pa + DMA_SIZE - 1) >> 32) && !(ufs_rd(REG_CAP) & CAP_64AS)) {
++	if (((su.dma_pa + su.dma_size - 1) >> 32) && !(ufs_rd(REG_CAP) & CAP_64AS)) {
+ 		printf("SWEET UFS: DMA memory at 0x%llx but the host has no 64-bit addressing\n",
+ 		    su.dma_pa);
+ 		return ENXIO;
+@@ -432,7 +682,13 @@ sweet_ufs_strategy(buf_t bp)
+ 	uint64_t part_bytes = su.nblocks * UFS_BLOCK;
+ 
+ 	bool rd = buf_flags(bp) & B_READ;
++	bool fua = !rd && (su.fua >= 1) && (buf_flags(bp) & B_FUA);
+ 
++	if (rd) {
++		ss.strat_reads++;
++	} else {
++		ss.strat_writes++;
++	}
+ 	buf_setresid(bp, count);
+ 	if (!rd && !su.writable) {
+ 		error = EROFS;
+@@ -466,11 +722,12 @@ sweet_ufs_strategy(buf_t bp)
+ 		} else {
+ 			/* Partial device blocks at either end: read, merge, write back. */
+ 			if (skip || (want % UFS_BLOCK)) {
++				ss.strat_rmw++;
+ 				error = ufs_read_blocks(su.first_block + lba, blocks);
+ 			}
+ 			if (!error) {
+ 				memcpy((char *)bounce + skip, vaddr + done, want);
+-				error = ufs_write_blocks(su.first_block + lba, blocks);
++				error = ufs_write_blocks_ex(su.first_block + lba, blocks, fua);
+ 			}
+ 		}
+ 		if (error) {
+@@ -484,7 +741,12 @@ sweet_ufs_strategy(buf_t bp)
+ 
+ done:
+ 	if (error) {
++		ss.strat_errors++;
+ 		buf_seterror(bp, error);
++		if (ss.strat_errors <= UFS_FAIL_LOG_MAX) {
++			printf("SWEET UFS: strategy %s blkno %lld count %u failed: %d (resid %u)\n",
++			    rd ? "read" : "write", (long long)buf_blkno(bp), count, error, buf_resid(bp));
++		}
+ 	}
+ 	buf_biodone(bp);
+ }
+@@ -524,6 +786,7 @@ sweet_ufs_ioctl(__unused dev_t dev, u_long cmd, caddr_t data, __unused int flag,
+ 			return 0;
+ 		}
+ 		lck_mtx_lock(&sweet_ufs_lock);
++		ss.ioctl_syncs++;
+ 		int error = ufs_sync_cache();
+ 		lck_mtx_unlock(&sweet_ufs_lock);
+ 		return error;
+@@ -793,14 +1056,46 @@ sweet_ufs_init(void)
+ 	uint32_t dmasync = 1;
+ 	PE_parse_boot_argn("ufsdmasync", &dmasync, sizeof(dmasync));
+ 	su.dmasync = (dmasync != 0);
++	su.verify = 0;
++	su.fua = 0;
++	su.retries = UFS_RETRIES;
++	su.syncsecs = UFS_SYNC_SECS;
++	PE_parse_boot_argn("ufsverify", &su.verify, sizeof(su.verify));
++	PE_parse_boot_argn("ufsfua", &su.fua, sizeof(su.fua));
++	PE_parse_boot_argn("ufsretries", &su.retries, sizeof(su.retries));
++	PE_parse_boot_argn("ufssyncsecs", &su.syncsecs, sizeof(su.syncsecs));
++	if (su.verify > 2) {
++		su.verify = 2;
++	}
++	if (su.fua > 2) {
++		su.fua = 2;
++	}
++	if (su.retries > 10) {
++		su.retries = 10;
++	}
++	if (su.syncsecs > 3600) {
++		su.syncsecs = UFS_SYNC_SECS;
++	}
++	su.dma_size = DMA_SIZE + (su.verify ? BOUNCE_SIZE : 0);
++	printf("SWEET UFS: durability: verify %u, fua %u, retries %u, syncer %u s, dmasync %d\n",
++	    su.verify, su.fua, su.retries, su.syncsecs, su.dmasync);
+ 
+ 	printf("SWEET UFS: init, regs 0x%lx+0x%lx\n", (unsigned long)reg[0], (unsigned long)reg[1]);
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+ 	printf("SWEET UFS: hce 0x%x hcs 0x%x cap 0x%x ver 0x%x is 0x%x utrlba 0x%x:%x dbr 0x%x rsr 0x%x\n",
+ 	    ufs_rd(REG_HCE), ufs_rd(REG_HCS), ufs_rd(REG_CAP), ufs_rd(0x08), ufs_rd(REG_IS),
+ 	    ufs_rd(REG_UTRLBAU), ufs_rd(REG_UTRLBA), ufs_rd(REG_UTRLDBR), ufs_rd(REG_UTRLRSR));
+-	if (kmem_alloc_contig(kernel_map, &su.dma, DMA_SIZE, PAGE_MASK, 0, 0,
+-	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++	kern_return_t kr = kmem_alloc_contig(kernel_map, &su.dma, su.dma_size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++	if (kr != KERN_SUCCESS && su.verify) {
++		/* no room for the read-back window: run without it */
++		printf("SWEET UFS: no contiguous memory for ufsverify, verify off\n");
++		su.verify = 0;
++		su.dma_size = DMA_SIZE;
++		kr = kmem_alloc_contig(kernel_map, &su.dma, su.dma_size, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT);
++	}
++	if (kr != KERN_SUCCESS) {
+ 		printf("SWEET UFS: no contiguous DMA memory\n");
+ 		return ENOMEM;
+ 	}
+@@ -809,7 +1104,7 @@ sweet_ufs_init(void)
+ 		return ENOMEM;
+ 	}
+ 	su.dma_pa = ptoa_64(pn);
+-	printf("SWEET UFS: DMA 0x%llx (+0x%x)\n", su.dma_pa, (unsigned)DMA_SIZE);
++	printf("SWEET UFS: DMA 0x%llx (+0x%x)\n", su.dma_pa, (unsigned)su.dma_size);
+ 	su.lun = 0;
+ 	su.secsize = DEV_BSIZE;
+ 
+@@ -849,6 +1144,7 @@ sweet_ufs_init(void)
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++	sweet_ufs_syncer_start();
+ 	sweet_ufs_selftest_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+@@ -1178,6 +1474,173 @@ sweet_ufs_selftest_start(void)
+ 	}
+ }
+ 
++/*
++ * Durability (patch 0221).
++ *
++ * The root is a non-journaled HFS+ volume. HFS only starts its periodic syncer thread for
++ * non-root ejectable media (hfs_mount: HFS_RUN_SYNCER), the buffer cache writes delayed-write
++ * buffers only when it recycles them, and dirty file pages sit in the UBC until a sync or memory
++ * pressure. So on this system nothing pushed recent file data to the device until a userland
++ * sync(), the shutdown path, or an fsync: metadata (B-tree nodes, recycled out of the small buffer
++ * cache) reached the device, file data did not. After a reset the files had their size and
++ * extents and zeros as contents, and a half-written B-tree gives EIO/EINVAL. This thread closes
++ * that window: every ufssyncsecs seconds (default 5, 0 = off) all writable mounts get a
++ * synchronous VFS sync (the same hfs_sync(MNT_WAIT) the unmount path runs: file data first, then
++ * the B-trees, bitmap and volume header), followed by SYNCHRONIZE CACHE when anything was written.
++ */
++static int sweet_ufs_sync_chan;
++
++static int
++sweet_ufs_sync_cb(mount_t mp, __unused void *arg)
++{
++	if (!(vfs_flags(mp) & MNT_RDONLY)) {
++		(void)VFS_SYNC(mp, MNT_WAIT, vfs_context_kernel());
++	}
++	return VFS_RETURNED;
++}
++
++/* VFS sync of everything writable, then SYNCHRONIZE CACHE if the device has unflushed writes. */
++static int
++sweet_ufs_sync_all(void)
++{
++	int error = 0;
++
++	(void)vfs_iterate(LK_NOWAIT, sweet_ufs_sync_cb, NULL);
++	lck_mtx_lock(&sweet_ufs_lock);
++	if (su.dirty) {
++		error = ufs_sync_cache();
++	}
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++static void
++sweet_ufs_syncer_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t runs = 0;
++	uint64_t bad_mark = 0;
++
++	printf("SWEET UFS: syncer every %u s\n", su.syncsecs);
++	for (;;) {
++		(void)tsleep(&sweet_ufs_sync_chan, PZERO, "sweetsync", hz * (int)su.syncsecs);
++		int error = sweet_ufs_sync_all();
++		ss.syncer_runs++;
++		if (error) {
++			ss.syncer_errors++;
++		}
++		/* A stats line in the persistent log every minute, and at once when something went wrong. */
++		uint64_t bad = ss.errors + ss.timeouts + ss.retries + ss.is_errors + ss.verify_bad +
++		    ss.verify_io_errors + ss.flush_errors + ss.strat_errors;
++		if (bad != bad_mark || ++runs * su.syncsecs >= 60) {
++			printf("SWEET UFS STATS: rd %llu (%llu blk) wr %llu (%llu blk) flush %llu rmw %llu "
++			    "fua %llu | err %llu fail %llu timeout %llu retry %llu is_err %llu flush_err %llu "
++			    "strat_err %llu resid %llu verify ok %llu bad %llu io %llu | last cdb 0x%x ocs 0x%x "
++			    "status 0x%x sense 0x%06x is 0x%x\n",
++			    ss.reads, ss.read_blocks, ss.writes, ss.write_blocks, ss.flushes, ss.strat_rmw,
++			    ss.strat_fua, ss.errors, ss.cmd_failures, ss.timeouts, ss.retries, ss.is_errors,
++			    ss.flush_errors, ss.strat_errors, ss.resid_nonzero, ss.verify_ok, ss.verify_bad,
++			    ss.verify_io_errors, ss.last_cdb, ss.last_ocs, ss.last_status, ss.last_sense,
++			    ss.last_is);
++			bad_mark = bad;
++			runs = 0;
++		}
++	}
++}
++
++static void
++sweet_ufs_syncer_start(void)
++{
++	thread_t thread;
++
++	if (!su.writable || su.syncsecs == 0) {
++		return;
++	}
++	if (kernel_thread_start(sweet_ufs_syncer_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++/*
++ * Last flush before the SoC reset (sweet_reboot_restart, also on a panic restart): nothing the
++ * file system or the device queue completed may still sit in the UFS write cache. Safe in
++ * non-preemptible context: the mutex is only tried (a panic inside a UFS command owns it; then the
++ * flush is skipped, as nothing consistent can be said about the device anyway).
++ */
++int sweet_ufs_flush_final(void);
++
++int
++sweet_ufs_flush_final(void)
++{
++	if (!su.ready || !su.writable) {
++		return ENXIO;
++	}
++	if (!lck_mtx_try_lock(&sweet_ufs_lock)) {
++		ss.final_flush_skipped++;
++		return EBUSY;
++	}
++	int error = ufs_sync_cache();
++	ss.final_flushes++;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
++/* kern.sweet_ufs.flush: write 1 for a VFS sync of every mount + SYNCHRONIZE CACHE, now. */
++static int
++sweet_ufs_flush_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	int v = 0, error = sysctl_handle_int(oidp, &v, 0, req);
++	if (error || !req->newptr || !v) {
++		return error;
++	}
++	if (!su.ready || !su.writable) {
++		return ENXIO;
++	}
++	ss.user_flushes++;
++	return sweet_ufs_sync_all();
++}
++
++SYSCTL_NODE(_kern, OID_AUTO, sweet_ufs, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
++    "SWEET UFS root device: I/O counters and durability controls (patch 0221)");
++SYSCTL_PROC(_kern_sweet_ufs, OID_AUTO, flush, CTLTYPE_INT | CTLFLAG_WR | CTLFLAG_LOCKED, 0, 0,
++    sweet_ufs_flush_sysctl, "I", "write 1: sync every mount (MNT_WAIT) and SYNCHRONIZE CACHE now");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, reads, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.reads, "READ(10) commands completed");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, read_blocks, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.read_blocks, "4 KiB blocks read");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, writes, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.writes, "WRITE(10) commands completed");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, write_blocks, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.write_blocks, "4 KiB blocks written");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, flushes, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.flushes, "SYNCHRONIZE CACHE commands completed");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, flush_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.flush_errors, "SYNCHRONIZE CACHE commands that failed");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.errors, "commands that failed after all retries");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, cmd_failures, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.cmd_failures, "failed command attempts, retried or not");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, timeouts, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.timeouts, "command attempts that timed out");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, retries, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.retries, "command attempts repeated");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, is_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.is_errors, "host interrupt status with an error bit (UE/DFES/UTPES/HCFES/SBFES)");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, resid_nonzero, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.resid_nonzero, "good commands with a non-zero residual count");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, strat_reads, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.strat_reads, "BSD strategy read calls");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, strat_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.strat_writes, "BSD strategy write calls");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, strat_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.strat_errors, "BSD strategy calls that returned an error to the file system");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, strat_rmw, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.strat_rmw, "partial-block writes (read-modify-write)");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, fua_writes, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.strat_fua, "WRITE(10) commands issued with FUA");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, verify_ok, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.verify_ok, "writes read back and compared equal (ufsverify)");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, verify_bad, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.verify_bad, "writes whose read-back differed (ufsverify)");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, verify_io_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.verify_io_errors, "read-backs that failed (ufsverify)");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, syncer_runs, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.syncer_runs, "periodic VFS sync passes");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, syncer_errors, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.syncer_errors, "periodic passes whose cache flush failed");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, ioctl_syncs, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.ioctl_syncs, "DKIOCSYNCHRONIZE requests from the file system");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, user_flushes, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.user_flushes, "kern.sweet_ufs.flush requests");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, final_flushes, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.final_flushes, "SYNCHRONIZE CACHE before the SoC reset");
++SYSCTL_QUAD(_kern_sweet_ufs, OID_AUTO, final_flush_skipped, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.final_flush_skipped, "pre-reset flushes skipped (lock busy)");
++SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, last_cdb, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.last_cdb, 0, "opcode of the last failed attempt");
++SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, last_ocs, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.last_ocs, 0, "UTRD overall command status of the last failed attempt (0xff: timeout)");
++SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, last_status, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.last_status, 0, "SCSI status of the last failed attempt");
++SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, last_sense, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.last_sense, 0, "sense key<<16 | asc<<8 | ascq of the last failed attempt");
++SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, last_is, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.last_is, 0, "host interrupt status of the last error");
++SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, last_hcs, CTLFLAG_RD | CTLFLAG_LOCKED, &ss.last_hcs, 0, "host controller status of the last error");
++SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, cfg_verify, CTLFLAG_RD | CTLFLAG_LOCKED, &su.verify, 0, "boot-arg ufsverify");
++SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, cfg_fua, CTLFLAG_RD | CTLFLAG_LOCKED, &su.fua, 0, "boot-arg ufsfua");
++SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, cfg_retries, CTLFLAG_RD | CTLFLAG_LOCKED, &su.retries, 0, "boot-arg ufsretries");
++SYSCTL_UINT(_kern_sweet_ufs, OID_AUTO, cfg_syncsecs, CTLFLAG_RD | CTLFLAG_LOCKED, &su.syncsecs, 0, "boot-arg ufssyncsecs");
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 

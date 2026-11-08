@@ -1,0 +1,24 @@
+From: Bergamota
+Subject: [PATCH] sweet: touch events are built-in (kIOHIDEventOptionIsBuiltIn)
+
+---
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -568,6 +568,9 @@
+ 	 * but no touch reaches the screen.
+ 	 */
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
++	/* Built-in like Apple's touchscreen (kIOHIDEventOptionIsBuiltIn): backboardd copies the flag into every touch
++	 * event it sends on to SpringBoard (BKDirectTouchState _builtIn). */
++	collection->setIntegerValue(kIOHIDEventFieldIsBuiltIn, 1);
+ 
+ 	UInt32 cmask = 0;
+ 	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
+@@ -599,6 +602,7 @@
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerTouch, d);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, mask);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
++		child->setIntegerValue(kIOHIDEventFieldIsBuiltIn, 1);
+ 		collection->appendChild(child);
+ 		child->release();
+ 		cmask |= mask;

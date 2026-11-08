@@ -1,0 +1,27 @@
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+index 682943460b620105c58864d2796a8ee292a64ec6..ba726585545573a1ebcc1068647169bf09a96658 100644
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -91,6 +91,7 @@ static_assert(sizeof(struct sweet80211_req) == 40, "apple80211req is 40 bytes");
+ #define IOC_HARDWARE_VERSION    44
+ #define IOC_COUNTRY_CODE        51
+ #define IOC_SCAN_REQ_MULTIPLE   86
++#define IOC_HW_SUPPORTED_CHANNELS 254  /* real index table: gaps at 0, 114, 353 */
+ #define IOC_MAX                 640
+ 
+ /* APPLE80211_M_* event codes */
+@@ -331,7 +332,13 @@ s8_get(struct sweet80211_req *req)
+ 		memcpy(cc, s8.country_set ? s8.country : "BR", 2);
+ 		return s8_reply(req, cc, sizeof(cc));
+ 	}
+-	case IOC_SUPPORTED_CHANNELS: {
++	case IOC_SUPPORTED_CHANNELS:
++	case IOC_HW_SUPPORTED_CHANNELS: {
++		/*
++		 * Settings › Wi-Fi asks wifid for the hardware channel list first (CoreWiFi GET HW SUPP
++		 * CHANNELS = type 254, len 4824) and does not scan at all when it is nil (boot 28). IO80211
++		 * reads both types with the same layout: {version, count, {version, channel, flags}[]}.
++		 */
+ 		static const uint8_t ch5[] = {
+ 			36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140,
+ 			149, 153, 157, 161, 165,

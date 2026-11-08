@@ -1,0 +1,201 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 917d4cd..179aec0 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -49,6 +49,7 @@ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sw
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ class SweetSurface;
+ static void sweet_hold_release(SweetSurface **set);
++static uint32_t get32(const uint8_t *p, uint32_t off);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -152,6 +153,7 @@ class AppleCLCD : public IOMobileFramebuffer {
+ 	uint64_t            fVsyncCount;
+ 
+ 	static void vsyncFired(OSObject *owner, IOTimerEventSource *sender);
++	static void swapFired(OSObject *owner, IOTimerEventSource *sender);
+ 
+ public:
+ 	uint64_t      fPhys;
+@@ -238,7 +240,18 @@ public:
+ 		uint64_t zcAbs, zcMaxAbs;       /* zero-copy: cache clean + register programming */
+ 		uint64_t cleanAbs, cleans, cleanSkips;
+ 	} fSt, fStPrev;
+-	bool          fDirect;          /* sweetfb_direct=1 (patch 0211) */
++	/*
++	 * Direct scanout (sweetfb_direct=1, patch 0211): hw scaler + page flipping + zero-copy
++	 * implied, and a swap is scanned as soon as it arrives instead of at the next vsync
++	 * tick: fSwapTimer (same work loop as the vsync timer, so the two never run at once)
++	 * is armed by swap(), swapFired() tries zcPresent only; a frame that cannot be scanned
++	 * in place stays pending for the vsync tick, which copies it at the sweetfb_hz rate.
++	 * fEarly: the early path is usable (zero-copy armed and the MDP SMMU verified bypass).
++	 */
++	bool          fDirect, fEarly;
++	IOTimerEventSource *fSwapTimer;
++	uint8_t       fEarlyRec[SWEET_FB_SWAP_REC_SIZE];
++	void          quietConsole(void);
+ 	uint32_t      fZcCleanMode;     /* sweetfb_zcclean: 0 never, 1 always (0127 behaviour), 2 auto (patch 0212) */
+ 	uint64_t      fStPrevT, fStLogT;
+ 	uint32_t      fStLogSecs;       /* sweetfb_statlog: seconds between IOLog lines, 0 = sysctl only */
+@@ -350,8 +363,15 @@ AppleCLCD::start(IOService *provider)
+ 		fScale = 0;
+ 	}
+ 	int hwReq = 0;
++	int directReq = 0;
+ 	if (sweet_board_beryllium()) {
+ 		PE_parse_boot_argn("sweetfb_hw", &hwReq, sizeof(hwReq));
++		PE_parse_boot_argn("sweetfb_direct", &directReq, sizeof(directReq));
++		if (directReq) {
++			fDirect = true;
++			hwReq = 1;      /* the QSEED3 scaler turns the canvas into the panel rectangle */
++			IOLog("SWEET FB: sweetfb_direct=1: hardware scaler, page flipping and zero-copy scanout requested\n");
++		}
+ 	}
+ 	if (hwReq && fScale == 0 && !scaleGiven && (fLogicalW != fWidth || fLogicalH != fHeight)) {
+ 		fScale = 1;     /* the scaler has nothing to do in crop mode: fit */
+@@ -425,6 +445,9 @@ AppleCLCD::start(IOService *provider)
+ 		int smmuLevel = 0, zcReq = 0;
+ 		PE_parse_boot_argn("sweetfb_smmu", &smmuLevel, sizeof(smmuLevel));
+ 		PE_parse_boot_argn("sweetfb_zc", &zcReq, sizeof(zcReq));
++		if (fDirect) {
++			zcReq = 1;
++		}
+ 		if (zcReq && smmuLevel == 0) {
+ 			smmuLevel = 1;
+ 		}
+@@ -462,6 +485,13 @@ AppleCLCD::start(IOService *provider)
+ 				}
+ 			}
+ 		}
++		if (fDirect) {
++			fEarly = fZc && fZcOK;
++			if (!fEarly) {
++				IOLog("SWEET FB: sweetfb_direct=1 but zero-copy is not available (%s): every frame is copied at sweetfb_hz\n",
++				    !fHw || !fFlip ? "no hardware scaler / page flipping" : (!fZcOK ? "MDP SMMU not verified bypass" : "no low pool"));
++			}
++		}
+ 		int blfade = 1;
+ 		PE_parse_boot_argn("sweetfb_blfade", &blfade, sizeof(blfade));
+ 		if (blfade) {
+@@ -486,19 +516,27 @@ AppleCLCD::start(IOService *provider)
+ 	 */
+ 	int vsync_at_copy = 0;
+ 	PE_parse_boot_argn("sweetfb_vsync", &vsync_at_copy, sizeof(vsync_at_copy));
+-	if (vsync_at_copy && hz > 0 && hz < 60) {
++	if (vsync_at_copy && hz > 0 && hz < 60 && !fDirect) {
+ 		fVsyncUS = 1000000u / hz;
+ 		fFlushTicks = 1;
+ 	}
+ 	fVsync->setTimeoutUS(fVsyncUS);
++	if (fEarly) {
++		fSwapTimer = IOTimerEventSource::timerEventSource(this, &AppleCLCD::swapFired);
++		if (fSwapTimer == NULL || fWorkLoop->addEventSource(fSwapTimer) != kIOReturnSuccess) {
++			OSSafeReleaseNULL(fSwapTimer);
++			fEarly = false;
++			IOLog("SWEET FB: no swap timer: direct frames wait for the vsync tick\n");
++		}
++	}
+ 
+ 	setProperty(kIOUserClientClassKey, "IOMobileFramebufferUserClient");
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
+-	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, vsync %u us, copy every %u, scale %u (pad %d,%d)\n",
++	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, vsync %u us, copy every %u, scale %u (pad %d,%d), direct %d early %d\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fVsyncUS, fFlushTicks,
+-	    fScale, fPadX, fPadY);
++	    fScale, fPadX, fPadY, fDirect ? 1 : 0, fEarly ? 1 : 0);
+ 	return true;
+ }
+ 
+@@ -569,6 +607,51 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	sender->setTimeoutUS(fb->fVsyncUS);
+ }
+ 
++/*
++ * Early (direct) path: runs on the work loop right after a swap. Takes the pending
++ * frame like vsyncFired does, scans it in place when it can, and otherwise puts it
++ * back (unless a newer swap arrived meanwhile) for the vsync tick's copy path. Never
++ * copies: a copied frame is rate limited by sweetfb_hz, a scanned one is not.
++ */
++void
++AppleCLCD::swapFired(OSObject *owner, IOTimerEventSource *)
++{
++	AppleCLCD *fb = (AppleCLCD *)owner;
++	SweetSurface *taken[4] = {};
++
++	if (fb->fPowerOff) {
++		return;         /* the vsync tick runs the backlight ramp and redraws on power on */
++	}
++	IOLockLock(fb->fLock);
++	if (!fb->fDirty) {
++		IOLockUnlock(fb->fLock);
++		return;
++	}
++	memcpy(fb->fEarlyRec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
++	fb->fDirty = false;
++	memcpy(taken, fb->fPendHold, sizeof(taken));
++	bzero(fb->fPendHold, sizeof(fb->fPendHold));
++	IOLockUnlock(fb->fLock);
++
++	fb->quietConsole();
++	if (fb->zcPresent(fb->fEarlyRec, get32(fb->fEarlyRec, 0x104))) {
++		sweet_hold_release(taken);      /* zcPresent holds the surface itself until its frame latched */
++		return;
++	}
++	SweetSurface *dropped[4] = {};
++	IOLockLock(fb->fLock);
++	if (!fb->fDirty) {
++		memcpy(fb->fPending, fb->fEarlyRec, SWEET_FB_SWAP_REC_SIZE);
++		fb->fDirty = true;
++		memcpy(fb->fPendHold, taken, sizeof(taken));
++	} else {
++		memcpy(dropped, taken, sizeof(dropped));        /* a newer swap replaced it while we looked */
++		fb->fSt.coalesced++;
++	}
++	IOLockUnlock(fb->fLock);
++	sweet_hold_release(dropped);
++}
++
+ /* x100 fixed point for rates and averages: no floating point in the kernel. */
+ #define SW_F2(v) (unsigned)((v) / 100), (unsigned)((v) % 100)
+ 
+@@ -738,6 +821,9 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	memcpy(fPendHold, held, sizeof(held));
+ 	IOLockUnlock(fLock);
+ 	sweet_hold_release(dropped);
++	if (fEarly && !fPowerOff) {
++		fSwapTimer->setTimeoutUS(1);    /* scan it now: the MDP latches at its next vsync */
++	}
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}
+@@ -1712,11 +1798,8 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
+ }
+ 
+ void
+-AppleCLCD::present(const uint8_t *rec)
++AppleCLCD::quietConsole(void)
+ {
+-	uint32_t mask = get32(rec, 0x104);
+-
+-
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		fConsolePaused = true;
+@@ -1726,6 +1809,14 @@ AppleCLCD::present(const uint8_t *rec)
+ 			sweet_console_muted = 1;
+ 		}
+ 	}
++}
++
++void
++AppleCLCD::present(const uint8_t *rec)
++{
++	uint32_t mask = get32(rec, 0x104);
++
++	quietConsole();
+ 
+ 	if (fZc && zcPresent(rec, mask)) {
+ 		return;         /* scanned in place */

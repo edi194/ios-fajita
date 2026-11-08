@@ -1,0 +1,139 @@
+diff --git a/bsd/dev/arm/kern_machdep.c b/bsd/dev/arm/kern_machdep.c
+index 2d8067794221b4d945f8aadaf14095ba82a2421e..93b0b20da1c14b4289539f656e36e3d17775ae4f 100644
+--- a/bsd/dev/arm/kern_machdep.c
++++ b/bsd/dev/arm/kern_machdep.c
+@@ -19,6 +19,8 @@
+ 
+ #if __arm64__
+ static cpu_subtype_t cpu_subtype32(void);
++/* kern_exec.c: boot-arg sweetarm64e=1 (iOS 18 arm64e userland on a CPU without PAuth) */
++extern bool sweet_arm64e_enabled(void);
+ #endif /* __arm64__ */
+ 
+ #if __arm64__
+@@ -89,6 +91,17 @@ grade_binary(cpu_type_t exectype, cpu_subtype_t execsubtype, cpu_subtype_t execf
+ 				return 10;
+ 			case CPU_SUBTYPE_ARM64_ALL:
+ 				return 9;
++			case CPU_SUBTYPE_ARM64E:
++				/*
++				 * sweetarm64e=1: accept arm64e on this PAuth-less host. The
++				 * code was rewritten offline (tools/ios18/pacstrip.py) so it
++				 * contains no PAC instruction; preferred below a real arm64
++				 * slice, which keeps fat iOS 16 binaries on their arm64 slice.
++				 */
++				if (sweet_arm64e_enabled()) {
++					return 8;
++				}
++				break;
+ 			}
+ 			break;
+ 
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 715b856da03150602831d0e86c0880ef4f12b0d9..4a28fe757ced8e69dc0d6bdfad5918c4897b1277 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -6218,6 +6218,33 @@ is_arm64e_running_as_arm64(const struct image_params *imgp)
+ }
+ #endif /* __has_feature(ptrauth_calls) */
+ 
++/*
++ * Boot-arg sweetarm64e=1: run iOS 18 arm64e userland on this CPU, which has no
++ * pointer authentication (docs/IOS18_PORT.md). Everything it enables is keyed
++ * on the Mach-O CPU subtype being arm64e, so arm64 (iOS 16) processes are
++ * unaffected: grade_binary() accepts arm64e (bsd/dev/arm/kern_machdep.c),
++ * exec tells dyld "ptrauth_disabled=1" (below) and the AMFI "AMFI" policy
++ * answers dyld's policy query (sweet_amfi.c). The binaries themselves are
++ * rewritten offline to contain no PAC instructions (tools/ios18/pacstrip.py).
++ */
++bool
++sweet_arm64e_enabled(void)
++{
++	static int state = -1;
++	if (state < 0) {
++		uint32_t v = 0;
++		state = PE_parse_boot_argn("sweetarm64e", &v, sizeof(v)) && v != 0;
++	}
++	return state > 0;
++}
++
++bool
++sweet_proc_is_arm64e(struct proc *p)
++{
++	return p != PROC_NULL && p->p_cputype == CPU_TYPE_ARM64 &&
++	       (p->p_cpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E;
++}
++
+ _Atomic uint64_t libmalloc_experiment_factors = 0;
+ 
+ static int
+@@ -6422,6 +6449,23 @@ exec_add_apple_strings(struct image_params *imgp,
+ #endif /* __has_feature(ptrauth_calls) */
+ 
+ 
++#if !__has_feature(ptrauth_calls)
++	/*
++	 * sweetarm64e=1: an arm64e binary on a CPU without PAuth. Same string a
++	 * ptrauth kernel passes when it disables the JOP keys; dyld then also
++	 * accepts arm64 slices for the process (GradedArchs keysOff).
++	 */
++	if (sweet_arm64e_enabled() &&
++	    (imgp->ip_origcpusubtype & ~CPU_SUBTYPE_MASK) == CPU_SUBTYPE_ARM64E) {
++		error = exec_add_user_string(imgp, CAST_USER_ADDR_T("ptrauth_disabled=1"), UIO_SYSSPACE, FALSE);
++		if (error) {
++			goto bad;
++		}
++
++		imgp->ip_applec++;
++	}
++#endif /* !__has_feature(ptrauth_calls) */
++
+ #if __has_feature(ptrauth_calls) && defined(XNU_TARGET_OS_OSX)
+ 	{
+ 		char dyld_abi_string[strlen(DYLD_ARM64E_ABI_KEY) + 8];
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 44b10f4c95853fc1ebe99ae9c4705870797346b0..1e4fd2e96fe33984de2a9ab3507f9cc4474be974 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -463,6 +463,25 @@ static mac_policy_handle_t sweet_amfi_mac_handle;
+  * docs/EXTENSION_CACHE.md. Every other op keeps the old answer, ENOPOLICY.
+  */
+ #define SWEET_AMFI_OP_BOOTARG_STATE     0x60
++/*
++ * Op 0x5a = amfi_check_dyld_policy_self(uint64_t input, uint64_t *output).
++ * libamfi (iOS 18 dyld) calls __sandbox_ms("AMFI", 0x5a, &req) with
++ * struct { uint64_t input_flags; uint64_t *output_flags; } (disassembled in
++ * dyld 22H352: stp output-slot,input to sp+8/sp+0x10, [sp+0x18] = &output).
++ * ENOPOLICY makes dyld treat the process as restricted: no DYLD_* env vars,
++ * no @-paths, no DYLD_PRINT_*. For arm64e processes (iOS 18 userland, only
++ * with sweetarm64e=1) every AMFI_DYLD_OUTPUT_ALLOW_* bit (0x3ff) is granted.
++ */
++#define SWEET_AMFI_OP_DYLD_POLICY       0x5a
++#define SWEET_AMFI_DYLD_ALLOW_ALL       0x3ffULL
++
++struct sweet_amfi_dyld_policy_req {
++	uint64_t        input_flags;
++	user_addr_t     output_flags;
++};
++
++extern bool sweet_arm64e_enabled(void);
++extern bool sweet_proc_is_arm64e(struct proc *p);
+ static uint64_t sweet_amfi_ops_seen[4];
+ 
+ static int
+@@ -478,6 +497,15 @@ sweet_amfi_name_syscall(struct proc *p, int call, user_addr_t arg)
+ 		uint64_t state = 0x86;
+ 		return copyout(&state, arg, sizeof(state));
+ 	}
++	if (call == SWEET_AMFI_OP_DYLD_POLICY && sweet_arm64e_enabled() && sweet_proc_is_arm64e(p)) {
++		struct sweet_amfi_dyld_policy_req req;
++		uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;
++		int error = copyin(arg, &req, sizeof(req));
++		if (error == 0 && req.output_flags != 0) {
++			error = copyout(&allow, req.output_flags, sizeof(allow));
++		}
++		return error;
++	}
+ 	return ENOPOLICY;
+ }
+ 

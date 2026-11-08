@@ -1,0 +1,1713 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index bc16102c14a2594299e7bd99e08ac201f31f647e..d17823274826556af172c7810427df344203ab6f 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
++bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3d87b2ee10fb1232602818ec6b37975fdd2fc18
+--- /dev/null
++++ b/bsd/dev/beryllium_wlan.c
+@@ -0,0 +1,1292 @@
++/*
++ * Poco F1 (beryllium, SDM845 + WCN3990) Wi-Fi / Bluetooth bring-up ladder.
++ *
++ * OFF by default. Boot-arg sweetwlan=N selects ONE stage (each stage runs the
++ * read-only probe first); sweetwlandelay=S waits S seconds after the root
++ * device is up (default 90) so the persistent log and the UI are alive if a
++ * register access hangs the SoC.
++ *
++ *   1  read-only probe: GCC clock status, SE6 (BT UART) geometry and QUP
++ *      firmware protocol, TLMM, cmd-db rail addresses, SMEM table, apps SMMU
++ *      stream mapping of the WLAN stream (0x40), TCSR mutex. Writes nothing.
++ *   2  Bluetooth: vote the WCN3990 rails through RPMh, bring up the polled
++ *      GENI UART on SE6 (QUP wrap0 S6, 0x898000), send the QCA power pulses,
++ *      then HCI Reset / Read Local Version / QCA "read patch version"
++ *      (vendor 0xfc00 0x19). No firmware download. Needs NO modem.
++ *   3  Modem groundwork, READ-ONLY: UFS partition inventory (modem, modemst1/2,
++ *      fsg, fsc, bluetooth), FAT16 walk of the modem and bluetooth partitions,
++ *      MBA / MPSS .mdt ELF segment table checked against the MSS carve-outs.
++ *      No SCM call, no MSS reset, no write to any partition.
++ *
++ * Reference: docs/WIFI_BT_PLAN.md. Linux behaviour mirrored here:
++ * drivers/bluetooth/hci_qca.c (power pulses 0xc0 off / 0xfc on at 2400 and
++ * 115200 baud, flow control off while pulsing), btqca.c (EDL read version),
++ * drivers/soc/qcom/qcom-geni-se.c + drivers/tty/serial/qcom_geni_serial.c
++ * (SE init, FIFO UART), gcc-sdm845.c (clock registers).
++ * Nothing here is verified on hardware yet.
++ */
++#if defined(WLAN_HOST_TEST)
++#include <stdint.h>
++#include <stdbool.h>
++#include <stdio.h>
++#include <string.h>
++#include <errno.h>
++#define MIN(a, b) ((a) < (b) ? (a) : (b))
++#define MAX(a, b) ((a) > (b) ? (a) : (b))
++int wl_host_read(const char *part, uint64_t off, void *dst, uint64_t len);
++#define WL_PART_READ(p, o, d, l)  wl_host_read((p), (o), (d), (l))
++#elif defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++extern int sweet_ufs_read_part(const char *name, uint64_t off, void *dst, uint64_t len);
++extern int sweet_ufs_part_size(const char *name, uint8_t *lun, uint64_t *bytes);
++extern int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
++extern int sweet_rpmh_lookup(const char *res, uint32_t *address);
++void beryllium_wlan_init(void);
++#define WL_PART_READ(p, o, d, l)  sweet_ufs_read_part((p), (o), (d), (l))
++#endif
++
++#if defined(WLAN_HOST_TEST) || defined(ARM64_BOARD_CONFIG_SWEET)
++
++/* ======================================================================== */
++/* Portable part: FAT16 reader + ELF32 .mdt parser (host-tested on backup/)   */
++/* ======================================================================== */
++
++#define FAT_BUF_MAX     65536u
++#define DIR_BUF_MAX     131072u
++
++struct wl_fat {
++	const char *part;
++	uint32_t bps, spc, reserved, nfats, rootent, fatsz, ncl;
++	uint64_t fat_off, root_off, data_off, cl_bytes;
++};
++
++static uint8_t wl_fatbuf[FAT_BUF_MAX];
++static uint8_t wl_dirbuf[DIR_BUF_MAX];
++
++static uint32_t
++le16(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8);
++}
++
++static uint32_t
++le32(const uint8_t *p)
++{
++	return le16(p) | (le16(p + 2) << 16);
++}
++
++static int
++fat_mount(struct wl_fat *f, const char *part)
++{
++	uint8_t b[512];
++	int err = WL_PART_READ(part, 0, b, sizeof(b));
++	if (err) {
++		return err;
++	}
++	if (b[510] != 0x55 || b[511] != 0xaa) {
++		return ENXIO;
++	}
++	f->part = part;
++	f->bps = le16(b + 11);
++	f->spc = b[13];
++	f->reserved = le16(b + 14);
++	f->nfats = b[16];
++	f->rootent = le16(b + 17);
++	uint32_t total = le16(b + 19) ? le16(b + 19) : le32(b + 32);
++	f->fatsz = le16(b + 22);
++	if (f->bps < 512 || f->bps > 4096 || (f->bps & (f->bps - 1)) || f->spc == 0 ||
++	    (f->spc & (f->spc - 1)) || f->nfats == 0 || f->nfats > 2 || f->rootent == 0 ||
++	    f->fatsz == 0 || (uint64_t)f->fatsz * f->bps > FAT_BUF_MAX || f->reserved == 0) {
++		return ENXIO;       /* not FAT12/16 */
++	}
++	f->fat_off = (uint64_t)f->reserved * f->bps;
++	f->root_off = f->fat_off + (uint64_t)f->nfats * f->fatsz * f->bps;
++	uint32_t root_sectors = (f->rootent * 32u + f->bps - 1) / f->bps;
++	f->data_off = f->root_off + (uint64_t)root_sectors * f->bps;
++	f->cl_bytes = (uint64_t)f->spc * f->bps;
++	uint32_t data_sectors = total - (uint32_t)(f->data_off / f->bps);
++	f->ncl = data_sectors / f->spc;
++	if (f->ncl < 4085 || f->ncl > 65524) {
++		return ENXIO;       /* FAT12 or FAT32 */
++	}
++	return WL_PART_READ(part, f->fat_off, wl_fatbuf, (uint64_t)f->fatsz * f->bps);
++}
++
++static uint32_t
++fat_next(const struct wl_fat *f, uint32_t cl)
++{
++	if (cl < 2 || cl >= f->ncl + 2 || (cl * 2 + 1) >= (uint64_t)f->fatsz * f->bps) {
++		return 0xffff;
++	}
++	return le16(wl_fatbuf + cl * 2);
++}
++
++static int
++fat_read_chain(const struct wl_fat *f, uint32_t cl, uint64_t off, void *dst, uint64_t len)
++{
++	uint8_t *out = (uint8_t *)dst;
++	uint32_t guard = 0;
++	while (off >= f->cl_bytes) {
++		cl = fat_next(f, cl);
++		off -= f->cl_bytes;
++		if (cl < 2 || cl >= 0xfff0 || ++guard > f->ncl) {
++			return EIO;
++		}
++	}
++	while (len) {
++		if (cl < 2 || cl >= 0xfff0 || ++guard > f->ncl + 1) {
++			return EIO;
++		}
++		uint64_t n = MIN(len, f->cl_bytes - off);
++		int err = WL_PART_READ(f->part, f->data_off + (uint64_t)(cl - 2) * f->cl_bytes + off, out, n);
++		if (err) {
++			return err;
++		}
++		out += n;
++		len -= n;
++		off = 0;
++		if (len) {
++			cl = fat_next(f, cl);
++		}
++	}
++	return 0;
++}
++
++/* Load a directory (cl == 0: root) into wl_dirbuf; returns the entry count. */
++static int
++fat_dir_load(const struct wl_fat *f, uint32_t cl, uint32_t *nent)
++{
++	if (cl == 0) {
++		uint64_t bytes = (uint64_t)f->rootent * 32;
++		if (bytes > DIR_BUF_MAX) {
++			return EFBIG;
++		}
++		*nent = f->rootent;
++		return WL_PART_READ(f->part, f->root_off, wl_dirbuf, bytes);
++	}
++	uint32_t n = 0, guard = 0;
++	while (cl >= 2 && cl < 0xfff0 && ++guard <= f->ncl) {
++		if ((uint64_t)(n + 1) * f->cl_bytes > DIR_BUF_MAX) {
++			return EFBIG;
++		}
++		int err = WL_PART_READ(f->part, f->data_off + (uint64_t)(cl - 2) * f->cl_bytes,
++		    wl_dirbuf + (uint64_t)n * f->cl_bytes, f->cl_bytes);
++		if (err) {
++			return err;
++		}
++		n++;
++		cl = fat_next(f, cl);
++	}
++	*nent = (uint32_t)((uint64_t)n * f->cl_bytes / 32);
++	return 0;
++}
++
++static void
++fat_83(const char *name, size_t n, char out[11])
++{
++	size_t i = 0, o = 0;
++	memset(out, ' ', 11);
++	for (; i < n && name[i] != '.' && o < 8; i++, o++) {
++		out[o] = (name[i] >= 'a' && name[i] <= 'z') ? (char)(name[i] - 32) : name[i];
++	}
++	if (i < n && name[i] == '.') {
++		i++;
++	}
++	for (o = 8; i < n && o < 11; i++, o++) {
++		out[o] = (name[i] >= 'a' && name[i] <= 'z') ? (char)(name[i] - 32) : name[i];
++	}
++}
++
++/* Only plain 8.3 names (all firmware files here are); long names never match. */
++static int
++fat_find(const uint8_t *dir, uint32_t nent, const char *name, size_t n,
++    uint32_t *cluster, uint32_t *size, bool *is_dir)
++{
++	char want[11];
++	fat_83(name, n, want);
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = dir + (uint64_t)i * 32;
++		if (e[0] == 0) {
++			break;
++		}
++		if (e[0] == 0xe5 || (e[11] & 0x0f) == 0x0f || (e[11] & 0x08)) {
++			continue;
++		}
++		if (memcmp(e, want, 11) == 0) {
++			*cluster = le16(e + 26);
++			*size = le32(e + 28);
++			*is_dir = (e[11] & 0x10) != 0;
++			return 0;
++		}
++	}
++	return ENOENT;
++}
++
++/* "image/mba.mbn" style path, one directory level at a time. */
++static int
++fat_open(const struct wl_fat *f, const char *path, uint32_t *cluster, uint32_t *size)
++{
++	uint32_t cl = 0, nent = 0, sz = 0;
++	bool dir = true;
++	const char *p = path;
++	while (*p) {
++		const char *s = p;
++		while (*p && *p != '/') {
++			p++;
++		}
++		if (!dir) {
++			return ENOTDIR;
++		}
++		int err = fat_dir_load(f, cl, &nent);
++		if (err) {
++			return err;
++		}
++		err = fat_find(wl_dirbuf, nent, s, (size_t)(p - s), &cl, &sz, &dir);
++		if (err) {
++			return err;
++		}
++		if (*p == '/') {
++			p++;
++		}
++	}
++	*cluster = cl;
++	*size = sz;
++	return 0;
++}
++
++/* Count entries of the directory at path whose 8.3 name starts with prefix. */
++static int
++fat_count_prefix(const struct wl_fat *f, const char *dirpath, const char *prefix, uint32_t *count)
++{
++	uint32_t cl = 0, sz = 0, nent = 0;
++	if (*dirpath && fat_open(f, dirpath, &cl, &sz)) {
++		return ENOENT;
++	}
++	int err = fat_dir_load(f, cl, &nent);
++	if (err) {
++		return err;
++	}
++	size_t pl = strlen(prefix);
++	uint32_t c = 0;
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = wl_dirbuf + (uint64_t)i * 32;
++		if (e[0] == 0) {
++			break;
++		}
++		if (e[0] == 0xe5 || (e[11] & 0x0f) == 0x0f || (e[11] & 0x18)) {
++			continue;
++		}
++		size_t k;
++		for (k = 0; k < pl; k++) {
++			char ch = (char)e[k];
++			if (ch >= 'A' && ch <= 'Z') {
++				ch = (char)(ch + 32);
++			}
++			if (ch != prefix[k]) {
++				break;
++			}
++		}
++		c += (k == pl);
++	}
++	*count = c;
++	return 0;
++}
++
++struct elf32_ehdr {
++	uint8_t e_ident[16];
++	uint16_t e_type, e_machine;
++	uint32_t e_version, e_entry, e_phoff, e_shoff, e_flags;
++	uint16_t e_ehsize, e_phentsize, e_phnum, e_shentsize, e_shnum, e_shstrndx;
++} __attribute__((packed));
++struct elf32_phdr {
++	uint32_t p_type, p_offset, p_vaddr, p_paddr, p_filesz, p_memsz, p_flags, p_align;
++} __attribute__((packed));
++
++#define MDT_TYPE_MASK   (7u << 24)
++#define MDT_TYPE_HASH   (2u << 24)
++#define MDT_RELOCATABLE (1u << 27)
++
++struct wl_mdt {
++	uint32_t nphdr, hash_idx, nload;
++	uint32_t lo, hi;                /* span of loadable segments */
++	uint64_t total_file;            /* bytes of the .bNN segment files */
++	uint32_t hash_size;
++	bool relocatable;
++};
++
++/* Print the .mdt program headers and summarise; fw_name for log lines. */
++static int
++mdt_summarise(const struct wl_fat *f, const char *path, const char *tag, struct wl_mdt *out)
++{
++	static uint8_t mdt[16384];
++	uint32_t cl, size;
++	int err = fat_open(f, path, &cl, &size);
++	if (err) {
++		printf("SWEET WLAN: %s: %s not found (%d)\n", tag, path, err);
++		return err;
++	}
++	if (size < sizeof(struct elf32_ehdr) || size > sizeof(mdt)) {
++		printf("SWEET WLAN: %s: %s size %u unexpected\n", tag, path, size);
++		return EFBIG;
++	}
++	err = fat_read_chain(f, cl, 0, mdt, size);
++	if (err) {
++		printf("SWEET WLAN: %s: read %s failed %d\n", tag, path, err);
++		return err;
++	}
++	struct elf32_ehdr eh;
++	memcpy(&eh, mdt, sizeof(eh));
++	if (memcmp(eh.e_ident, "\x7f" "ELF", 4) != 0 || eh.e_ident[4] != 1 ||
++	    eh.e_phentsize != sizeof(struct elf32_phdr) ||
++	    (uint64_t)eh.e_phoff + (uint64_t)eh.e_phnum * sizeof(struct elf32_phdr) > size) {
++		printf("SWEET WLAN: %s: %s is not a 32-bit ELF .mdt\n", tag, path);
++		return ENOEXEC;
++	}
++	memset(out, 0, sizeof(*out));
++	out->nphdr = eh.e_phnum;
++	out->hash_idx = ~0u;
++	out->lo = ~0u;
++	printf("SWEET WLAN: %s: %s %u bytes, %u program headers, entry %#x\n", tag, path, size,
++	    eh.e_phnum, eh.e_entry);
++	for (uint32_t i = 0; i < eh.e_phnum; i++) {
++		struct elf32_phdr ph;
++		memcpy(&ph, mdt + eh.e_phoff + (uint64_t)i * sizeof(ph), sizeof(ph));
++		bool hash = (ph.p_flags & MDT_TYPE_MASK) == MDT_TYPE_HASH;
++		bool load = ph.p_type == 1 && ph.p_memsz != 0 && !hash;
++		if (hash) {
++			out->hash_idx = i;
++			out->hash_size = ph.p_filesz;
++		}
++		if (load) {
++			out->nload++;
++			out->lo = MIN(out->lo, ph.p_paddr);
++			out->hi = MAX(out->hi, ph.p_paddr + ph.p_memsz);
++			out->total_file += ph.p_filesz;
++			out->relocatable |= (ph.p_flags & MDT_RELOCATABLE) != 0;
++		}
++		if (i < 6 || hash || i + 1 == eh.e_phnum) {
++			printf("SWEET WLAN: %s:  ph%u type %u paddr %#x filesz %#x memsz %#x flags %#x%s%s\n",
++			    tag, i, ph.p_type, ph.p_paddr, ph.p_filesz, ph.p_memsz, ph.p_flags,
++			    hash ? " HASH" : "", load ? "" : " (not loaded)");
++		}
++	}
++	printf("SWEET WLAN: %s: %u loadable segments span %#x..%#x (%u MiB), hash segment ph%d %u bytes, %s\n",
++	    tag, out->nload, out->lo, out->hi, (out->hi - out->lo) >> 20, (int)out->hash_idx,
++	    out->hash_size, out->relocatable ? "RELOCATABLE" : "fixed address");
++	return 0;
++}
++
++#if !defined(WLAN_HOST_TEST)
++
++/* ======================================================================== */
++/* Hardware part                                                             */
++/* ======================================================================== */
++
++/* Register bases (mainline sdm845.dtsi, live DT where noted) */
++#define WL_GCC_PA       0x00100000u     /* gcc: reg 0x100000 */
++#define WL_GCC_SIZE     0x00090000u     /* up to 0x18a154 (mss axi) */
++#define WL_TLMM_E_PA    0x03500000u     /* TLMM 0x3400000 + EAST 0x100000 */
++#define WL_SE6_PA       0x00898000u     /* uart6 (BT): qup wrap0 SE6, live DT qup_uart@898000 */
++#define WL_SMMU_PA      0x15000000u     /* apps_smmu */
++#define WL_SMEM_PA      0x86000000u     /* smem reserved-memory */
++#define WL_SMEM_SIZE    0x00200000u
++#define WL_MUTEX_PA     0x01f40000u     /* tcsr_mutex, stride 0x1000 */
++#define WL_SMEM_HWLOCK  3u
++
++/* GCC */
++#define GCC_VOTE_WRAP0  0x5200cu        /* hlos1 vote enable */
++#define VOTE_M_AHB      (1u << 6)       /* gcc_qupv3_wrap_0_m_ahb_clk, CBCR 0x17004 */
++#define VOTE_S_AHB      (1u << 7)       /* gcc_qupv3_wrap_0_s_ahb_clk, CBCR 0x17008 */
++#define VOTE_S6         (1u << 16)      /* gcc_qupv3_wrap0_s6_clk,     CBCR 0x17750 */
++#define CBCR_M_AHB      0x17004u
++#define CBCR_S_AHB      0x17008u
++#define CBCR_S6         0x17750u
++#define RCG_S6          0x17754u        /* gcc_qupv3_wrap0_s6_clk_src */
++#define GPLL0_HZ        600000000ull    /* gcc-sdm845.c gpll0 (UNVERIFIED on hw; table print checks it) */
++
++/* GENI serial engine (qcom-geni-se.h / qcom_geni_serial.c) */
++#define SE_FORCE_DEFAULT        0x020u
++#define SE_OUTPUT_CTRL          0x024u
++#define SE_CGC_CTRL             0x028u
++#define SE_STATUS               0x040u
++#define SE_M_CLK_CFG            0x048u
++#define SE_S_CLK_CFG            0x04cu
++#define SE_IF_DISABLE           0x064u
++#define SE_FW_REV               0x068u
++#define SE_CLK_SEL              0x07cu
++#define SE_DMA_MODE_EN          0x258u
++#define SE_UART_TX_TRANS_CFG    0x25cu
++#define SE_TX_PACKING0          0x260u
++#define SE_TX_PACKING1          0x264u
++#define SE_UART_TX_WORD_LEN     0x268u
++#define SE_UART_TX_STOP_LEN     0x26cu
++#define SE_UART_TX_TRANS_LEN    0x270u
++#define SE_UART_RX_TRANS_CFG    0x280u
++#define SE_RX_PACKING0          0x284u
++#define SE_RX_PACKING1          0x288u
++#define SE_UART_RX_WORD_LEN     0x28cu
++#define SE_UART_RX_STALE        0x294u
++#define SE_UART_TX_PARITY       0x2a4u
++#define SE_UART_RX_PARITY       0x2a8u
++#define SE_UART_MANUAL_RFR      0x2acu
++#define SE_BYTE_GRAN            0x254u
++#define SE_M_CMD0               0x600u
++#define SE_M_CMD_CTRL           0x604u
++#define SE_M_IRQ_STATUS         0x610u
++#define SE_M_IRQ_EN             0x614u
++#define SE_M_IRQ_CLEAR          0x618u
++#define SE_S_CMD0               0x630u
++#define SE_S_CMD_CTRL           0x634u
++#define SE_S_IRQ_STATUS         0x640u
++#define SE_S_IRQ_EN             0x644u
++#define SE_S_IRQ_CLEAR          0x648u
++#define SE_TX_FIFO              0x700u
++#define SE_RX_FIFO              0x780u
++#define SE_TX_FIFO_STATUS       0x800u
++#define SE_RX_FIFO_STATUS       0x804u
++#define SE_TX_WM                0x80cu
++#define SE_RX_WM                0x810u
++#define SE_RX_RFR_WM            0x814u
++#define SE_DMA_TX_IRQ_CLR       0xc44u
++#define SE_DMA_RX_IRQ_CLR       0xd44u
++#define SE_GSI_EVENT_EN         0xe18u
++#define SE_IRQ_EN               0xe1cu
++#define SE_HW_PARAM_0           0xe24u
++#define SE_HW_PARAM_1           0xe28u
++#define SE_DMA_GENERAL_CFG      0xe30u
++#define SE_PROTO_UART           2u
++#define M_CMD_DONE              (1u << 0)
++#define M_CMD_ABORT             (1u << 5)
++#define UART_START_TX           1u
++#define UART_START_READ         1u
++#define UART_CTS_MASK           (1u << 1)
++#define UART_OVERSAMPLING       32u
++
++#define QCA_POWER_ON_PULSE      0xfcu   /* btqca.h QCA_WCN3990_POWERON_PULSE */
++#define QCA_POWER_OFF_PULSE     0xc0u   /* btqca.h QCA_WCN3990_POWEROFF_PULSE */
++
++static struct {
++	vm_offset_t gcc, tlmm, se, smmu, smem, mutex;
++	uint32_t vote_before;           /* GCC_VOTE_WRAP0 before we touched it */
++	uint32_t tx_depth, rx_depth;
++	uint8_t rxq[512];
++	unsigned rxn;
++	unsigned stage, delay_s;
++	int sleep_chan;
++	bool started;
++} wl;
++
++static uint32_t
++wl_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wl_wr(vm_offset_t base, uint32_t off, uint32_t val)
++{
++	__asm__ volatile("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = val;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++wl_sleep(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&wl.sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static bool
++wl_map(void)
++{
++	if (!wl.gcc) {
++		wl.gcc = ml_io_map(WL_GCC_PA, WL_GCC_SIZE);
++	}
++	if (!wl.tlmm) {
++		wl.tlmm = ml_io_map(WL_TLMM_E_PA, 0x50000);
++	}
++	if (!wl.se) {
++		wl.se = ml_io_map(WL_SE6_PA, 0x4000);
++	}
++	if (!wl.smmu) {
++		wl.smmu = ml_io_map(WL_SMMU_PA, 0x1000 + 0x1000);   /* global space: SMR 0x800, S2CR 0xc00 */
++	}
++	if (!wl.smem) {
++		wl.smem = ml_io_map(WL_SMEM_PA, WL_SMEM_SIZE);
++	}
++	if (!wl.mutex) {
++		wl.mutex = ml_io_map(WL_MUTEX_PA, 0x4000);
++	}
++	return wl.gcc && wl.tlmm && wl.se && wl.smmu && wl.smem && wl.mutex;
++}
++
++/* ---------------------------------------------------------------- probe */
++
++static bool
++cbcr_on(uint32_t off)
++{
++	uint32_t v = wl_rd(wl.gcc, off);
++	return v != 0xffffffffu && !(v & (1u << 31));
++}
++
++static void
++wl_dump_gcc(void)
++{
++	static const struct { const char *name; uint32_t off; } clk[] = {
++		{ "wrap0 m_ahb", CBCR_M_AHB }, { "wrap0 s_ahb", CBCR_S_AHB }, { "wrap0 s6", CBCR_S6 },
++		{ "mss cfg_ahb", 0x8a000 }, { "mss q6_memnoc_axi", 0x8a154 }, { "mss snoc_axi", 0x8a150 },
++		{ "mss mfab_axis", 0x8a004 }, { "boot_rom_ahb", 0x38004 }, { "prng_ahb", 0x34004 },
++	};
++	for (unsigned i = 0; i < sizeof(clk) / sizeof(clk[0]); i++) {
++		uint32_t v = wl_rd(wl.gcc, clk[i].off);
++		printf("SWEET WLAN: GCC %-18s CBCR %#x = %#010x (%s)\n", clk[i].name, clk[i].off, v,
++		    (v & (1u << 31)) ? "off" : "on");
++	}
++	printf("SWEET WLAN: GCC vote 0x5200c=%#x 0x52004=%#x (mss_gpll0_div bit17)\n",
++	    wl_rd(wl.gcc, GCC_VOTE_WRAP0), wl_rd(wl.gcc, 0x52004));
++}
++
++/* DFS performance levels of the S6 root clock (clk-rcg2.c clk_rcg2_dfs): decode Hz. */
++static uint64_t
++wl_dfs_level_hz(unsigned lvl)
++{
++	uint32_t cfg = wl_rd(wl.gcc, RCG_S6 + 0x1c + 0x24 * lvl);
++	uint32_t m = wl_rd(wl.gcc, RCG_S6 + 0x20 + 0x24 * lvl);
++	uint32_t nr = wl_rd(wl.gcc, RCG_S6 + 0x24 + 0x24 * lvl);
++	unsigned src = (cfg >> 8) & 7, hid = cfg & 0x1f, mode = (cfg >> 12) & 3;
++	uint64_t parent = src == 0 ? 19200000ull : src == 1 ? GPLL0_HZ : src == 6 ? GPLL0_HZ / 2 : 0;
++	if (!parent || cfg == 0xffffffffu) {
++		return 0;
++	}
++	uint64_t hz = parent * 2 / (hid + 1);
++	if (mode && m) {
++		uint32_t n = (~nr + m) & 0xffffu;
++		if (n == 0) {
++			return 0;
++		}
++		hz = hz * m / n;
++	}
++	return hz;
++}
++
++static void
++wl_dump_dfs(void)
++{
++	uint32_t dfs = wl_rd(wl.gcc, RCG_S6 + 0x14);
++	printf("SWEET WLAN: S6 RCG cmd=%#x cfg=%#x dfs-cmd=%#x (%s)\n", wl_rd(wl.gcc, RCG_S6),
++	    wl_rd(wl.gcc, RCG_S6 + 4), dfs, (dfs & 1) ? "DFS on" : "DFS off: plain RCG");
++	for (unsigned l = 0; l < 8; l++) {
++		printf("SWEET WLAN: S6 DFS level %u: cfg %#x m %#x n %#x -> %llu Hz\n", l,
++		    wl_rd(wl.gcc, RCG_S6 + 0x1c + 0x24 * l), wl_rd(wl.gcc, RCG_S6 + 0x20 + 0x24 * l),
++		    wl_rd(wl.gcc, RCG_S6 + 0x24 + 0x24 * l), wl_dfs_level_hz(l));
++	}
++}
++
++static void
++wl_dump_gpio(void)
++{
++	static const char *const role[] = { "CTS", "RFR", "TX", "RX" };
++	for (unsigned i = 0; i < 4; i++) {
++		uint32_t cfg = wl_rd(wl.tlmm, (45 + i) * 0x1000u);
++		uint32_t io = wl_rd(wl.tlmm, (45 + i) * 0x1000u + 4);
++		printf("SWEET WLAN: TLMM EAST gpio%u (%s) ctl=%#x func=%u pull=%u drv=%u oe=%u in=%u\n",
++		    45 + i, role[i], cfg, (cfg >> 2) & 0xf, cfg & 3, (cfg >> 6) & 7, (cfg >> 9) & 1, io & 1);
++	}
++}
++
++static bool
++wl_se_clocks_ok(void)
++{
++	return cbcr_on(CBCR_M_AHB) && cbcr_on(CBCR_S_AHB) && cbcr_on(CBCR_S6);
++}
++
++static void
++wl_dump_se(void)
++{
++	if (!wl_se_clocks_ok()) {
++		printf("SWEET WLAN: SE6 clocks are gated (ABL left them off): SE6 registers NOT read\n");
++		return;
++	}
++	uint32_t fw = wl_rd(wl.se, SE_FW_REV);
++	uint32_t hw0 = wl_rd(wl.se, SE_HW_PARAM_0), hw1 = wl_rd(wl.se, SE_HW_PARAM_1);
++	printf("SWEET WLAN: SE6 fw-rev %#x protocol %u (2 = UART) if-disable %#x status %#x clk-sel %#x\n",
++	    fw, (fw >> 8) & 0xff, wl_rd(wl.se, SE_IF_DISABLE), wl_rd(wl.se, SE_STATUS),
++	    wl_rd(wl.se, SE_CLK_SEL));
++	printf("SWEET WLAN: SE6 hw-param0 %#x hw-param1 %#x\n", hw0, hw1);
++}
++
++static void
++wl_dump_rails(void)
++{
++	static const char *const rails[] = { "smpa4", "ldoa5", "ldoa7", "ldoa17", "ldoa23", "ldoa25" };
++	for (unsigned i = 0; i < sizeof(rails) / sizeof(rails[0]); i++) {
++		uint32_t addr = 0;
++		int err = sweet_rpmh_lookup(rails[i], &addr);
++		printf("SWEET WLAN: cmd-db %s -> %s %#x\n", rails[i], err ? "lookup failed" : "VRM address", addr);
++		if (err == EBUSY || err == ENODEV || err == EINVAL) {
++			if (i == 0) {
++				break;      /* RSC/cmd-db unusable: do not repeat the failure five times */
++			}
++		}
++	}
++}
++
++/* Linux qcom_smem.c layout (smem_ptable at the top of SMEM, "$PRT" partitions). */
++static uint32_t
++smem_u32(uint32_t off)
++{
++	return wl_rd(wl.smem, off & ~3u);
++}
++
++static void
++wl_dump_smem(void)
++{
++	uint32_t top = WL_SMEM_SIZE - 0x1000;
++	uint32_t magic = smem_u32(top), version = smem_u32(top + 4), n = smem_u32(top + 8);
++	printf("SWEET WLAN: SMEM table magic %#x (\"$TOC\" = 0x434f5424) version %u entries %u\n",
++	    magic, version, n);
++	if (magic != 0x434f5424u || n > 32) {
++		printf("SWEET WLAN: SMEM table not recognised\n");
++		return;
++	}
++	for (uint32_t i = 0; i < n; i++) {
++		uint32_t e = top + 32 + i * 32;
++		uint32_t offset = smem_u32(e), size = smem_u32(e + 4), hosts = smem_u32(e + 12);
++		if (!offset || !size) {
++			continue;
++		}
++		printf("SWEET WLAN: SMEM partition %u: offset %#x size %#x hosts %u<->%u\n", i, offset, size,
++		    hosts & 0xffff, hosts >> 16);
++		if ((hosts & 0xffff) == 0 && (hosts >> 16) == 1 && offset + 32 < WL_SMEM_SIZE &&
++		    smem_u32(offset) == 0x54525024u) {
++			/* apps<->modem: list the items (the modem is cold if 435 is absent) */
++			uint32_t free_u = smem_u32(offset + 16), pos = offset + 32;
++			unsigned items = 0;
++			printf("SWEET WLAN: apps<->modem partition: free-uncached %#x\n", free_u);
++			while (pos + 16 <= offset + free_u && pos + 16 < WL_SMEM_SIZE && items < 16) {
++				uint32_t w0 = smem_u32(pos), size_e = smem_u32(pos + 4), w2 = smem_u32(pos + 8);
++				if ((w0 & 0xffff) != 0xa5a5) {
++					break;
++				}
++				printf("SWEET WLAN:   item %u size %u\n", w0 >> 16, size_e - (w2 & 0xffff));
++				pos += 16 + (w2 >> 16) + size_e;
++				items++;
++			}
++		}
++	}
++	printf("SWEET WLAN: TCSR mutex 3 (SMEM hwlock) reads %#x\n", wl_rd(wl.mutex, WL_SMEM_HWLOCK * 0x1000));
++}
++
++static void
++wl_dump_smmu(void)
++{
++	uint32_t id0 = wl_rd(wl.smmu, 0x20), id1 = wl_rd(wl.smmu, 0x24), id2 = wl_rd(wl.smmu, 0x28);
++	unsigned nsmr = id0 & 0xff, ncb = id1 & 0xff;
++	printf("SWEET WLAN: apps_smmu sCR0 %#x IDR0 %#x IDR1 %#x IDR2 %#x (%u SMRs, %u context banks)\n",
++	    wl_rd(wl.smmu, 0), id0, id1, id2, nsmr, ncb);
++	if (nsmr == 0 || nsmr > 256 || 0xc00 + nsmr * 4 > 0x2000) {
++		return;
++	}
++	static const unsigned sids[] = { 0x40, 0x740 };     /* WLAN (iommus 0x40 mask 1), USB1 */
++	for (unsigned s = 0; s < sizeof(sids) / sizeof(sids[0]); s++) {
++		bool found = false;
++		for (unsigned i = 0; i < nsmr; i++) {
++			uint32_t smr = wl_rd(wl.smmu, 0x800 + i * 4), s2cr = wl_rd(wl.smmu, 0xc00 + i * 4);
++			if (!(smr >> 31)) {
++				continue;
++			}
++			uint32_t id = smr & 0x7fff, mask = (smr >> 16) & 0x7fff;
++			if (((sids[s] ^ id) & ~mask & 0x7fff) == 0) {
++				printf("SWEET WLAN: SMMU sid %#x matched by SMR%u id %#x mask %#x -> S2CR %#x (type %u cb %u)\n",
++				    sids[s], i, id, mask, s2cr, (s2cr >> 16) & 3, s2cr & 0xff);
++				found = true;
++			}
++		}
++		if (!found) {
++			printf("SWEET WLAN: SMMU sid %#x: no valid SMR matches\n", sids[s]);
++		}
++	}
++}
++
++static void
++wl_probe(void)
++{
++	printf("SWEET WLAN: probe (read-only), stage %u\n", wl.stage);
++	wl_dump_gcc();
++	wl_dump_dfs();
++	wl_dump_gpio();
++	wl_dump_se();
++	wl_dump_rails();
++	wl_dump_smem();
++	wl_dump_smmu();
++	printf("SWEET WLAN: probe done (RMB 0x4180000 / QDSP6 0x4080000 deliberately not read: gated)\n");
++}
++
++/* ---------------------------------------------------------------- stage 3: inventory */
++
++static void
++wl_part_info(const char *name)
++{
++	uint8_t lun = 0;
++	uint64_t bytes = 0;
++	uint8_t head[16];
++	int err = sweet_ufs_part_size(name, &lun, &bytes);
++	if (err) {
++		printf("SWEET WLAN: partition \"%s\": not found (%d)\n", name, err);
++		return;
++	}
++	err = sweet_ufs_read_part(name, 0, head, sizeof(head));
++	bool nonzero = false;
++	for (unsigned i = 0; i < sizeof(head); i++) {
++		nonzero |= head[i] != 0;
++	}
++	printf("SWEET WLAN: partition \"%s\": LUN %u, %llu KiB, first 16 bytes %s%s\n", name, lun,
++	    bytes >> 10, err ? "unreadable" : nonzero ? "non-zero" : "all zero", "");
++}
++
++static void
++wl_file_info(const struct wl_fat *f, const char *path)
++{
++	uint32_t cl, size;
++	int err = fat_open(f, path, &cl, &size);
++	if (err) {
++		printf("SWEET WLAN: %s:%s not found (%d)\n", f->part, path, err);
++	} else {
++		printf("SWEET WLAN: %s:%s cluster %u size %u\n", f->part, path, cl, size);
++	}
++}
++
++static void
++wl_inventory(void)
++{
++	static struct wl_fat fat;
++	static struct wl_mdt mdt, mba_unused;
++	uint32_t cnt = 0;
++	uint32_t cl, size;
++	int err;
++
++	(void)mba_unused;
++	printf("SWEET WLAN: inventory (read-only UFS reads; nothing is written)\n");
++	static const char *const parts[] = { "modemst1", "modemst2", "fsg", "fsc", "persist", "dsp" };
++	for (unsigned i = 0; i < sizeof(parts) / sizeof(parts[0]); i++) {
++		wl_part_info(parts[i]);
++	}
++	err = fat_mount(&fat, "modem");
++	printf("SWEET WLAN: modem partition FAT16 mount: %d", err);
++	if (!err) {
++		printf(" (bytes/sector %u, sectors/cluster %u, clusters %u, FAT %u sectors)\n", fat.bps,
++		    fat.spc, fat.ncl, fat.fatsz);
++		wl_file_info(&fat, "image/mba.mbn");
++		wl_file_info(&fat, "image/wlanmdsp.mbn");
++		wl_file_info(&fat, "image/qdsp6m.qdb");
++		if (!fat_count_prefix(&fat, "image", "bdwlan", &cnt)) {
++			printf("SWEET WLAN: modem:image/bdwlan.* %u files\n", cnt);
++		}
++		if (!fat_count_prefix(&fat, "image", "bdf_", &cnt)) {
++			printf("SWEET WLAN: modem:image/bdf_*.bin %u files\n", cnt);
++		}
++		err = mdt_summarise(&fat, "image/modem.mdt", "MPSS", &mdt);
++		if (!err) {
++			/* DT carve-outs (live DT = Linux beryllium dtsi): mpss 0x8e400000+0x7800000,
++			 * mba 0x96900000+0x200000, wlan msa 0x8e300000+0x100000 */
++			printf("SWEET WLAN: MPSS image %#x..%#x vs carve-out 0x8e400000..0x95c00000: %s\n", mdt.lo, mdt.hi,
++			    mdt.relocatable ? "relocatable (loader picks the base)" :
++			    (mdt.lo >= 0x8e400000u && mdt.hi <= 0x95c00000u) ? "fits" : "DOES NOT FIT at its fixed address");
++		}
++		if (!fat_open(&fat, "image/mba.mbn", &cl, &size)) {
++			printf("SWEET WLAN: MBA %u bytes vs 2 MiB carve-out (0x96900000): %s\n", size,
++			    size <= 0x200000 ? "fits" : "TOO BIG");
++		}
++	} else {
++		printf("\n");
++	}
++	err = fat_mount(&fat, "bluetooth");
++	printf("SWEET WLAN: bluetooth partition FAT16 mount: %d\n", err);
++	if (!err) {
++		static const char *const bt[] = {
++			"image/crbtfw21.tlv", "image/crnv21.bin", "image/crbtfw20.tlv", "image/crnv20.bin",
++			"image/crbtfw11.tlv", "image/crnv11.bin",
++		};
++		for (unsigned i = 0; i < sizeof(bt) / sizeof(bt[0]); i++) {
++			wl_file_info(&fat, bt[i]);
++		}
++	}
++	printf("SWEET WLAN: inventory done\n");
++}
++
++/* ---------------------------------------------------------------- stage 2: Bluetooth */
++
++static void
++wl_gpio_cfg(unsigned pin, unsigned func, unsigned pull, unsigned drive)
++{
++	uint32_t off = pin * 0x1000u;
++	uint32_t cfg = wl_rd(wl.tlmm, off);
++	cfg &= ~0x3ffu;
++	cfg |= (func << 2) | pull | (drive << 6);     /* output enable: owned by the function */
++	wl_wr(wl.tlmm, off, cfg);
++}
++
++static bool
++wl_clocks_on(void)
++{
++	wl.vote_before = wl_rd(wl.gcc, GCC_VOTE_WRAP0);
++	wl_wr(wl.gcc, GCC_VOTE_WRAP0, wl.vote_before | VOTE_M_AHB | VOTE_S_AHB | VOTE_S6);
++	for (unsigned i = 0; i < 2000 && !wl_se_clocks_ok(); i++) {
++		delay(10);
++	}
++	if (!wl_se_clocks_ok()) {
++		printf("SWEET WLAN: SE6 clock branches did not come on: m_ahb %#x s_ahb %#x s6 %#x\n",
++		    wl_rd(wl.gcc, CBCR_M_AHB), wl_rd(wl.gcc, CBCR_S_AHB), wl_rd(wl.gcc, CBCR_S6));
++		return false;
++	}
++	return true;
++}
++
++static void
++wl_clocks_off(void)
++{
++	/* put back only the bits we added */
++	uint32_t now = wl_rd(wl.gcc, GCC_VOTE_WRAP0);
++	uint32_t add = (VOTE_M_AHB | VOTE_S_AHB | VOTE_S6) & ~wl.vote_before;
++	wl_wr(wl.gcc, GCC_VOTE_WRAP0, now & ~add);
++}
++
++/* pick DFS level and GENI divider for a baud rate; 0 on failure */
++static bool
++wl_baud(unsigned baud)
++{
++	unsigned best_l = 8, best_div = 0;
++	uint64_t best_err = ~0ull;
++	if (!(wl_rd(wl.gcc, RCG_S6 + 0x14) & 1)) {
++		printf("SWEET WLAN: S6 root clock is not in DFS mode: need RCG programming, aborting\n");
++		return false;
++	}
++	for (unsigned l = 0; l < 8; l++) {
++		uint64_t hz = wl_dfs_level_hz(l);
++		uint64_t unit = (uint64_t)baud * UART_OVERSAMPLING;
++		if (hz < unit) {
++			continue;
++		}
++		uint64_t div = (hz + unit / 2) / unit;
++		if (div == 0 || div > 4095) {
++			continue;
++		}
++		uint64_t got = hz / div;
++		uint64_t err = got > unit ? got - unit : unit - got;
++		if (err * 1000 < unit * 5 && err < best_err) {      /* < 0.5 % */
++			best_err = err;
++			best_l = l;
++			best_div = (unsigned)div;
++		}
++	}
++	if (best_l == 8) {
++		printf("SWEET WLAN: no DFS level of S6 gives %u baud within 0.5 %%\n", baud);
++		return false;
++	}
++	wl_wr(wl.se, SE_CLK_SEL, best_l);
++	wl_wr(wl.se, SE_M_CLK_CFG, (best_div << 4) | 1u);
++	wl_wr(wl.se, SE_S_CLK_CFG, (best_div << 4) | 1u);
++	printf("SWEET WLAN: UART %u baud: DFS level %u (%llu Hz), divider %u\n", baud, best_l,
++	    wl_dfs_level_hz(best_l), best_div);
++	return true;
++}
++
++static void
++wl_flow(bool hw)
++{
++	uint32_t v = wl_rd(wl.se, SE_UART_TX_TRANS_CFG);
++	v = hw ? (v & ~UART_CTS_MASK) : (v | UART_CTS_MASK);
++	wl_wr(wl.se, SE_UART_TX_TRANS_CFG, v);
++}
++
++/* geni_se_config_packing(8, 4, false, true, true) */
++static void
++wl_packing(void)
++{
++	uint32_t cfg[4] = { 0 };
++	for (int i = 0; i < 4; i++) {
++		cfg[i] = ((uint32_t)(i * 8) << 5) | (7u << 1);
++	}
++	cfg[3] |= 1u;                                 /* stop bit */
++	uint32_t c0 = cfg[0] | (cfg[1] << 10), c1 = cfg[2] | (cfg[3] << 10);
++	wl_wr(wl.se, SE_TX_PACKING0, c0);
++	wl_wr(wl.se, SE_TX_PACKING1, c1);
++	wl_wr(wl.se, SE_RX_PACKING0, c0);
++	wl_wr(wl.se, SE_RX_PACKING1, c1);
++	wl_wr(wl.se, SE_BYTE_GRAN, 0);
++}
++
++static bool
++wl_uart_open(void)
++{
++	uint32_t fw = wl_rd(wl.se, SE_FW_REV);
++	if (((fw >> 8) & 0xff) != SE_PROTO_UART) {
++		printf("SWEET WLAN: SE6 protocol is %u, not UART (QUP firmware not loaded for UART): stop\n",
++		    (fw >> 8) & 0xff);
++		return false;
++	}
++	if (wl_rd(wl.se, SE_STATUS) & ((1u << 0) | (1u << 12))) {
++		printf("SWEET WLAN: SE6 busy (status %#x): stop\n", wl_rd(wl.se, SE_STATUS));
++		return false;
++	}
++	wl.tx_depth = (wl_rd(wl.se, SE_HW_PARAM_0) >> 16) & 0x3f;
++	wl.rx_depth = (wl_rd(wl.se, SE_HW_PARAM_1) >> 16) & 0x3f;
++	if (wl.tx_depth < 8 || wl.rx_depth < 8) {
++		printf("SWEET WLAN: odd FIFO depths tx %u rx %u (hw-param %#x/%#x): stop\n", wl.tx_depth,
++		    wl.rx_depth, wl_rd(wl.se, SE_HW_PARAM_0), wl_rd(wl.se, SE_HW_PARAM_1));
++		return false;
++	}
++	/* geni_se_io_init + io_set_mode + init */
++	wl_wr(wl.se, SE_CGC_CTRL, wl_rd(wl.se, SE_CGC_CTRL) | 0x7fu);
++	wl_wr(wl.se, SE_DMA_GENERAL_CFG, wl_rd(wl.se, SE_DMA_GENERAL_CFG) | 0xfu);
++	wl_wr(wl.se, SE_OUTPUT_CTRL, 0x7fu);
++	wl_wr(wl.se, SE_FORCE_DEFAULT, 1u);
++	wl_wr(wl.se, SE_GSI_EVENT_EN, 0);
++	wl_wr(wl.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	wl_wr(wl.se, SE_S_IRQ_CLEAR, 0xffffffffu);
++	wl_wr(wl.se, SE_DMA_TX_IRQ_CLR, 0xffffffffu);
++	wl_wr(wl.se, SE_DMA_RX_IRQ_CLR, 0xffffffffu);
++	wl_wr(wl.se, SE_IRQ_EN, wl_rd(wl.se, SE_IRQ_EN) | 0xfu);
++	wl_wr(wl.se, SE_DMA_MODE_EN, wl_rd(wl.se, SE_DMA_MODE_EN) & ~1u);
++	wl_packing();
++	wl_wr(wl.se, SE_RX_WM, 2);
++	wl_wr(wl.se, SE_RX_RFR_WM, wl.rx_depth - 2);
++	wl_wr(wl.se, SE_UART_RX_STALE, 160);          /* DEFAULT_BITS_PER_CHAR * STALE_TIMEOUT */
++	wl_wr(wl.se, SE_UART_TX_WORD_LEN, 8);
++	wl_wr(wl.se, SE_UART_RX_WORD_LEN, 8);
++	wl_wr(wl.se, SE_UART_TX_STOP_LEN, 0);
++	wl_wr(wl.se, SE_UART_TX_PARITY, 0);
++	wl_wr(wl.se, SE_UART_RX_PARITY, 0);
++	wl_wr(wl.se, SE_UART_RX_TRANS_CFG, 0);
++	wl_wr(wl.se, SE_UART_TX_TRANS_CFG, UART_CTS_MASK);    /* flow control off */
++	wl_wr(wl.se, SE_UART_MANUAL_RFR, 0);
++	return true;
++}
++
++static void
++wl_rx_start(void)
++{
++	wl_wr(wl.se, SE_S_IRQ_CLEAR, 0xffffffffu);
++	wl_wr(wl.se, SE_S_CMD0, UART_START_READ << 27);
++}
++
++static void
++wl_rx_stop(void)
++{
++	if (wl_rd(wl.se, SE_STATUS) & (1u << 12)) {
++		wl_wr(wl.se, SE_S_CMD_CTRL, 1u << 2);     /* cancel */
++		for (unsigned i = 0; i < 2000 && (wl_rd(wl.se, SE_STATUS) & (1u << 12)); i++) {
++			delay(10);
++		}
++		if (wl_rd(wl.se, SE_STATUS) & (1u << 12)) {
++			wl_wr(wl.se, SE_S_CMD_CTRL, 1u << 1); /* abort */
++			for (unsigned i = 0; i < 2000 && (wl_rd(wl.se, SE_STATUS) & (1u << 12)); i++) {
++				delay(10);
++			}
++		}
++	}
++	wl_wr(wl.se, SE_S_IRQ_CLEAR, 0xffffffffu);
++}
++
++/* drain the RX FIFO into wl.rxq */
++static void
++wl_rx_poll(void)
++{
++	uint32_t st = wl_rd(wl.se, SE_RX_FIFO_STATUS);
++	uint32_t words = st & 0x1ffffffu;
++	if (!words) {
++		return;
++	}
++	uint32_t bytes = 4 * (words - 1);
++	uint32_t lastv = (st >> 28) & 7;
++	bytes += ((st >> 31) && lastv) ? lastv : 4;
++	for (uint32_t w = 0; w < words; w++) {
++		uint32_t v = wl_rd(wl.se, SE_RX_FIFO);
++		for (unsigned k = 0; k < 4 && bytes; k++, bytes--) {
++			if (wl.rxn < sizeof(wl.rxq)) {
++				wl.rxq[wl.rxn++] = (uint8_t)(v >> (8 * k));
++			}
++		}
++	}
++}
++
++static bool
++wl_tx(const uint8_t *buf, unsigned len, unsigned baud)
++{
++	if (len == 0 || len > 4u * (wl.tx_depth - 2)) {
++		return false;
++	}
++	for (unsigned i = 0; i < 1000 && (wl_rd(wl.se, SE_STATUS) & 1u); i++) {
++		delay(10);
++	}
++	wl_wr(wl.se, SE_M_IRQ_CLEAR, 0xffffffffu);
++	wl_wr(wl.se, SE_TX_WM, 2);
++	wl_wr(wl.se, SE_UART_TX_TRANS_LEN, len);
++	wl_wr(wl.se, SE_M_CMD0, UART_START_TX << 27);
++	for (unsigned i = 0; i < len; i += 4) {
++		uint32_t w = 0;
++		for (unsigned k = 0; k < 4 && i + k < len; k++) {
++			w |= (uint32_t)buf[i + k] << (8 * k);
++		}
++		wl_wr(wl.se, SE_TX_FIFO, w);
++	}
++	/* 12 bit times per byte plus 50 ms; flow control may hold the transmitter */
++	uint64_t us = ((uint64_t)len * 12 * 1000000ull) / baud + 50000;
++	bool done = false;
++	for (uint64_t t = 0; t < us; t += 20) {
++		if (wl_rd(wl.se, SE_M_IRQ_STATUS) & M_CMD_DONE) {
++			done = true;
++			break;
++		}
++		delay(20);
++	}
++	if (!done) {
++		wl_wr(wl.se, SE_M_CMD_CTRL, 1u << 1);     /* abort */
++		for (unsigned i = 0; i < 1000 && !(wl_rd(wl.se, SE_M_IRQ_STATUS) & M_CMD_ABORT); i++) {
++			delay(10);
++		}
++		wl_wr(wl.se, SE_M_IRQ_CLEAR, M_CMD_ABORT);
++		printf("SWEET WLAN: UART TX of %u bytes timed out (aborted)\n", len);
++		return false;
++	}
++	wl_wr(wl.se, SE_M_IRQ_CLEAR, M_CMD_DONE);
++	return true;
++}
++
++static void
++wl_power_pulse(bool on, unsigned baud)
++{
++	uint8_t b = on ? QCA_POWER_ON_PULSE : QCA_POWER_OFF_PULSE;
++	wl_rx_stop();
++	wl_flow(false);
++	(void)wl_tx(&b, 1, baud);
++	wl_sleep(on ? 100 : 10);
++	wl_rx_start();
++	wl.rxn = 0;
++}
++
++/* One HCI command; prints and returns the first matching event in rsp. */
++static int
++wl_hci_cmd(uint16_t opcode, const uint8_t *params, unsigned plen, uint8_t *rsp, unsigned *rlen,
++    unsigned timeout_ms)
++{
++	uint8_t pkt[16];
++	if (plen > sizeof(pkt) - 4) {
++		return EINVAL;
++	}
++	pkt[0] = 0x01;
++	pkt[1] = (uint8_t)opcode;
++	pkt[2] = (uint8_t)(opcode >> 8);
++	pkt[3] = (uint8_t)plen;
++	if (plen) {
++		memcpy(pkt + 4, params, plen);
++	}
++	wl.rxn = 0;
++	if (!wl_tx(pkt, 4 + plen, 115200)) {
++		return EIO;
++	}
++	for (unsigned t = 0; t < timeout_ms; t++) {
++		wl_rx_poll();
++		unsigned pos = 0;
++		while (pos < wl.rxn) {
++			if (wl.rxq[pos] != 0x04) {
++				pos++;                      /* not an event: resync */
++				continue;
++			}
++			if (pos + 3 > wl.rxn) {
++				break;
++			}
++			unsigned elen = wl.rxq[pos + 2];
++			if (pos + 3 + elen > wl.rxn) {
++				break;
++			}
++			uint8_t evt = wl.rxq[pos + 1];
++			const uint8_t *d = &wl.rxq[pos + 3];
++			bool match = (evt == 0x0e && elen >= 3 && (d[1] | (d[2] << 8)) == opcode) ||
++			    (evt == 0x0f && elen >= 4 && (d[2] | (d[3] << 8)) == opcode) ||
++			    (evt == 0xff && opcode == 0xfc00);
++			if (match) {
++				*rlen = MIN(elen + 2, 48u);
++				rsp[0] = evt;
++				rsp[1] = (uint8_t)elen;
++				memcpy(rsp + 2, d, *rlen - 2);
++				return 0;
++			}
++			pos += 3 + elen;
++		}
++		delay(1000);
++	}
++	return ETIMEDOUT;
++}
++
++static void
++wl_print_hex(const char *what, const uint8_t *b, unsigned n)
++{
++	char line[3 * 48 + 1];
++	unsigned o = 0;
++	for (unsigned i = 0; i < n && o + 3 < sizeof(line); i++) {
++		o += (unsigned)snprintf(line + o, sizeof(line) - o, "%02x ", b[i]);
++	}
++	printf("SWEET WLAN: HCI %s: %s\n", what, line);
++}
++
++static const struct { const char *res; unsigned mv; } wl_bt_rails[] = {
++	{ "ldoa7", 1800 }, { "ldoa17", 1304 }, { "ldoa25", 3300 },
++};
++
++static void
++wl_bt(void)
++{
++	uint8_t rsp[48];
++	unsigned rlen = 0, n = 0;
++	int err;
++
++	if (!wl_clocks_on()) {
++		return;
++	}
++	/* pins first (Linux order: pinctrl default state, then the UART probes) */
++	wl_gpio_cfg(45, 1, 1 /* pull-down */, 0);
++	wl_gpio_cfg(46, 1, 0, 0);
++	wl_gpio_cfg(47, 1, 0, 0);
++	wl_gpio_cfg(48, 1, 3 /* pull-up */, 0);
++	wl_dump_gpio();
++	if (!wl_uart_open()) {
++		goto out_clocks;
++	}
++	for (n = 0; n < sizeof(wl_bt_rails) / sizeof(wl_bt_rails[0]); n++) {
++		err = sweet_rpmh_vreg_set(wl_bt_rails[n].res, wl_bt_rails[n].mv, true);
++		printf("SWEET WLAN: rail %s %u mV -> %d\n", wl_bt_rails[n].res, wl_bt_rails[n].mv, err);
++		if (err) {
++			goto out_rails;
++		}
++		wl_sleep(2);
++	}
++	wl_sleep(10);
++	/* qca_regulator_init(): 2400 baud power-off pulse, then 115200 baud power-on pulse */
++	if (!wl_baud(2400)) {
++		goto out_rails;
++	}
++	wl_rx_start();
++	wl_power_pulse(false, 2400);
++	if (!wl_baud(115200)) {
++		goto out_rails;
++	}
++	wl_power_pulse(true, 115200);
++	wl_flow(true);
++	wl_rx_poll();
++	printf("SWEET WLAN: after power-on pulse: %u stray RX bytes\n", wl.rxn);
++	wl.rxn = 0;
++
++	err = wl_hci_cmd(0x0c03, NULL, 0, rsp, &rlen, 1000);        /* HCI_Reset */
++	if (err) {
++		printf("SWEET WLAN: HCI Reset: no event (%d)\n", err);
++	} else {
++		wl_print_hex("Reset event", rsp, rlen);
++	}
++	err = wl_hci_cmd(0x1001, NULL, 0, rsp, &rlen, 1000);        /* Read_Local_Version_Information */
++	if (err) {
++		printf("SWEET WLAN: HCI Read Local Version: no event (%d)\n", err);
++	} else {
++		wl_print_hex("Read Local Version", rsp, rlen);
++	}
++	{
++		static const uint8_t ver_req[1] = { 0x19 };             /* EDL_PATCH_VER_REQ_CMD */
++		err = wl_hci_cmd(0xfc00, ver_req, 1, rsp, &rlen, 1000);
++		if (err) {
++			printf("SWEET WLAN: QCA read patch version: no event (%d)\n", err);
++		} else {
++			wl_print_hex("QCA patch version (product/patch/rom/soc follow the 0x19 header)", rsp, rlen);
++		}
++	}
++	/* hci_qca qca_power_off(): 2400 baud power-off pulse, rails off */
++	wl_rx_stop();
++	if (wl_baud(2400)) {
++		wl_power_pulse(false, 2400);
++	}
++out_rails:
++	{
++		unsigned keep = 0;
++		(void)PE_parse_boot_argn("sweetwlankeep", &keep, sizeof(keep));
++		if (!keep) {
++			for (unsigned i = n >= sizeof(wl_bt_rails) / sizeof(wl_bt_rails[0]) ?
++			    (unsigned)(sizeof(wl_bt_rails) / sizeof(wl_bt_rails[0])) : n; i-- > 0;) {
++				err = sweet_rpmh_vreg_set(wl_bt_rails[i].res, wl_bt_rails[i].mv, false);
++				printf("SWEET WLAN: rail %s off -> %d\n", wl_bt_rails[i].res, err);
++				wl_sleep(2);
++			}
++		} else {
++			printf("SWEET WLAN: sweetwlankeep=1: rails left on\n");
++		}
++	}
++out_clocks:
++	wl_rx_stop();
++	wl_clocks_off();
++	printf("SWEET WLAN: bluetooth stage done\n");
++}
++
++/* ---------------------------------------------------------------- thread */
++
++static void
++wl_thread(void *arg, wait_result_t wr)
++{
++	(void)arg;
++	(void)wr;
++	printf("SWEET WLAN: stage %u starts in %u s\n", wl.stage, wl.delay_s);
++	wl_sleep(wl.delay_s * 1000u);
++	if (!wl_map()) {
++		printf("SWEET WLAN: MMIO mapping failed\n");
++		goto out;
++	}
++	wl_probe();
++	if (wl.stage == 2) {
++		wl_bt();
++	} else if (wl.stage == 3) {
++		wl_inventory();
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++beryllium_wlan_init(void)
++{
++	unsigned stage = 0, delay_s = 90;
++	thread_t thread;
++
++	if (wl.started || !sweet_board_beryllium()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweetwlan", &stage, sizeof(stage));
++	if (stage == 0) {
++		return;                 /* off by default: no log line, no mapping */
++	}
++	(void)PE_parse_boot_argn("sweetwlandelay", &delay_s, sizeof(delay_s));
++	wl.started = true;
++	wl.stage = stage;
++	wl.delay_s = delay_s;
++	if (kernel_thread_start(wl_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET WLAN: kernel_thread_start failed\n");
++	}
++}
++
++#endif /* !WLAN_HOST_TEST */
++#endif /* WLAN_HOST_TEST || ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 4da50d882002fd92489b73494a5803f1e3ede3c9..2d88a344fd3a07f81f5afda97e4930a6b99deb96 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -9,13 +9,25 @@
+ #include <sys/errno.h>
+ #include <kern/clock.h>
+ #include <machine/machine_routines.h>
++#include "sweet_board.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
++int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+ #define RH_TCS_PA       0x18220d00u
++/*
++ * Poco F1 (SDM845): apps_rsc drv-2 (mainline sdm845.dtsi and the live DT notes:
++ * reg 0x179e0000, qcom,tcs-offset 0xd00, ACTIVE 2 / SLEEP 3 / WAKE 3 / CONTROL 1)
++ * and the cmd-db reserved-memory node 0x85fe0000+0x20000. There is no IMEM
++ * locator to read here: the address is the fixed carve-out.
++ */
++#define RH_BE_RSC_PA    0x179e0000u
++#define RH_BE_TCS_PA    0x179e0d00u
++#define RH_BE_DB_PA     0x85fe0000u
++#define RH_BE_DB_SIZE   0x20000u
+ #define RH_TCS_SIZE     0x3000u
+ #define RH_DICT_PA      0x0c3f000cu
+ #define RH_DRV          2u
+@@ -47,6 +59,7 @@ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
++static bool rh_be;
+ static uint32_t rh_db_size;
+ static unsigned rh_ncpt;
+ static unsigned rh_lock;
+@@ -100,16 +113,17 @@ rh_range(uint32_t off, uint32_t size)
+ static int
+ rh_map(void)
+ {
++	rh_be = sweet_board_beryllium();
+ 	if (!rh_rsc) {
+-		rh_rsc = ml_io_map(RH_RSC_PA, 0x100);
++		rh_rsc = ml_io_map(rh_be ? RH_BE_RSC_PA : RH_RSC_PA, 0x100);
+ 	}
+ 	if (!rh_tcs) {
+-		rh_tcs = ml_io_map(RH_TCS_PA, RH_TCS_SIZE);
++		rh_tcs = ml_io_map(rh_be ? RH_BE_TCS_PA : RH_TCS_PA, RH_TCS_SIZE);
+ 	}
+-	if (!rh_dict) {
++	if (!rh_dict && !rh_be) {
+ 		rh_dict = ml_io_map(RH_DICT_PA, 8);
+ 	}
+-	if (!rh_rsc || !rh_tcs || !rh_dict) {
++	if (!rh_rsc || !rh_tcs || (!rh_dict && !rh_be)) {
+ 		printf("SWEET RPMH: RSC/locator mapping failed\n");
+ 		return ENOMEM;
+ 	}
+@@ -120,7 +134,8 @@ rh_map(void)
+ 	unsigned count = (config >> (6u * RH_DRV)) & 0x3fu;
+ 	rh_ncpt = (config >> 27) & 0x1fu;
+ 	printf("SWEET RPMH: rsc=%#x tcs=%#x DRV=%u id=%#x solver=%#x config=%#x TCS=%u ncpt=%u\n",
+-	    RH_RSC_PA, RH_TCS_PA, RH_DRV, id, solver, config, count, rh_ncpt);
++	    rh_be ? RH_BE_RSC_PA : RH_RSC_PA, rh_be ? RH_BE_TCS_PA : RH_TCS_PA, RH_DRV, id, solver,
++	    config, count, rh_ncpt);
+ 	/* This client implements the pre-v3 layout only; do not guess v3 offsets. */
+ 	if ((major != 1 && major != 2) || config == 0xffffffffu ||
+ 	    solver == 0xffffffffu || count < RH_NORMAL_N ||
+@@ -129,9 +144,9 @@ rh_map(void)
+ 		return ENODEV;
+ 	}
+ 	if (!rh_db) {
+-		uint32_t pa = rh_read(rh_dict, 0);
+-		uint32_t size = rh_read(rh_dict, 4);
+-		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", RH_DICT_PA, pa, size);
++		uint32_t pa = rh_be ? RH_BE_DB_PA : rh_read(rh_dict, 0);
++		uint32_t size = rh_be ? RH_BE_DB_SIZE : rh_read(rh_dict, 4);
++		printf("SWEET RPMH: cmd-db locator=%#x pa=%#x size=%#x\n", rh_be ? 0u : RH_DICT_PA, pa, size);
+ 		/* Firmware supplies the reserved RAM address; never scan physical RAM. */
+ 		if (pa < 0x80000000u || (pa & 3u) || (size & 3u) ||
+ 		    size < RH_DB_HEADER || size > RH_DB_MAX ||
+@@ -218,8 +233,9 @@ rh_free(unsigned t)
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
++/* enable=false: a single ENABLE=0 command (voltage and mode stay as they were). */
+ static int
+-rh_send(uint32_t address, unsigned mv)
++rh_send(uint32_t address, unsigned mv, bool enable)
+ {
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+@@ -269,16 +285,20 @@ rh_send(uint32_t address, unsigned mv)
+ 	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+ 	const uint32_t offsets[3] = {0, 8, 4};
+ 	const uint32_t values[3] = {mv, 7, 1};
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=1 irq-enable=%#x\n", t, mv, irq_en);
+-	for (unsigned c = 0; c < 3; ++c) {
++	const unsigned ncmd = enable ? 3 : 1;
++	const uint32_t cmdmask = (1u << ncmd) - 1u;
++	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=%d irq-enable=%#x\n", t, mv, enable, irq_en);
++	for (unsigned c = 0; c < ncmd; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
++		uint32_t off = enable ? offsets[c] : 4u;
++		uint32_t val = enable ? values[c] : 0u;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + offsets[c]) ||
+-		    !rh_sync(cmd + RH_DATA, values[c])) {
++		    !rh_sync(cmd + RH_ADDR, address + off) ||
++		    !rh_sync(cmd + RH_DATA, val)) {
+ 			return EIO;
+ 		}
+ 	}
+-	if (!rh_sync(b + RH_WAIT, 7) || !rh_sync(b + RH_ENABLE, 7) ||
++	if (!rh_sync(b + RH_WAIT, cmdmask) || !rh_sync(b + RH_ENABLE, cmdmask) ||
+ 	    !rh_sync(b + RH_CONTROL, 0) || !rh_sync(b + RH_CONTROL, RH_AMC_EN)) {
+ 		return EIO;
+ 	}
+@@ -289,7 +309,7 @@ rh_send(uint32_t address, unsigned mv)
+ 		irq = rh_read(rh_tcs, RH_IRQ_STATUS);
+ 		idle = rh_read(rh_tcs, b + RH_STATUS);
+ 		bool complete = true;
+-		for (unsigned c = 0; c < 3; ++c) {
++		for (unsigned c = 0; c < ncmd; ++c) {
+ 			status[c] = rh_read(rh_tcs, b + RH_CMD_STATUS + c * RH_CMD_STRIDE);
+ 			complete &= status[c] != 0xffffffffu &&
+ 			    (status[c] & (RH_ISSUED | RH_COMPLETE)) == (RH_ISSUED | RH_COMPLETE);
+@@ -320,10 +340,79 @@ rh_send(uint32_t address, unsigned mv)
+ 		return EIO;
+ 	}
+ 	rh_poisoned = false;
+-	printf("SWEET RPMH: L11C ACTIVE vote complete (rail voltage requires hardware verification)\n");
++	printf("SWEET RPMH: ACTIVE vote complete (rail voltage requires hardware verification)\n");
+ 	return 0;
+ }
+ 
++/*
++ * Poco F1 WCN3990 rails (mainline sdm845-xiaomi-beryllium-common.dtsi):
++ * l5a 0.8 V (cx/mx), l7a 1.8 V (xo), l17a 1.304 V (rfa), l23a 3.3 V (ch1),
++ * l25a 3.3 V (ch0). s4a 1.8 V is a fixed always-on rail: never voted here.
++ * An allow-list on purpose: the PMIC4 LDO policy (HPM mode 7) must not be
++ * applied to arbitrary cmd-db resources.
++ */
++static const struct { const char *res; unsigned lo, hi; } rh_wcn_rails[] = {
++	{ "ldoa5", 800, 800 }, { "ldoa7", 1800, 1800 }, { "ldoa17", 1304, 1304 },
++	{ "ldoa23", 3300, 3312 }, { "ldoa25", 3300, 3312 },
++};
++
++/* Read-only: RSC geometry check, cmd-db lookup, no TCS access. */
++int
++sweet_rpmh_lookup(const char *res, uint32_t *address)
++{
++	int error = EBUSY;
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return error;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, address);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
++int
++sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable)
++{
++	unsigned i;
++	if (!sweet_board_beryllium() || !res) {
++		return EINVAL;
++	}
++	for (i = 0; i < sizeof(rh_wcn_rails) / sizeof(rh_wcn_rails[0]); ++i) {
++		if (!strcmp(res, rh_wcn_rails[i].res) &&
++		    mv >= rh_wcn_rails[i].lo && mv <= rh_wcn_rails[i].hi) {
++			break;
++		}
++	}
++	if (i == sizeof(rh_wcn_rails) / sizeof(rh_wcn_rails[0])) {
++		printf("SWEET RPMH: %s %u mV is not an allowed WCN3990 rail\n", res, mv);
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, &address);
++	}
++	if (!error) {
++		error = rh_send(address, mv, enable);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: %s %s failed errno=%d\n", res, enable ? "enable" : "disable", error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ int
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+@@ -346,7 +435,7 @@ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ 		error = rh_lookup(res, &address);
+ 	}
+ 	if (!error) {
+-		error = rh_send(address, mv);
++		error = rh_send(address, mv, true);
+ 	}
+ out:
+ 	if (error) {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 6011e91400e3b8477e233c79c78887e085d48757..5c4086fd50003669bbe02a1f159c80fbed22571e 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
++extern void beryllium_wlan_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
+ extern void sweet_a630_probe(void);
+@@ -599,6 +600,163 @@ static const struct cdevsw sweet_ufs_cdevsw = {
+ 	.d_type       = D_DISK,
+ };
+ 
++/*
++ * Read-only access to other GPT partitions (modem, modemst1/2, fsg, fsc,
++ * bluetooth, ...) on LUNs 0-5, for the Wi-Fi/Bluetooth firmware work
++ * (bsd/dev/beryllium_wlan.c). Only READ(10) is ever issued here, the root
++ * device state (su.lun, su.first_block, su.nblocks) is restored before the
++ * lock is dropped, and nothing is cached in the bounce buffer.
++ */
++#define PART_LUNS       6u
++#define PART_CACHE_N    8u
++static struct {
++	char name[24];
++	uint8_t lun;
++	uint64_t first, nblocks;
++} part_cache[PART_CACHE_N];
++static unsigned part_cache_n;
++
++/* Caller holds sweet_ufs_lock and has set su.lun. */
++static int
++ufs_gpt_find_on_lun(const char *want, uint64_t *first, uint64_t *nblocks)
++{
++	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	int error = ufs_read_blocks(1, 1);
++	if (error) {
++		return error;
++	}
++	if (memcmp(b, "EFI PART", 8) != 0) {
++		return ENXIO;
++	}
++	uint64_t entry_lba;
++	uint32_t nent, esz;
++	memcpy(&entry_lba, b + 72, 8);
++	memcpy(&nent, b + 80, 4);
++	memcpy(&esz, b + 84, 4);
++	if (esz != 128 || nent == 0 || nent * esz > BOUNCE_SIZE) {
++		return ENXIO;
++	}
++	error = ufs_read_blocks(entry_lba, (nent * esz + UFS_BLOCK - 1) / UFS_BLOCK);
++	if (error) {
++		return error;
++	}
++	for (uint32_t i = 0; i < nent; i++) {
++		const uint8_t *e = b + i * esz;
++		char name[37];
++		unsigned c;
++		for (c = 0; c < 36; c++) {
++			uint16_t ch = (uint16_t)(e[56 + 2 * c] | e[57 + 2 * c] << 8);
++			if (ch == 0 || ch > 0x7f) {
++				break;
++			}
++			name[c] = (char)ch;
++		}
++		name[c] = 0;
++		if (strcmp(name, want) != 0) {
++			continue;
++		}
++		uint64_t f, l;
++		memcpy(&f, e + 32, 8);
++		memcpy(&l, e + 40, 8);
++		if (l < f) {
++			return ENXIO;
++		}
++		*first = f;
++		*nblocks = l - f + 1;
++		return 0;
++	}
++	return ENOENT;
++}
++
++/* Caller holds sweet_ufs_lock. */
++static int
++ufs_part_locate(const char *want, uint8_t *lun, uint64_t *first, uint64_t *nblocks)
++{
++	for (unsigned i = 0; i < part_cache_n; i++) {
++		if (strcmp(part_cache[i].name, want) == 0) {
++			*lun = part_cache[i].lun;
++			*first = part_cache[i].first;
++			*nblocks = part_cache[i].nblocks;
++			return 0;
++		}
++	}
++	if (strlen(want) >= sizeof(part_cache[0].name)) {
++		return EINVAL;
++	}
++	uint8_t saved = su.lun;
++	int error = ENOENT;
++	for (uint8_t l = 0; l < PART_LUNS && error == ENOENT; l++) {
++		su.lun = l;
++		int e = ufs_gpt_find_on_lun(want, first, nblocks);
++		if (e == 0) {
++			*lun = l;
++			error = 0;
++		}
++	}
++	su.lun = saved;
++	if (!error && part_cache_n < PART_CACHE_N) {
++		strlcpy(part_cache[part_cache_n].name, want, sizeof(part_cache[0].name));
++		part_cache[part_cache_n].lun = *lun;
++		part_cache[part_cache_n].first = *first;
++		part_cache[part_cache_n].nblocks = *nblocks;
++		part_cache_n++;
++	}
++	return error;
++}
++
++int
++sweet_ufs_part_size(const char *name, uint8_t *lun, uint64_t *bytes)
++{
++	uint64_t first, nblocks;
++	uint8_t l = 0;
++	if (!su.ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	int error = ufs_part_locate(name, &l, &first, &nblocks);
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (!error) {
++		if (lun) {
++			*lun = l;
++		}
++		if (bytes) {
++			*bytes = nblocks * UFS_BLOCK;
++		}
++	}
++	return error;
++}
++
++int
++sweet_ufs_read_part(const char *name, uint64_t off, void *dst, uint64_t len)
++{
++	uint64_t first, nblocks;
++	uint8_t lun = 0, saved;
++	if (!su.ready) {
++		return ENXIO;
++	}
++	lck_mtx_lock(&sweet_ufs_lock);
++	int error = ufs_part_locate(name, &lun, &first, &nblocks);
++	if (!error && (off > nblocks * UFS_BLOCK || len > nblocks * UFS_BLOCK - off)) {
++		error = EINVAL;
++	}
++	saved = su.lun;
++	su.lun = lun;
++	for (uint64_t done = 0; !error && done < len;) {
++		uint64_t pos = off + done;
++		uint32_t skip = (uint32_t)(pos % UFS_BLOCK);
++		uint32_t want = (uint32_t)MIN(len - done, (uint64_t)BOUNCE_SIZE - skip);
++		uint32_t blocks = (skip + want + UFS_BLOCK - 1) / UFS_BLOCK;
++		error = ufs_read_blocks(first + pos / UFS_BLOCK, blocks);
++		if (!error) {
++			memcpy((uint8_t *)dst + done, (const uint8_t *)(su.dma + DMA_BOUNCE) + skip, want);
++			done += want;
++		}
++	}
++	su.lun = saved;
++	lck_mtx_unlock(&sweet_ufs_lock);
++	return error;
++}
++
+ static int
+ sweet_ufs_init(void)
+ {
+@@ -688,6 +846,7 @@ sweet_ufs_init(void)
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_a630_probe();	/* sweetgpu=N, beryllium only, off by default */
++	beryllium_wlan_init();      /* boot-arg sweetwlan=N, off by default */
+ 	return 0;
+ }
+ 

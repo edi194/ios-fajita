@@ -1,0 +1,76 @@
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1040,16 +1040,20 @@
+ 	task_unlock(task);
+ 
+ 	/*
+-	 * Receive rights of the task: is the service endpoint checked in (a receive right exists) and are messages
+-	 * piling up on it (clients sent, nobody dequeues)? "SMP name PORTS recv N queued M: name:count ..." lists the
+-	 * receive rights that hold queued messages (up to 24), N = all receive rights, M = those with messages.
++	 * Receive rights of the task, one line each (up to 40): "SMP name R 0xname msgs/seqno srights/mscount/sorights
++	 * knote/nsreq/kotype". seqno = messages ever received by the port (imq_seqno): 0 on a service port = no client
++	 * message was ever delivered to it; knote = a kevent/dispatch source is attached (someone will dequeue);
++	 * srights = send rights outstanding (launchd's copy of a MachService endpoint counts 1+).
+ 	 */
+ 	{
+ 		ipc_space_t space = task->itk_space;
+-		mach_port_name_t qn[24];
+-		uint32_t qc[24];
+-		int nq = 0;
+-		uint32_t nrecv = 0, nqueued = 0, npset = 0;
++		struct {
++			mach_port_name_t name;
++			uint32_t msgs, seqno, srights, mscount, sorights;
++			uint8_t knote, nsreq, kot;
++		} rr[40];
++		int nr = 0;
++		uint32_t nrecv = 0;
+ 
+ 		if (space != IS_NULL) {
+ 			is_read_lock(space);
+@@ -1064,30 +1068,29 @@
+ 					}
+ 					nrecv++;
+ 					ipc_object_t obj = entry->ie_object;
+-					if (io_otype(obj) != IOT_PORT) {
+-						npset++;
++					if (io_otype(obj) != IOT_PORT || nr >= 40) {
+ 						continue;
+ 					}
+ 					ipc_port_t port = ip_object_to_port(obj);
+-					uint32_t cnt = port->ip_messages.imq_msgcount;
+-					if (cnt != 0) {
+-						nqueued++;
+-						if (nq < 24) {
+-							qn[nq] = MACH_PORT_MAKE(index, IE_BITS_GEN(bits));
+-							qc[nq] = cnt;
+-							nq++;
+-						}
+-					}
++					rr[nr].name = MACH_PORT_MAKE(index, IE_BITS_GEN(bits));
++					rr[nr].msgs = port->ip_messages.imq_msgcount;
++					rr[nr].seqno = port->ip_messages.imq_seqno;
++					rr[nr].srights = port->ip_srights;
++					rr[nr].mscount = port->ip_mscount;
++					rr[nr].sorights = port->ip_sorights;
++					rr[nr].knote = SLIST_FIRST(&port->ip_klist) != NULL;
++					rr[nr].nsreq = port->ip_nsrequest != IP_NULL;
++					rr[nr].kot = (uint8_t)ip_kotype(port);
++					nr++;
+ 				}
+ 			}
+ 			is_read_unlock(space);
+ 		}
+-		char pl[300];
+-		int pn = snprintf(pl, sizeof(pl), "SMP %s PORTS recv %u psets %u queued %u:", name, nrecv, npset, nqueued);
+-		for (int i = 0; i < nq && pn < (int)sizeof(pl) - 24; i++) {
+-			pn += snprintf(pl + pn, sizeof(pl) - pn, " 0x%x:%u", qn[i], qc[i]);
++		printf("SMP %s PORTS recv %u listed %d\n", name, nrecv, nr);
++		for (int i = 0; i < nr; i++) {
++			printf("SMP %s R 0x%x %u/%u %u/%u/%u %u/%u/%u\n", name, rr[i].name, rr[i].msgs, rr[i].seqno,
++			    rr[i].srights, rr[i].mscount, rr[i].sorights, rr[i].knote, rr[i].nsreq, rr[i].kot);
+ 		}
+-		printf("%s\n", pl);
+ 	}
+ }
+ 

@@ -1,0 +1,716 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index e6804cac0a077589acbad56a18e77a74e820eb6f..ddb09b4ad134e943a76dffa29c128b42a9442afa 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -530,6 +530,10 @@ static struct {
+ 	uint32_t tx_depth, rx_depth;
+ 	uint8_t rxq[512];
+ 	unsigned rxn;
++	unsigned baud;                  /* UART baud currently programmed by wl_baud() */
++	unsigned tx_extra_us;           /* extra TX completion slack (flow control held by the controller) */
++	unsigned ev_cc, ev_other;       /* events seen while downloading firmware */
++	unsigned bt_fw, bt_baud, bt_fast, bt_ibs, bt_poweroff;   /* sweetbt* boot-args */
+ 	unsigned stage, delay_s;
+ 	int sleep_chan;
+ 	bool started;
+@@ -1219,6 +1223,7 @@ wl_baud(unsigned baud)
+ 	if (!ok) {
+ 		return false;
+ 	}
++	wl.baud = baud;
+ 	printf("SWEET WLAN: UART %u baud: S6 root %llu Hz (ftbl row %d), GENI divider %u, oversampling %u\n",
+ 	    baud, wl_row_hz(&wl_ftbl[r]), r, div, wl.os);
+ 	return true;
+@@ -1400,7 +1405,7 @@ wl_tx(const uint8_t *buf, unsigned len, unsigned baud)
+ 		wl_wr(wl.se, SE_TX_FIFO, w);
+ 	}
+ 	/* 12 bit times per byte plus 50 ms; flow control may hold the transmitter */
+-	uint64_t us = ((uint64_t)len * 12 * 1000000ull) / baud + 50000;
++	uint64_t us = ((uint64_t)len * 12 * 1000000ull) / baud + 50000 + wl.tx_extra_us;
+ 	bool done = false;
+ 	for (uint64_t t = 0; t < us; t += 20) {
+ 		if (wl_rd(wl.se, SE_M_IRQ_STATUS) & M_CMD_DONE) {
+@@ -1434,26 +1439,78 @@ wl_power_pulse(bool on, unsigned baud)
+ 	wl.rxn = 0;
+ }
+ 
+-/* One HCI command; prints and returns the first matching event in rsp. */
+-static int
+-wl_hci_cmd(uint16_t opcode, const uint8_t *params, unsigned plen, uint8_t *rsp, unsigned *rlen,
+-    unsigned timeout_ms)
++static void
++wl_print_hex(const char *what, const uint8_t *b, unsigned n)
+ {
+-	uint8_t pkt[16];
+-	if (plen > sizeof(pkt) - 4) {
+-		return EINVAL;
++	char line[3 * 48 + 1];
++	unsigned o = 0;
++	for (unsigned i = 0; i < n && o + 3 < sizeof(line); i++) {
++		o += (unsigned)snprintf(line + o, sizeof(line) - o, "%02x ", b[i]);
+ 	}
+-	pkt[0] = 0x01;
+-	pkt[1] = (uint8_t)opcode;
+-	pkt[2] = (uint8_t)(opcode >> 8);
+-	pkt[3] = (uint8_t)plen;
+-	if (plen) {
+-		memcpy(pkt + 4, params, plen);
++	printf("SWEET WLAN: HCI %s: %s\n", what, line);
++}
++
++/* ---------------------------------------------------------------- HCI transport */
++
++#define WL_EVT_CC       1u      /* Command Complete / Command Status for the opcode */
++#define WL_EVT_VSE      2u      /* vendor specific event (0xff) */
++
++static uint8_t wl_pkt[4 + 255];
++
++/* drop the first n bytes of the RX queue */
++static void
++wl_rxq_drop(unsigned n)
++{
++	if (n >= wl.rxn) {
++		wl.rxn = 0;
++		return;
+ 	}
+-	wl.rxn = 0;
+-	if (!wl_tx(pkt, 4 + plen, 115200)) {
+-		return EIO;
++	memmove(wl.rxq, wl.rxq + n, wl.rxn - n);
++	wl.rxn -= n;
++}
++
++/* TX of any length: split into pieces the FIFO accepts, keep the RX FIFO drained in between */
++static bool
++wl_tx_buf(const uint8_t *buf, unsigned len)
++{
++	unsigned chunk = 4u * (wl.tx_depth - 2);
++	while (len) {
++		unsigned n = MIN(len, chunk);
++		if (!wl_tx(buf, n, wl.baud ? wl.baud : 115200)) {
++			return false;
++		}
++		buf += n;
++		len -= n;
++		wl_rx_poll();
++	}
++	return true;
++}
++
++/* H4 command packet out, nothing waited for and the RX queue untouched */
++static bool
++wl_hci_send(uint16_t opcode, const uint8_t *params, unsigned plen)
++{
++	if (plen > 255) {
++		return false;
+ 	}
++	wl_pkt[0] = 0x01;
++	wl_pkt[1] = (uint8_t)opcode;
++	wl_pkt[2] = (uint8_t)(opcode >> 8);
++	wl_pkt[3] = (uint8_t)plen;
++	if (plen) {
++		memcpy(wl_pkt + 4, params, plen);
++	}
++	return wl_tx_buf(wl_pkt, 4 + plen);
++}
++
++/*
++ * Wait for one event of the wanted kind. The event and every byte before it are
++ * removed from the RX queue; rsp = event code, parameter length, parameters
++ * (at most 48 bytes).
++ */
++static int
++wl_hci_wait(uint16_t opcode, unsigned want, uint8_t *rsp, unsigned *rlen, unsigned timeout_ms)
++{
+ 	for (unsigned t = 0; t < timeout_ms; t++) {
+ 		wl_rx_poll();
+ 		unsigned pos = 0;
+@@ -1471,32 +1528,524 @@ wl_hci_cmd(uint16_t opcode, const uint8_t *params, unsigned plen, uint8_t *rsp,
+ 			}
+ 			uint8_t evt = wl.rxq[pos + 1];
+ 			const uint8_t *d = &wl.rxq[pos + 3];
+-			bool match = (evt == 0x0e && elen >= 3 && (d[1] | (d[2] << 8)) == opcode) ||
+-			    (evt == 0x0f && elen >= 4 && (d[2] | (d[3] << 8)) == opcode) ||
+-			    (evt == 0xff && opcode == 0xfc00);
++			bool match = ((want & WL_EVT_CC) &&
++			    ((evt == 0x0e && elen >= 3 && (d[1] | (d[2] << 8)) == opcode) ||
++			    (evt == 0x0f && elen >= 4 && (d[2] | (d[3] << 8)) == opcode))) ||
++			    ((want & WL_EVT_VSE) && evt == 0xff);
+ 			if (match) {
+ 				*rlen = MIN(elen + 2, 48u);
+ 				rsp[0] = evt;
+ 				rsp[1] = (uint8_t)elen;
+ 				memcpy(rsp + 2, d, *rlen - 2);
++				wl_rxq_drop(pos + 3 + elen);
+ 				return 0;
+ 			}
+ 			pos += 3 + elen;
+ 		}
+ 		delay(1000);
+ 	}
++	if (wl.rxn) {
++		wl_print_hex("(unmatched RX bytes at timeout)", wl.rxq, MIN(wl.rxn, 48u));
++	}
+ 	return ETIMEDOUT;
+ }
+ 
++/* One HCI command; prints and returns the first matching event in rsp. */
++static int
++wl_hci_cmd(uint16_t opcode, const uint8_t *params, unsigned plen, uint8_t *rsp, unsigned *rlen,
++    unsigned timeout_ms)
++{
++	wl.rxn = 0;
++	if (!wl_hci_send(opcode, params, plen)) {
++		return EIO;
++	}
++	return wl_hci_wait(opcode, WL_EVT_CC | ((opcode >> 10) == 0x3f ? WL_EVT_VSE : 0), rsp, rlen,
++	    timeout_ms);
++}
++
++/* consume every complete event already queued; false when one reports an error */
++static bool
++wl_evt_drain(const char *ctx)
++{
++	bool ok = true;
++	unsigned pos = 0;
++	wl_rx_poll();
++	while (pos < wl.rxn) {
++		if (wl.rxq[pos] != 0x04) {
++			pos++;
++			continue;
++		}
++		if (pos + 3 > wl.rxn) {
++			break;
++		}
++		unsigned elen = wl.rxq[pos + 2];
++		if (pos + 3 + elen > wl.rxn) {
++			break;
++		}
++		uint8_t evt = wl.rxq[pos + 1];
++		const uint8_t *d = &wl.rxq[pos + 3];
++		if (evt == 0x0e && elen >= 4) {
++			if (d[3] != 0) {
++				printf("SWEET WLAN: BT fw %s: Command Complete for %#06x status %#x\n", ctx,
++				    d[1] | (d[2] << 8), d[3]);
++				ok = false;
++			} else {
++				wl.ev_cc++;
++			}
++		} else if (evt == 0xff && elen >= 3 && d[0] == 0 && d[1] == 4 && d[2] != 0) {
++			printf("SWEET WLAN: BT fw %s: TLV download vendor event status %#x\n", ctx, d[2]);
++			ok = false;
++		} else {
++			wl.ev_other++;
++			if (wl.ev_other <= 8) {
++				wl_print_hex("BT fw event during download", &wl.rxq[pos], 3 + elen);
++			}
++		}
++		pos += 3 + elen;
++	}
++	wl_rxq_drop(pos);
++	return ok;
++}
++
++/* ---------------------------------------------------------------- QCA WCN3990 setup */
++/* drivers/bluetooth/btqca.[ch] + hci_qca.c qca_setup(), no IBS */
++
++#define QCA_EDL_PATCH_CMD_OPCODE        0xfc00u
++#define QCA_EDL_PATCH_VER_REQ_CMD       0x19u
++#define QCA_EDL_PATCH_TLV_REQ_CMD       0x1eu
++#define QCA_EDL_SET_BAUDRATE_OPCODE     0xfc48u
++#define QCA_MAX_SIZE_PER_TLV_SEGMENT    243u
++#define QCA_EDL_CMD_REQ_RES_EVT         0x00u
++#define QCA_EDL_APP_VER_RES_EVT         0x02u
++#define QCA_EDL_TVL_DNLD_RES_EVT        0x04u
++#define QCA_EDL_TAG_ID_HCI              17u
++#define QCA_EDL_TAG_ID_DEEP_SLEEP       27u
++#define QCA_TLV_TYPE_PATCH              1u
++#define QCA_WCN3991_SOC_ID              0x40014320u
++#define WL_BT_FW_PATCH                  "crbtfw21.tlv"  /* fallback names (Android's, rom 2.1) */
++#define WL_BT_FW_NVM                    "crnv21.bin"
++
++extern bool sweet_a630_fw_get(const char *adt_prop, const char *file, void **buf, size_t *len);
++extern void sweet_a630_fw_put(void *buf, size_t len);
++
++struct wl_qca_ver {
++	uint32_t product_id, soc_id, soc_ver;
++	uint16_t patch_ver, rom_ver;
++	unsigned rom;                   /* get rom_ver of qca_uart_setup(): the 21 in crbtfw21 */
++};
++
++/* qca_read_soc_version(): EDL_PATCH_VER_REQ_CMD, struct qca_btsoc_version in the vendor event */
++static bool
++wl_qca_read_version(struct wl_qca_ver *v, const char *label)
++{
++	static const uint8_t req[1] = { QCA_EDL_PATCH_VER_REQ_CMD };
++	uint8_t rsp[48];
++	unsigned rlen = 0;
++	int err = wl_hci_cmd(QCA_EDL_PATCH_CMD_OPCODE, req, 1, rsp, &rlen, 1000);
++	if (err) {
++		printf("SWEET WLAN: QCA %s: no event (%d)\n", label, err);
++		return false;
++	}
++	wl_print_hex(label, rsp, rlen);
++	/* rsp: evt, len, edl.cresp, edl.rtype, product_id le32, patch_ver le16, rom_ver le16, soc_id le32 */
++	if (rsp[0] != 0xff || rlen < 16 || rsp[2] != QCA_EDL_CMD_REQ_RES_EVT || rsp[3] != QCA_EDL_APP_VER_RES_EVT) {
++		printf("SWEET WLAN: QCA %s: not a version response\n", label);
++		return false;
++	}
++	v->product_id = le32(rsp + 4);
++	v->patch_ver = le16(rsp + 8);
++	v->rom_ver = le16(rsp + 10);
++	v->soc_id = le32(rsp + 12);
++	/* btqca.c: upper 2 bytes from the SoC id, lower 2 bytes the ROM version */
++	v->soc_ver = (v->soc_id << 16) | v->rom_ver;
++	/* qca_uart_setup(): rom_ver = ((soc_ver & 0x0f00) >> 4) | (soc_ver & 0x0f) */
++	v->rom = ((v->soc_ver & 0x00000f00u) >> 4) | (v->soc_ver & 0x0000000fu);
++	printf("SWEET WLAN: BT fw QCA %s: product ID %#010x, patch version %#06x, ROM version %#06x, SoC ID %#010x "
++	    "-> soc_ver %#010x, rom_ver %#04x\n", label, v->product_id, v->patch_ver, v->rom_ver, v->soc_id,
++	    v->soc_ver, v->rom);
++	return true;
++}
++
++/* enum qca_baudrate of btqca.h */
++static int
++wl_qca_baud_code(unsigned baud)
++{
++	switch (baud) {
++	case 115200:  return 0;
++	case 230400:  return 5;
++	case 460800:  return 7;
++	case 921600:  return 10;
++	case 1000000: return 11;
++	case 2000000: return 13;
++	case 3000000: return 14;
++	case 3200000: return 17;
++	default:      return -1;
++	}
++}
++
++/* HCI Read Local Version at the current baud, decoded; Read_Local_Version_Information */
++static bool
++wl_hci_read_local_version(const char *label)
++{
++	uint8_t rsp[48];
++	unsigned rlen = 0;
++	int err = wl_hci_cmd(0x1001, NULL, 0, rsp, &rlen, 1000);
++	if (err) {
++		printf("SWEET WLAN: HCI Read Local Version (%s): no event (%d)\n", label, err);
++		return false;
++	}
++	wl_print_hex(label, rsp, rlen);
++	if (rsp[0] != 0x0e || rlen < 14 || rsp[5] != 0) {
++		printf("SWEET WLAN: HCI Read Local Version (%s): bad reply\n", label);
++		return false;
++	}
++	printf("SWEET WLAN: HCI Read Local Version (%s): HCI version %u revision %#06x, LMP version %u, "
++	    "manufacturer %#06x, LMP subversion %#06x\n", label, rsp[6], le16(rsp + 7), rsp[9], le16(rsp + 10),
++	    le16(rsp + 12));
++	return true;
++}
++
++/*
++ * hci_qca.c qca_set_speed() for WCN399x: flow control off, EDL_SET_BAUDRATE_CMD
++ * (vendor 0xfc48, one byte qca_baudrate) goes out at the old speed without waiting,
++ * 10 ms for the controller, switch the host UART, flow control on, then the
++ * controller's vendor event arrives at the new speed (Linux drops it). Verified
++ * here with HCI Read Local Version at the new rate.
++ */
++static bool
++wl_qca_set_baud(unsigned baud)
++{
++	uint8_t rsp[48];
++	unsigned rlen = 0, old = wl.baud;
++	unsigned div = 0;
++	int code = wl_qca_baud_code(baud);
++	if (code < 0 || wl_pick_row(baud, &div) < 0) {
++		printf("SWEET WLAN: BT fw: %u baud not usable (QCA code %d, S6 row %d)\n", baud, code,
++		    wl_pick_row(baud, &div));
++		return false;
++	}
++	printf("SWEET WLAN: BT fw: EDL_SET_BAUDRATE_CMD %#06x code %#x (%u baud), host %u -> %u baud\n",
++	    QCA_EDL_SET_BAUDRATE_OPCODE, code, baud, old, baud);
++	wl_flow(false);
++	wl.rxn = 0;
++	uint8_t c = (uint8_t)code;
++	if (!wl_hci_send(QCA_EDL_SET_BAUDRATE_OPCODE, &c, 1)) {
++		printf("SWEET WLAN: BT fw: baud command TX failed\n");
++		return false;
++	}
++	wl_sleep(10);
++	if (!wl_baud(baud)) {
++		printf("SWEET WLAN: BT fw: host UART could not switch to %u baud\n", baud);
++		return false;
++	}
++	wl.rxn = 0;
++	wl_rx_start();
++	if (wl_hci_wait(QCA_EDL_SET_BAUDRATE_OPCODE, WL_EVT_CC | WL_EVT_VSE, rsp, &rlen, 100) == 0) {
++		wl_print_hex("baud change event at the new rate", rsp, rlen);
++	} else {
++		printf("SWEET WLAN: BT fw: no baud change event at %u baud (Linux drops it anyway)\n", baud);
++	}
++	wl_flow(true);
++	if (!wl_hci_read_local_version("at new baud")) {
++		printf("SWEET WLAN: BT fw: controller does not answer at %u baud\n", baud);
++		return false;
++	}
++	printf("SWEET WLAN: BT fw: controller answers at %u baud\n", baud);
++	return true;
++}
++
++/* qca_tlv_check_data(), TLV_TYPE_PATCH: log the header, return download_mode */
++static bool
++wl_qca_patch_check(const uint8_t *fw, size_t size, unsigned *mode)
++{
++	if (size < 28) {
++		printf("SWEET WLAN: BT fw patch: only %u bytes\n", (unsigned)size);
++		return false;
++	}
++	uint32_t type_len = le32(fw);
++	if ((type_len & 0xff) != QCA_TLV_TYPE_PATCH) {
++		printf("SWEET WLAN: BT fw patch: TLV type %#x is not a patch (1)\n", type_len & 0xff);
++		return false;
++	}
++	/* tlv_type_hdr {type_len} + tlv_type_patch {total_size, data_length, format_version, signature,
++	 * download_mode, reserved1, product_id, rom_build, patch_version, reserved2, entry} */
++	printf("SWEET WLAN: BT fw patch: TLV type %u length %u (file %u), total_size %u, data_length %u, "
++	    "format %u, signature %u, download_mode %u, product %#06x, rom_build %#06x, patch_version %#06x, "
++	    "entry %#x\n", type_len & 0xff, type_len >> 8, (unsigned)size, le32(fw + 4), le32(fw + 8), fw[12], fw[13], fw[14],
++	    le16(fw + 16), le16(fw + 18), le16(fw + 20), le32(fw + 24));
++	if ((type_len >> 8) != size - 4) {
++		printf("SWEET WLAN: BT fw patch: note: TLV length %u != file size - 4\n", type_len >> 8);
++	}
++	*mode = fw[14] <= 3 ? fw[14] : 0;
++	return true;
++}
++
++struct wl_nvm_scan {
++	unsigned start, ntags, idx17, idx27, stop_idx, stop_tag;
++};
++
++/* walk tlv_type_nvm entries {tag_id, tag_len, reserve1, reserve2, data[tag_len]} from start */
+ static void
+-wl_print_hex(const char *what, const uint8_t *b, unsigned n)
++wl_nvm_scan_at(const uint8_t *d, size_t limit, unsigned start, struct wl_nvm_scan *s)
+ {
+-	char line[3 * 48 + 1];
+-	unsigned o = 0;
+-	for (unsigned i = 0; i < n && o + 3 < sizeof(line); i++) {
+-		o += (unsigned)snprintf(line + o, sizeof(line) - o, "%02x ", b[i]);
++	unsigned idx = start, prev = 0;
++	memset(s, 0, sizeof(*s));
++	s->start = start;
++	while (idx + 12 <= limit) {
++		unsigned id = le16(d + idx), len = le16(d + idx + 2);
++		if (id == 0 || id > 0x400 || id <= prev || idx + 12 + len > limit) {
++			s->stop_tag = id;
++			break;
++		}
++		if (id == QCA_EDL_TAG_ID_HCI) {
++			s->idx17 = idx;
++		} else if (id == QCA_EDL_TAG_ID_DEEP_SLEEP) {
++			s->idx27 = idx;
++		}
++		s->ntags++;
++		prev = id;
++		idx += 12 + len;
+ 	}
+-	printf("SWEET WLAN: HCI %s: %s\n", what, line);
++	s->stop_idx = idx;
++}
++
++/*
++ * qca_tlv_check_data(), TLV_TYPE_NVM: HCI transport tag (17): data[0] |= 0x80
++ * (software in-band sleep), data[1] = UART baud rate code (WCN399x); deep sleep
++ * tag (27): data[0] |= 0x01. Linux enables both because it runs IBS; this stage
++ * has no IBS (a sleeping controller would need the 0xfd/0xfc/0xfe protocol), so
++ * unless sweetbtibs=1 the two bits are cleared instead.
++ */
++static bool
++wl_qca_nvm_edit(uint8_t *fw, size_t size, int baud_code)
++{
++	if (size < 16) {
++		printf("SWEET WLAN: BT fw NVM: only %u bytes\n", (unsigned)size);
++		return false;
++	}
++	uint32_t type_len = le32(fw);
++	size_t limit = MIN(size, (size_t)4 + (type_len >> 8));
++	printf("SWEET WLAN: BT fw NVM: TLV type %u length %u (file %u)\n", type_len & 0xff, type_len >> 8, (unsigned)size);
++	struct wl_nvm_scan a, b;
++	wl_nvm_scan_at(fw, limit, 4, &a);       /* Linux: tlv->data */
++	wl_nvm_scan_at(fw, limit, 8, &b);       /* some images carry one more header word */
++	const struct wl_nvm_scan *s = b.ntags > a.ntags ? &b : &a;
++	if (s->start != 4) {
++		printf("SWEET WLAN: BT fw NVM: tags start at offset %u (extra header word %#010x), not at 4 as "
++		    "in Linux's struct tlv_type_hdr\n", s->start, le32(fw + 4));
++	}
++	printf("SWEET WLAN: BT fw NVM: %u tags from offset %u, stopped at %u (tag id %#x); HCI tag 17 at %u, "
++	    "deep sleep tag 27 at %u\n", s->ntags, s->start, s->stop_idx, s->stop_tag, s->idx17, s->idx27);
++	if (s->ntags < 3) {
++		printf("SWEET WLAN: BT fw NVM: tag layout not recognised, NVM sent unmodified\n");
++		return true;
++	}
++	if (s->idx17 && le16(fw + s->idx17 + 2) >= 2) {
++		uint8_t *t = fw + s->idx17 + 12;
++		uint8_t old0 = t[0], old1 = t[1];
++		t[0] = wl.bt_ibs ? (t[0] | 0x80) : (t[0] & ~0x80);
++		t[1] = (uint8_t)baud_code;
++		printf("SWEET WLAN: BT fw NVM: HCI tag: data[0] %#04x -> %#04x (IBS %s), data[1] (baud) %#04x -> %#04x\n",
++		    old0, t[0], wl.bt_ibs ? "on" : "off", old1, t[1]);
++	} else {
++		printf("SWEET WLAN: BT fw NVM: no HCI tag 17, baud not patched\n");
++	}
++	if (s->idx27 && le16(fw + s->idx27 + 2) >= 1) {
++		uint8_t *t = fw + s->idx27 + 12;
++		uint8_t old0 = t[0];
++		t[0] = wl.bt_ibs ? (t[0] | 0x01) : (t[0] & ~0x01);
++		printf("SWEET WLAN: BT fw NVM: deep sleep tag: data[0] %#04x -> %#04x (deep sleep %s)\n", old0, t[0],
++		    wl.bt_ibs ? "on" : "off");
++	} else {
++		printf("SWEET WLAN: BT fw NVM: no deep sleep tag 27\n");
++	}
++	return true;
++}
++
++/*
++ * qca_download_firmware() + qca_tlv_send_segment(): the whole TLV file (header
++ * included) goes out in vendor 0xfc00 commands {0x1e, len, data[len]}, 243 bytes
++ * per segment. download_mode (patch header; NVM is always 0): bit 0 = no vendor
++ * event for the segment, bit 1 = no command complete. WCN399x patches say 3: only
++ * the last segment (or any short one) is acknowledged, by the vendor event
++ * {cresp 0, rtype 4, result}; mode 1 waits for the command complete instead.
++ */
++static bool
++wl_qca_send_tlv(const char *what, const uint8_t *fw, size_t size, unsigned mode)
++{
++	unsigned total = (unsigned)((size + QCA_MAX_SIZE_PER_TLV_SEGMENT - 1) / QCA_MAX_SIZE_PER_TLV_SEGMENT);
++	unsigned seg = 0, next_pct = 10;
++	size_t off = 0;
++	bool cc_wait = (mode == 1);
++	uint8_t cmd[QCA_MAX_SIZE_PER_TLV_SEGMENT + 2], rsp[48];
++	unsigned rlen;
++
++	wl.rxn = 0;
++	wl.ev_cc = wl.ev_other = 0;
++	wl.tx_extra_us = 500000;
++	printf("SWEET WLAN: BT fw %s: %u bytes in %u segments of %u, download_mode %u (%s)\n", what, (unsigned)size, total,
++	    QCA_MAX_SIZE_PER_TLV_SEGMENT, mode, mode == 3 ? "only the last segment is acknowledged" :
++	    mode == 1 ? "command complete per segment" : "vendor event per segment");
++	while (off < size) {
++		unsigned n = (unsigned)MIN(size - off, (size_t)QCA_MAX_SIZE_PER_TLV_SEGMENT);
++		bool last = (off + n >= size) || n < QCA_MAX_SIZE_PER_TLV_SEGMENT;
++		unsigned m = last ? 0 : mode;   /* "the last segment is always acked regardless of download mode" */
++		cmd[0] = QCA_EDL_PATCH_TLV_REQ_CMD;
++		cmd[1] = (uint8_t)n;
++		memcpy(cmd + 2, fw + off, n);
++		if (!wl_hci_send(QCA_EDL_PATCH_CMD_OPCODE, cmd, n + 2)) {
++			printf("SWEET WLAN: BT fw %s: segment %u/%u: TX failed\n", what, seg + 1, total);
++			goto fail;
++		}
++		if (m == 0 || m == 2) {
++			if (wl_hci_wait(QCA_EDL_PATCH_CMD_OPCODE, WL_EVT_VSE, rsp, &rlen, last ? 10000 : 2000)) {
++				printf("SWEET WLAN: BT fw %s: segment %u/%u: no vendor event\n", what, seg + 1, total);
++				goto fail;
++			}
++			if (rlen < 5 || rsp[2] != QCA_EDL_CMD_REQ_RES_EVT || rsp[3] != QCA_EDL_TVL_DNLD_RES_EVT ||
++			    rsp[4] != 0) {
++				printf("SWEET WLAN: BT fw %s: segment %u/%u: TLV with invalid response or error status\n",
++				    what, seg + 1, total);
++				wl_print_hex("segment vendor event", rsp, rlen);
++				goto fail;
++			}
++		} else if (m == 1 && cc_wait) {
++			if (wl_hci_wait(QCA_EDL_PATCH_CMD_OPCODE, WL_EVT_CC, rsp, &rlen, 100)) {
++				printf("SWEET WLAN: BT fw %s: segment %u/%u: no command complete, not waiting for them "
++				    "any more\n", what, seg + 1, total);
++				cc_wait = false;
++			} else if (rsp[0] == 0x0e && rlen >= 6 && rsp[5] != 0) {
++				printf("SWEET WLAN: BT fw %s: segment %u/%u: command complete status %#x\n", what,
++				    seg + 1, total, rsp[5]);
++				goto fail;
++			}
++		}
++		if (!wl_evt_drain(what)) {
++			printf("SWEET WLAN: BT fw %s: segment %u/%u: controller reported an error\n", what, seg + 1, total);
++			goto fail;
++		}
++		off += n;
++		seg++;
++		while (next_pct <= 100 && (uint64_t)seg * 100 >= (uint64_t)total * next_pct) {
++			printf("SWEET WLAN: BT fw %s: segment %u/%u (%u%%), %u/%u bytes\n", what, seg, total, next_pct,
++			    (unsigned)off, (unsigned)size);
++			next_pct += 10;
++		}
++	}
++	wl.tx_extra_us = 0;
++	printf("SWEET WLAN: BT fw %s: download complete, last segment acknowledged (%u command complete, %u other "
++	    "events along the way)\n", what, wl.ev_cc, wl.ev_other);
++	return true;
++fail:
++	wl.tx_extra_us = 0;
++	printf("SWEET WLAN: BT fw %s: download FAILED after %u/%u segments (%u/%u bytes)\n", what, seg, total, (unsigned)off,
++	    (unsigned)size);
++	return false;
++}
++
++/* Linux name first, then Android's file names */
++static bool
++wl_qca_fw_load(const char *name, const char *fallback, void **buf, size_t *len)
++{
++	if (sweet_a630_fw_get(NULL, name, buf, len)) {
++		printf("SWEET WLAN: BT fw: loaded %s (%u bytes)\n", name, (unsigned)*len);
++		return true;
++	}
++	if (strcmp(name, fallback) == 0) {
++		printf("SWEET WLAN: BT fw: %s not found in /usr/standalone/firmware/sweet/\n", name);
++		return false;
++	}
++	printf("SWEET WLAN: BT fw: %s not found, falling back to %s\n", name, fallback);
++	if (sweet_a630_fw_get(NULL, fallback, buf, len)) {
++		printf("SWEET WLAN: BT fw: loaded %s (%u bytes)\n", fallback, (unsigned)*len);
++		return true;
++	}
++	printf("SWEET WLAN: BT fw: %s not found either\n", fallback);
++	return false;
++}
++
++/*
++ * qca_uart_setup() for QCA_WCN3990 plus hci_qca.c qca_setup(). Order here:
++ * rampatch, 10 ms, NVM, HCI Reset, QCA baud change to wl.bt_baud + Read Local Version
++ * there, Read BD_ADDR. (sweetbtfast=1: baud change first, as Linux does, so the
++ * 223 kB go out at the operating speed instead of 115200.)
++ */
++static bool
++wl_bt_fw(const struct wl_qca_ver *v)
++{
++	char pname[32], nname[32];
++	void *pbuf = NULL, *nbuf = NULL;
++	size_t plen = 0, nlen = 0;
++	unsigned mode = 0, div = 0;
++	uint8_t rsp[48];
++	unsigned rlen = 0;
++	bool ok = false;
++	int err;
++
++	snprintf(pname, sizeof(pname), "crbtfw%02x.tlv", v->rom);
++	snprintf(nname, sizeof(nname), v->soc_id == QCA_WCN3991_SOC_ID ? "crnv%02xu.bin" : "crnv%02x.bin", v->rom);
++	printf("SWEET WLAN: BT fw: btqca.c names for WCN3990 soc_ver %#010x: qca/%s, qca/%s%s\n", v->soc_ver, pname,
++	    nname, (!strcmp(pname, WL_BT_FW_PATCH) && !strcmp(nname, WL_BT_FW_NVM)) ? " (same as the Android files)" :
++	    " (differs from the Android files crbtfw21.tlv/crnv21.bin)");
++	int oper_code = wl_qca_baud_code(wl.bt_baud);
++	if (oper_code < 0 || wl_pick_row(wl.bt_baud, &div) < 0) {
++		printf("SWEET WLAN: BT fw: sweetbtbaud=%u has no QCA code or no exact S6 rate: no download\n", wl.bt_baud);
++		return false;
++	}
++	if (!wl_qca_fw_load(pname, WL_BT_FW_PATCH, &pbuf, &plen) || !wl_qca_fw_load(nname, WL_BT_FW_NVM, &nbuf, &nlen)) {
++		printf("SWEET WLAN: BT fw: firmware files not available: no download\n");
++		goto out;
++	}
++	/* NVM baud tag: the speed the controller will find itself at after the NVM (Linux: the operating speed) */
++	unsigned dl_baud = wl.bt_fast ? wl.bt_baud : 115200;
++	if (!wl_qca_patch_check(pbuf, plen, &mode) || !wl_qca_nvm_edit(nbuf, nlen, wl_qca_baud_code(dl_baud))) {
++		goto out;
++	}
++	printf("SWEET WLAN: BT fw: patch version in file %#06x, in controller %#06x\n", le16((uint8_t *)pbuf + 20),
++	    v->patch_ver);
++	if (wl.bt_fast && !wl_qca_set_baud(wl.bt_baud)) {
++		goto out;
++	}
++	if (!wl_qca_send_tlv("patch", pbuf, plen, mode)) {
++		goto out;
++	}
++	wl_sleep(10);           /* "give the controller some time to get ready to receive the NVM" */
++	if (!wl_qca_send_tlv("NVM", nbuf, nlen, 0)) {
++		goto out;
++	}
++	wl_sleep(10);
++	err = wl_hci_cmd(0x0c03, NULL, 0, rsp, &rlen, 3000);        /* qca_send_reset */
++	if (err) {
++		printf("SWEET WLAN: BT fw: HCI Reset after download: no event (%d)\n", err);
++		goto out;
++	}
++	wl_print_hex("Reset event after download", rsp, rlen);
++	{
++		struct wl_qca_ver nv;
++		(void)wl_qca_read_version(&nv, "version after download");
++	}
++	if (!wl.bt_fast && !wl_qca_set_baud(wl.bt_baud)) {
++		goto out;
++	}
++	if (wl.bt_fast && !wl_hci_read_local_version("after download")) {
++		goto out;
++	}
++	err = wl_hci_cmd(0x1009, NULL, 0, rsp, &rlen, 1000);        /* Read_BD_ADDR */
++	if (err || rsp[0] != 0x0e || rlen < 12 || rsp[5] != 0) {
++		printf("SWEET WLAN: BT fw: Read BD_ADDR failed (%d)\n", err);
++		goto out;
++	}
++	printf("SWEET WLAN: BT fw BD_ADDR %02x:%02x:%02x:%02x:%02x:%02x\n", rsp[11], rsp[10], rsp[9], rsp[8],
++	    rsp[7], rsp[6]);
++	ok = true;
++out:
++	if (pbuf) {
++		sweet_a630_fw_put(pbuf, plen);
++	}
++	if (nbuf) {
++		sweet_a630_fw_put(nbuf, nlen);
++	}
++	return ok;
+ }
+ 
+ static const struct { const char *res; unsigned mv; } wl_bt_rails[] = {
+@@ -1563,18 +2112,30 @@ wl_bt(void)
+ 		wl_print_hex("Read Local Version", rsp, rlen);
+ 	}
+ 	{
+-		static const uint8_t ver_req[1] = { 0x19 };             /* EDL_PATCH_VER_REQ_CMD */
+-		err = wl_hci_cmd(0xfc00, ver_req, 1, rsp, &rlen, 1000);
+-		if (err) {
+-			printf("SWEET WLAN: QCA read patch version: no event (%d)\n", err);
+-		} else {
+-			wl_print_hex("QCA patch version (product/patch/rom/soc follow the 0x19 header)", rsp, rlen);
++		struct wl_qca_ver qv;
++		if (wl_qca_read_version(&qv, "patch version (product/patch/rom/soc follow the header)")) {
++			if (wl.bt_fw) {
++				bool fwok = wl_bt_fw(&qv);
++				printf("SWEET WLAN: BT fw %s\n", fwok ? "setup complete (patch + NVM downloaded, controller up at the "
++				    "operating baud)" : "setup FAILED or skipped (see above)");
++			} else {
++				printf("SWEET WLAN: BT fw: sweetbtfw=0, no download\n");
++			}
+ 		}
+ 	}
+-	/* hci_qca qca_power_off(): 2400 baud power-off pulse (the rails are NOT voted off, see below) */
++	/*
++	 * hci_qca qca_power_off(): 2400 baud power-off pulse (the rails are NOT voted off, see below).
++	 * Only with sweetbtpoweroff=1; by default the controller stays powered (and keeps its firmware)
++	 * so it can be used later.
++	 */
+ 	wl_rx_stop();
+-	if (wl_baud(2400)) {
+-		wl_power_pulse(false, 2400);
++	if (wl.bt_poweroff) {
++		if (wl_baud(2400)) {
++			wl_power_pulse(false, 2400);
++			printf("SWEET WLAN: BT power-off pulse sent (sweetbtpoweroff=1)\n");
++		}
++	} else {
++		printf("SWEET WLAN: BT controller left powered (no power-off pulse; sweetbtpoweroff=1 sends it)\n");
+ 	}
+ out_restore:
+ 	/*
+@@ -1632,6 +2193,14 @@ beryllium_wlan_init(void)
+ 		return;                 /* off by default: no log line, no mapping */
+ 	}
+ 	(void)PE_parse_boot_argn("sweetwlandelay", &delay_s, sizeof(delay_s));
++	/* Bluetooth firmware (stage 2): sweetbtfw=1 (default) downloads rampatch + NVM when the files exist */
++	wl.bt_fw = 1;
++	wl.bt_baud = 3000000;           /* 3200000 is the dtsi max-speed and also has an exact S6 rate */
++	(void)PE_parse_boot_argn("sweetbtfw", &wl.bt_fw, sizeof(wl.bt_fw));
++	(void)PE_parse_boot_argn("sweetbtbaud", &wl.bt_baud, sizeof(wl.bt_baud));
++	(void)PE_parse_boot_argn("sweetbtfast", &wl.bt_fast, sizeof(wl.bt_fast));       /* 1: baud change before the download */
++	(void)PE_parse_boot_argn("sweetbtibs", &wl.bt_ibs, sizeof(wl.bt_ibs));          /* 1: Linux NVM IBS/deep-sleep bits */
++	(void)PE_parse_boot_argn("sweetbtpoweroff", &wl.bt_poweroff, sizeof(wl.bt_poweroff));
+ 	wl.started = true;
+ 	wl.stage = stage;
+ 	wl.delay_s = delay_s;

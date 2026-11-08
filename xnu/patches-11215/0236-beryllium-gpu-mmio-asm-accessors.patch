@@ -1,0 +1,50 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -327,20 +327,27 @@
+ static void *gmu_fw;                    /* kept for warm re-boots (stage 8 only) */
+ static size_t gmu_fw_size;
+ 
++/*
++ * 0236: one plain `ldr`/`str` with a bare base register, written as asm. A volatile C access leaves the addressing mode to
++ * the compiler, and clang 21 (Xcode 27) folded a loop's induction into a post-indexed `ldr w, [x], #4` on the SMMU
++ * context banks: an access with writeback has no valid syndrome (ESR.ISV = 0), so a hypervisor that traps and emulates
++ * the device page cannot replay it, and the bring-up stalled right there on locally built kernels (CI's clang 16 used
++ * a register offset). Here the address is computed in C and the access itself is fixed.
++ */
+ static uint32_t
+ gpu_rd(vm_offset_t base, uint32_t off)
+ {
+-	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile ("dmb oshld" ::: "memory");
++	uint32_t v;
++	uintptr_t p = (uintptr_t)base + off;
++	__asm__ volatile ("ldr %w0, [%1]\n\tdmb oshld" : "=r"(v) : "r"(p) : "memory");
+ 	return v;
+ }
+ 
+ static void
+ gpu_wr(vm_offset_t base, uint32_t off, uint32_t value)
+ {
+-	__asm__ volatile ("dmb oshst" ::: "memory");
+-	*(volatile uint32_t *)(base + off) = value;
+-	__asm__ volatile ("dsb osh" ::: "memory");
++	uintptr_t p = (uintptr_t)base + off;
++	__asm__ volatile ("dmb oshst\n\tstr %w0, [%1]\n\tdsb osh" :: "r"(value), "r"(p) : "memory");
+ }
+ 
+ /* Poll until (reg & mask) == want; true on success. */
+@@ -1016,9 +1023,10 @@
+ 	gpu_wr(smmu, SMMU_GR1 + SMMU_CBAR(cb), CBAR_S1_BYPASS_S2);
+ 	gpu_wr(b, SMMU_CB_TTBCR2, TTBCR2_CB);
+ 	gpu_wr(b, SMMU_CB_TCR, TTBCR_CB);
+-	__asm__ volatile ("dmb oshst" ::: "memory");
+-	*(volatile uint64_t *)(b + SMMU_CB_TTBR0) = ttbr;
+-	__asm__ volatile ("dsb osh" ::: "memory");
++	{
++		uintptr_t p = (uintptr_t)b + SMMU_CB_TTBR0;    /* 0236: fixed addressing mode, as gpu_wr */
++		__asm__ volatile ("dmb oshst\n\tstr %0, [%1]\n\tdsb osh" :: "r"(ttbr), "r"(p) : "memory");
++	}
+ 	gpu_wr(b, SMMU_CB_MAIR0, MAIR0_CB);
+ 	gpu_wr(b, SMMU_CB_MAIR1, 0);
+ 	gpu_wr(b, SMMU_CB_ACTLR, ACTLR_QCOM);

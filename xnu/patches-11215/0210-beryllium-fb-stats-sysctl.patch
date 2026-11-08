@@ -1,0 +1,342 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 0170a21..ea5a65a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_charger.c			standard
+ bsd/dev/sweet_smmu.c			standard
++bsd/dev/sweet_fb.c			standard
+ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
+ bsd/dev/beryllium_wlan.c		standard
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+new file mode 100644
+index 0000000..3cd194d
+--- /dev/null
++++ b/bsd/dev/sweet_fb.c
+@@ -0,0 +1,58 @@
++/*
++ * sysctl kern.sweet_fb: display path statistics of the Poco F1 framebuffer
++ * (iokit/Kernel/arm/SweetFramebuffer.cpp, AppleCLCD).
++ *
++ * The framebuffer formats one line of space separated key=value words
++ * ("sweet_fb v1 mode=direct hz=60 ...", docs/DISPLAY_HW.md section 5) about
++ * once per second and hands it to sweet_fb_stats_publish(); the sysctl only
++ * returns the latest line (double buffered, one writer: the framebuffer's
++ * work loop). Before the framebuffer exists, or on another board, the line is
++ * "sweet_fb v1 mode=off". Keys may be added in later versions, readers must
++ * ignore unknown ones; an incompatible change bumps "v1".
++ */
++#include <pexpert/arm64/board_config.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <string.h>
++
++#define SWEET_FB_TEXT_MAX 1024
++
++static char sweet_fb_text[2][SWEET_FB_TEXT_MAX];
++static volatile unsigned sweet_fb_cur;
++static volatile unsigned sweet_fb_have;
++
++void sweet_fb_stats_publish(const char *text);
++
++void
++sweet_fb_stats_publish(const char *text)
++{
++	unsigned next = sweet_fb_cur ^ 1u;
++	size_t n = strnlen(text, SWEET_FB_TEXT_MAX - 1);
++
++	memcpy(sweet_fb_text[next], text, n);
++	sweet_fb_text[next][n] = 0;
++	__atomic_store_n(&sweet_fb_cur, next, __ATOMIC_RELEASE);
++	__atomic_store_n(&sweet_fb_have, 1u, __ATOMIC_RELEASE);
++}
++
++static int sweet_fb_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[SWEET_FB_TEXT_MAX];
++
++	if (!__atomic_load_n(&sweet_fb_have, __ATOMIC_ACQUIRE)) {
++		snprintf(buf, sizeof(buf), "sweet_fb v1 mode=off\n");
++	} else {
++		unsigned cur = __atomic_load_n(&sweet_fb_cur, __ATOMIC_ACQUIRE);
++		memcpy(buf, sweet_fb_text[cur], sizeof(buf));
++		buf[sizeof(buf) - 1] = 0;
++	}
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_fb_sysctl, "A",
++    "Poco F1 display path statistics, key=value string (see bsd/dev/sweet_fb.c)");
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index fa50135..917d4cd 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -46,6 +46,7 @@ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cp
+ #include "../../../bsd/dev/sweet_board.h"
+ #include "../../../bsd/dev/sweet_spmi.h"
+ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sweet_smmu.c, read only */
++extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ class SweetSurface;
+ static void sweet_hold_release(SweetSurface **set);
+ 
+@@ -82,6 +83,7 @@ enum {
+ #define SWEET_FB_VSYNC_US               16667
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ #define SWEET_FB_BL_STEPS               12      /* vsyncs of backlight ramp */
++#define SWEET_FB_STATS_MAX              1024    /* kern.sweet_fb line (bsd/dev/sweet_fb.c) */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+@@ -219,6 +221,29 @@ public:
+ 	uint32_t      fZcCount, fZcNo[8], fZcNoNext, fZcWhySeen;
+ 	uint64_t      fZcFrames, fCopyFrames;
+ 	bool          zcPresent(const uint8_t *rec, uint32_t mask);
++	/*
++	 * Display path statistics (patch 0210, sysctl kern.sweet_fb). Totals since
++	 * boot; once a second the window since the last publish is turned into
++	 * rates and averages (statsTick). swaps/coalesced change under fLock (swap
++	 * thread), the rest on the work loop thread. Times are mach absolute units.
++	 */
++	struct SwStats {
++		uint64_t swaps;         /* SwapEnd calls */
++		uint64_t coalesced;     /* a swap replaced a frame that was never presented */
++		uint64_t ticks;         /* vsync timer ticks */
++		uint64_t zc, copy;      /* frames presented in place / by CPU copy */
++		uint64_t scanReplaced;  /* scan address replaced before the MDP latched the previous one */
++		uint64_t latchWaits, latchWaitAbs, latchTimeouts;
++		uint64_t copyAbs, copyMaxAbs;   /* copy path, latch waits excluded */
++		uint64_t zcAbs, zcMaxAbs;       /* zero-copy: cache clean + register programming */
++		uint64_t cleanAbs, cleans, cleanSkips;
++	} fSt, fStPrev;
++	bool          fDirect;          /* sweetfb_direct=1 (patch 0211) */
++	uint32_t      fZcCleanMode;     /* sweetfb_zcclean: 0 never, 1 always (0127 behaviour), 2 auto (patch 0212) */
++	uint64_t      fStPrevT, fStLogT;
++	uint32_t      fStLogSecs;       /* sweetfb_statlog: seconds between IOLog lines, 0 = sysctl only */
++	int           fSmmuA, fSmmuB;   /* MDP SMMU probe results, -2 = not probed */
++	void          statsTick(uint64_t now);
+ 	bool          zcDecline(uint32_t why, const char *text, uint32_t id);
+ 	void          zcStats(const char *when);
+ 	void          zcPoll(void);
+@@ -373,6 +398,13 @@ AppleCLCD::start(IOService *provider)
+ 	fDraw = fPixels;
+ 	fDrawIdx = 0;
+ 	fPipe = -1;
++	fSmmuA = fSmmuB = -2;
++	fZcCleanMode = 1;
++	{
++		uint32_t secs = 10;
++		PE_parse_boot_argn("sweetfb_statlog", &secs, sizeof(secs));
++		fStLogSecs = secs;
++	}
+ 	if (sweet_board_beryllium()) {
+ 		mdpProbe();
+ 		int flip = 0;
+@@ -401,6 +433,8 @@ AppleCLCD::start(IOService *provider)
+ 			int a = sweet_smmu_probe_sid(0x880, (unsigned)smmuLevel);
+ 			int b = sweet_smmu_probe_sid(0xc80, (unsigned)smmuLevel);
+ 			fZcOK = a == 1 && b == 1;
++			fSmmuA = a;
++			fSmmuB = b;
+ 			IOLog("SWEET FB: MDP SMMU streams 0x880 -> %d, 0xc80 -> %d (1 bypass, 2 translate, 3 fault, 4 mixed, 0 none, -1 unreadable)\n", a, b);
+ 		}
+ 		if (zcReq) {
+@@ -474,6 +508,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	AppleCLCD *fb = (AppleCLCD *)owner;
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
++	fb->fSt.ticks++;
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+ 		(uint32_t)now, (uint32_t)(now >> 32),
+@@ -530,9 +565,92 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->blStep(+1);     /* back on: the latest frame is up, light the panel again */
+ 	}
+ 	sweet_hold_release(taken);      /* copied: CA may render into them again */
++	fb->statsTick(now);
+ 	sender->setTimeoutUS(fb->fVsyncUS);
+ }
+ 
++/* x100 fixed point for rates and averages: no floating point in the kernel. */
++#define SW_F2(v) (unsigned)((v) / 100), (unsigned)((v) % 100)
++
++static uint64_t
++sweet_abs_us(uint64_t abs)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(abs, &ns);
++	return ns / 1000;
++}
++
++/*
++ * Once per second (checked every vsync tick): the window since the previous
++ * publish becomes rates and averages, formatted as one key=value line for
++ * sysctl kern.sweet_fb (bsd/dev/sweet_fb.c) and, every sweetfb_statlog seconds
++ * (default 10, 0 = never), an IOLog line. Cheap: one snprintf per second.
++ */
++void
++AppleCLCD::statsTick(uint64_t now)
++{
++	uint64_t winAbs = now - fStPrevT;
++	if (fStPrevT == 0) {
++		fStPrevT = now;
++		return;
++	}
++	uint64_t winUS = sweet_abs_us(winAbs);
++	if (winUS < 1000000) {
++		return;
++	}
++	uint64_t swaps, coalesced;
++	IOLockLock(fLock);
++	swaps = fSt.swaps;
++	coalesced = fSt.coalesced;
++	IOLockUnlock(fLock);
++	const SwStats &c = fSt;
++	const SwStats &p = fStPrev;
++	uint64_t dSwaps = swaps - p.swaps, dCoal = coalesced - p.coalesced;
++	uint64_t dZc = c.zc - p.zc, dCopy = c.copy - p.copy, dTicks = c.ticks - p.ticks;
++	uint64_t dRepl = c.scanReplaced - p.scanReplaced;
++	uint64_t dLw = c.latchWaits - p.latchWaits, dCl = c.cleans - p.cleans;
++	#define PER_S(n) ((uint64_t)(n) * 100000000ull / winUS)
++	uint64_t copyAvg = dCopy ? sweet_abs_us(c.copyAbs - p.copyAbs) * 100 / dCopy : 0;
++	uint64_t zcAvg = dZc ? sweet_abs_us(c.zcAbs - p.zcAbs) * 100 / dZc : 0;
++	uint64_t clAvg = dCl ? sweet_abs_us(c.cleanAbs - p.cleanAbs) * 100 / dCl : 0;
++	uint64_t lwAvg = dLw ? sweet_abs_us(c.latchWaitAbs - p.latchWaitAbs) * 100 / dLw : 0;
++	const char *mode = fZc && fZcOK ? (fDirect ? "direct" : "zc") : "copy";
++	const char *smmu = fSmmuA == -2 ? "untested" : ((fSmmuA == 1 && fSmmuB == 1) ? "bypass" : "translate-or-unknown");
++	uint32_t used = 0, total = 0;
++	uint64_t pallocs = 0, pfails = 0;
++	sweet_lowpool_stats(&used, &total, &pallocs, &pfails);
++	uint32_t hz = fVsyncUS ? 1000000u / fVsyncUS : 0;
++	char line[SWEET_FB_STATS_MAX];
++	snprintf(line, sizeof(line),
++	    "sweet_fb v1 mode=%s hz=%u flushticks=%u hw=%d flip=%d smmu=%s clean=%s up_s=%llu win_ms=%llu "
++	    "swaps=%llu swaps_s=%u.%02u coalesced=%llu coalesced_s=%u.%02u "
++	    "zc_frames=%llu zc_s=%u.%02u copy_frames=%llu copy_s=%u.%02u scan_replaced=%llu scan_replaced_s=%u.%02u "
++	    "copy_us=%u.%02u copy_us_max=%llu zc_us=%u.%02u zc_us_max=%llu clean_us=%u.%02u cleans=%llu clean_skips=%llu "
++	    "latch_waits=%llu latch_wait_us=%u.%02u latch_timeouts=%llu vsync_s=%u.%02u "
++	    "pool_used=%u pool_total=%u pool_surfaces=%llu pool_fallbacks=%llu\n",
++	    mode, hz, fFlushTicks, fHw ? 1 : 0, fFlip ? 1 : 0, smmu, fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : "auto"),
++	    sweet_abs_us(now) / 1000000, winUS / 1000,
++	    swaps, SW_F2(PER_S(dSwaps)), coalesced, SW_F2(PER_S(dCoal)),
++	    c.zc, SW_F2(PER_S(dZc)), c.copy, SW_F2(PER_S(dCopy)), c.scanReplaced, SW_F2(PER_S(dRepl)),
++	    SW_F2(copyAvg), sweet_abs_us(c.copyMaxAbs), SW_F2(zcAvg), sweet_abs_us(c.zcMaxAbs), SW_F2(clAvg), c.cleans, c.cleanSkips,
++	    c.latchWaits, SW_F2(lwAvg), c.latchTimeouts, SW_F2(PER_S(dTicks)),
++	    used, total, pallocs, pfails);
++	#undef PER_S
++	sweet_fb_stats_publish(line);
++	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
++		fStLogT = now;
++		IOLog("SWEET FB: stats %s", line);
++	}
++	fStPrev = fSt;
++	fStPrev.swaps = swaps;
++	fStPrev.coalesced = coalesced;
++	fSt.copyMaxAbs = 0;     /* maxima are per window */
++	fSt.zcMaxAbs = 0;
++	fStPrev.copyMaxAbs = 0;
++	fStPrev.zcMaxAbs = 0;
++	fStPrevT = now;
++}
++
+ void
+ AppleCLCD::addClient(IOMobileFramebufferUserClient *client)
+ {
+@@ -610,6 +728,10 @@ AppleCLCD::swap(const uint8_t *rec)
+ 		}
+ 	}
+ 	IOLockLock(fLock);
++	fSt.swaps++;
++	if (fDirty) {
++		fSt.coalesced++;        /* the previous swap never reached the panel */
++	}
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
+ 	memcpy(dropped, fPendHold, sizeof(dropped));     /* replaced before it was copied */
+@@ -1042,12 +1164,20 @@ AppleCLCD::waitLatch(void)
+ 	volatile uint32_t *flush = (volatile uint32_t *)(fMdp + SWEET_MDP_CTL0 + SWEET_MDP_CTL_FLUSH);
+ 	uint32_t mask = fLastFlush ? fLastFlush : (sweet_mdp_pipes[fPipe].flush | SWEET_MDP_CTL_BIT);
+ 
++	if (!(*flush & mask)) {
++		return;
++	}
++	uint64_t t0 = mach_absolute_time();
++	fSt.latchWaits++;
+ 	for (uint32_t i = 0; i < 25000; i++) {
+ 		if (!(*flush & mask)) {
++			fSt.latchWaitAbs += mach_absolute_time() - t0;
+ 			return;
+ 		}
+ 		IODelay(1);
+ 	}
++	fSt.latchWaitAbs += mach_absolute_time() - t0;
++	fSt.latchTimeouts++;
+ 	if (!warned) {
+ 		warned = true;
+ 		IOLog("SWEET FB: MDP flush 0x%x did not latch within 25 ms\n", *flush);
+@@ -1071,6 +1201,10 @@ AppleCLCD::scanAddr(uint32_t pa, uint32_t stride, bool hwFrame)
+ 		fHwOn = false;
+ 		fLmPending = fBorderFix;
+ 	}
++	if (fLastFlush != 0 &&
++	    (*(volatile uint32_t *)(fMdp + SWEET_MDP_CTL0 + SWEET_MDP_CTL_FLUSH) & fLastFlush) != 0) {
++		fSt.scanReplaced++;     /* the previous address was still waiting for its vsync: that frame is never shown */
++	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");      /* WC writes of the frame land first */
+ 	p[SSPP_SRC0_ADDR / 4] = pa;
+ 	p[SSPP_YSTRIDE0 / 4] = stride;
+@@ -1293,9 +1427,13 @@ AppleCLCD::zcPresent(const uint8_t *rec, uint32_t mask)
+ 		s->release();
+ 		return zcDecline(10, "no kernel mapping of the surface", id);
+ 	}
++	uint64_t tz0 = mach_absolute_time();
+ 	if (sweet_lowpool_cacheable()) {
+ 		/* CoreAnimation drew through the CPU cache (write-back mapping): the MDP reads DRAM */
++		uint64_t tc0 = mach_absolute_time();
+ 		sweet_dcache_clean_va((const void *)(kva + s->offset), (size_t)(need - s->offset));
++		fSt.cleanAbs += mach_absolute_time() - tc0;
++		fSt.cleans++;
+ 	} else {
+ 		__asm__ volatile ("dsb sy" ::: "memory");
+ 	}
+@@ -1303,6 +1441,12 @@ AppleCLCD::zcPresent(const uint8_t *rec, uint32_t mask)
+ 	fZcHeld[fZcCount++] = s;        /* keeps the reference sweet_surface_copy gave */
+ 	scanAddr((uint32_t)(s->poolPA + s->offset), s->bytesPerRow, true);
+ 	fZcFront = true;
++	uint64_t tzd = mach_absolute_time() - tz0;
++	fSt.zc++;
++	fSt.zcAbs += tzd;
++	if (tzd > fSt.zcMaxAbs) {
++		fSt.zcMaxAbs = tzd;
++	}
+ 	if (fZcFrames++ == 0) {
+ 		IOLog("SWEET FB: first zero-copy scanout: surface %u at 0x%llx stride %u (%ux%u canvas, no copy)\n",
+ 		    id, s->poolPA + s->offset, s->bytesPerRow, fLogicalW, fLogicalH);
+@@ -1586,6 +1730,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (fZc && zcPresent(rec, mask)) {
+ 		return;         /* scanned in place */
+ 	}
++	uint64_t tcp0 = mach_absolute_time(), tlw0 = fSt.latchWaitAbs;
+ 	uint32_t back = 0;
+ 	if (fFlip) {
+ 		back = fFront == 1 ? 2 : 1;
+@@ -1684,6 +1829,13 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (fFlip) {
+ 		scanTo(back);
+ 	}
++	uint64_t tcpd = mach_absolute_time() - tcp0;
++	tcpd = tcpd > fSt.latchWaitAbs - tlw0 ? tcpd - (fSt.latchWaitAbs - tlw0) : 0;
++	fSt.copy++;
++	fSt.copyAbs += tcpd;
++	if (tcpd > fSt.copyMaxAbs) {
++		fSt.copyMaxAbs = tcpd;
++	}
+ 	fCopyFrames++;
+ 	if (fZc && ((fZcFrames + fCopyFrames) & 255) == 0) {
+ 		zcStats("counters");

@@ -1,0 +1,193 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index d22cbe6a8111d2cb695d5435d6c1c070054f6d04..554451e92de1fe7ac240d5fd1369b6e905a22753 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -51,6 +51,7 @@ extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
+ extern void thread_deallocate(thread_t);
+ extern int hz;
+ static void sweet_log_start(void);
++static void sweet_ufs_selftest_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_reboot_init(void);
+@@ -781,9 +782,16 @@ sweet_ufs_init(void)
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
+-	uint32_t dmasync = 0;
++	/*
++	 * xnu-11215: real cache maintenance (clean+invalidate by VA around every DMA) is the
++	 * default now. Freshly written files read back with foreign data (stale bounce buffer
++	 * contents) and writes failed with EIO on full3, which relied on the host snooping the
++	 * CPU caches (a bare dsb). Harmless on a coherent master. ufsdmasync=0 restores the old
++	 * behaviour (e.g. to compare with ufsselftest).
++	 */
++	uint32_t dmasync = 1;
+ 	PE_parse_boot_argn("ufsdmasync", &dmasync, sizeof(dmasync));
+-	su.dmasync = (dmasync == 1);
++	su.dmasync = (dmasync != 0);
+ 
+ 	printf("SWEET UFS: init, regs 0x%lx+0x%lx\n", (unsigned long)reg[0], (unsigned long)reg[1]);
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+@@ -840,6 +848,7 @@ sweet_ufs_init(void)
+ 	    want, su.lun, su.first_block, su.nblocks * UFS_BLOCK >> 20,
+ 	    su.writable ? "read-write" : "read-only", su.dma_pa);
+ 	sweet_log_start();
++	sweet_ufs_selftest_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_cpufreq_max();
+@@ -1020,6 +1029,153 @@ sweet_log_start(void)
+ 	}
+ }
+ 
++/*
++ * Boot-arg ufsselftest=N (MiB, 1..16, needs ufsrw=1 and a log area): write, read back and compare
++ * N MiB of a pseudo-random pattern in the reserved area right BEFORE the persistent log ring at
++ * the end of the partition, never inside the HFS volume (the volume header is parsed and the test
++ * refuses to run if the area starts below the end of the volume). Three passes:
++ *   1 write chunks of 1 MiB, read back chunks of 1 MiB
++ *   2 write odd sizes (1, 3, 7 blocks), read back in 1 MiB chunks
++ *   3 like 1, but the CPU cache lines of the bounce buffer are dirtied with junk before every read
++ *     (stale-cache hazard: a missing invalidate shows up as junk in the read data)
++ * and the root/log I/O keeps running in between (the mutex is taken per transfer). Results are
++ * printed as "SWEET UFS SELFTEST: ..." (and so land in the persistent log / UDP live log).
++ */
++#define ST_AREA_GAP_BLOCKS      256u    /* keep clear of the ring */
++
++static uint32_t
++st_word(uint64_t blk, uint32_t i, uint32_t pass_seed)
++{
++	uint64_t x = (blk * 0x9E3779B97F4A7C15ull) ^ ((uint64_t)i * 0xD1B54A32D192ED03ull) ^ pass_seed;
++	x ^= x >> 33; x *= 0xFF51AFD7ED558CCDull; x ^= x >> 33; x *= 0xC4CEB9FE1A85EC53ull; x ^= x >> 33;
++	return (uint32_t)x;
++}
++
++static void
++st_fill(uint32_t *b, uint64_t blk, uint32_t nblk, uint32_t seed)
++{
++	for (uint32_t k = 0; k < nblk; k++) {
++		for (uint32_t i = 0; i < UFS_BLOCK / 4; i++) {
++			b[k * (UFS_BLOCK / 4) + i] = st_word(blk + k, i, seed);
++		}
++	}
++}
++
++static int
++st_verify(const uint32_t *b, uint64_t blk, uint32_t nblk, uint32_t seed, uint64_t *bad)
++{
++	for (uint32_t k = 0; k < nblk; k++) {
++		for (uint32_t i = 0; i < UFS_BLOCK / 4; i++) {
++			uint32_t want = st_word(blk + k, i, seed), got = b[k * (UFS_BLOCK / 4) + i];
++			if (got != want) {
++				if ((*bad)++ < 4) {
++					printf("SWEET UFS SELFTEST: MISMATCH block +%llu word %u: got 0x%08x want 0x%08x\n",
++					    blk + k, i, got, want);
++				}
++				return 1;
++			}
++		}
++	}
++	return 0;
++}
++
++static void
++sweet_ufs_selftest_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint32_t mib = 0;
++	PE_parse_boot_argn("ufsselftest", &mib, sizeof(mib));
++	if (mib == 0 || mib > 16 || !su.writable || su.nblocks < 2 * SWEET_LOG_BLOCKS + 8192) {
++		return;
++	}
++	uint32_t nblk = mib * (1u << 20) / UFS_BLOCK;
++	uint64_t ring = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	uint64_t base = ring - ST_AREA_GAP_BLOCKS - nblk;      /* absolute device block */
++	void *bounce = (void *)(su.dma + DMA_BOUNCE);
++	uint32_t *b = (uint32_t *)bounce;
++	uint64_t bad = 0, io_err = 0;
++
++	/* never inside the HFS volume: read its header (partition block 0, offset 1024) */
++	lck_mtx_lock(&sweet_ufs_lock);
++	int error = ufs_read_blocks(su.first_block, 1);
++	uint8_t vh[16];
++	memcpy(vh, (const uint8_t *)bounce + 1024, sizeof(vh));
++	uint8_t tb[8];
++	memcpy(tb, (const uint8_t *)bounce + 1024 + 40, 8);
++	lck_mtx_unlock(&sweet_ufs_lock);
++	if (error || !((vh[0] == 'H' && (vh[1] == '+' || vh[1] == 'X')))) {
++		printf("SWEET UFS SELFTEST: no HFS volume header (err %d): refusing to run\n", error);
++		return;
++	}
++	uint64_t bsize = (uint64_t)tb[0] << 24 | tb[1] << 16 | tb[2] << 8 | tb[3];
++	uint64_t total = (uint64_t)tb[4] << 24 | tb[5] << 16 | tb[6] << 8 | tb[7];
++	uint64_t vol_end = su.first_block + bsize * total / UFS_BLOCK;
++	if (base < vol_end + 1024) {
++		printf("SWEET UFS SELFTEST: test area 0x%llx..0x%llx not clear of the HFS volume (ends 0x%llx): refusing\n",
++		    base, base + nblk, vol_end);
++		return;
++	}
++	printf("SWEET UFS SELFTEST: %u MiB at device block 0x%llx (volume ends 0x%llx, ring at 0x%llx), dmasync=%d\n",
++	    mib, base, vol_end, ring, su.dmasync);
++
++	const uint32_t chunk = BOUNCE_SIZE / UFS_BLOCK;
++	const uint32_t odd[3] = { 1, 3, 7 };
++	for (int pass = 1; pass <= 3; pass++) {
++		uint32_t seed = 0x5eed0000u + (uint32_t)pass;
++		uint64_t pass_bad = 0, errs = 0;
++		/* write */
++		for (uint32_t done = 0, oi = 0; done < nblk; oi++) {
++			uint32_t n = pass == 2 ? odd[oi % 3] : chunk;
++			n = MIN(n, nblk - done);
++			lck_mtx_lock(&sweet_ufs_lock);
++			st_fill(b, base + done, n, seed);
++			error = ufs_write_blocks(base + done, n);
++			lck_mtx_unlock(&sweet_ufs_lock);
++			if (error) {
++				errs++;
++			}
++			done += n;
++		}
++		/* read back */
++		for (uint32_t done = 0; done < nblk; done += chunk) {
++			uint32_t n = MIN(chunk, nblk - done);
++			lck_mtx_lock(&sweet_ufs_lock);
++			if (pass == 3) {
++				for (uint32_t i = 0; i < n * (UFS_BLOCK / 4); i++) {
++					b[i] = 0xDEADC0DEu ^ i;         /* dirty the cache lines */
++				}
++			}
++			error = ufs_read_blocks(base + done, n);
++			if (error) {
++				errs++;
++			} else {
++				st_verify(b, base + done, n, seed, &pass_bad);
++			}
++			lck_mtx_unlock(&sweet_ufs_lock);
++		}
++		printf("SWEET UFS SELFTEST: pass %d: %llu bad chunks, %llu I/O errors\n", pass, pass_bad, errs);
++		bad += pass_bad;
++		io_err += errs;
++	}
++	/* leave the area zeroed so a later run starts clean */
++	lck_mtx_lock(&sweet_ufs_lock);
++	bzero(bounce, BOUNCE_SIZE);
++	(void)ufs_write_blocks(base, MIN(chunk, nblk));
++	lck_mtx_unlock(&sweet_ufs_lock);
++	printf("SWEET UFS SELFTEST: %s (%llu bad chunks, %llu I/O errors)\n",
++	    (bad || io_err) ? "FAILED" : "PASSED", bad, io_err);
++}
++
++static void
++sweet_ufs_selftest_start(void)
++{
++	uint32_t mib = 0;
++	thread_t thread;
++	PE_parse_boot_argn("ufsselftest", &mib, sizeof(mib));
++	if (mib && kernel_thread_start(sweet_ufs_selftest_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
+ /* Root device for rd=ufsroot0 (IOFindBSDRoot). */
+ int sweet_ufs_rootdev(dev_t *dev);
+ 

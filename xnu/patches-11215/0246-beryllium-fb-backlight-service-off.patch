@@ -1,0 +1,16 @@
+The 0243 backlight service only with boot-arg sweetfb_blsvc=1: published, it held iOS at ~1 frame/s (cause under
+investigation). Panel power (0242) is unaffected.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -779,7 +779,9 @@
+ 		PE_parse_boot_argn("sweetfb_blfade", &blfade, sizeof(blfade));
+ 		if (blfade) {
+ 			blInit();
+-			if ((fBacklight = OSTypeAlloc(SweetBacklight)) != NULL && fBacklight->init() && fBacklight->attach(this)) {
++			int blsvc = 0;  /* test: the 0243 service off unless sweetfb_blsvc=1 */
++			PE_parse_boot_argn("sweetfb_blsvc", &blsvc, sizeof(blsvc));
++			if (blsvc && (fBacklight = OSTypeAlloc(SweetBacklight)) != NULL && fBacklight->init() && fBacklight->attach(this)) {
+ 				fBacklight->fFB = this;
+ 				fBacklight->setProperty("backlight-control", true);
+ 				OSDictionary *dp = OSDictionary::withCapacity(1), *br = OSDictionary::withCapacity(3);

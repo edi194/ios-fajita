@@ -1,0 +1,86 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -63,6 +63,7 @@
+ extern int sweet_ufs_part_size(const char *name, uint8_t *lun, uint64_t *bytes);
+ extern int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
+ extern int sweet_smmu_map_sid(unsigned sid);
++extern int sweet_rpmh_rfclk_enable(const char *res);
+ extern int sweet_rpmh_lookup(const char *res, uint32_t *address);
+ void beryllium_wlan_init(void);
+ /* bsd/dev/beryllium_bt_hci.c: the kernel control the iOS userland talks to */
+@@ -3695,6 +3696,18 @@
+ 		wl_sleep(2);
+ 	}
+ 	printf("SWEET IPC: wlfw: WCN3990 rails voted on:%s%s\n", log, ok ? "" : ": FAILED, no WLFW client (ath10k probe fails)");
++	/*
++	 * sweetrfclk=1: then the reference clock, as ath10k_hw_power_on() enables cxo_ref_clk_pin (RPMH_RF_CLK2) right
++	 * after the regulators. Off by default to compare scans with and without it (boot 47 had none).
++	 */
++	int rfclk = 0;
++	(void)PE_parse_boot_argn("sweetrfclk", &rfclk, sizeof(rfclk));
++	if (ok && rfclk == 1) {
++		int err = sweet_rpmh_rfclk_enable("rfclka2");
++		printf("SWEET IPC: wlfw: RF reference clock rfclka2 -> %d\n", err);
++		ipc_note(" rfclk %d;", err);
++		ok = err == 0;
++	}
+ 	return ok;
+ }
+ 
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -15,6 +15,7 @@
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
+ int sweet_rpmh_arc_vote(const char *res, bool max);
++int sweet_rpmh_rfclk_enable(const char *res);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -383,6 +384,44 @@
+ 	{ "ldoa23", 3300, 3312 }, { "ldoa25", 3300, 3312 },
+ };
+ 
++/*
++ * WCN3990 reference clock (beryllium &wifi clocks = <&rpmhcc RPMH_RF_CLK2>, "cxo_ref_clk_pin"): clk-rpmh.c
++ * DEFINE_CLK_RPMH_VRM(rf_clk2, _a, "rfclka2", 1) votes value 1 at the cmd-db address + CLK_RPMH_VRM_EN_OFFSET (4).
++ * Active-set vote only, like the rail votes; never voted off. Only "rfclka2" is accepted.
++ */
++int
++sweet_rpmh_rfclk_enable(const char *res)
++{
++	if (!sweet_board_beryllium() || !res || strcmp(res, "rfclka2")) {
++		printf("SWEET RPMH: %s is not an allowed RF clock\n", res ? res : "(null)");
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup(res, &address);
++	}
++	if (!error) {
++		const uint32_t a[1] = { address + 4 }, v[1] = { 1 };
++		printf("SWEET RPMH: RF clock %s enable at %#x\n", res, address + 4);
++		error = rh_cmds(a, v, 1);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: RF clock %s enable failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
++
+ /* Read-only: RSC geometry check, cmd-db lookup, no TCS access. */
+ int
+ sweet_rpmh_lookup(const char *res, uint32_t *address)

@@ -1,0 +1,45 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a136c6296f298b44261548a80ca1694445911a0b..908ac3aef4458cb5a74780bf5f084d48d8f7611d 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -117,6 +117,22 @@ class IOMobileFramebuffer : public IOService {
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebuffer, IOService);
+ 
++/*
++ * The graphics accelerator's service class (ios-topaz 0138). QuartzCore
++ * (CAMetalContextCreate, once per process) polls IOServiceMatching(
++ * "IOAcceleratorES") 300 times, 100 ms apart, before it goes on: thirty
++ * seconds at every backboardd start (338 "IOAcceleratorES -> 0 found" lines in
++ * logs/boot-0091q.clean.txt). One without MetalPluginName/MetalPluginClassName
++ * is found and then passed over by Metal (_MTLRegisterDevices), which leaves
++ * the renderers as they were. A real GPU driver (sweetgpu) must replace this
++ * stub, not add a second service: Metal wants exactly one.
++ */
++class IOAcceleratorES : public IOService {
++	OSDeclareDefaultStructors(IOAcceleratorES);
++};
++
++OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
+ class IOMobileFramebufferUserClient;
+ 
+ class AppleCLCD : public IOMobileFramebuffer {
+@@ -231,6 +247,17 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
+ 	}
++	uint32_t accelOn = 1;
++	(void)PE_parse_boot_argn("sweetaccel", &accelOn, sizeof(accelOn));
++	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
++	if (accel != NULL && accel->init()) {
++		accel->setName("sgx");
++		if (accel->attach(this)) {
++			accel->registerService();
++			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");
++		}
++	}
++	OSSafeReleaseNULL(accel);
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;

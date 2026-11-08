@@ -1,0 +1,152 @@
+diff --git a/bsd/dev/sweet_board.h b/bsd/dev/sweet_board.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..597256bd7c560dfcce2ce0f95e7834d147d55df2
+--- /dev/null
++++ b/bsd/dev/sweet_board.h
+@@ -0,0 +1,51 @@
++/*
++ * SWEET kernels run on two Xiaomi phones. The ADT root compatible
++ * (tools/mkadt.py --board) names the board; everything else is common.
++ *   xiaomi,sweet      Redmi Note 10 Pro, SM7150 (default)
++ *   xiaomi,beryllium  Poco F1, SDM845
++ */
++#ifndef _SWEET_BOARD_H_
++#define _SWEET_BOARD_H_
++
++#include <stdbool.h>
++#include <pexpert/device_tree.h>
++
++static inline bool
++sweet_board_is(const char *want)
++{
++	DTEntry root;
++	void const *prop;
++	unsigned int size;
++
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
++		return false;
++	}
++	const char *s = (const char *)prop, *end = s + size;
++	while (s < end) {
++		const char *a = s, *b = want;
++		while (a < end && *a && *a == *b) {
++			a++, b++;
++		}
++		if (a < end && *a == 0 && *b == 0) {
++			return true;
++		}
++		while (s < end && *s) {
++			s++;
++		}
++		s++;
++	}
++	return false;
++}
++
++static inline bool
++sweet_board_beryllium(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		cached = sweet_board_is("xiaomi,beryllium") ? 1 : 0;
++	}
++	return cached == 1;
++}
++
++#endif /* _SWEET_BOARD_H_ */
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index 207b7986d1d5dfa18fe385d38ece328511505538..c89fc24c1db3bead38dc6eac01a04b8bbdf6357f 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -361,6 +361,8 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++	sweet_early_set_video(args->Video.v_baseAddr, args->Video.v_width,
++	    args->Video.v_height, args->Video.v_rowBytes);
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
+ 
+ 	arm_setup_pre_sign();
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index 69289572d00a12f84b69611365e47c102c576db4..ec4affddc142f6bbfd90e59a29513957a42b65fc 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,11 +11,20 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++/*
++ * start.s and arm_vm_init map one 32MB block at 0x9c000000. It holds the
++ * splash framebuffer of both boards (sweet 0x9c000000 1080x2400, Poco F1
++ * 0x9d400000 1080x2246); sweet_early_set_video picks it from boot_args.
++ */
++#define EARLY_BLOCK_PA 0x9c000000ull
++#define EARLY_BLOCK_SIZE 0x2000000ull
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
++static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
++static uint64_t early_off;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_WIDTH early_width
++#define EARLY_HEIGHT early_height
++#define EARLY_STRIDE early_stride
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -125,11 +134,25 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++void
++sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
++{
++	if (pa < EARLY_BLOCK_PA || width == 0 || height <= 32 || rowbytes < width * 4 ||
++	    pa + height * rowbytes > EARLY_BLOCK_PA + EARLY_BLOCK_SIZE) {
++		return; /* keep the sweet default */
++	}
++	early_off = pa - EARLY_BLOCK_PA;
++	early_width = (unsigned int)width;
++	early_height = (unsigned int)height;
++	early_stride = (unsigned int)(rowbytes / 4);
++	early_fb = (volatile uint32_t *)(uintptr_t)pa; /* bootstrap V=P */
++}
++
+ void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	early_fb = (volatile uint32_t *)(uintptr_t)(base + early_off);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index d7a25f2fae9f66ec2c4c0b4e639d5ffbfbb4bd23..01dac4e4f734ee304da05e11093996662ae43897 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -11,6 +11,7 @@ void sweet_early_mark(unsigned int stage, const char *label);
+ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
++void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes);
+ void sweet_early_disable(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+@@ -19,6 +20,13 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ 	(void)label;
+ }
+ static inline void sweet_early_disable(void) {}
++static inline void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
++{
++	(void)pa;
++	(void)width;
++	(void)height;
++	(void)rowbytes;
++}
+ #endif
+ 
+ #endif

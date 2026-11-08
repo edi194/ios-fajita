@@ -1,0 +1,91 @@
+diff --git a/osfmk/vm/vm_map_store.c b/osfmk/vm/vm_map_store.c
+index a55d833b68b9203b8ee2d4c0bb0f7d64059bb2c5..a7f0f756de1902bdf9fd63760b44d33264e6301c 100644
+--- a/osfmk/vm/vm_map_store.c
++++ b/osfmk/vm/vm_map_store.c
+@@ -43,7 +43,47 @@
+ #define VMS_USE_NEON            0
+ #endif
+ 
++#if defined(SWEET)
++/*
++ * No corecrypto kext is loaded on SWEET yet. The kmem RNG contract permits
++ * a non-cryptographic generator and requires lock-free generation. Keep the
++ * guard-object RNG state per CPU; seed it from XNU's built-in early
++ * HMAC-SHA256 DRBG during single-CPU initialization.
++ *
++ * SplitMix64: Sebastiano Vigna, 2015, public-domain reference:
++ * https://prng.di.unimi.it/splitmix64.c
++ * This is private to the VM map store; it does not register or replace crypto services.
++ */
++struct sweet_kmem_rng {
++	uint64_t state;
++};
++
++static uint64_t
++sweet_kmem_random64(struct sweet_kmem_rng *rng)
++{
++	uint64_t value = (rng->state += 0x9e3779b97f4a7c15ULL);
++	value = (value ^ (value >> 30)) * 0xbf58476d1ce4e5b9ULL;
++	value = (value ^ (value >> 27)) * 0x94d049bb133111ebULL;
++	return value ^ (value >> 31);
++}
++
++static uint64_t
++sweet_kmem_uniform(struct sweet_kmem_rng *rng, uint64_t bound)
++{
++	assert(bound != 0);
++	/* Reject the incomplete residue interval to avoid modulo bias. */
++	const uint64_t threshold = -bound % bound;
++	uint64_t value;
++	do {
++		value = sweet_kmem_random64(rng);
++	} while (value < threshold);
++	return value % bound;
++}
++
++static struct sweet_kmem_rng *__zpercpu ks_rng_ctx;
++#else
+ static crypto_random_ctx_t __zpercpu ks_rng_ctx;
++#endif /* SWEET */
+ #ifdef __BUILDING_XNU_LIB_UNITTEST__
+ static bool vmgo_enabled = true;
+ #else
+@@ -709,17 +749,25 @@ vms_path_update_holes_eagerly(vms_path_t path, uint32_t pos, uint32_t mask)
+ 
+ /*
+  * This is done during EARLY_BOOT as it needs the corecrypto module to be
+- * set up.
++ * set up on platforms that use it for allocator randomness.
+  */
+ __startup_func
+ static void
+ vm_map_store_crypto_init(void)
+ {
++#if defined(SWEET)
++	vm_size_t ctx_size = sizeof(struct sweet_kmem_rng);
++#else
+ 	vm_size_t ctx_size = crypto_random_kmem_ctx_size();
++#endif
+ 
+ 	ks_rng_ctx = zalloc_percpu_permanent(ctx_size, ZALIGN_PTR);
+ 	zpercpu_foreach(ctx, ks_rng_ctx) {
++#if defined(SWEET)
++		ctx->state = early_random();
++#else
+ 		crypto_random_kmem_init(ctx);
++#endif
+ 	}
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, vm_map_store_crypto_init);
+@@ -1115,7 +1163,11 @@ vmgo_chunk_select_random_slot(vm_guard_object_chunk_t chunk)
+ 		n = kmem_get_random16((uint16_t)free - 1);
+ 	} else {
+ 		disable_preemption();
++#if defined(SWEET)
++		n = sweet_kmem_uniform(zpercpu_get(ks_rng_ctx), free);
++#else
+ 		crypto_random_uniform(zpercpu_get(ks_rng_ctx), free, &n);
++#endif
+ 		enable_preemption();
+ 	}
+ 

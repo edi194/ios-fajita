@@ -1,0 +1,393 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 6148ba8..ae7066a 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -317,6 +317,13 @@ static uint32_t a630_bw_linux;          /* sweetgpubw=linux: the fixed Linux a63
+ static int a630_gov;                    /* sweetgpufreq=gov */
+ static unsigned a630_level = 1;         /* current GX level (index into gpu_levels) */
+ static unsigned a630_level_max = 7;     /* sweetgpumax=N */
++/* Input boost (patch 0217), driven from the touch driver through sweet_input_boost() in sweet_cpufreq.c. */
++static uint64_t a630_input_until;       /* mach time until which the input floor holds (written lock-free by the hook) */
++static uint32_t a630_input_level = 4;   /* sweetgpuinput=N: floor while the screen is touched (0 = off); default L4, 520 MHz */
++static uint32_t a630_input_ms = 300;    /* sweetgpuinputms=MS: hold after the last touch event */
++static uint32_t a630_input_events;      /* touch events accepted by the hook (rate-limited) */
++static uint32_t a630_input_votes;       /* level votes made because of the input floor */
++static int a630_pm_chan;                /* the PM thread's sleep channel; the hook wakes it on the first event of a burst */
+ static void *gmu_fw;                    /* kept for warm re-boots (stage 8 only) */
+ static size_t gmu_fw_size;
+ 
+@@ -369,6 +376,15 @@ gpu_w64(uint32_t reg, uint64_t value)
+ 	gpu_w(reg + 1, (uint32_t)(value >> 32));
+ }
+ 
++static void
++pm_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&a630_pm_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
+ static void
+ sleep_ms(unsigned ms)
+ {
+@@ -3154,6 +3170,9 @@ gpu_resume(void)
+ 		a630_level = MAX(a630_level, MIN(a630_boost_level, a630_level_max));
+ 		gov_boost_until = mach_absolute_time() + hold;
+ 	}
++	if (a630_gov && a630_input_level && mach_absolute_time() < a630_input_until) {
++		a630_level = MAX(a630_level, MIN(a630_input_level, a630_level_max));   /* the vote below applies it */
++	}
+ 	a630_quiet = a630_resumes >= 2;
+ 	if (a630_resumes < 2) {
+ 		printf("SWEET GPU: waking from slumber (resume %u)\n", a630_resumes + 1);
+@@ -3300,6 +3319,57 @@ gpu_hfi_start_dcvs(bool gx_on)
+ static uint64_t gov_win_ns, gov_win_busy_ns, gov_busy_pct, res_ns[8];
+ static unsigned gov_low_windows, gov_prev_submits, gov_rate;
+ 
++/*
++ * Input boost (patch 0217). sweet_gpu_input_boost() is called by the touch thread (through sweet_input_boost(), at most
++ * every ~10 ms) and only stores the hold deadline (now + sweetgpuinputms): the DCVS vote needs the GPU lock and an OOB handshake with the GMU, so
++ * the PM thread makes it. The first event of a burst wakes the PM thread (one thread_wakeup, no GPU lock), so the vote
++ * follows the touch within the thread's wake latency instead of the 100 ms governor window; during the burst the thread's
++ * regular 4 ms tick re-checks the deadline. The governor is the only user: with the governor off (sweetgpufreq not "gov",
++ * or turned off after a failed vote) the level stays where the fixed setting put it.
++ */
++void sweet_gpu_input_boost(uint64_t now);
++void
++sweet_gpu_input_boost(uint64_t now)
++{
++	uint64_t hold;
++
++	if (!a630_input_level || !a630_gov) {
++		return;
++	}
++	nanoseconds_to_absolutetime((uint64_t)a630_input_ms * NSEC_PER_MSEC, &hold);
++	bool first = now >= a630_input_until;
++	a630_input_until = now + hold;
++	a630_input_events++;
++	if (first) {
++		thread_wakeup((event_t)&a630_pm_chan);
++	}
++}
++
++/* The floor the input boost asks for right now (0 = none). */
++static unsigned
++gpu_input_floor(uint64_t now)
++{
++	return (a630_gov && a630_input_level && now < a630_input_until) ? MIN(a630_input_level, a630_level_max) : 0;
++}
++
++/*
++ * PM thread, lock held. Awake: vote the floor now. Asleep: only raise the target level, the next resume's
++ * gpu_hfi_start_dcvs() votes it (no wake for a touch).
++ */
++static void
++gpu_input_tick(uint64_t now)
++{
++	unsigned lvl = gpu_input_floor(now);
++
++	if (lvl && a630_level < lvl) {
++		if (!a630_awake) {
++			a630_level = lvl;
++		} else if (gpu_set_level(lvl)) {
++			a630_input_votes++;
++		}
++	}
++}
++
+ /* Busy ticks (19.2 MHz) of the submissions completed since the last call, from the CP's own stamps. */
+ static uint64_t
+ gpu_busy_collect(void)
+@@ -3359,6 +3429,7 @@ gpu_gov_tick(uint64_t dt)
+ 		gov_boost_until = now + hold;
+ 	}
+ 	unsigned floor_lvl = (a630_boost_level && now < gov_boost_until) ? MIN(a630_boost_level, cap) : 1;
++	floor_lvl = MAX(floor_lvl, gpu_input_floor(now));
+ 	if (!a630_gov) {
+ 		return;
+ 	}
+@@ -3396,7 +3467,7 @@ static int
+ sweet_gpu_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(arg1, arg2)
+-	char buf[640], pids[96];
++	char buf[768], pids[96];
+ 	uint32_t clients = 0;
+ 	const char *state = !a630_dev.ready ? "off" : a630_dev.lost ? "lost" : a630_awake ? "on" : "slumber";
+ 	unsigned lvl = a630_awake ? a630_level : 0;
+@@ -3413,10 +3484,11 @@ sweet_gpu_sysctl SYSCTL_HANDLER_ARGS
+ 	}
+ 	n = snprintf(buf, sizeof(buf),
+ 	    "state=%s level=%u mhz=%u max_level=%u freq=%s busy_pct=%llu clients=%u pids=%s submitted=%u completed=%u "
+-	    "suspends=%u resumes=%u recoveries=%u hangs=%u idle_ms=%u hwcg=%u boost_level=%u boosted=%u submits_100ms=%u dcvs_sets=%u dcvs_errors=%u total_ms=%llu res_ms=",
++	    "suspends=%u resumes=%u recoveries=%u hangs=%u idle_ms=%u hwcg=%u boost_level=%u boosted=%u submits_100ms=%u dcvs_sets=%u dcvs_errors=%u input_level=%u input_ms=%u input_boosts=%u input_boosted=%u input_votes=%u total_ms=%llu res_ms=",
+ 	    state, lvl, lvl ? gpu_levels[lvl].mhz : 0, a630_level_max, a630_gov ? "gov" : "fixed", gov_busy_pct, clients, pids,
+ 	    a630_dev.seqno, a630_dev.ready && cp_memory ? *(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) : 0,
+-	    a630_suspends, a630_resumes, a630_recoveries, a630_dev.hangs, a630_idle_ms, a630_hwcg, a630_boost_level, (unsigned)(a630_boost_level && mach_absolute_time() < gov_boost_until), gov_rate, a630_level_sets, a630_dcvs_errors, tot / NSEC_PER_MSEC);
++	    a630_suspends, a630_resumes, a630_recoveries, a630_dev.hangs, a630_idle_ms, a630_hwcg, a630_boost_level, (unsigned)(a630_boost_level && mach_absolute_time() < gov_boost_until), gov_rate, a630_level_sets, a630_dcvs_errors,
++	    a630_input_level, a630_input_ms, a630_input_events, (unsigned)(a630_input_level && mach_absolute_time() < a630_input_until), a630_input_votes, tot / NSEC_PER_MSEC);
+ 	(void)now_in;
+ 	for (unsigned i = 0; i < 8 && n > 0 && (size_t)n < sizeof(buf); i++) {
+ 		if (i) {
+@@ -3458,13 +3530,14 @@ a630_pm_thread(void *arg, wait_result_t wr)
+ 	(void)arg;
+ 	(void)wr;
+ 	for (;;) {
+-		sleep_ms(a630_gov ? 4 : 20);
++		pm_sleep_ms(a630_gov ? 4 : 20);
+ 		sweet_gpu_lock();
+ 		uint64_t now = mach_absolute_time(), dt;
+ 		absolutetime_to_nanoseconds(now - last, &dt);
+ 		last = now;
+ 		if (a630_dev.ready && !a630_dev.lost) {
+ 			res_ns[a630_awake ? MIN(a630_level, 7u) : 0] += dt;
++			gpu_input_tick(now);                            /* before the governor: its floor includes the input floor */
+ 			if (a630_awake) {
+ 				gpu_gov_tick(dt);                       /* measures always, acts only with sweetgpufreq=gov */
+ 				if (a630_idle_ms && ns_since(a630_last_active) >= (uint64_t)a630_idle_ms * NSEC_PER_MSEC && gpu_cp_idle_now()) {
+@@ -3701,6 +3774,12 @@ sweet_a630_probe(void)
+ 		if (PE_parse_boot_argn("sweetgpuboost", &v, sizeof(v)) && v >= 0) {
+ 			a630_boost_level = (uint32_t)MIN(v, 7);
+ 		}
++		if (PE_parse_boot_argn("sweetgpuinput", &v, sizeof(v)) && v >= 0) {
++			a630_input_level = (uint32_t)MIN(v, 7);
++		}
++		if (PE_parse_boot_argn("sweetgpuinputms", &v, sizeof(v)) && v > 0) {
++			a630_input_ms = (uint32_t)MIN(v, 5000);
++		}
+ 		if (PE_parse_boot_argn("sweetgpubw", fb, sizeof(fb)) && fb[0] == 'l') {
+ 			a630_bw_linux = 1;
+ 		}
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 578f6b9..1976391 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -52,6 +52,14 @@
+  *                                      ceiling for 1 s, raise the ceiling by 2 LUT states (up to
+  *                                      sweetcpufreq_little_boost_max, % of max, default 100); back
+  *                                      to the base cap after 1 s below 50% load (default off)
++ *   sweetinputboost=0|1                touch boost (patch 0217) for the GPU and the CPU (default 1)
++ *   sweetcpuinput_khz=<khz>            gov: on every touch event, for sweetgpuinputms (default 300) after
++ *                                      the last one, the A75 cluster goes to its cap (max) at once and the
++ *                                      A55 ceiling is lifted to this clock, the A55 jumping to it (default
++ *                                      1766400 = A55 max; 0 = no CPU boost). Afterwards the A55 ceiling
++ *                                      falls back to its base cap / boost ceiling in one step and the
++ *                                      governor takes over. The GPU half is sweetgpuinput= /
++ *                                      sweetgpuinputms= in sweet_a630.c.
+  *   sweetamp=0|1                       idle-core steering in the scheduler (default 1)
+  *   sweetamp_prio=<n>                  base_pri threshold (default 31)
+  * Core-class steering (independent of the cpufreq mode): once all CPUs are up,
+@@ -77,6 +85,8 @@
+  *            milliseconds spent in each since start)
+  *   line 3:  cluster1 ... (A75, cpus=4-7), same keys
+  * idx/cur_khz are read live from PERF_STATE; they are 0 unless state=applied.
++ * Line 1 also carries input=<on|off> input_khz=<A55 touch ceiling> input_ms=<hold> input_boosts=<touch events
++ * accepted by sweet_input_boost(), at most one per 10 ms> input_boosted=<1 while the hold is running>.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -95,7 +105,9 @@ extern uint64_t sweet_processor_idle_time(int cpu);
+ extern void sweet_amp_enable(uint64_t big, uint64_t little, int pri);
+ extern kern_return_t thread_terminate(thread_t);
+ extern boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
++extern void sweet_gpu_input_boost(uint64_t now);        /* bsd/dev/sweet_a630.c */
+ void sweet_cpufreq_max(void);
++void sweet_input_boost(void);
+ 
+ #define CPUFREQ_ENABLE          0x000u
+ #define CPUFREQ_FREQ_LUT        0x110u
+@@ -134,6 +146,8 @@ static struct cf_domain {
+ 	uint32_t cap;                   /* base policy ceiling (LUT index) */
+ 	uint32_t eff_cap;               /* current ceiling: cap, or higher while boosted */
+ 	uint32_t boost_top;             /* highest index the boost may reach */
++	uint32_t in_idx;                /* touch boost: floor and, if higher, ceiling while the input hold runs */
++	bool in_on;                     /* the touch boost was applied at the last governor step */
+ 	uint32_t sat_cnt;
+ 	uint32_t calm_cnt;
+ 	uint32_t req;                   /* last requested LUT index */
+@@ -160,6 +174,14 @@ static int cf_amp = 1;
+ static int cf_amp_pri = 31;             /* BASEPRI_DEFAULT */
+ static uint64_t cf_amp_big;
+ static bool cf_amp_on;
++/* Touch boost (patch 0217). The hook runs on the touch thread; the governor thread reads these words. */
++static uint64_t cf_in_hold_abs;         /* hold after the last touch event; 0 = touch boost off (sweetinputboost=0) */
++static uint64_t cf_in_gap_abs;          /* the hook does nothing within this long of its last accepted event */
++static uint64_t cf_in_last;
++static volatile uint64_t cf_in_until;
++static uint32_t cf_in_events;
++static uint32_t cf_in_khz = 1766400;    /* sweetcpuinput_khz */
++static uint32_t cf_in_ms = 300;
+ 
+ static inline uint32_t
+ cf_rd(const struct cf_domain *d, uint32_t off)
+@@ -302,6 +324,16 @@ cf_setup(unsigned id, struct cf_domain *d)
+ 	    cf_mode == MODE_GOV ? "cap" : "fixed target", d->percent, d->cap, d->khz[d->cap]);
+ 	/* gov starts at the cap and lets the first idle samples bring it down */
+ 	d->eff_cap = d->cap;
++	d->in_idx = d->cap;
++	if (id == 0 && cf_in_khz) {
++		uint32_t i = 0;
++		while (i < d->top && d->khz[i] < cf_in_khz) {
++			i++;
++		}
++		if (i > d->in_idx) {
++			d->in_idx = i;
++		}
++	}
+ 	d->boost_top = (id == 0 && cf_boost) ? cf_pick(d, cf_boost_pct) : d->cap;
+ 	if (d->boost_top < d->cap) {
+ 		d->boost_top = d->cap;
+@@ -347,9 +379,23 @@ cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
+ 	if (cf_mode != MODE_GOV) {
+ 		return;
+ 	}
++	/*
++	 * Touch boost (patch 0217): while the hold runs the floor is in_idx (A75: its cap, A55: the touch clock) and the
++	 * A55 ceiling is at least that; when it ends the ceiling drops back in one step, not the governor's slow descent.
++	 */
++	bool in_act = cf_in_khz && mach_absolute_time() < cf_in_until;
++	uint32_t ceil_i = d->eff_cap;
++	if (in_act && d->in_idx > ceil_i) {
++		ceil_i = d->in_idx;
++	}
++	if (d->in_on && !in_act && cur > ceil_i) {
++		cf_request(d, ceil_i);
++		cur = ceil_i;
++	}
++	d->in_on = in_act;
+ 	/* A55 boost (sweetcpufreq_little_boost=1): saturated at its ceiling for 1 s -> raise it. */
+ 	if (id == 0 && cf_boost && d->boost_top > d->cap) {
+-		if (load >= GOV_JUMP_PCT && cur >= d->eff_cap) {
++		if (load >= GOV_JUMP_PCT && cur >= d->eff_cap && !in_act) {
+ 			d->calm_cnt = 0;
+ 			if (++d->sat_cnt >= BOOST_SAT_SAMPLES && d->eff_cap < d->boost_top) {
+ 				d->sat_cnt = 0;
+@@ -373,16 +419,19 @@ cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
+ 	}
+ 	uint32_t target;
+ 	if (load >= GOV_JUMP_PCT) {
+-		target = d->eff_cap;
++		target = ceil_i;
+ 	} else {
+ 		uint64_t need = (uint64_t)d->khz[cur] * load / GOV_TARGET_PCT;
+ 		target = 0;
+-		while (target < d->eff_cap && d->khz[target] < need) {
++		while (target < ceil_i && d->khz[target] < need) {
+ 			target++;
+ 		}
+ 	}
+-	if (target > d->eff_cap) {
+-		target = d->eff_cap;
++	if (target > ceil_i) {
++		target = ceil_i;
++	}
++	if (in_act && target < d->in_idx) {
++		target = d->in_idx;
+ 	}
+ 	uint32_t next = cur;
+ 	if (target > cur) {
+@@ -401,6 +450,39 @@ cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
+ 	}
+ }
+ 
++/*
++ * Touch boost entry point, called by the touch driver for every touch-down and move report (bsd/dev/sweet_touch.c,
++ * touch_report(), on the touch thread). Cheap: with sweetinputboost=0 or before init one load; otherwise one clock read
++ * and a compare, and every ~10 ms a few stores. It takes no lock and sleeps nowhere: the CPU part is one MMIO store per
++ * cluster (the same store the governor makes) so the clocks move now, not at the governor's next 25 ms sample; the GPU part
++ * stores a deadline for the GPU PM thread, which votes with the GPU lock held (sweet_gpu_input_boost in sweet_a630.c).
++ * The governors then keep the floor for the hold. Only gov mode raises the CPU (fixed/off leave it).
++ */
++void
++sweet_input_boost(void)
++{
++	if (cf_in_hold_abs == 0) {
++		return;
++	}
++	uint64_t now = mach_absolute_time();
++	if (now - cf_in_last < cf_in_gap_abs) {
++		return;
++	}
++	cf_in_last = now;
++	cf_in_events++;
++	cf_in_until = now + cf_in_hold_abs;
++	sweet_gpu_input_boost(now);
++	if (cf_mode != MODE_GOV || !cf_in_khz) {
++		return;
++	}
++	for (unsigned i = 0; i < 2; i++) {
++		struct cf_domain *d = &cf_dom[i];
++		if (d->state == CF_APPLIED && cf_rd(d, CPUFREQ_PERF_STATE) < d->in_idx) {
++			cf_request(d, d->in_idx);
++		}
++	}
++}
++
+ static void
+ cf_log_summary(unsigned id, struct cf_domain *d)
+ {
+@@ -543,6 +625,21 @@ sweet_cpufreq_max(void)
+ 		return;
+ 	}
+ 	cf_started = true;
++	{
++		int on = 1, ms = 300, khz = 1766400;
++
++		(void)PE_parse_boot_argn("sweetinputboost", &on, sizeof(on));
++		(void)PE_parse_boot_argn("sweetgpuinputms", &ms, sizeof(ms));
++		(void)PE_parse_boot_argn("sweetcpuinput_khz", &khz, sizeof(khz));
++		cf_in_ms = (uint32_t)(ms < 1 ? 300 : MIN(ms, 5000));
++		cf_in_khz = khz > 0 ? (uint32_t)khz : 0;
++		if (on) {
++			nanoseconds_to_absolutetime((uint64_t)cf_in_ms * NSEC_PER_MSEC, &cf_in_hold_abs);
++			nanoseconds_to_absolutetime(10 * NSEC_PER_MSEC, &cf_in_gap_abs);
++		}
++		printf("SWEET CPUFREQ: touch boost %s: hold %u ms, A55 ceiling %u kHz\n", on ? "on" : "off (sweetinputboost=0)",
++		    cf_in_ms, cf_in_khz);
++	}
+ 	(void)PE_parse_boot_argn("sweetcpufreq", arg, sizeof(arg));
+ 	(void)PE_parse_boot_argn("sweetamp", &cf_amp, sizeof(cf_amp));
+ 	(void)PE_parse_boot_argn("sweetamp_prio", &cf_amp_pri, sizeof(cf_amp_pri));
+@@ -600,13 +697,16 @@ static int
+ cf_sysctl SYSCTL_HANDLER_ARGS
+ {
+ #pragma unused(arg1, arg2)
+-	char buf[1536];
++	char buf[2048];
+ 	size_t n = 0;
+ 	const char *modes[] = { "off", "gov", "fixed" };
+ 
+-	n = cf_cat(buf, sizeof(buf), n, "sweet_cpufreq v1 mode=%s period_ms=%u amp=%s amp_big=0x%llx amp_pri=%d\n",
++	n = cf_cat(buf, sizeof(buf), n, "sweet_cpufreq v1 mode=%s period_ms=%u amp=%s amp_big=0x%llx amp_pri=%d "
++	    "input=%s input_khz=%u input_ms=%u input_boosts=%u input_boosted=%u\n",
+ 	    modes[cf_mode], cf_mode == MODE_GOV ? GOV_PERIOD_MS : FIXED_PERIOD_MS,
+-	    cf_amp_on ? "on" : "off", cf_amp_big, cf_amp_pri);
++	    cf_amp_on ? "on" : "off", cf_amp_big, cf_amp_pri,
++	    cf_in_hold_abs ? "on" : "off", cf_in_khz, cf_in_ms, cf_in_events,
++	    (unsigned)(cf_in_hold_abs && mach_absolute_time() < cf_in_until));
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		const struct cf_domain *d = &cf_dom[i];
+ 		const char *st = d->state == CF_OFF ? "off" : d->state == CF_PENDING ? "pending" :
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 1ae50ee..204207f 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -32,6 +32,7 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
++extern void sweet_input_boost(void);    /* bsd/dev/sweet_cpufreq.c: GPU + CPU input boost (patch 0217) */
+ void sweet_touch_init(void);
+ 
+ #define TOUCH_GCC_PA     0x00100000u
+@@ -566,6 +567,8 @@ touch_report(uint32_t mask, const int *x, const int *y)
+ 		uint32_t bit = 1u << id;
+ 		if (mask & bit) {
+ 			if (!(st.active & bit) || x[id] != st.x[id] || y[id] != st.y[id]) {
++				/* Input boost (patch 0217): a few loads and one compare when rate-limited, no locks. */
++				sweet_input_boost();
+ 				sweet_hid_touch((int)id, 1, x[id], y[id]);
+ 			}
+ 			st.x[id] = x[id];

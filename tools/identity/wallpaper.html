@@ -1,0 +1,60 @@
+<!doctype html>
+<!-- Bergamota lock/home wallpaper (tools/identity/mkwallpaper.sh renders it): the identity of IDENTITY.md at phone size.
+     Lime halftone ground, the iOS generation's giant white numerals behind the figure, Newton's halftone portrait
+     rising from the bottom edge. The top third stays plain ground: the lock screen's date and clock sit there.
+     Query: ?w=1125&h=2436&n=26 -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+@font-face { font-family: Archivo; src: url(fonts/archivo.woff2) format('woff2'); font-weight: 100 900; font-stretch: 62% 125%; }
+@font-face { font-family: JBMono; src: url(fonts/jetbrains-mono.woff2) format('woff2'); font-weight: 100 800; }
+:root { --lime: #d7e98a; --dot: #c6dc72; --ink: #161616; --paper: #f4f3ec; --white: #ffffff; }
+html, body { margin: 0; padding: 0; background: var(--lime); overflow: hidden; }
+#wall {
+  position: relative; overflow: hidden;
+  background-color: var(--lime);
+  /* the identity's 1.6 px dots on a 7 px grid, doubled for a 2x-3x phone panel */
+  background-image: radial-gradient(circle, var(--dot) 1.55px, transparent 1.8px);
+  background-size: 14px 14px;
+}
+#numerals {
+  position: absolute; left: 0; right: 0; text-align: center;
+  font-family: Archivo; font-weight: 900; font-stretch: 112%;
+  color: var(--white); letter-spacing: -0.04em; line-height: 0.8;
+}
+#newton { position: absolute; left: 50%; bottom: 0; transform: translateX(-50%); }
+#mark {
+  position: absolute; left: 0; right: 0; text-align: center;
+  font-family: JBMono; font-weight: 700; color: var(--paper); letter-spacing: 0.32em; text-transform: uppercase;
+}
+</style>
+</head>
+<body>
+<div id="wall">
+  <div id="numerals"></div>
+  <img id="newton" src="newton-halftone.png" alt="">
+  <div id="mark">Bergamota</div>
+</div>
+<script>
+const q = new URLSearchParams(location.search);
+const W = +(q.get('w') || 1125), H = +(q.get('h') || 2436), N = q.get('n') || '26';
+const wall = document.getElementById('wall');
+wall.style.width = W + 'px'; wall.style.height = H + 'px';
+// numerals: as wide as the screen allows, their baseline hidden behind the shoulders
+const num = document.getElementById('numerals');
+num.textContent = N;
+num.style.fontSize = Math.round(W * 0.62) + 'px';
+num.style.top = Math.round(H * 0.215) + 'px';
+// the portrait: the master is 1280x1798; it fills the width a little past the edges and stands on the bottom edge
+const img = document.getElementById('newton');
+const pw = Math.round(W * 1.12);
+img.style.width = pw + 'px';
+img.style.height = Math.round(pw * 1798 / 1280) + 'px';
+// wordmark over the dark coat, above the home indicator
+const mark = document.getElementById('mark');
+mark.style.fontSize = Math.round(W * 0.03) + 'px';
+mark.style.bottom = Math.round(H * 0.045) + 'px';
+</script>
+</body>
+</html>

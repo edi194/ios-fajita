@@ -1,0 +1,97 @@
+diff --git a/iokit/Kernel/arm/SweetKeyStore.cpp b/iokit/Kernel/arm/SweetKeyStore.cpp
+index d11fe26..bb641c8 100644
+--- a/iokit/Kernel/arm/SweetKeyStore.cpp
++++ b/iokit/Kernel/arm/SweetKeyStore.cpp
+@@ -170,6 +170,79 @@ sweet_aks_struct_out_size(IOExternalMethodArguments *args)
+ 	       (uint32_t)args->structureOutputDescriptor->getLength() : args->structureOutputSize;
+ }
+ 
++/* Copy the caller's input structure (inband or descriptor); returns its length or 0. */
++static uint32_t
++sweet_aks_struct_in(IOExternalMethodArguments *args, void *buf, uint32_t max)
++{
++	uint32_t len;
++	if (args->structureInputDescriptor != NULL) {
++		len = (uint32_t)args->structureInputDescriptor->getLength();
++		if (len == 0 || len > max) {
++			return 0;
++		}
++		return args->structureInputDescriptor->readBytes(0, buf, len) == len ? len : 0;
++	}
++	len = args->structureInputSize;
++	if (args->structureInput == NULL || len == 0 || len > max) {
++		return 0;
++	}
++	memcpy(buf, args->structureInput, len);
++	return len;
++}
++
++/*
++ * Key wrap / unwrap (aks_wrap_key / aks_unwrap_key): securityd wraps every keychain
++ * item's 32-byte key with a class key held by the SEP: inputs { handle, class }, the
++ * key in, the effective class out (scalar) and the wrapped key out (40 bytes, the size
++ * of an RFC 3394 wrap of 32 bytes). There is no SEP and no passcode here, so the
++ * "wrapped" key is the key behind an 8-byte header { 'SWAK', class }: keychain items
++ * round-trip, but their keys are readable from the disk (as on a device without
++ * data protection). Unwrap accepts only that header. Before this every SecItemAdd
++ * failed (bluetoothd: "LeSecurityManager hit a keychain problem").
++ */
++#define SWEET_AKS_WRAP_MAGIC    0x4b415753u     /* 'SWAK' little endian */
++#define SWEET_AKS_WRAP_HDR      8u
++#define SWEET_AKS_KEY_MAX       128u
++
++static IOReturn
++sweet_aks_wrap(IOExternalMethodArguments *args)
++{
++	uint8_t buf[SWEET_AKS_WRAP_HDR + SWEET_AKS_KEY_MAX];
++	uint32_t cls = args->scalarInputCount > 1 ? (uint32_t)args->scalarInput[1] : 0;
++	uint32_t len = sweet_aks_struct_in(args, buf + SWEET_AKS_WRAP_HDR, SWEET_AKS_KEY_MAX);
++	if (len == 0) {
++		return kIOReturnBadArgument;
++	}
++	uint32_t magic = SWEET_AKS_WRAP_MAGIC;
++	memcpy(buf, &magic, 4);
++	memcpy(buf + 4, &cls, 4);
++	IOReturn ret = sweet_aks_struct_out(args, buf, SWEET_AKS_WRAP_HDR + len);
++	if (ret == kIOReturnSuccess) {
++		if (args->scalarOutputCount > 0) {
++			args->scalarOutput[0] = cls;
++			args->scalarOutputCount = 1;
++		}
++	}
++	return ret;
++}
++
++static IOReturn
++sweet_aks_unwrap(IOExternalMethodArguments *args)
++{
++	uint8_t buf[SWEET_AKS_WRAP_HDR + SWEET_AKS_KEY_MAX];
++	uint32_t len = sweet_aks_struct_in(args, buf, sizeof(buf));
++	uint32_t magic;
++	if (len <= SWEET_AKS_WRAP_HDR) {
++		return kIOReturnBadArgument;
++	}
++	memcpy(&magic, buf, 4);
++	if (magic != SWEET_AKS_WRAP_MAGIC) {
++		return kIOReturnNotPermitted;   /* not wrapped by this stand-in */
++	}
++	args->scalarOutputCount = 0;
++	return sweet_aks_struct_out(args, buf + SWEET_AKS_WRAP_HDR, len - SWEET_AKS_WRAP_HDR);
++}
++
+ IOReturn
+ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArguments *args,
+     __unused IOExternalMethodDispatch *dispatch, __unused OSObject *target,
+@@ -227,6 +300,12 @@ AppleKeyStoreUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 		args->scalarOutputCount = 0;
+ 		ret = sweet_aks_device_state(args);
+ 		break;
++	case kAKSWrapKey:
++		ret = sweet_aks_wrap(args);
++		break;
++	case kAKSUnwrapKey:
++		ret = sweet_aks_unwrap(args);
++		break;
+ 	default:
+ 		ret = kIOReturnUnsupported;
+ 		break;

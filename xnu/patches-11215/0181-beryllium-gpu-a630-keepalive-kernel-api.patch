@@ -1,0 +1,553 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index e83469d..6b78546 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -20,6 +20,13 @@
+  *      configuration, SQE (a630_sqe.fw) + ring buffer in a GPU SMMU context
+  *      (stream ID 0), SQE_CNTL=1, CP_ME_INIT, zap, CP_SET_SECURE_MODE 0, then
+  *      a NOP/MEM_WRITE/CACHE_FLUSH_TS submission with timestamp readback
++ *   8  7, and when the self-test passes the GPU is KEPT UP (GMU running, GX
++ *      held on through OOB_GPU, zap authenticated and left running, CP ring
++ *      live) and the msm-style kernel interface below (sweet_gpu_*) plus the
++ *      IOKit service "SweetAdreno630" (iokit/Kernel/arm/SweetAdreno.cpp) are
++ *      published. docs/GPU_KERNEL.md. If the self-test fails, stage 8 ends
++ *      exactly like stage 7 (zap shutdown, slumber, GMU reset) and nothing is
++ *      published.
+  *
+  * Stages >= 3 need firmware: files under /usr/standalone/firmware/sweet/
+  * of the iOS root (a630_gmu.bin, a630_sqe.fw, a630_zap.mdt + a630_zap.bNN)
+@@ -161,6 +168,7 @@ enum { CC_AHB, CC_CX_GMU, CC_CXO, CC_CX_SNOC_DVM, CC_CX_APB, CC_CXO_AON, CC_GX_G
+ #define GMU_GMU2HOST_INTR_INFO  R(0x5192)
+ #define GMU_HOST2GMU_INTR_SET   R(0x5194)
+ #define GMU_GENERAL_7           R(0x51cc)
++#define GMU_PWR_COL_KEEPALIVE   R(0x50c3)       /* a6xx_gmu.xml: 1 = the GMU does not collapse GX */
+ #define GMU_BOOT_SLUMBER_OPTION R(0x23f8)       /* in the GMU DTCM */
+ #define GMU_GX_VOTE_IDX         R(0x23f9)
+ #define GMU_MX_VOTE_IDX         R(0x23fa)
+@@ -1781,6 +1789,8 @@ gpu_gx_slumber(void)
+ #define SCRATCH_RPTR            0x000u          /* RPTR shadow (disabled by NO_UPDATE) */
+ #define SCRATCH_MEMWR           0x100u
+ #define SCRATCH_TS              0x110u
++#define SCRATCH_FENCE           0x200u
++#define SCRATCH_FILL            0x400u          /* stage 8 fill test: 64 dwords */          /* kernel interface: last completed submission (CACHE_FLUSH_TS target) */
+ #define CP_RB_CNTL_VALUE        ((1u << 27) | (2u << 8) | 12u)  /* NO_UPDATE, 32 byte blocks, 32 KiB ring */
+ 
+ #define CP_NOP                  16
+@@ -1788,6 +1798,9 @@ gpu_gx_slumber(void)
+ #define CP_MEM_WRITE            61
+ #define CP_EVENT_WRITE          70
+ #define CP_SET_SECURE_MODE      102
++#define CP_INDIRECT_BUFFER      63
++#define PC_CCU_INVALIDATE_DEPTH 24
++#define PC_CCU_INVALIDATE_COLOR 25
+ #define CACHE_FLUSH_TS          4
+ #define CP_EVENT_WRITE_IRQ      0x80000000u
+ 
+@@ -2147,6 +2160,452 @@ gpu_cp_nop_test(void)
+ 	return false;
+ }
+ 
++/*
++ * Stage 8 self-test, second half: the CP fills 256 bytes through CP_MEM_WRITE (a "clear"
++ * of a buffer with no shader involved) and signals CACHE_FLUSH_TS; every word is read back.
++ */
++static bool
++gpu_cp_fill_test(void)
++{
++	volatile uint32_t *buf = (volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FILL);
++	volatile uint32_t *ts = (volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_TS);
++	const uint32_t seq = 0x600d0002u;
++	unsigned bad = 0;
++
++	for (unsigned i = 0; i < 64; i++) {
++		buf[i] = 0xdeadbeefu;
++	}
++	*ts = 0;
++	sweet_dma_sync_va((const void *)(cp_memory + SCRATCH_OFF), 0x500);
++	ring_emit(pkt7(CP_MEM_WRITE, 2 + 64));
++	ring_emit((uint32_t)(SCRATCH_VA + SCRATCH_FILL));
++	ring_emit(0);
++	for (unsigned i = 0; i < 64; i++) {
++		ring_emit(0xc1ea0000u | i);
++	}
++	ring_emit(pkt7(CP_EVENT_WRITE, 4));
++	ring_emit(CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
++	ring_emit((uint32_t)(SCRATCH_VA + SCRATCH_TS));
++	ring_emit(0);
++	ring_emit(seq);
++	ring_flush();
++	bool idle = ring_wait_idle("fill submission");
++	for (unsigned i = 0; i < 50000 && *ts != seq; i++) {
++		sweet_dma_sync_va((const void *)(cp_memory + SCRATCH_OFF), 0x500);
++		delay(1);
++	}
++	sweet_dma_sync_va((const void *)(cp_memory + SCRATCH_OFF), 0x500);
++	for (unsigned i = 0; i < 64; i++) {
++		bad += buf[i] != (0xc1ea0000u | i);
++	}
++	uint32_t irq = gpu_r(A6XX_RBBM_INT_0_STATUS);
++	if (irq) {
++		gpu_w(A6XX_RBBM_INT_CLEAR_CMD, irq & 0x00ffffffu);
++	}
++	printf("SWEET GPU: CP fill test: %u of 64 words wrong, timestamp 0x%08x (want 0x%08x), first/last 0x%08x 0x%08x\n",
++	    bad, *ts, seq, buf[0], buf[63]);
++	if (idle && bad == 0 && *ts == seq) {
++		printf("SWEET GPU: CP fill test PASSED\n");
++		return true;
++	}
++	printf("SWEET GPU: CP fill test FAILED\n");
++	return false;
++}
++
++/* ------------------------------------------------------------------ */
++/* Stage 8: the kept-up GPU and its kernel interface (sweet_gpu_*)     */
++/* ------------------------------------------------------------------ */
++
++/*
++ * Everything below is only reachable after the stage-8 self-test passed
++ * (a630_dev.ready). The IOKit side (SweetAdreno.cpp) serializes all calls with
++ * one lock; nothing here takes a lock of its own. Interface shape and the
++ * division of work (kernel allocates GPU addresses, userland only asks) follow
++ * what Linux msm exposes to Mesa freedreno (msm_gem_get_iova, MSM_INFO_GET_IOVA);
++ * the code is ours.
++ *
++ * Client buffers live in the GPU address space [GVM_BASE, 4 GiB) of context
++ * bank 1 (the same one the CP uses for ring/SQE/scratch at 0x40000000, which
++ * stays out of the allocatable range): 4 KiB pages, tables taken on demand
++ * from a pool of normal-non-cacheable pages (ptp) so the SMMU walker sees what
++ * the CPU wrote. The static L1 table of gpu_cp_memory gets entries 2 and 3.
++ */
++#define GVM_BASE                0x80000000ull
++#define GVM_END                 0x100000000ull
++#define GVM_GUARD               0x1000ull       /* unmapped page after every kernel-placed buffer */
++#define GVM_MAXFREE             512
++#define PTP_PAGES               256             /* 1 MiB of tables: 2 L2 + up to 254 L3 (2 MiB each) */
++
++static struct {
++	bool     ready;         /* GPU up and the interface usable */
++	bool     lost;          /* a submission did not complete: nothing more is given to the CP */
++	uint32_t seqno;         /* last submitted */
++	uint32_t submissions, hangs;
++	uint64_t bytes_mapped;
++} a630_dev;
++static bool a630_kept;
++
++static vm_offset_t ptp;
++static uint64_t ptp_pa;
++static unsigned ptp_used;
++static struct {
++	uint64_t start, size;
++} gvm_free[GVM_MAXFREE];
++static unsigned gvm_nfree;
++
++extern void SweetAdrenoPublish(void);   /* iokit/Kernel/arm/SweetAdreno.cpp */
++
++static bool
++gvm_init(void)
++{
++	if (ptp) {
++		return true;
++	}
++	if (!dma_alloc((vm_size_t)PTP_PAGES * PAGE_SIZE, &ptp, &ptp_pa)) {
++		ptp = 0;
++		return false;
++	}
++	gvm_free[0].start = GVM_BASE;
++	gvm_free[0].size = GVM_END - GVM_BASE;
++	gvm_nfree = 1;
++	return true;
++}
++
++/* A page of the table pool (zeroed by dma_alloc); 0 when the pool is used up. */
++static uint64_t
++gvm_table_page(void)
++{
++	if (ptp_used >= PTP_PAGES) {
++		return 0;
++	}
++	return ptp_pa + (uint64_t)(ptp_used++) * PAGE_SIZE;
++}
++
++static volatile uint64_t *
++gvm_table_va(uint64_t pa)
++{
++	if (pa < ptp_pa || pa - ptp_pa >= (uint64_t)PTP_PAGES * PAGE_SIZE || (pa & 0xfff)) {
++		return NULL;
++	}
++	return (volatile uint64_t *)(ptp + (pa - ptp_pa));
++}
++
++/* Slot of the level-3 entry for iova; creates missing tables when asked. NULL: not mapped / pool full. */
++static volatile uint64_t *
++gvm_slot(uint64_t iova, bool create)
++{
++	volatile uint64_t *l1 = (volatile uint64_t *)(cp_memory + CP_L1), *tab;
++	uint64_t e, pa;
++	unsigned i1 = (unsigned)(iova >> 30) & 3, i2 = (unsigned)(iova >> 21) & 0x1ff, i3 = (unsigned)(iova >> 12) & 0x1ff;
++
++	if (iova < GVM_BASE || iova >= GVM_END) {
++		return NULL;
++	}
++	e = l1[i1];
++	if ((e & 3) != PTE_TABLE) {
++		if (!create || !(pa = gvm_table_page())) {
++			return NULL;
++		}
++		pte_wr(cp_memory, CP_L1 + 8 * i1, pa | PTE_TABLE);
++		e = pa | PTE_TABLE;
++	}
++	if (!(tab = gvm_table_va(e & PA_MASK))) {
++		return NULL;
++	}
++	e = tab[i2];
++	if ((e & 3) != PTE_TABLE) {
++		if (!create || !(pa = gvm_table_page())) {
++			return NULL;
++		}
++		pte_wr(ptp, (uint32_t)((uintptr_t)(tab + i2) - ptp), pa | PTE_TABLE);
++		e = pa | PTE_TABLE;
++	}
++	if (!(tab = gvm_table_va(e & PA_MASK))) {
++		return NULL;
++	}
++	return tab + i3;
++}
++
++static void
++gvm_tlb_flush(void)
++{
++	vm_offset_t b = smmu_base + SMMU_CB(CP_CB);
++
++	gpu_wr(b, SMMU_CB_TLBIALL, 0);
++	(void)smmu_sync(b, SMMU_CB_TLBSYNC, SMMU_CB_TLBSTATUS);
++}
++
++/* First-fit allocation of size bytes plus a guard page. */
++bool
++sweet_gpu_iova_alloc(uint64_t size, uint64_t *iova, uint64_t *taken)
++{
++	uint64_t need = size + GVM_GUARD;
++
++	if (!a630_dev.ready || size == 0 || (size & 0xfff)) {
++		return false;
++	}
++	for (unsigned i = 0; i < gvm_nfree; i++) {
++		if (gvm_free[i].size >= need) {
++			*iova = gvm_free[i].start;
++			*taken = need;
++			gvm_free[i].start += need;
++			gvm_free[i].size -= need;
++			if (gvm_free[i].size == 0) {
++				memmove(&gvm_free[i], &gvm_free[i + 1], (gvm_nfree - i - 1) * sizeof(gvm_free[0]));
++				gvm_nfree--;
++			}
++			return true;
++		}
++	}
++	return false;
++}
++
++/* Take exactly [iova, iova+size) out of the free list (MSM_INFO_SET_IOVA). */
++bool
++sweet_gpu_iova_reserve(uint64_t iova, uint64_t size)
++{
++	if (!a630_dev.ready || size == 0 || (size & 0xfff) || (iova & 0xfff) || iova < GVM_BASE || iova + size > GVM_END) {
++		return false;
++	}
++	for (unsigned i = 0; i < gvm_nfree; i++) {
++		uint64_t s = gvm_free[i].start, e = s + gvm_free[i].size;
++		if (iova < s || iova + size > e) {
++			continue;
++		}
++		if (iova == s && iova + size == e) {
++			memmove(&gvm_free[i], &gvm_free[i + 1], (gvm_nfree - i - 1) * sizeof(gvm_free[0]));
++			gvm_nfree--;
++		} else if (iova == s) {
++			gvm_free[i].start += size;
++			gvm_free[i].size -= size;
++		} else if (iova + size == e) {
++			gvm_free[i].size -= size;
++		} else {
++			if (gvm_nfree == GVM_MAXFREE) {
++				return false;
++			}
++			memmove(&gvm_free[i + 1], &gvm_free[i], (gvm_nfree - i) * sizeof(gvm_free[0]));
++			gvm_nfree++;
++			gvm_free[i].size = iova - s;
++			gvm_free[i + 1].start = iova + size;
++			gvm_free[i + 1].size = e - (iova + size);
++		}
++		return true;
++	}
++	return false;
++}
++
++/* Give a range back, coalescing; a full list drops the range (address space is lost, not corrupted). */
++void
++sweet_gpu_iova_free(uint64_t iova, uint64_t size)
++{
++	unsigned i = 0;
++
++	while (i < gvm_nfree && gvm_free[i].start < iova) {
++		i++;
++	}
++	if (i > 0 && gvm_free[i - 1].start + gvm_free[i - 1].size == iova) {
++		gvm_free[i - 1].size += size;
++		if (i < gvm_nfree && gvm_free[i - 1].start + gvm_free[i - 1].size == gvm_free[i].start) {
++			gvm_free[i - 1].size += gvm_free[i].size;
++			memmove(&gvm_free[i], &gvm_free[i + 1], (gvm_nfree - i - 1) * sizeof(gvm_free[0]));
++			gvm_nfree--;
++		}
++		return;
++	}
++	if (i < gvm_nfree && iova + size == gvm_free[i].start) {
++		gvm_free[i].start = iova;
++		gvm_free[i].size += size;
++		return;
++	}
++	if (gvm_nfree == GVM_MAXFREE) {
++		printf("SWEET GPU: iova free list full; %#llx+%#llx lost\n", iova, size);
++		return;
++	}
++	memmove(&gvm_free[i + 1], &gvm_free[i], (gvm_nfree - i) * sizeof(gvm_free[0]));
++	gvm_nfree++;
++	gvm_free[i].start = iova;
++	gvm_free[i].size = size;
++}
++
++/* One 4 KiB page; false when the table pool is full or pa does not fit the SMMU. */
++bool
++sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly)
++{
++	volatile uint64_t *slot;
++
++	if (!a630_dev.ready || (pa & ~PA_MASK) || (iova & 0xfff) || !(slot = gvm_slot(iova, true))) {
++		return false;
++	}
++	pte_wr((vm_offset_t)slot, 0, pa | PTE_PAGE_NC | (readonly ? PTE_RDONLY : 0));
++	a630_dev.bytes_mapped += PAGE_SIZE;
++	return true;
++}
++
++/* Clear the pages of [iova, iova+size) and invalidate the context's TLB. */
++void
++sweet_gpu_vm_unmap(uint64_t iova, uint64_t size)
++{
++	for (uint64_t d = 0; d < size; d += 0x1000) {
++		volatile uint64_t *slot = gvm_slot(iova + d, false);
++		if (slot && *slot) {
++			pte_wr((vm_offset_t)slot, 0, 0);
++			a630_dev.bytes_mapped -= PAGE_SIZE;
++		}
++	}
++	gvm_tlb_flush();
++}
++
++bool
++sweet_gpu_ready(void)
++{
++	return a630_dev.ready && !a630_dev.lost;
++}
++
++/* Make CPU stores to ordinary (cacheable) kernel memory visible to the GPU / drop stale lines. */
++void
++sweet_gpu_cache_sync(void *va, size_t len)
++{
++	sweet_dma_sync_va(va, len);
++}
++
++/* msm MSM_PARAM_* values; false for parameters this driver does not answer. */
++bool
++sweet_gpu_param(uint32_t which, uint64_t *value)
++{
++	if (!a630_dev.ready) {
++		return false;
++	}
++	switch (which) {
++	case 1:  *value = 630; return true;                     /* GPU_ID */
++	case 2:  *value = 0x100000; return true;                /* GMEM_SIZE */
++	case 3:  *value = 0x06030001; return true;              /* CHIP_ID */
++	case 4:  *value = 710000000ull; return true;            /* MAX_FREQ (the GPU runs at 257 MHz: docs/GPU_KERNEL.md) */
++	case 5:  *value = (uint64_t)gpu_r(A6XX_CP_ALWAYS_ON_COUNTER) |
++	    ((uint64_t)gpu_r(A6XX_CP_ALWAYS_ON_COUNTER + 1) << 32); return true;    /* TIMESTAMP, 19.2 MHz */
++	case 6:  *value = 0x100000; return true;                /* GMEM_BASE */
++	case 7:  *value = 1; return true;                       /* PRIORITIES */
++	case 8:  *value = 0; return true;                       /* PP_PGTABLE */
++	case 9:  *value = 0; return true;                       /* FAULTS */
++	case 10: *value = 0; return true;                       /* SUSPENDS */
++	case 14: *value = GVM_BASE; return true;                /* VA_START */
++	case 15: *value = GVM_END - GVM_BASE; return true;      /* VA_SIZE */
++	default: return false;
++	}
++}
++
++uint32_t
++sweet_gpu_fence_last(void)
++{
++	return a630_dev.seqno;
++}
++
++bool
++sweet_gpu_fence_done(uint32_t fence)
++{
++	volatile uint32_t *word = (volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE);
++	uint32_t v = *word;
++
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return (int32_t)(v - fence) >= 0;
++}
++
++/* What the CP says when a submission does not come back. */
++void
++sweet_gpu_report(const char *why)
++{
++	printf("SWEET GPU: %s: submitted %u, completed %u; ring RPTR %u WPTR %u RBBM_STATUS %#x CP_STATUS_1 %#x HW_FAULT %#x CP_IRQ %#x PROTECT %#x RBBM_IRQ %#x\n",
++	    why, a630_dev.seqno, *(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE),
++	    gpu_r(A6XX_CP_RB_RPTR), ring_wptr, gpu_r(A6XX_RBBM_STATUS), gpu_r(A6XX_CP_STATUS_1),
++	    gpu_r(A6XX_CP_HW_FAULT), gpu_r(A6XX_CP_INTERRUPT_STATUS), gpu_r(A6XX_CP_PROTECT_STATUS),
++	    gpu_r(A6XX_RBBM_INT_0_STATUS));
++	gpu_smmu_cb_faults(CP_CB);
++	gpu_smmu_faults();
++	sweet_log_sync();
++}
++
++/* The GPU stopped answering; no recovery is attempted (docs/GPU_KERNEL.md, risks): nothing more is submitted. */
++void
++sweet_gpu_mark_lost(void)
++{
++	if (!a630_dev.lost) {
++		a630_dev.lost = true;
++		a630_dev.hangs++;
++		sweet_gpu_report("GPU LOST (no completion)");
++	}
++}
++
++/*
++ * One submission: invalidate the CCU, run each indirect buffer, then write the
++ * sequence number with CACHE_FLUSH_TS (the tail of Linux a6xx_submit). Returns
++ * the sequence number, or 0 when the ring has no room for 2 s / the GPU is lost.
++ */
++uint32_t
++sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count)
++{
++	unsigned need = 16 + 4 * count, room = 0;
++
++	if (!sweet_gpu_ready() || count == 0 || count > 128) {
++		return 0;
++	}
++	for (unsigned i = 0; i < 20000; i++) {
++		uint32_t rptr = gpu_r(A6XX_CP_RB_RPTR);
++		room = (rptr + RING_SIZE / 4 - ring_wptr - 1) % (RING_SIZE / 4);
++		if (room >= need) {
++			break;
++		}
++		delay(100);
++	}
++	if (room < need) {
++		sweet_gpu_mark_lost();
++		return 0;
++	}
++	if (++a630_dev.seqno == 0) {
++		a630_dev.seqno = 1;
++	}
++	ring_emit(pkt7(CP_EVENT_WRITE, 1));
++	ring_emit(PC_CCU_INVALIDATE_DEPTH);
++	ring_emit(pkt7(CP_EVENT_WRITE, 1));
++	ring_emit(PC_CCU_INVALIDATE_COLOR);
++	for (unsigned i = 0; i < count; i++) {
++		ring_emit(pkt7(CP_INDIRECT_BUFFER, 3));
++		ring_emit((uint32_t)ib_iova[i]);
++		ring_emit((uint32_t)(ib_iova[i] >> 32));
++		ring_emit(ib_dwords[i]);
++	}
++	ring_emit(pkt7(CP_EVENT_WRITE, 4));
++	ring_emit(CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
++	ring_emit((uint32_t)(SCRATCH_VA + SCRATCH_FENCE));
++	ring_emit(0);
++	ring_emit(a630_dev.seqno);
++	ring_flush();
++	a630_dev.submissions++;
++	return a630_dev.seqno;
++}
++
++/*
++ * Stage 8 keep-up: called with the self-test passed, GX on, OOB_GPU held.
++ * Clears the boot-slumber OOB like Linux after HFI start, forbids GX collapse
++ * and sets up the address space for client buffers. Leaves OOB_GPU set.
++ */
++static bool
++gpu_keep_up(void)
++{
++	if (!gvm_init()) {
++		printf("SWEET GPU: no memory for the GPU page-table pool; interface not published\n");
++		return false;
++	}
++	gmu_oob_clear(OOB_BOOT_SLUMBER);
++	gpu_wr(gmu, GMU_PWR_COL_KEEPALIVE, 1);
++	*(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) = 0;
++	a630_dev.seqno = 0;
++	a630_dev.ready = true;
++	printf("SWEET GPU: KEPT UP: GX on (OOB_GPU held, GMU keep-alive), ring %u dwords at RPTR=WPTR=%u, client VA 0x%llx-0x%llx, %u table pages\n",
++	    RING_SIZE / 4, ring_wptr, GVM_BASE, GVM_END, PTP_PAGES);
++	sweet_log_sync();
++	return true;
++}
++
+ /* ------------------------------------------------------------------ */
+ /* The window with GX on: report, zap, CP                              */
+ /* ------------------------------------------------------------------ */
+@@ -2176,6 +2635,7 @@ gpu_gx_test(int mode)
+ 			}
+ 		}
+ 		if (mode >= 6 && gx && (mode < 7 || cp_ok)) {
++			bool nop_ok = false;
+ 			if (!sweet_a630_zap_load()) {
+ 				printf("SWEET GPU: zap load failed\n");
+ 			} else if (mode >= 7) {
+@@ -2184,8 +2644,20 @@ gpu_gx_test(int mode)
+ 				ring_emit(0);
+ 				ring_flush();
+ 				if (ring_wait_idle("CP_SET_SECURE_MODE 0")) {
+-					(void)gpu_cp_nop_test();
++					nop_ok = gpu_cp_nop_test();
++					if (mode >= 8 && nop_ok) {
++						nop_ok = gpu_cp_fill_test();
++					}
++				}
++			}
++			if (mode >= 8 && nop_ok) {
++				/* Self-test passed: keep the GPU up (zap stays authenticated, OOB_GPU stays held). */
++				if (gpu_keep_up()) {
++					a630_kept = true;
++					return true;
+ 				}
++			} else if (mode >= 8) {
++				printf("SWEET GPU: stage 8 self-test did not pass; shutting the GPU down like stage 7\n");
+ 			}
+ 			if (!sweet_a630_zap_shutdown() && sweet_a630_zap_running()) {
+ 				printf("SWEET GPU: zap operation not quiesced; retaining GX/GMU until reset\n");
+@@ -2293,6 +2765,13 @@ a630_run(int mode)
+ 		if (!gpu_gx_test(mode)) {
+ 			return;
+ 		}
++		if (a630_kept) {
++			/* No GMU reset, no slumber: the GPU stays as gpu_keep_up left it. */
++			sweet_log_sync();
++			printf("SWEET GPU: stage %d finished: GPU kept up, publishing SweetAdreno630\n", mode);
++			SweetAdrenoPublish();
++			return;
++		}
+ 	} else if (rail) {
+ 		/* GX was voted on but the start did not complete: power it down again. */
+ 		gmu_oob_clear(OOB_BOOT_SLUMBER);
+@@ -2347,8 +2826,8 @@ sweet_a630_probe(void)
+ 	if (mode <= 0) {
+ 		return;
+ 	}
+-	if (mode > 7) {
+-		mode = 7;
++	if (mode > 8) {
++		mode = 8;
+ 	}
+ 	a630_mode = mode;
+ 	if (mode <= 2) {

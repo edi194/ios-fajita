@@ -1,0 +1,58 @@
+--- a/osfmk/vm/vm_dyld_pager.c
++++ b/osfmk/vm/vm_dyld_pager.c
+@@ -467,7 +467,31 @@
+ 	return KERN_SUCCESS;
+ }
+ 
++#else /* !defined(HAS_APPLE_PAC) */
+ /*
++ * No pointer authentication in this kernel (SWEET, SDM845): arm64e images
++ * (rewritten offline by tools/ios18/pacstrip.py so that their code contains no
++ * PAC instruction) still carry DYLD_CHAINED_PTR_ARM64E fixups. Their pointers
++ * stay unsigned: the AUTx and PACx instructions are NOPs in the rewritten code.
++ * Without this the pager failed every such page ("unknown pointer_format",
++ * KERN_MEMORY_ERROR on the first touch of __AUTH_CONST/__AUTH).
++ */
++static kern_return_t
++signPointer(
++	uint64_t         unsignedAddr,
++	__unused void    *loc,
++	__unused bool    addrDiv,
++	__unused uint16_t diversity,
++	__unused ptrauth_key key,
++	__unused dyld_pager_t pager,
++	uint64_t         *signedAddr)
++{
++	*signedAddr = unsignedAddr;
++	return KERN_SUCCESS;
++}
++#endif /* defined(HAS_APPLE_PAC) */
++
++/*
+  * Apply fixups to a page used by a 64 bit process using pointer authentication.
+  */
+ static kern_return_t
+@@ -563,7 +587,6 @@
+ 	} while (delta != 0);
+ 	return KERN_SUCCESS;
+ }
+-#endif /* defined(HAS_APPLE_PAC) */
+ 
+ 
+ /*
+@@ -649,7 +672,6 @@
+ 	 * Route to the appropriate fixup routine
+ 	 */
+ 	switch (hdr->mwli_pointer_format) {
+-#if defined(HAS_APPLE_PAC)
+ 	case DYLD_CHAINED_PTR_ARM64E:
+ 		fixupPageAuth64(userVA, contents, end_contents, pager, segInfo, pageIndex, false);
+ 		break;
+@@ -657,7 +679,6 @@
+ 	case DYLD_CHAINED_PTR_ARM64E_USERLAND24:
+ 		fixupPageAuth64(userVA, contents, end_contents, pager, segInfo, pageIndex, true);
+ 		break;
+-#endif /* defined(HAS_APPLE_PAC) */
+ 	case DYLD_CHAINED_PTR_64:
+ 		fixupPage64(contents, end_contents, link_info, segInfo, pageIndex, false);
+ 		break;

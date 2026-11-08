@@ -1,0 +1,57 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 1a16f3fbeb1d9358dd10b1909b41adba56804995..36230fef90a167868fec86ba4ce55bde69ac1c24 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -41,6 +41,22 @@
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void sweet_bootlog_stop(void);     /* osfmk/console/video_console.c: the -v boot log stops at the first frame */
++
++/*
++ * Debug: boot-arg sweetbootlog_keep=1 (with -v) keeps the boot log on the screen for the whole session. The GUI's swaps
++ * are accepted and completed as usual, only never scanned out, so the console framebuffer the boot log draws into stays
++ * what the panel shows (watching an iOS bring-up whose GUI hangs or crash-loops).
++ */
++static bool
++sweet_bootlog_keep(void)
++{
++	static int keep = -1;
++	if (keep < 0) {
++		int v = 0;
++		keep = PE_parse_boot_argn("sweetbootlog_keep", &v, sizeof(v)) && v != 0;
++	}
++	return keep != 0;
++}
+ extern "C" void (*sweet_fb_panic_hook)(void);   /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */
+@@ -1087,7 +1103,7 @@ AppleCLCD::swapFired(OSObject *owner, IOTimerEventSource *)
+ 	IOLockUnlock(fb->fLock);
+ 
+ 	fb->quietConsole();
+-	if (fb->zcPresent(fb->fEarlyRec, get32(fb->fEarlyRec, 0x104))) {
++	if (!sweet_bootlog_keep() && fb->zcPresent(fb->fEarlyRec, get32(fb->fEarlyRec, 0x104))) {
+ 		sweet_hold_release(taken);      /* zcPresent holds the surface itself until its frame latched */
+ 		fb->latchWatch();
+ 		return;
+@@ -3228,6 +3244,10 @@ AppleCLCD::presentScaled(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
+ void
+ AppleCLCD::quietConsole(void)
+ {
++	if (!fConsolePaused && sweet_bootlog_keep()) {
++		fConsolePaused = true;  /* the boot log keeps drawing; present() shows nothing of the GUI */
++		return;
++	}
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
+ 		sweet_bootlog_stop();
+@@ -3247,6 +3267,9 @@ AppleCLCD::present(const uint8_t *rec)
+ 
+ 	fCurSwapID = get32(rec, 0x50);
+ 	quietConsole();
++	if (sweet_bootlog_keep()) {
++		return;         /* sweetbootlog_keep: the swap completes, the boot log stays on the panel */
++	}
+ 
+ 	if (fZc && zcPresent(rec, mask)) {
+ 		fEmptyBlackArmed = false;

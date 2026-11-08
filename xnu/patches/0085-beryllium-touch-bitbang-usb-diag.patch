@@ -1,0 +1,273 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -104,7 +104,7 @@
+ 
+ static struct {
+ 	vm_offset_t se, gcc, gpio;
+-	bool started, dead, probing;
++	bool started, dead, probing, bitbang;
+ 	int kind, irq_hint;
+ 	uint32_t irq_status, irq_last, active;
+ 	unsigned sent, got;
+@@ -331,6 +331,143 @@
+ 		    addr, nr ? "read" : "write", nr ? nr : nt, stretch ? 1u : 0u,
+ 		    err, st.irq_last, st.irq_status, st.sent, st.got,
+ 		    touch_rd(st.se, SE_STATUS));
++	}
++	return err;
++}
++
++/*
++ * Poco F1: QUP firmware runs SE14 in GSI-only mode (GENI_IF_DISABLE_RO
++ * FIFO_IF_DISABLE; Linux drives it through GPI DMA). Without a GPI driver
++ * the bus is bit-banged on its own pins as plain GPIOs: open drain by
++ * switching output enable (the board pulls SDA/SCL up), ~100 kHz.
++ */
++#define BB_HALF_US 5u
++static void
++bb_line(unsigned pin, bool high)
++{
++	uint32_t off = TOUCH_GPIO_CFG(pin);
++	if (high) {
++		touch_wr(st.gpio, off, touch_rd(st.gpio, off) & ~0x200u);    /* release */
++	} else {
++		touch_wr(st.gpio, TOUCH_GPIO_IO(pin), touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & ~2u);
++		touch_wr(st.gpio, off, touch_rd(st.gpio, off) | 0x200u);     /* drive low */
++	}
++}
++
++static bool
++bb_get(unsigned pin)
++{
++	return touch_rd(st.gpio, TOUCH_GPIO_IO(pin)) & 1u;
++}
++
++static bool
++bb_scl_high(void)
++{
++	bb_line(tb->scl, true);
++	for (unsigned i = 0; i < 1000; ++i) {      /* clock stretching, <= 1 ms */
++		if (bb_get(tb->scl)) {
++			delay(BB_HALF_US);
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static bool
++bb_start(void)
++{
++	bb_line(tb->sda, true);
++	if (!bb_scl_high()) {
++		return false;
++	}
++	bb_line(tb->sda, false);
++	delay(BB_HALF_US);
++	bb_line(tb->scl, false);
++	delay(BB_HALF_US);
++	return true;
++}
++
++static void
++bb_stop(void)
++{
++	bb_line(tb->sda, false);
++	delay(BB_HALF_US);
++	(void)bb_scl_high();
++	bb_line(tb->sda, true);
++	delay(BB_HALF_US);
++}
++
++/* Returns 0 on ACK, ENXIO on NACK, ETIMEDOUT if SCL is held low. */
++static int
++bb_write(uint8_t v)
++{
++	for (int b = 7; b >= 0; --b) {
++		bb_line(tb->sda, (v >> b) & 1u);
++		delay(BB_HALF_US);
++		if (!bb_scl_high()) {
++			return ETIMEDOUT;
++		}
++		bb_line(tb->scl, false);
++	}
++	bb_line(tb->sda, true);
++	delay(BB_HALF_US);
++	if (!bb_scl_high()) {
++		return ETIMEDOUT;
++	}
++	bool nack = bb_get(tb->sda);
++	bb_line(tb->scl, false);
++	delay(BB_HALF_US);
++	return nack ? ENXIO : 0;
++}
++
++static int
++bb_read(uint8_t *v, bool ack)
++{
++	uint8_t x = 0;
++	bb_line(tb->sda, true);
++	for (int b = 7; b >= 0; --b) {
++		delay(BB_HALF_US);
++		if (!bb_scl_high()) {
++			return ETIMEDOUT;
++		}
++		x |= (uint8_t)(bb_get(tb->sda) << b);
++		bb_line(tb->scl, false);
++	}
++	bb_line(tb->sda, !ack);
++	delay(BB_HALF_US);
++	if (!bb_scl_high()) {
++		return ETIMEDOUT;
++	}
++	bb_line(tb->scl, false);
++	bb_line(tb->sda, true);
++	*v = x;
++	return 0;
++}
++
++static int
++bb_xfer(uint8_t addr, const uint8_t *reg, unsigned nreg, uint8_t *buf, unsigned len)
++{
++	int err = bb_start() ? 0 : ETIMEDOUT;
++	if (!err) {
++		err = bb_write((uint8_t)(addr << 1));
++	}
++	for (unsigned i = 0; !err && i < nreg; ++i) {
++		err = bb_write(reg[i]);
++	}
++	if (!err && len) {
++		err = bb_start() ? 0 : ETIMEDOUT;         /* repeated START */
++		if (!err) {
++			err = bb_write((uint8_t)(addr << 1) | 1u);
++		}
++		for (unsigned i = 0; !err && i < len; ++i) {
++			err = bb_read(&buf[i], i + 1 < len);
++		}
++	}
++	bb_stop();
++	if (st.probing) {
++		printf("SWEET TOUCH: bb addr=%#x reg=%#x len=%u err=%d sda=%d scl=%d\n",
++		    addr, nreg ? reg[0] : 0, len, err, bb_get(tb->sda), bb_get(tb->scl));
+ 	}
+ 	return err;
+ }
+@@ -338,6 +475,10 @@
+ static int
+ touch_read(uint8_t addr, uint16_t reg, bool wide, uint8_t *buf, unsigned len)
+ {
++	if (st.bitbang) {
++		uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
++		return bb_xfer(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u, buf, len);
++	}
+ 	uint8_t ptr[2] = {(uint8_t)(reg >> 8), (uint8_t)reg};
+ 	int err = touch_msg(addr, wide ? ptr : ptr + 1, wide ? 2u : 1u,
+ 	    NULL, 0, true);
+@@ -591,8 +732,18 @@
+ 	    tb->irq, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)));
+ 	touch_gpio(tb->irq, 0, 1, 0, false, false);       /* input, pull-down (rising IRQ) */
+-	touch_gpio(tb->sda, tb->mux, 0, 0, false, false); /* qup14, 2 mA, no pull */
+-	touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
++	if (st.bitbang) {
++		/* GPIO function, inputs (released) until a bit is driven low */
++		touch_gpio(tb->sda, 0, 0, 0, false, false);
++		touch_gpio(tb->scl, 0, 0, 0, false, false);
++		/* Latch rising edges of the IRQ line in the TLMM status bit
++		 * (RAW_STATUS_EN, edge, active high) without routing it to the GIC. */
++		touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 8u, (1u << 4) | (1u << 2) | (1u << 1));
++		touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 0xcu, 0);
++	} else {
++		touch_gpio(tb->sda, tb->mux, 0, 0, false, false); /* qup14, 2 mA, no pull */
++		touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
++	}
+ 	touch_gpio(tb->rst, 0, 0, 0, true, true);         /* reset released (pin high) */
+ 	touch_wait(100);
+ 	st.probing = true;
+@@ -694,15 +845,22 @@
+ 		printf("SWEET TOUCH: MMIO mapping failed\n");
+ 		goto out;
+ 	}
+-	if (!touch_clocks() || !touch_se_init()) {
+-		goto out;
+-	}
+ 	if (!tb->rpmh_l11c) {
++		uint32_t ifdis = touch_rd(st.se, 0x64), fw = touch_rd(st.se, SE_FW);
++		st.bitbang = (ifdis & 1u) != 0;
++		printf("SWEET TOUCH: %s fw=%#x if-disable=%#x -> %s\n", tb->name, fw, ifdis,
++		    st.bitbang ? "GSI-only SE, bit-banged I2C on the GPIOs" : "FIFO I2C");
++		if (!st.bitbang && (!touch_clocks() || !touch_se_init())) {
++			goto out;
++		}
+ 		if (!touch_beryllium_start()) {
+ 			goto out;
+ 		}
+ 		goto selected;
+ 	}
++	if (!touch_clocks() || !touch_se_init()) {
++		goto out;
++	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+@@ -752,6 +910,13 @@
+ 		/* sweet's IRQ lines idle high (low = report pending); NT36672A pulses high. */
+ 		bool irq_level = touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u;
+ 		bool pending = st.kind == TOUCH_NVT ? irq_level : !irq_level;
++		if (st.bitbang) {
++			/* NT36672A pulses its IRQ: use the TLMM edge latch */
++			pending = touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 0xcu) & 1u;
++			if (pending) {
++				touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 0xcu, 0);
++			}
++		}
+ 		if (!st.irq_hint || st.active || pending || (++ticks % 10u) == 0) {
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
+ 			    st.kind == TOUCH_NVT ? touch_novatek() : touch_focaltech();
+@@ -785,6 +950,7 @@
+ 	st.started = true;
+ 	if (sweet_board_beryllium()) {
+ 		tb = &touch_beryllium;
++		st.irq_hint = 1; /* bit-banged reads are slow: only on IRQ edges or while touched */
+ 	}
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -273,7 +273,7 @@
+ 	dwc_wr(DEPCMDPAR1(ep), p1);
+ 	dwc_wr(DEPCMDPAR2(ep), p2);
+ 	dwc_wr(DEPCMD(ep), cmd | DEPCMD_CMDACT);
+-	for (int i = 0; i < 1000; i++) {
++	for (int i = 0; i < 50000; i++) {          /* 50 ms: DWC3 3.00a can be slow */
+ 		uint32_t v = dwc_rd(DEPCMD(ep));
+ 		if (!(v & DEPCMD_CMDACT)) {
+ 			uint32_t status = (v >> 12) & 0xf;
+@@ -285,7 +285,8 @@
+ 		}
+ 		delay(1);
+ 	}
+-	printf("SWEET USB: ep%u cmd 0x%x timeout\n", ep, cmd & 0xf);
++	printf("SWEET USB: ep%u cmd 0x%x timeout, DEPCMD 0x%08x DSTS 0x%08x GSTS 0x%08x\n", ep, cmd & 0xf,
++	    dwc_rd(DEPCMD(ep)), dwc_rd(DSTS), dwc_rd(0xc118));
+ 	return -1;
+ }
+ 
+@@ -884,11 +885,11 @@
+ 	 * that nobody started; endpoint commands then time out. Keep ABL's
+ 	 * GCTL (bus clock). No change on sweet, whose GCTL survives the reset.
+ 	 */
+-	if (dwc_rd(GCTL) != gctl_abl) {
+-		dwc_wr(GCTL, gctl_abl);
+-		printf("SWEET USB: GCTL restored to 0x%08x (now 0x%08x), GUSB3PIPECTL 0x%08x\n",
+-		    gctl_abl, dwc_rd(GCTL), dwc_rd(0xc2c0));
+-	}
++	uint32_t gctl_rst = dwc_rd(GCTL);
++	/* Bus clock for the controller RAM (RAMCLKSEL 7:6 = 0) whatever reset left. */
++	dwc_wr(GCTL, gctl_abl & ~(3u << 6));
++	printf("SWEET USB: GCTL before reset 0x%08x, after 0x%08x, now 0x%08x; GUSB3PIPECTL 0x%08x GUSB2PHYCFG 0x%08x GUCTL 0x%08x GSTS 0x%08x\n",
++	    gctl_abl, gctl_rst, dwc_rd(GCTL), dwc_rd(0xc2c0), dwc_rd(0xc200), dwc_rd(0xc12c), dwc_rd(0xc118));
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));
+ 	dwc_wr(GEVNTADRHI, (uint32_t)((ud.dma_pa + UD_EVT) >> 32));

@@ -1,0 +1,342 @@
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+index 5765c18..04b6caa 100644
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -91,8 +91,13 @@ struct sweet_gem {
+ 	uint32_t                  lastFence;    /* last submission that referenced the BO */
+ 	uint32_t                  lastWrite;    /* last one that wrote it */
+ 	bool                      submitted;    /* SET_IOVA is refused after the first submit */
++	IOMemoryMap              *alias;        /* SBO_IN_WRITABLE_ALIAS: RW CPU mapping in fTask of the pages of md (patch 0214) */
+ };
+ 
++/* Boot-arg sweetgpualias=0 turns the writable alias of client-memory surfaces off (default on). */
++static bool gSboAlias = true;
++#define ALIAS_RANGES_MAX        4096    /* physical segments of one alias (merged): 64 MiB of scattered 16 KiB pages */
++
+ class SweetAdreno630 : public IOService {
+ 	OSDeclareDefaultStructors(SweetAdreno630);
+ };
+@@ -122,6 +127,7 @@ class SweetAdrenoUserClient : public IOUserClient {
+ 	IOReturn submit(struct sweet_msm_gem_submit *r);
+ 	IOReturn waitFenceCall(struct sweet_msm_wait_fence *r);
+ 	IOReturn surfaceBo(struct sweet_gpu_surface_bo *r);
++	IOReturn aliasGem(struct sweet_gem *g, struct sweet_gpu_surface_bo *r);
+ 	IOReturn boSync(struct sweet_gpu_bo_sync *r);
+ 
+ public:
+@@ -191,12 +197,18 @@ SweetAdrenoPublish(void)
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("sweetgpuuc", &agx, sizeof(agx));
++	{
++		uint32_t al = 1;
++		(void)PE_parse_boot_argn("sweetgpualias", &al, sizeof(al));
++		gSboAlias = al != 0;
++	}
+ 	SweetAdreno630 *svc = OSTypeAlloc(SweetAdreno630);
+ 	if (svc != NULL && svc->init()) {
+ 		svc->setName(SWEET_GPU_SERVICE_NAME);
+ 		svc->setProperty(kIOUserClientClassKey, agx ? "AGXDeviceUserClient" : "SweetAdrenoUserClient");
+ 		svc->setProperty("SweetGPUABIVersion", (uint64_t)SWEET_GPU_ABI_VERSION, 32);
+ 		svc->setProperty("SweetGPUChipID", (uint64_t)0x06030001, 32);
++		svc->setProperty("SweetGPUABIMinor", (uint64_t)2, 32);
+ 		IOService *platform = IOService::getPlatform();
+ 		if (platform != NULL && svc->attach(platform)) {
+ 			svc->registerService();
+@@ -391,6 +403,16 @@ SweetAdrenoUserClient::releaseGem(struct sweet_gem *g)
+ 		sweet_gpu_vm_unmap(g->iova, g->size);
+ 		sweet_gpu_iova_free(g->iova, g->vaLen);
+ 	}
++	if (g->alias != NULL) {
++		/*
++		 * The CPU alias goes first, always (also on the leak path above, which only keeps the GPU's pages alive): it
++		 * is valid only while this BO holds the surface, whose prepare() keeps the pages wired. unmap() removes the
++		 * range from the task now; the map object then drops the physical descriptor it owns.
++		 */
++		g->alias->unmap();
++		g->alias->release();
++		g->alias = NULL;
++	}
+ 	OSSafeReleaseNULL(g->md);
+ 	g->buf = NULL;
+ 	if (g->surface != NULL) {
+@@ -747,11 +769,107 @@ SweetAdrenoUserClient::waitFenceCall(struct sweet_msm_wait_fence *r)
+ 	return ret;
+ }
+ 
++/*
++ * Writable CPU alias of a client-memory (wrapped) surface BO (patch 0214; lock held).
++ *
++ * Why the surface is read-only to begin with: sweet_surface_use_task_memory() wraps the owner's range first as
++ * kIODirectionInOut and, if prepare() refuses (the owner's mapping has no write permission: max_prot is read-only, e.g. a
++ * read-only remap or file-backed page), again as kIODirectionOut. A kIODirectionOut descriptor makes a read-only memory
++ * entry and IOMemoryMap clamps every mapping to it (prot &= entry prot), so the mapping the render server gets from
++ * createMappingInTask() (SweetSurfaceRef) and our own kernelMap are VM_PROT_READ with max_prot READ: neither the CPU nor
++ * vm_protect can write them. Nothing to do with IOSurface lock flags or kIOSurfaceIsGlobal (not looked at anywhere).
++ *
++ * The alias is a SECOND descriptor over the same wired pages, built from their physical segments with kIODirectionInOut,
++ * mapped RW with the default (write-back) cache attribute into the calling task. It is as safe as the kernel's own
++ * CPU alias (SweetSurface::kernelMap) of the same range, whose lifetime rule it copies: it exists only while this BO exists,
++ * and this BO holds the surface, whose prepare() keeps the pages wired. releaseGem() unmaps it before it lets go of the
++ * surface, so no mapping can outlive the wiring. The GPU mapping of the BO stays read-only (never writable: an asynchronous
++ * writer cannot be stopped when the owner dies; the CPU writes only when its thread asks).
++ * Cache: the alias and kernelMap are both write-back, physically tagged caches see one line per address, so BO_SYNC
++ * (dc civac over g->kva) also cleans lines dirtied through the alias. kva is required for that, hence no alias without it.
++ */
++IOReturn
++SweetAdrenoUserClient::aliasGem(struct sweet_gem *g, struct sweet_gpu_surface_bo *r)
++{
++	if (g->alias == NULL) {
++		if (fClosed || fTask == NULL) {
++			return kIOReturnNotAttached;
++		}
++		if (g->surface == NULL || !g->surface->wrapped || g->md == NULL) {
++			return kIOReturnUnsupported;
++		}
++		if (g->kva == NULL) {
++			return kIOReturnNoMemory;               /* BO_SYNC could not reach CPU writes made through the alias */
++		}
++		IOAddressRange *ranges = (IOAddressRange *)IOMallocZeroData(sizeof(IOAddressRange) * ALIAS_RANGES_MAX);
++		if (ranges == NULL) {
++			return kIOReturnNoMemory;
++		}
++		uint32_t n = 0;
++		IOReturn ret = kIOReturnSuccess;
++		for (uint64_t off = 0; off < g->size && ret == kIOReturnSuccess;) {
++			IOByteCount len = 0;
++			addr64_t pa = g->md->getPhysicalSegment(off, &len, kIOMemoryMapperNone);
++			if (pa == 0 || len == 0 || (pa & PAGE_MASK) != 0) {
++				ret = kIOReturnVMError;
++			} else if (len > g->size - off) {
++				len = (IOByteCount)(g->size - off);
++			}
++			if (ret != kIOReturnSuccess) {
++				break;
++			}
++			if (n > 0 && ranges[n - 1].address + ranges[n - 1].length == pa) {
++				ranges[n - 1].length += len;
++			} else if (n < ALIAS_RANGES_MAX) {
++				ranges[n].address = pa;
++				ranges[n].length = len;
++				n++;
++			} else {
++				ret = kIOReturnNoSpace;
++			}
++			off += len;
++		}
++		IOMemoryDescriptor *amd = NULL;
++		if (ret == kIOReturnSuccess) {
++			amd = IOMemoryDescriptor::withAddressRanges(ranges, n, kIODirectionInOut | kIOMemoryTypePhysical64, NULL);
++			if (amd == NULL) {
++				ret = kIOReturnNoMemory;
++			}
++		}
++		IOFreeData(ranges, sizeof(IOAddressRange) * ALIAS_RANGES_MAX);
++		if (ret != kIOReturnSuccess) {
++			IOLog("SWEET GPU: writable alias of BO iova %#llx: cannot describe the pages (%#x)\n", g->iova, ret);
++			return ret;
++		}
++		IOMemoryMap *m = amd->createMappingInTask(fTask, 0, kIOMapAnywhere | kIOMapDefaultCache);
++		amd->release();                         /* the map keeps the descriptor */
++		if (m == NULL || m->getLength() != g->size) {
++			IOLog("SWEET GPU: writable alias of BO iova %#llx: cannot map %llu bytes into pid %d\n", g->iova, g->size, fPid);
++			if (m != NULL) {
++				m->unmap();
++				m->release();
++			}
++			return kIOReturnVMError;
++		}
++		g->alias = m;
++		static uint32_t told;
++		if (told++ < 8) {
++			IOLog("SWEET GPU: writable alias of surface BO iova %#llx: %llu bytes at %#llx in pid %d (%u segments)\n",
++			    g->iova, g->size, (uint64_t)m->getVirtualAddress(), fPid, n);
++		}
++	}
++	r->alias_addr = (uint64_t)g->alias->getVirtualAddress();
++	r->alias_size = g->size;
++	r->flags |= SWEET_GPU_SBO_ALIAS;
++	return kIOReturnSuccess;
++}
++
+ IOReturn
+ SweetAdrenoUserClient::surfaceBo(struct sweet_gpu_surface_bo *r)
+ {
+ 	SweetSurface *s = sweet_surface_copy(r->surface_id);
+ 	IOReturn ret;
++	const bool wantAlias = (r->flags & SWEET_GPU_SBO_IN_WRITABLE_ALIAS) != 0;
+ 
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+@@ -760,6 +878,14 @@ SweetAdrenoUserClient::surfaceBo(struct sweet_gpu_surface_bo *r)
+ 		s->release();
+ 		return kIOReturnUnsupported;
+ 	}
++	if (wantAlias && (!gSboAlias || !s->wrapped)) {
++		s->release();                           /* kernel-allocated surfaces are already CPU-mappable RW (clientMemoryForType) */
++		return kIOReturnUnsupported;
++	}
++	if (wantAlias && r->handle == SWEET_GPU_DESCRIBE_ONLY) {
++		s->release();
++		return kIOReturnBadArgument;
++	}
+ 	/*
+ 	 * Client-memory (wrapped) surfaces: the memory is another task's, wired by IOMemoryDescriptor::prepare() for as long
+ 	 * as the SweetSurface lives (sweet_surface_use_task_memory); this BO holds a reference to the surface, so the pages
+@@ -817,22 +943,20 @@ SweetAdrenoUserClient::surfaceBo(struct sweet_gpu_surface_bo *r)
+ 	if (!sweet_gpu_ready()) {
+ 		ret = kIOReturnNotReady;
+ 	} else {
++		struct sweet_gem *bo = NULL;
++		bool fresh = false;
+ 		/* Idempotent: the same surface in the same connection is the same BO (one mapping per surface, not per frame). */
+ 		for (uint32_t i = 0; i < GEM_MAX; i++) {
+ 			if (fGems[i].md != NULL && fGems[i].surface == s) {
++				bo = &fGems[i];
+ 				r->handle = i + 1;
+-				r->iova = fGems[i].iova;
++				r->iova = bo->iova;
+ 				r->flags |= SWEET_GPU_SBO_EXISTING;
+-				if ((r->flags & SWEET_GPU_SBO_IN_SYNC) && fGems[i].kva != NULL) {
+-					sweet_gpu_cache_sync(fGems[i].kva, (size_t)fGems[i].size);
+-				}
+-				r->flags &= ~(uint32_t)SWEET_GPU_SBO_IN_SYNC;
+-				sweet_gpu_unlock();
+-				s->release();
+-				return kIOReturnSuccess;
++				ret = kIOReturnSuccess;
++				break;
+ 			}
+ 		}
+-		for (uint32_t n = 0; n < GEM_MAX; n++) {
++		for (uint32_t n = 0; bo == NULL && n < GEM_MAX; n++) {
+ 			uint32_t i = (fNextGem + n) % GEM_MAX;
+ 			if (fGems[i].md == NULL) {
+ 				struct sweet_gem *g = &fGems[i];
+@@ -850,15 +974,27 @@ SweetAdrenoUserClient::surfaceBo(struct sweet_gpu_surface_bo *r)
+ 				} else {
+ 					fNextGem = i + 1;
+ 					r->iova = g->iova;
+-					if ((r->flags & SWEET_GPU_SBO_IN_SYNC) && g->kva != NULL) {
+-						sweet_gpu_cache_sync(g->kva, (size_t)g->size);
+-					}
+-					r->flags &= ~(uint32_t)SWEET_GPU_SBO_IN_SYNC;
++					bo = g;
++					fresh = true;
+ 					s = NULL;
+ 				}
+ 				break;
+ 			}
+ 		}
++		if (bo != NULL) {
++			if (wantAlias) {
++				ret = aliasGem(bo, r);
++				if (ret != kIOReturnSuccess && fresh) {
++					releaseGem(bo);         /* do not leave a BO behind whose handle the caller never got */
++					r->handle = 0;
++					r->iova = 0;
++				}
++			}
++			if (ret == kIOReturnSuccess && (r->flags & SWEET_GPU_SBO_IN_SYNC) && bo->kva != NULL) {
++				sweet_gpu_cache_sync(bo->kva, (size_t)bo->size);
++			}
++			r->flags &= ~(uint32_t)SWEET_GPU_SBO_IN_SYNC;
++		}
+ 	}
+ 	sweet_gpu_unlock();
+ 	if (s != NULL) {
+@@ -880,6 +1016,8 @@ SweetAdrenoUserClient::boSync(struct sweet_gpu_bo_sync *r)
+ 		} else if (r->offset > g->size || r->size > g->size - r->offset) {
+ 			ret = kIOReturnBadArgument;
+ 		} else if (g->surface != NULL && sweet_surface_gpu_wrote(g->surface)) {
++			/* (0214: a writable-alias BO is a wrapped surface, never pooled, so it never takes this shortcut: its
++			 * BO_SYNC is always the clean+invalidate below, which covers CPU stores made through the alias.) */
+ 			ret = kIOReturnSuccess;         /* pool surface already on the panel path: GPU-only, no CPU cache involved (0212) */
+ 		} else {
+ 			uint64_t len = r->size ? r->size : g->size - r->offset;
+@@ -1052,13 +1190,13 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		uint64_t v = 0;
+ 		sweet_gpu_lock();
+ 		r.info.abi_version = SWEET_GPU_ABI_VERSION;
+-		r.info.flags = sweet_gpu_ready() ? 1u : 2u;
++		r.info.flags = (sweet_gpu_ready() ? 1u : 2u) | (gSboAlias ? SWEET_GPU_INFO_CAP_SBO_ALIAS : 0u);
+ 		r.info.gpu_id = 630;
+ 		r.info.chip_id = 0x06030001;
+ 		r.info.va_start = sweet_gpu_param(SWEET_MSM_PARAM_VA_START, &v) ? v : 0;
+ 		r.info.va_size = sweet_gpu_param(SWEET_MSM_PARAM_VA_SIZE, &v) ? v : 0;
+ 		r.info.last_fence = sweet_gpu_ready() ? sweet_gpu_fence_last() : 0;
+-		r.info.abi_minor = 1;
++		r.info.abi_minor = 2;
+ 		sweet_gpu_unlock();
+ 		outLen = sizeof(r.info);
+ 		break;
+@@ -1067,8 +1205,15 @@ SweetAdrenoUserClient::externalMethod(uint32_t selector, IOExternalMethodArgumen
+ 		if (in < SWEET_GPU_SURFACE_BO_V1_SIZE) {
+ 			return kIOReturnBadArgument;
+ 		}
++		if ((r.surface.flags & SWEET_GPU_SBO_IN_WRITABLE_ALIAS) &&
++		    (in < SWEET_GPU_SURFACE_BO_MINOR2_SIZE || args->structureOutputSize < SWEET_GPU_SURFACE_BO_MINOR2_SIZE)) {
++			return kIOReturnBadArgument;    /* the alias address comes back in a minor 2 field */
++		}
+ 		ret = surfaceBo(&r.surface);
+-		outLen = args->structureOutputSize >= sizeof(r.surface) ? (uint32_t)sizeof(r.surface) : SWEET_GPU_SURFACE_BO_V1_SIZE;
++		/* the answer is as long as the caller's struct: minor 2 (128), minor 1 (112), minor 0 (48) */
++		outLen = args->structureOutputSize >= SWEET_GPU_SURFACE_BO_MINOR2_SIZE ? (uint32_t)SWEET_GPU_SURFACE_BO_MINOR2_SIZE :
++		    (args->structureOutputSize >= SWEET_GPU_SURFACE_BO_MINOR1_SIZE ? (uint32_t)SWEET_GPU_SURFACE_BO_MINOR1_SIZE :
++		    (uint32_t)SWEET_GPU_SURFACE_BO_V1_SIZE);
+ 		break;
+ 	case SWEET_GPU_SEL_DEBUG:
+ 		sweet_gpu_lock();
+diff --git a/iokit/Kernel/arm/SweetAdrenoABI.h b/iokit/Kernel/arm/SweetAdrenoABI.h
+index a7ae2f7..da7ca70 100644
+--- a/iokit/Kernel/arm/SweetAdrenoABI.h
++++ b/iokit/Kernel/arm/SweetAdrenoABI.h
+@@ -166,8 +166,12 @@ struct sweet_gpu_info {
+ 	uint64_t va_start;      /* GPU address range the kernel places BOs in */
+ 	uint64_t va_size;
+ 	uint32_t last_fence;    /* last submitted sequence number */
+-	uint32_t abi_minor;     /* 1: SURFACE_BO accepts client-memory surfaces (read-only mappings), is idempotent, returns planes */
++	uint32_t abi_minor;     /* 1: SURFACE_BO accepts client-memory surfaces (read-only mappings), is idempotent, returns planes
++	                         * 2: SURFACE_BO can make a writable CPU alias of a client-memory surface (SBO_IN_WRITABLE_ALIAS),
++	                         *    see SWEET_GPU_INFO_CAP_SBO_ALIAS */
+ };
++/* INFO.flags capability bits (bit0/bit1 above are ready/lost; capabilities start at bit 4). */
++#define SWEET_GPU_INFO_CAP_SBO_ALIAS    0x10    /* minor 2: SBO_IN_WRITABLE_ALIAS works (absent when boot-arg sweetgpualias=0) */
+ 
+ /* IOSurface memory as a BO: the pages of the surface (pixels from byte 0 of its memory) are entered into the
+  * GPU address space. On input handle = SWEET_GPU_DESCRIBE_ONLY asks only for the geometry (no BO is made). */
+@@ -175,11 +179,22 @@ struct sweet_gpu_info {
+ /* Minor 1 (INFO.abi_minor >= 1) added everything after `planes`; a caller may pass/accept only the first
+  * SWEET_GPU_SURFACE_BO_V1_SIZE bytes (minor 0 layout). */
+ #define SWEET_GPU_SURFACE_BO_V1_SIZE    48
++/* Minor 2 appended `alias_addr`/`alias_size`. A minor 1 caller (112 bytes in, 112 bytes out) is answered with 112 bytes. */
++#define SWEET_GPU_SURFACE_BO_MINOR1_SIZE 112
++#define SWEET_GPU_SURFACE_BO_MINOR2_SIZE 128
+ #define SWEET_GPU_SBO_IN_SYNC           0x1     /* in flags: clean+invalidate the CPU alias of the whole BO before returning */
+ #define SWEET_GPU_SBO_READONLY          0x1     /* out flags: GPU mapping is read-only (client-memory surface) */
+ #define SWEET_GPU_SBO_CPU_CACHEABLE     0x2     /* out: the CPU maps it cacheable: BO_SYNC after CPU writes / before CPU reads */
+ #define SWEET_GPU_SBO_WRAPPED           0x4     /* out: the surface is client (another process') memory, pinned */
+ #define SWEET_GPU_SBO_EXISTING          0x8     /* out: this surface already had a BO for this connection: same handle returned */
++/* Minor 2. Input bit (in flags, needs >= 128 input bytes; wrapped surfaces only; kIOReturnUnsupported otherwise or when
++ * sweetgpualias=0): also map the pages of the BO READ-WRITE, cacheable, into the calling task and return the address in
++ * alias_addr. The mapping lives exactly as long as the BO (GEM_CLOSE or connection close unmaps it; do not munmap it
++ * yourself) and is the CPU's door to a surface whose own mapping is read-only. The GPU mapping stays read-only. Idempotent.
++ * After writing through it call BO_SYNC on the written range (clean to the point of coherency) before the surface is
++ * used by the GPU, by CoreAnimation's consumer or by the display. */
++#define SWEET_GPU_SBO_IN_WRITABLE_ALIAS 0x2     /* in flags */
++#define SWEET_GPU_SBO_ALIAS             0x10    /* out: alias_addr/alias_size are valid (a RW CPU mapping exists) */
+ struct sweet_gpu_surface_plane {
+ 	uint32_t offset;        /* byte offset of the plane in the BO (includes the client-memory start delta) */
+ 	uint32_t stride;        /* bytes per row of the plane */
+@@ -203,7 +218,11 @@ struct sweet_gpu_surface_bo {
+ 	uint32_t ubwc;          /* out: 0 = no UBWC (IOSurfaces here are never compressed) */
+ 	uint32_t reserved;
+ 	struct sweet_gpu_surface_plane plane[3];        /* out: first three planes (planes == 0: plane 0 describes the surface) */
++	/* ---- minor 2 ---- */
++	uint64_t alias_addr;    /* out: SBO_ALIAS: address in the calling task of byte 0 of the BO (pixel (0,0) is at + offset) */
++	uint64_t alias_size;    /* out: SBO_ALIAS: bytes mapped (== size) */
+ };
++_Static_assert(sizeof(struct sweet_gpu_surface_bo) == SWEET_GPU_SURFACE_BO_MINOR2_SIZE, "sweet_gpu_surface_bo is 128 bytes (minor 2)");
+ 
+ struct sweet_gpu_bo_sync {
+ 	uint32_t handle;

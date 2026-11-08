@@ -1,0 +1,110 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 228ae19675d283b42c298d4a4ac46665a95417d3..fdaebe30a6e3c89b491af9daa5702cdcf3604128 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -112,6 +112,7 @@ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2f409f1617212a6e6c42ca8f96c6eadf18b46a9
+--- /dev/null
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -0,0 +1,72 @@
++/*
++ * Poco F1 (SDM845): run both CPU clusters at their top cpufreq-hw state.
++ * XNU has no cpufreq driver, so the cores otherwise stay where ABL left
++ * them, and everything (CoreAnimation renders on the CPU) runs slow.
++ * SDM845 "qcom,cpufreq-hw" (Linux qcom-cpufreq-hw.c, v1 register layout,
++ * as ios-topaz patch 0094 for SM6225): freq-domain0 (A55) 0x17d43000,
++ * freq-domain1 (A75) 0x17d45800; LUT at +0x110 (32-byte rows, bits 31:30
++ * clock source, 7:0 L-value x 19.2 MHz), PERF_STATE at +0x920.
++ * The firmware (OSM/LMh) still applies its voltage and thermal limits.
++ * Boot-arg sweetcpufreq=0 leaves the frequencies alone.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_board.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_cpufreq_max(void);
++
++#define CPUFREQ_FREQ_LUT        0x110u
++#define CPUFREQ_LUT_ROW         0x20u
++#define CPUFREQ_PERF_STATE      0x920u
++#define CPUFREQ_LUT_MAX         40u
++
++static void
++cpufreq_domain_max(const char *name, vm_offset_t pa)
++{
++	vm_offset_t b = ml_io_map(pa, 0x1400);
++	if (b == 0) {
++		printf("SWEET CPUFREQ: %s: map failed\n", name);
++		return;
++	}
++	uint32_t best = 0, bestKHz = 0, prevKHz = 0, n = 0;
++	for (uint32_t i = 0; i < CPUFREQ_LUT_MAX; i++) {
++		uint32_t v = *(volatile uint32_t *)(b + CPUFREQ_FREQ_LUT + i * CPUFREQ_LUT_ROW);
++		uint32_t src = (v >> 30) & 3u, lval = v & 0xffu;
++		uint32_t khz = src ? 19200u * lval : 300000u;
++		if (i > 0 && khz == prevKHz) {
++			break;          /* the LUT repeats its last entry */
++		}
++		prevKHz = khz;
++		n++;
++		if (khz > bestKHz) {
++			bestKHz = khz;
++			best = i;
++		}
++	}
++	uint32_t old = *(volatile uint32_t *)(b + CPUFREQ_PERF_STATE);
++	uint32_t oldv = old < CPUFREQ_LUT_MAX ?
++	    *(volatile uint32_t *)(b + CPUFREQ_FREQ_LUT + old * CPUFREQ_LUT_ROW) : 0;
++	uint32_t oldKHz = ((oldv >> 30) & 3u) ? 19200u * (oldv & 0xffu) : 300000u;
++	__asm__ volatile("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(b + CPUFREQ_PERF_STATE) = best;
++	__asm__ volatile("dsb sy" ::: "memory");
++	printf("SWEET CPUFREQ: %s: %u LUT states, perf state %u (%u MHz) -> %u (%u MHz)\n",
++	    name, n, old, oldKHz / 1000, best, bestKHz / 1000);
++}
++
++void
++sweet_cpufreq_max(void)
++{
++	int on = 1;
++	PE_parse_boot_argn("sweetcpufreq", &on, sizeof(on));
++	if (!on || !sweet_board_beryllium()) {
++		return;
++	}
++	cpufreq_domain_max("silver (A55)", 0x17d43000u);
++	cpufreq_domain_max("gold (A75)", 0x17d45800u);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 9a78f8e8337692e9aa7c62d680248987ebe6949d..93d0db59b9b1916a03e0c924d08c68e4b7a4d0d4 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,7 @@ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_cpufreq_max(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -665,6 +666,7 @@ sweet_ufs_init(void)
+ 	sweet_log_start();
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
++	sweet_cpufreq_max();
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();

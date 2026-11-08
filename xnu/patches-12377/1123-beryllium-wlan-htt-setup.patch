@@ -1,0 +1,113 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -3819,7 +3819,16 @@
+ #define WCE_MEMBASE_PA          0x18800000ull   /* &wifi reg "membase" */
+ #define WCE_MEMBASE_LEN         0x250000u       /* through the CE wrap registers at 0x24c000 */
+ #define WCE_POOL_PA             0xe0100000ull
+-#define WCE_POOL_LEN            0x400000u       /* rings, buffers, then host memory from +1 MiB */
++#define WCE_POOL_LEN            0xc00000u       /* rings + buffers, host memory +1..4 MiB, HTT RX +4..12 MiB */
++#define WCE_HOSTMEM_END         0x400000u
++#define HTT_FRAG_OFF            0x400000u       /* frag desc bank: 1056 x 72 bytes */
++#define HTT_RXRING_OFF          0x420000u       /* RX ring: 2048 x le64 buffer addresses */
++#define HTT_ALLOC_IDX_OFF       0x424000u       /* the host's alloc index word (fw_idx_shadow_reg) */
++#define HTT_RXBUF_OFF           0x800000u       /* 2048 buffers of 2048 bytes */
++#define HTT_RX_RING_SIZE        2048u
++#define HTT_RX_BUF_SIZE         2048u
++#define HTT_FRAG_DESCS          1056u           /* max_num_pending_tx = TARGET_TLV_NUM_MSDU_DESC */
++#define HTT_FRAG_DESC_SIZE      72u             /* sizeof(struct htt_msdu_ext_desc_64) */
+ #define WCE_BASE(ce)            (0x240000u + (ce) * 0x1000u)    /* wcn3990_regs ce0..ce11_base_address */
+ #define WCE_RRI_LOW             0x24c004u       /* wcn3990_ce_regs ce_rri_low / high */
+ #define WCE_RRI_HIGH            0x24c008u
+@@ -4308,7 +4317,7 @@
+ 		uint64_t sz = (uint64_t)units * usize;
+ 		printf("SWEET IPC: wmi: memory request %u: id %u, %u units of %u bytes (info %#x) = %llu bytes\n",
+ 		    wce.nchunks, q[0], units, q[1], q[2], sz);
+-		if (sz == 0 || sz > WCE_POOL_LEN - off) {
++		if (sz == 0 || sz > WCE_HOSTMEM_END - off) {
+ 			wf_fail("memory request does not fit the pool", 0);
+ 			return;
+ 		}
+@@ -4391,6 +4400,61 @@
+ 	*n += 4u + len;
+ }
+ 
++/*
++ * The rest of ath10k_htt_setup() after the version exchange (64-bit variants, target_64bit): FRAG_DESC_BANK_CFG,
++ * the RX ring filled to HTT_RX_RING_FILL_LEVEL_DUAL_MAC (2047) with the alloc index word, RX_RING_CFG (all 16 rx
++ * flags, the htt_rx_desc_v2 offsets of wcn3990_rx_desc_ops) and AGGR_CFG v2 (64 / 3). The pool is zeroed, so the
++ * descriptors and every buffer's rx_attention word start at 0 as ath10k leaves them.
++ */
++static bool
++scan_htt_setup(void)
++{
++	uint8_t m[64];
++	/* FRAG_DESC_BANK_CFG: type, info 0, 1 bank, desc size 72, 4 x le64 bank base, 4 x {min, max} id, q_state */
++	memset(m, 0, sizeof(m));
++	m[0] = 6;
++	m[2] = 1;
++	m[3] = HTT_FRAG_DESC_SIZE;
++	uint64_t bank = WCE_POOL_PA + HTT_FRAG_OFF;
++	memcpy(m + 4, &bank, 8);
++	uint16_t maxid = HTT_FRAG_DESCS - 1;
++	memcpy(m + 36 + 2, &maxid, 2);          /* bank_id[0] = {0, 1055} */
++	m[60] = 1;                              /* q_state record_size HTT_TX_Q_STATE_ENTRY_SIZE, multiplier 0 */
++	if (!wce_send(4, wce.htt_eid, m, 64)) {
++		return false;
++	}
++	/* RX ring: buffer i at pool + 8 MiB + i * 2 KiB, 2047 posted, alloc index = 2047 */
++	uint64_t *ring = (uint64_t *)(wce.pool + HTT_RXRING_OFF);
++	for (uint32_t i = 0; i < HTT_RX_RING_SIZE; i++) {
++		ring[i] = i < HTT_RX_RING_SIZE - 1 ? WCE_POOL_PA + HTT_RXBUF_OFF + (uint64_t)i * HTT_RX_BUF_SIZE : 0;
++	}
++	*(volatile uint32_t *)(wce.pool + HTT_ALLOC_IDX_OFF) = HTT_RX_RING_SIZE - 1;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	/* RX_RING_CFG: type 2, 1 ring, rsvd; fw idx shadow paddr, ring paddr, len, bufsize, flags, idx init, offsets */
++	memset(m, 0, sizeof(m));
++	m[0] = 2;
++	m[1] = 1;
++	uint64_t idxpa = WCE_POOL_PA + HTT_ALLOC_IDX_OFF, ringpa = WCE_POOL_PA + HTT_RXRING_OFF;
++	memcpy(m + 4, &idxpa, 8);
++	memcpy(m + 12, &ringpa, 8);
++	uint16_t r16[4] = { HTT_RX_RING_SIZE, HTT_RX_BUF_SIZE, 0xffff, HTT_RX_RING_SIZE - 1 };   /* len in entries */
++	memcpy(m + 20, r16, 8);
++	/* mac80211_hdr, msdu_payload, ppdu_start, ppdu_end, mpdu_start, mpdu_end, msdu_start, msdu_end, attention, frag */
++	static const uint16_t offs[10] = { 74, 90, 27, 37, 4, 26, 7, 12, 1, 2 };
++	memcpy(m + 28, offs, 20);
++	if (!wce_send(4, wce.htt_eid, m, 48)) {
++		return false;
++	}
++	uint8_t ag[4] = { 5, 64, 3, 0 };        /* AGGR_CFG v2: max A-MPDU 64, max A-MSDU 3 */
++	if (!wce_send(4, wce.htt_eid, ag, 4)) {
++		return false;
++	}
++	printf("SWEET IPC: scan: HTT setup sent: frag bank %u x %u at %#llx, RX ring %u (%u posted) at %#llx, aggr 64/3\n",
++	    HTT_FRAG_DESCS, HTT_FRAG_DESC_SIZE, bank, HTT_RX_RING_SIZE, HTT_RX_RING_SIZE - 1, ringpa);
++	ipc_note(" htt setup;");
++	return true;
++}
++
+ /* the next command of the sequence once the WMI credit is back; false = nothing sent this time */
+ static bool
+ scan_step(void)
+@@ -4416,6 +4480,10 @@
+ 		}
+ 		if (!scan.htt_conf) {
+ 			printf("SWEET IPC: scan: no HTT VERSION_CONF in 3 s: continuing (scan results come over WMI)\n");
++		}
++		/* ath10k_htt_setup() stops when the version exchange failed: no setup without it */
++		if (scan.htt_conf && wce.htt_eid && !scan_htt_setup()) {
++			printf("SWEET IPC: scan: HTT setup not sent (CE4 ring full?): continuing without it\n");
+ 		}
+ 		scan.step++;
+ 		return true;
+@@ -4688,6 +4756,9 @@
+ static void
+ scan_htt(const uint8_t *pl, uint32_t plen)
+ {
++	if (plen >= 1) {
++		scan_tally(0x10000u | pl[0]);          /* HTT T2H message types, as 0x100xx in the event tally */
++	}
+ 	if (plen >= 4 && pl[0] == 0 && !scan.htt_conf) {
+ 		scan.htt_conf = true;
+ 		scan.htt_minor = pl[1];

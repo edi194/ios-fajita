@@ -1,0 +1,28 @@
+diff --git a/osfmk/vm/vm_map.c b/osfmk/vm/vm_map.c
+index fd9e108e2ba1450969d55fb00f9e2c69ba7c0b3e..f540f137afbd8250c8d81bb5f786351432c755e8 100644
+--- a/osfmk/vm/vm_map.c
++++ b/osfmk/vm/vm_map.c
+@@ -5932,7 +5932,23 @@ vm_map_protect(
+ 	}
+ 
+ 	vm_map_lock_ctx_set_preflight(ctx, ^kern_return_t (vm_map_lock_ctx_t vctx, vm_map_entry_t vme) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		vm_prot_t sweet_req = new_prot;
++		kern_return_t sweet_kr = vm_map_protect_preflight(vctx, vme, set_max, &new_prot /*in/out*/);
++		if (sweet_kr != KERN_SUCCESS) {
++			/* sweet: which vm_protect is refused and why (iOS 26 launchd died after MACH trap 14 kr=0x2) */
++			printf("SWEET VMPROT: %d[%s] 0x%llx-0x%llx req 0x%x%s refused 0x%x: entry 0x%llx-0x%llx prot 0x%x max 0x%x "
++			    "submap %d jit %d permanent %d csm %d nx-lock %d\n",
++			    proc_selfpid(), (get_bsdtask_info(current_task()) ? proc_name_address(get_bsdtask_info(current_task())) : "?"),
++			    (uint64_t)start, (uint64_t)end, sweet_req, set_max ? " (max)" : "", sweet_kr,
++			    (uint64_t)vme->vme_start, (uint64_t)vme->vme_end, vme->protection, vme->max_protection,
++			    vme->is_sub_map, vme->used_for_jit, vme->vme_permanent, vme->csm_associated,
++			    vctx->vmlc_map->map_disallow_new_exec);
++		}
++		return sweet_kr;
++#else
+ 		return vm_map_protect_preflight(vctx, vme, set_max, &new_prot /*in/out*/);
++#endif
+ 	});
+ 
+ 	/*

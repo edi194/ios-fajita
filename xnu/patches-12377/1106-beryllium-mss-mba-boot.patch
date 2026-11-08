@@ -1,0 +1,593 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 2ee8e565c4bfc011d374156cc0bd4ce436cdfc19..c03ee4c5c2fba56397b740727eaf8ff3e05a52e3 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -17,6 +17,10 @@
+  *      fsg, fsc, bluetooth), FAT16 walk of the modem and bluetooth partitions,
+  *      MBA / MPSS .mdt ELF segment table checked against the MSS carve-outs.
+  *      No SCM call, no MSS reset, no write to any partition.
++ *   4  MSS power-up and MBA boot (P3), needs sweetmss=1 too: AOSS QMP load_state, RPMh cx/mx/mss
++ *      votes, MSS clocks and resets, hyp-assign of the MBA/MPSS carve-outs (SCM), mba.mbn from the
++ *      modem partition into its carve-out, QDSP6 boot FSM, PBL and MBA status; stops at "MBA alive"
++ *      and tears everything down unless sweetmsskeep=1. Run only with the user present.
+  *
+  * Reference: docs/WIFI_BT_PLAN.md. Linux behaviour mirrored here:
+  * drivers/bluetooth/hci_qca.c (power pulses 0xc0 off / 0xfc on at 2400 and
+@@ -47,6 +51,10 @@ int wl_host_read(const char *part, uint64_t off, void *dst, uint64_t len);
+ #include <machine/atomic.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include <kern/kalloc.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <vm/vm_kern_xnu.h>
+ #include "sweet_board.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+@@ -919,6 +927,557 @@ wl_inventory(void)
+ 	printf("SWEET WLAN: inventory done\n");
+ }
+ 
++/* ---------------------------------------------------------------- stage 4: MSS power-up, MBA boot */
++
++/*
++ * P3 of docs/WIFI_BT_PLAN.md (docs/WIFI_IOS26.md 5.2): Linux qcom_q6v5_mss.c q6v5_mba_load() for
++ * "qcom,sdm845-mss-pil" (v6.6), stopping at "MBA alive" and, unless sweetmsskeep=1, undoing every
++ * step the way Linux's error path does. Needs sweetwlan=4 AND sweetmss=1: the first stage that makes
++ * TrustZone/hypervisor calls (hyp-assign of the MBA/MPSS carve-outs) and releases a remote processor
++ * from reset. Nothing is written to any partition; mba.mbn is read from the phone's own modem
++ * partition. Addresses: mainline sdm845.dtsi + sdm845-xiaomi-beryllium-common.dtsi carve-outs.
++ */
++#define MSS_QDSP6_PA            0x04080000u     /* "qdsp6", 0x408 bytes */
++#define MSS_RMB_PA              0x04180000u     /* "rmb", 0x48 bytes */
++#define MSS_AOSS_RESTART_PA     0x0c2b0000u     /* aoss_reset 0xc2a0000 + AOSS_CC_MSS_RESTART 0x10000 */
++#define MSS_PDC_RESET_PA        0x0b2e0000u     /* pdc_reset; sync reset reg +0x100, modem = bit 9 */
++#define MSS_PDC_SYNC_RESET      0x100u
++#define MSS_PDC_MODEM_BIT       (1u << 9)
++#define MSS_QMP_PA              0x0c300000u     /* aoss_qmp message RAM, 0x400 bytes */
++#define MSS_APSS_SHARED_PA      0x17990000u     /* doorbell: +12, bit = channel 0 (qcom-apcs-ipc sdm845) */
++#define MSS_HALT_PA             0x01f63000u     /* tcsr_regs_1 0x1f60000: halt q6 +0x3000, nc +0x4000, modem +0x5000 */
++#define MSS_MBA_PA              0x96900000ull   /* beryllium mba_region, 2 MiB */
++#define MSS_MBA_SIZE            0x200000u
++#define MSS_MPSS_PA             0x8e400000ull   /* beryllium mpss_region, 120 MiB */
++#define MSS_MPSS_SIZE           0x7800000u
++
++#define RMB_MBA_IMAGE           0x00
++#define RMB_PBL_STATUS          0x04
++#define RMB_MBA_STATUS          0x0c
++#define RMB_MBA_MSS_STATUS      0x40
++#define RMB_MBA_ALT_RESET       0x44
++#define QDSP6SS_SLEEP           0x3c
++#define QDSP6SS_BOOT_CORE_START 0x400
++#define QDSP6SS_BOOT_CMD        0x404
++
++#define SCM_VMID_HLOS           3u
++#define SCM_VMID_MSS_MSA        15u
++#define SCM_PERM_RW             6u
++#define SCM_PERM_RWX            7u
++
++extern int sweet_rpmh_arc_vote(const char *res, bool max);
++extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
++extern void sweet_log_sync(void);
++extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
++extern void pmap_set_cache_attributes(ppnum_t, unsigned int);
++
++static struct {
++	vm_offset_t q6, rmb, aoss, pdc, qmp, ipc, halt;
++	uint32_t qmp_off, qmp_size;
++	bool qmp_open, arc[3], snoc, memnoc, reset_out, mba_assigned, mpss_assigned;
++	uint32_t vote_set;              /* GCC 0x52004 bits we set (gpll0_mss 17, prng 13) */
++	bool mnoc_set;                  /* we set mfab_axis CBCR enable */
++	bool scm_dead;                  /* an SCM call did not complete: no further calls */
++} ms;
++
++static const char *const ms_arc_res[3] = { "cx.lvl", "mx.lvl", "mss.lvl" };
++
++/* ---- SCM: SMCCC SIP, std (yielding) 64-bit call with the x6 continuation token */
++struct ms_scm {
++	uint64_t a[7];
++};
++
++static void
++ms_smc(struct ms_scm *r)
++{
++	register uint64_t x0 __asm__("x0") = r->a[0];
++	register uint64_t x1 __asm__("x1") = r->a[1];
++	register uint64_t x2 __asm__("x2") = r->a[2];
++	register uint64_t x3 __asm__("x3") = r->a[3];
++	register uint64_t x4 __asm__("x4") = r->a[4];
++	register uint64_t x5 __asm__("x5") = r->a[5];
++	register uint64_t x6 __asm__("x6") = r->a[6];
++	register uint64_t x7 __asm__("x7") = 0;
++	__asm__ volatile ("smc #0"
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++	    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	*r = (struct ms_scm) { { x0, x1, x2, x3, x4, x5, x6 } };
++}
++
++/*
++ * x0 status: 0 ok, 1 interrupted, -12 busy. An interrupted call is re-issued like Linux
++ * __scm_smc_do_quirk: x0 = 1, the ORIGINAL x1..x5, x6 = the token TZ returned, x7 = 0.
++ */
++static bool
++ms_scm_call(const struct ms_scm *in, struct ms_scm *out)
++{
++	*out = (struct ms_scm) { { (uint64_t)-1, 0, 0, 0, 0, 0, 0 } };
++	if (ms.scm_dead) {
++		return false;
++	}
++	for (unsigned busy = 0; busy <= 3; busy++) {
++		struct ms_scm call = *in;
++		for (unsigned resume = 0;; resume++) {
++			*out = call;
++			ms_smc(out);
++			if ((int32_t)out->a[0] != 1) {
++				break;
++			}
++			if (resume == 64) {
++				ms.scm_dead = true;
++				return false;
++			}
++			call = *in;
++			call.a[0] = 1;
++			call.a[6] = out->a[6];
++		}
++		if ((int32_t)out->a[0] != -12) {
++			return true;
++		}
++		delay(30000);
++	}
++	ms.scm_dead = true;
++	return false;
++}
++
++/* physically contiguous, write-combined (non-cacheable) pages for TZ to read */
++static void *
++ms_dma_alloc(vm_size_t size, uint64_t *pa)
++{
++	vm_offset_t kva;
++	size = round_page(size);
++	if (kmem_alloc_contig(kernel_map, &kva, size, PAGE_MASK, 0, 0,
++	    KMA_DATA | KMA_ZERO | KMA_PERMANENT, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		return NULL;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)kva);
++	for (unsigned i = 1; pn && i < size / PAGE_SIZE; i++) {
++		if (pmap_find_phys(kernel_pmap, (addr64_t)(kva + i * PAGE_SIZE)) != pn + i) {
++			pn = 0;
++		}
++	}
++	if (!pn) {
++		return NULL;    /* KMA_PERMANENT: leaked on purpose, one page */
++	}
++	sweet_dma_sync_va((const void *)kva, size);
++	for (unsigned i = 0; i < size / PAGE_SIZE; i++) {
++		pmap_set_cache_attributes(pn + i, VM_WIMG_WCOMB);
++	}
++	sweet_dma_sync_va((const void *)kva, size);
++	*pa = ptoa_64(pn);
++	return (void *)kva;
++}
++
++/*
++ * qcom_scm_assign_mem(): SCM svc MP (0xc) cmd ASSIGN (0x16), arginfo SCM_ARGS(7, RO, VAL, RO, VAL,
++ * RO, VAL, VAL) = 0x1117. Buffer: source VMIDs @0, {u64 addr, u64 size} @64, destination
++ * {u32 vmid, u32 perm, u64 ctx, u32 ctx_size, u32 unused} @128. Args 3..9 go in an indirect
++ * buffer whose address is x5 (qcom_scm-smc.c, more than 4 arguments).
++ */
++static bool
++ms_assign(const char *what, uint64_t pa, uint64_t size, uint32_t src_vmid, uint32_t dst_vmid, uint32_t perm)
++{
++	static uint8_t *buf;
++	static uint64_t buf_pa;
++	if (buf == NULL && (buf = ms_dma_alloc(PAGE_SIZE, &buf_pa)) == NULL) {
++		printf("SWEET MSS: no SCM buffer\n");
++		return false;
++	}
++	bzero(buf, PAGE_SIZE);
++	*(volatile uint32_t *)(buf + 0) = src_vmid;
++	*(volatile uint64_t *)(buf + 64) = pa;
++	*(volatile uint64_t *)(buf + 72) = size;
++	*(volatile uint32_t *)(buf + 128) = dst_vmid;
++	*(volatile uint32_t *)(buf + 132) = perm;
++	uint64_t *ext = (uint64_t *)(buf + 256);
++	ext[0] = 4;                     /* args[3] = src size */
++	ext[1] = buf_pa + 128;          /* args[4] = dest */
++	ext[2] = 24;                    /* args[5] = dest size */
++	ext[3] = 0;                     /* args[6] */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	const struct ms_scm in = { { 0x42000c16ull, 0x1117, buf_pa + 64, 16, buf_pa, buf_pa + 256, 0 } };
++	struct ms_scm out;
++	printf("SWEET MSS: hyp-assign %s %#llx+%#llx vmid %u -> %u perm %u\n", what, pa, size, src_vmid,
++	    dst_vmid, perm);
++	sweet_log_sync();
++	bool done = ms_scm_call(&in, &out);
++	printf("SWEET MSS: hyp-assign %s: completed=%d status=%d result=%d\n", what, done, (int32_t)out.a[0],
++	    (int32_t)out.a[1]);
++	sweet_log_sync();
++	return done && (int32_t)out.a[0] == 0 && (int32_t)out.a[1] == 0;
++}
++
++/* ---- AOSS QMP (qcom_aoss.c): link + channel handshake, 64-byte messages */
++static void
++ms_qmp_kick(void)
++{
++	wl_wr(ms.ipc, 12, 1u << 0);
++}
++
++static bool
++ms_qmp_wait(uint32_t off, uint32_t want, unsigned ms_timeout)
++{
++	for (unsigned i = 0; i < ms_timeout; i++) {
++		if (wl_rd(ms.qmp, off) == want) {
++			return true;
++		}
++		wl_sleep(1);
++	}
++	return false;
++}
++
++static bool
++ms_qmp_open(void)
++{
++	uint32_t magic = wl_rd(ms.qmp, 0x0), version = wl_rd(ms.qmp, 0x4);
++	ms.qmp_off = wl_rd(ms.qmp, 0x38);
++	ms.qmp_size = wl_rd(ms.qmp, 0x34);
++	printf("SWEET MSS: QMP magic %#x version %u mcore mailbox %#x+%#x\n", magic, version, ms.qmp_off,
++	    ms.qmp_size);
++	if (magic != 0x4d41494cu || version != 1 || ms.qmp_size < 68 || ms.qmp_off + ms.qmp_size > 0x400) {
++		return false;
++	}
++	wl_wr(ms.qmp, 0x10, wl_rd(ms.qmp, 0x0c));       /* ack ucore link state */
++	wl_wr(ms.qmp, 0x24, 0xffffu);                   /* mcore link up */
++	ms_qmp_kick();
++	if (!ms_qmp_wait(0x28, 0xffffu, 1000)) {        /* ucore acks our link */
++		printf("SWEET MSS: QMP link not acked\n");
++		goto close_link;
++	}
++	wl_wr(ms.qmp, 0x2c, 0xffffu);                   /* mcore channel up */
++	ms_qmp_kick();
++	if (!ms_qmp_wait(0x14, 0xffffu, 1000)) {        /* ucore channel up */
++		printf("SWEET MSS: QMP ucore channel not up\n");
++		goto close;
++	}
++	wl_wr(ms.qmp, 0x18, 0xffffu);                   /* ack ucore channel */
++	ms_qmp_kick();
++	if (!ms_qmp_wait(0x30, 0xffffu, 1000)) {        /* ucore acks our channel */
++		printf("SWEET MSS: QMP channel not acked\n");
++		goto close;
++	}
++	ms.qmp_open = true;
++	return true;
++close:
++	wl_wr(ms.qmp, 0x2c, 0xffff0000u);
++close_link:
++	wl_wr(ms.qmp, 0x24, 0xffff0000u);
++	ms_qmp_kick();
++	return false;
++}
++
++static bool
++ms_qmp_send(const char *msg)
++{
++	uint32_t words[16] = { 0 };
++	strlcpy((char *)words, msg, sizeof(words));
++	for (unsigned i = 0; i < 16; i++) {             /* the message RAM only takes 32-bit accesses */
++		wl_wr(ms.qmp, ms.qmp_off + 4 + 4 * i, words[i]);
++	}
++	wl_wr(ms.qmp, ms.qmp_off, sizeof(words));
++	(void)wl_rd(ms.qmp, ms.qmp_off);
++	ms_qmp_kick();
++	bool ok = ms_qmp_wait(ms.qmp_off, 0, 1000);     /* AOP clears the length when consumed */
++	if (!ok) {
++		wl_wr(ms.qmp, ms.qmp_off, 0);
++	}
++	printf("SWEET MSS: QMP \"%s\" %s\n", msg, ok ? "consumed" : "NOT consumed");
++	return ok;
++}
++
++/* ---- clocks, resets, AXI halt */
++static bool
++ms_branch(uint32_t off, bool on, bool voted)
++{
++	uint32_t v = wl_rd(wl.gcc, off);
++	wl_wr(wl.gcc, off, on ? (v | 1u) : (v & ~1u));
++	if (!on || voted) {             /* BRANCH_VOTED: the off bit follows the remote vote */
++		return true;
++	}
++	for (unsigned i = 0; i < 200; i++) {
++		if (!(wl_rd(wl.gcc, off) & (1u << 31))) {
++			return true;
++		}
++		delay(1);
++	}
++	printf("SWEET MSS: GCC branch %#x did not turn on (%#x)\n", off, wl_rd(wl.gcc, off));
++	return false;
++}
++
++static void
++ms_pdc(bool assert_)
++{
++	uint32_t v = wl_rd(ms.pdc, MSS_PDC_SYNC_RESET);
++	wl_wr(ms.pdc, MSS_PDC_SYNC_RESET, assert_ ? (v | MSS_PDC_MODEM_BIT) : (v & ~MSS_PDC_MODEM_BIT));
++}
++
++static void
++ms_aoss_pulse(void)
++{
++	wl_wr(ms.aoss, 0, 1);
++	delay(300);
++	wl_wr(ms.aoss, 0, 0);
++	delay(300);
++}
++
++/* q6v5_reset_deassert(), has_alt_reset */
++static void
++ms_reset_deassert(void)
++{
++	ms_pdc(true);
++	wl_wr(ms.rmb, RMB_MBA_ALT_RESET, 1);
++	ms_aoss_pulse();
++	wl_wr(ms.rmb, RMB_MBA_ALT_RESET, 0);
++	ms_pdc(false);
++}
++
++/* q6v5_reset_assert(), has_alt_reset */
++static void
++ms_reset_assert(void)
++{
++	ms_pdc(true);
++	ms_aoss_pulse();
++	ms_pdc(false);
++}
++
++static void
++ms_halt_axi(const char *name, uint32_t off)
++{
++	if (wl_rd(ms.halt, off + 8)) {          /* AXI_IDLE */
++		printf("SWEET MSS: AXI %s already idle\n", name);
++		return;
++	}
++	wl_wr(ms.halt, off + 0, 1);             /* AXI_HALTREQ */
++	unsigned i;
++	for (i = 0; i < 100 && !wl_rd(ms.halt, off + 4); i++) {
++		wl_sleep(1);
++	}
++	printf("SWEET MSS: AXI %s halt ack %u idle %u\n", name, wl_rd(ms.halt, off + 4), wl_rd(ms.halt, off + 8));
++	wl_wr(ms.halt, off + 0, 0);
++}
++
++static bool
++ms_poll(vm_offset_t base, uint32_t off, uint32_t mask, unsigned us)
++{
++	for (unsigned i = 0; i < us; i += 10) {
++		if (wl_rd(base, off) & mask) {
++			return true;
++		}
++		delay(10);
++	}
++	return false;
++}
++
++/* read mba.mbn from the phone's own modem partition */
++static void *
++ms_read_mba(uint32_t *len)
++{
++	static struct wl_fat fat;
++	uint32_t cl, size;
++	if (fat_mount(&fat, "modem") || fat_open(&fat, "image/mba.mbn", &cl, &size)) {
++		printf("SWEET MSS: modem:image/mba.mbn not readable\n");
++		return NULL;
++	}
++	if (size == 0 || size > 0x100000u) {    /* "MBA is restricted to a maximum size of 1M" */
++		printf("SWEET MSS: mba.mbn size %u not accepted\n", size);
++		return NULL;
++	}
++	void *buf = kalloc_data(size, Z_WAITOK | Z_ZERO);
++	if (buf && fat_read_chain(&fat, cl, 0, buf, size)) {
++		kfree_data(buf, size);
++		buf = NULL;
++	}
++	if (buf) {
++		*len = size;
++	}
++	return buf;
++}
++
++static void
++ms_teardown(void)
++{
++	/* q6v5_mba_reclaim() order: halt the AXI ports, hold the Q6 in reset, clocks off, then reclaim */
++	printf("SWEET MSS: teardown\n");
++	if (ms.reset_out) {
++		ms_halt_axi("q6", 0x0000);
++		ms_halt_axi("modem", 0x2000);
++		ms_halt_axi("nc", 0x1000);
++		ms_reset_assert();
++	}
++	if (ms.memnoc) {
++		ms_branch(0x8a154, false, true);
++	}
++	if (ms.snoc) {
++		ms_branch(0x8a150, false, false);
++	}
++	if (ms.mnoc_set) {
++		ms_branch(0x8a004, false, true);
++	}
++	if (ms.vote_set) {
++		wl_wr(wl.gcc, 0x52004, wl_rd(wl.gcc, 0x52004) & ~ms.vote_set);
++	}
++	if (ms.mba_assigned &&
++	    ms_assign("mba back", MSS_MBA_PA, MSS_MBA_SIZE, SCM_VMID_MSS_MSA, SCM_VMID_HLOS, SCM_PERM_RWX)) {
++		ms.mba_assigned = false;
++	}
++	if (ms.mpss_assigned &&
++	    ms_assign("mpss back", MSS_MPSS_PA, MSS_MPSS_SIZE, SCM_VMID_MSS_MSA, SCM_VMID_HLOS, SCM_PERM_RWX)) {
++		ms.mpss_assigned = false;
++	}
++	if (ms.mba_assigned || ms.mpss_assigned) {
++		printf("SWEET MSS: a carve-out is still owned by the modem (never touch it from the kernel)\n");
++	}
++	for (int i = 2; i >= 0; i--) {
++		if (ms.arc[i]) {
++			(void)sweet_rpmh_arc_vote(ms_arc_res[i], false);
++		}
++	}
++	if (ms.qmp_open) {
++		(void)ms_qmp_send("{class: image, res: load_state, name: modem, val: off}");
++	}
++	printf("SWEET MSS: teardown done\n");
++	sweet_log_sync();
++}
++
++static void
++wl_mss(void)
++{
++	int gate = 0, keep = 0;
++	uint32_t mba_len = 0;
++	void *mba = NULL;
++	bool alive = false;
++
++	(void)PE_parse_boot_argn("sweetmss", &gate, sizeof(gate));
++	(void)PE_parse_boot_argn("sweetmsskeep", &keep, sizeof(keep));
++	if (gate != 1) {
++		printf("SWEET MSS: stage 4 needs sweetmss=1 as well (first TrustZone/hypervisor step): not run\n");
++		return;
++	}
++	printf("SWEET MSS: stage 4: power the modem DSP and boot its MBA, stop at \"MBA alive\"%s\n",
++	    keep ? " (sweetmsskeep=1: leave it running)" : ", then tear down");
++	sweet_log_sync();
++	ms.q6 = ml_io_map(MSS_QDSP6_PA, 0x1000);
++	ms.rmb = ml_io_map(MSS_RMB_PA, 0x1000);
++	ms.aoss = ml_io_map(MSS_AOSS_RESTART_PA, 0x1000);
++	ms.pdc = ml_io_map(MSS_PDC_RESET_PA, 0x1000);
++	ms.qmp = ml_io_map(MSS_QMP_PA, 0x1000);
++	ms.ipc = ml_io_map(MSS_APSS_SHARED_PA, 0x1000);
++	ms.halt = ml_io_map(MSS_HALT_PA, 0x3000);
++	if (!ms.q6 || !ms.rmb || !ms.aoss || !ms.pdc || !ms.qmp || !ms.ipc || !ms.halt) {
++		printf("SWEET MSS: MMIO mapping failed\n");
++		return;
++	}
++	mba = ms_read_mba(&mba_len);
++	if (mba == NULL) {
++		return;
++	}
++	printf("SWEET MSS: mba.mbn %u bytes read from the modem partition\n", mba_len);
++
++	/* qcom_q6v5_prepare(): AOSS load_state, then the proxy power domains */
++	if (!ms_qmp_open() || !ms_qmp_send("{class: image, res: load_state, name: modem, val: on}")) {
++		goto out;
++	}
++	for (int i = 0; i < 3; i++) {
++		if (sweet_rpmh_arc_vote(ms_arc_res[i], true) != 0) {
++			goto out;
++		}
++		ms.arc[i] = true;
++	}
++	/* proxy clocks xo/prng and the iface clock are on already (boot 30 probe); reset clock snoc_axi */
++	if (!cbcr_on(0x8a000) || !cbcr_on(0x34004) || !cbcr_on(0x38004) || !cbcr_on(0x8a004)) {
++		printf("SWEET MSS: an expected-on MSS clock is off: cfg_ahb %#x prng %#x boot_rom %#x mfab %#x\n",
++		    wl_rd(wl.gcc, 0x8a000), wl_rd(wl.gcc, 0x34004), wl_rd(wl.gcc, 0x38004), wl_rd(wl.gcc, 0x8a004));
++		goto out;
++	}
++	ms.snoc = true;                         /* set even if it fails: teardown clears the enable */
++	if (!ms_branch(0x8a150, true, false)) {
++		goto out;
++	}
++	ms_reset_deassert();
++	ms.reset_out = true;
++	ms_branch(0x8a154, true, true);         /* active clock "bus" (q6_memnoc_axi) */
++	ms.memnoc = true;
++	/* active clocks "gpll0_mss" (vote bit 17) and "mnoc_axi" (mfab CBCR enable), proxy "prng" (vote
++	 * bit 13): boot 30 read 0x52004 = 0x1619d7b, bits 17 and 13 clear (other masters keep prng on) */
++	uint32_t vote = wl_rd(wl.gcc, 0x52004);
++	ms.vote_set = ~vote & ((1u << 17) | (1u << 13));
++	if (ms.vote_set) {
++		wl_wr(wl.gcc, 0x52004, vote | ms.vote_set);
++	}
++	if (!(wl_rd(wl.gcc, 0x8a004) & 1u)) {
++		ms_branch(0x8a004, true, true);
++		ms.mnoc_set = true;
++	}
++	printf("SWEET MSS: GCC vote %#x -> %#x, mfab_axis CBCR %#x\n", vote, wl_rd(wl.gcc, 0x52004),
++	    wl_rd(wl.gcc, 0x8a004));
++
++	/* the MBA image goes in while the kernel still owns the carve-out, then both regions go to the Q6 */
++	vm_offset_t mba_va = ml_io_map_wcomb(MSS_MBA_PA, MSS_MBA_SIZE);
++	if (!mba_va) {
++		printf("SWEET MSS: MBA carve-out mapping failed\n");
++		goto out;
++	}
++	memcpy((void *)mba_va, mba, mba_len);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ml_io_unmap(mba_va, MSS_MBA_SIZE);      /* no kernel mapping may exist once the Q6 owns it */
++	mba_va = 0;
++	if (!ms_assign("mpss", MSS_MPSS_PA, MSS_MPSS_SIZE, SCM_VMID_HLOS, SCM_VMID_MSS_MSA, SCM_PERM_RW)) {
++		goto out;
++	}
++	ms.mpss_assigned = true;
++	if (!ms_assign("mba", MSS_MBA_PA, MSS_MBA_SIZE, SCM_VMID_HLOS, SCM_VMID_MSS_MSA, SCM_PERM_RW)) {
++		goto out;
++	}
++	ms.mba_assigned = true;
++	wl_wr(ms.rmb, RMB_MBA_IMAGE, (uint32_t)MSS_MBA_PA);
++
++	/* q6v5proc_reset(), MSS_SDM845 */
++	wl_wr(ms.q6, QDSP6SS_SLEEP, wl_rd(ms.q6, QDSP6SS_SLEEP) | 1u);
++	unsigned i;
++	for (i = 0; i < 200 && (wl_rd(ms.q6, QDSP6SS_SLEEP) & (1u << 31)); i++) {
++		delay(1);
++	}
++	if (i == 200) {
++		printf("SWEET MSS: QDSP6SS sleep clock timed out (%#x)\n", wl_rd(ms.q6, QDSP6SS_SLEEP));
++		goto out;
++	}
++	wl_wr(ms.q6, QDSP6SS_BOOT_CORE_START, 1);
++	wl_wr(ms.q6, QDSP6SS_BOOT_CMD, 1);
++	if (!ms_poll(ms.rmb, RMB_MBA_MSS_STATUS, 1u, 10000)) {
++		printf("SWEET MSS: boot FSM did not complete (MSS_STATUS %#x)\n", wl_rd(ms.rmb, RMB_MBA_MSS_STATUS));
++		ms_reset_deassert();
++		goto out;
++	}
++	uint32_t pbl = 0;
++	for (i = 0; i < 1000 && (pbl = wl_rd(ms.rmb, RMB_PBL_STATUS)) == 0; i++) {
++		wl_sleep(1);
++	}
++	printf("SWEET MSS: PBL status %#x after %u ms (1 = success)\n", pbl, i);
++	if (pbl != 1) {
++		goto out;
++	}
++	uint32_t st = 0;
++	for (i = 0; i < 5000; i++) {
++		st = wl_rd(ms.rmb, RMB_MBA_STATUS);
++		if ((int32_t)st < 0 || st != 0) {
++			break;
++		}
++		wl_sleep(1);
++	}
++	printf("SWEET MSS: MBA status %#x after %u ms (1 = XPU unlocked, 2 = unlocked + scribbled)\n", st, i);
++	alive = st == 1 || st == 2;
++	if (alive) {
++		printf("SWEET MSS: MBA ALIVE\n");
++	}
++out:
++	sweet_log_sync();
++	if (!(alive && keep)) {
++		ms_teardown();
++	}
++	kfree_data(mba, mba_len);
++}
++
+ /* ---------------------------------------------------------------- stage 2: Bluetooth */
+ 
+ static void wl_rx_stop(void);
+@@ -2801,6 +3360,8 @@ wl_thread(void *arg, wait_result_t wr)
+ 		wl_bt();
+ 	} else if (wl.stage == 3) {
+ 		wl_inventory();
++	} else if (wl.stage == 4) {
++		wl_mss();
+ 	}
+ out:
+ 	(void)thread_terminate(current_thread());

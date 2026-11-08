@@ -1,0 +1,155 @@
+diff --git a/bsd/dev/sweet_board.h b/bsd/dev/sweet_board.h
+index 597256bd7c560dfcce2ce0f95e7834d147d55df2..3d9c06a5b0d33107a60f46bc9a8089cee36d558b 100644
+--- a/bsd/dev/sweet_board.h
++++ b/bsd/dev/sweet_board.h
+@@ -8,8 +8,36 @@
+ #define _SWEET_BOARD_H_
+ 
+ #include <stdbool.h>
++#include <stddef.h>
++#include <stdint.h>
+ #include <pexpert/device_tree.h>
+ 
++/*
++ * Real cache maintenance for device DMA. This build defines
++ * __ARM_COHERENT_IO__ (apple_arm64_common.h), which turns flush_dcache64(),
++ * clean_dcache64() and dcache_incoherent_io_*() into a bare "dsb sy". The
++ * SDM845 / SM7150 DMA masters (USB DWC3, the SMMU's table walker, UFS) are
++ * not Apple's coherent fabric: clean+invalidate the buffer by kernel VA to
++ * the point of coherency instead (harmless where the master is coherent).
++ * Call after the CPU wrote data/descriptors the device will read, and before
++ * the CPU reads data the device wrote.
++ */
++static inline void
++sweet_dma_sync_va(const void *va, size_t len)
++{
++	uint64_t ctr;
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	uintptr_t line = (uintptr_t)4 << ((ctr >> 16) & 0xf);      /* DminLine */
++	uintptr_t p = (uintptr_t)va & ~(line - 1);
++	uintptr_t end = (uintptr_t)va + len;
++
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (; p < end; p += line) {
++		__asm__ volatile ("dc civac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
+ static inline bool
+ sweet_board_is(const char *want)
+ {
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 93d0db59b9b1916a03e0c924d08c68e4b7a4d0d4..9dc4ba1b812ff24ea1796919ede22ed7da697d3c 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -41,6 +41,7 @@
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
+ 
++#include "sweet_board.h"
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ /* osfmk/arm/machine_routines.h, not exported to the BSD layer */
+ extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+@@ -111,6 +112,7 @@ static struct {
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
++	bool dmasync;                           /* boot-arg ufsdmasync=1: real cache maintenance */
+ 	int bmajor, cmajor;
+ 	dev_t bdev;
+ 	bool ready;
+@@ -131,15 +133,26 @@ ufs_wr(uint32_t off, uint32_t v)
+ 	*(volatile uint32_t *)(su.regs + off) = v;
+ }
+ 
++/*
++ * flush_dcache64()/clean_dcache64() are a bare dsb under __ARM_COHERENT_IO__.
++ * The UFS root works with that today (the host evidently snoops), so the
++ * real clean+invalidate by VA (sweet_dma_sync_va) is opt-in: ufsdmasync=1.
++ */
+ static void
+ dma_sync(uint32_t off, uint32_t len)
+ {
++	if (su.dmasync) {
++		sweet_dma_sync_va((const void *)(su.dma + off), len);
++	}
+ 	flush_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+ }
+ 
+ static void
+ dma_clean(uint32_t off, uint32_t len)
+ {
++	if (su.dmasync) {
++		sweet_dma_sync_va((const void *)(su.dma + off), len);
++	}
+ 	clean_dcache64((addr64_t)(su.dma_pa + off), len, TRUE);
+ }
+ 
+@@ -608,6 +621,9 @@ sweet_ufs_init(void)
+ 	PE_parse_boot_argn("ufswait", &wait, sizeof(wait));
+ 	su.cache = (cache == 1);
+ 	su.wait = (wait == 1);
++	uint32_t dmasync = 0;
++	PE_parse_boot_argn("ufsdmasync", &dmasync, sizeof(dmasync));
++	su.dmasync = (dmasync == 1);
+ 
+ 	printf("SWEET UFS: init, regs 0x%lx+0x%lx\n", (unsigned long)reg[0], (unsigned long)reg[1]);
+ 	su.regs = ml_io_map(reg[0], reg[1]);
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 350d718d5f4c20bb8db036d0aca66ffdb0fa5f91..cdef666d102a1922f259b2ac5934b854dba84f96 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -34,6 +34,7 @@
+ #include <sys/systm.h>
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
++#include <machine/atomic.h>
+ #include <security/mac_policy.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+@@ -321,7 +322,7 @@ static struct {
+ 	int  priv;
+ 	char name[20];
+ } sweet_priv_logged[SWEET_PRIV_LOG_MAX];
+-static int sweet_priv_logged_count;
++static int _Atomic sweet_priv_logged_count;   /* slots reserved; may exceed the max */
+ 
+ static int
+ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+@@ -331,17 +332,29 @@ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ 	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
+-	for (int i = 0; i < sweet_priv_logged_count; i++) {
++	/*
++	 * priv_check_cred runs on every CPU: reserve a slot atomically. The
++	 * count was re-read for the index before, so two racing first denials
++	 * at count 63 could both pass the "< MAX" test and the second write
++	 * sweet_priv_logged[64], past the array.
++	 */
++	int seen = os_atomic_load(&sweet_priv_logged_count, relaxed);
++	if (seen > SWEET_PRIV_LOG_MAX) {
++		seen = SWEET_PRIV_LOG_MAX;
++	}
++	for (int i = 0; i < seen; i++) {
+ 		if (sweet_priv_logged[i].priv == priv &&
+ 		    strncmp(sweet_priv_logged[i].name, name, sizeof(name)) == 0) {
+ 			return EPERM;
+ 		}
+ 	}
+-	if (sweet_priv_logged_count < SWEET_PRIV_LOG_MAX) {
+-		sweet_priv_logged[sweet_priv_logged_count].priv = priv;
+-		strlcpy(sweet_priv_logged[sweet_priv_logged_count].name, name, sizeof(name));
+-		sweet_priv_logged_count++;
+-		printf("SWEET Sandbox: %s privilege %d denied\n", name, priv);
++	if (seen < SWEET_PRIV_LOG_MAX) {
++		int slot = os_atomic_inc_orig(&sweet_priv_logged_count, relaxed);
++		if (slot < SWEET_PRIV_LOG_MAX) {
++			sweet_priv_logged[slot].priv = priv;
++			strlcpy(sweet_priv_logged[slot].name, name, sizeof(name));
++			printf("SWEET Sandbox: %s privilege %d denied\n", name, priv);
++		}
+ 	}
+ 	return EPERM;
+ }

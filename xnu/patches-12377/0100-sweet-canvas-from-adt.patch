@@ -1,0 +1,119 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 90f71401e95a1c6a7d28cfd1b5eddf4b11424124..642e9c4e749b52ebbae02002b7f5cac1b3e675ef 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -85,6 +85,30 @@ enum {
+  */
+ #define SWEET_FB_LOGICAL_W              1125
+ #define SWEET_FB_LOGICAL_H              2436
++#include <pexpert/device_tree.h>
++
++/*
++ * Presented (logical) display size: ADT /arm-io/disp0 canvas-width/height
++ * (tools/mkadt.py; 1125x2436 = iPhone X @3x, 750x1624 = the same 375x812
++ * points @2x, 2.25x fewer pixels for CoreAnimation's CPU renderer).
++ * AppleCLCD and SweetHIDTouch must agree on it.
++ */
++static void
++sweet_canvas_size(int *w, int *h)
++{
++	DTEntry e;
++	void const *p;
++	unsigned int sz;
++	if (SecureDTLookupEntry(NULL, "/arm-io/disp0", &e) != kSuccess) {
++		return;
++	}
++	if (SecureDTGetProperty(e, "canvas-width", &p, &sz) == kSuccess && sz == 4 && *(const uint32_t *)p) {
++		*w = (int)*(const uint32_t *)p;
++	}
++	if (SecureDTGetProperty(e, "canvas-height", &p, &sz) == kSuccess && sz == 4 && *(const uint32_t *)p) {
++		*h = (int)*(const uint32_t *)p;
++	}
++}
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -210,9 +234,11 @@ AppleCLCD::start(IOService *provider)
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+ 	fLogicalW = fWidth;
+ 	fLogicalH = fHeight;
+-	if (!native && fWidth <= SWEET_FB_LOGICAL_W && fHeight <= SWEET_FB_LOGICAL_H) {
+-		fLogicalW = SWEET_FB_LOGICAL_W;
+-		fLogicalH = SWEET_FB_LOGICAL_H;
++	int canvasW = SWEET_FB_LOGICAL_W, canvasH = SWEET_FB_LOGICAL_H;
++	sweet_canvas_size(&canvasW, &canvasH);
++	if (!native) {
++		fLogicalW = (uint32_t)canvasW;
++		fLogicalH = (uint32_t)canvasH;
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
+@@ -221,6 +247,10 @@ AppleCLCD::start(IOService *provider)
+ 	if (fScale > 2 || (fLogicalW == fWidth && fLogicalH == fHeight)) {
+ 		fScale = 0;
+ 	}
++	/* a canvas smaller than the panel cannot be cropped: scale it up */
++	if (fScale == 0 && (fLogicalW < fWidth || fLogicalH < fHeight)) {
++		fScale = 1;
++	}
+ 	if (fScale == 1) {
+ 		/* the tighter axis decides; the other is centred */
+ 		if ((uint64_t)fHeight * fLogicalW <= (uint64_t)fWidth * fLogicalH) {
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 6c50ffab547c051578549d34ddb28e79b8afafce..3c2e46a01d079d96720cdeb6d12ae54b871f9bf9 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -21,6 +21,30 @@
+ #include <IOKit/IOTimerEventSource.h>
+ #include <libkern/c++/OSArray.h>
+ #include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++
++/*
++ * Presented (logical) display size: ADT /arm-io/disp0 canvas-width/height
++ * (tools/mkadt.py; 1125x2436 = iPhone X @3x, 750x1624 = the same 375x812
++ * points @2x, 2.25x fewer pixels for CoreAnimation's CPU renderer).
++ * AppleCLCD and SweetHIDTouch must agree on it.
++ */
++static void
++sweet_canvas_size(int *w, int *h)
++{
++	DTEntry e;
++	void const *p;
++	unsigned int sz;
++	if (SecureDTLookupEntry(NULL, "/arm-io/disp0", &e) != kSuccess) {
++		return;
++	}
++	if (SecureDTGetProperty(e, "canvas-width", &p, &sz) == kSuccess && sz == 4 && *(const uint32_t *)p) {
++		*w = (int)*(const uint32_t *)p;
++	}
++	if (SecureDTGetProperty(e, "canvas-height", &p, &sz) == kSuccess && sz == 4 && *(const uint32_t *)p) {
++		*h = (int)*(const uint32_t *)p;
++	}
++}
+ 
+ #include "IOHIDEventService.h"
+ #include "IOHIDEventServiceUserClient.h"
+@@ -441,8 +465,10 @@ SweetHIDTouch::start(IOService *provider)
+ 	PE_current_console(&video);
+ 	fPanelW = video.v_width ? (int)video.v_width : 1080;
+ 	fPanelH = video.v_height ? (int)video.v_height : 2400;
+-	fLogicalW = native ? fPanelW : 1125;
+-	fLogicalH = native ? fPanelH : 2436;
++	int canvasW = 1125, canvasH = 2436;
++	sweet_canvas_size(&canvasW, &canvasH);
++	fLogicalW = native ? fPanelW : canvasW;
++	fLogicalH = native ? fPanelH : canvasH;
+ 	fOffX = (fLogicalW - fPanelW) / 2;
+ 	fOffY = (fLogicalH - fPanelH) / 2;
+ 	/* Same mapping as AppleCLCD (sweetfb_scale, SweetFramebuffer.cpp). */
+@@ -451,6 +477,9 @@ SweetHIDTouch::start(IOService *provider)
+ 	if (native || fScale > 2) {
+ 		fScale = 0;
+ 	}
++	if (!native && fScale == 0 && (fLogicalW < fPanelW || fLogicalH < fPanelH)) {
++		fScale = 1;     /* as AppleCLCD: a smaller canvas is scaled up */
++	}
+ 	if (fScale == 1) {
+ 		if ((int64_t)fPanelH * fLogicalW <= (int64_t)fPanelW * fLogicalH) {
+ 			fScaleXNum = fScaleYNum = fPanelH;

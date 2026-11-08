@@ -1,0 +1,33 @@
+From: Bergamota
+Subject: [PATCH] sweet: sweethidlog dumps the first touch events' wire bytes
+
+---
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -627,6 +627,26 @@
+ 	if (touch_log && was != down) {
+ 		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
+ 		    fEdge[finger] ? " edge" : "");
++	}
++	/* The first few events as user space receives them, to compare with iOS's own IOHIDEventCreateData layout */
++	static int wire_dumps;
++	if (touch_log && wire_dumps < 4) {
++		OSData *wire = collection->createBytes();
++		if (wire) {
++			const uint8_t *b = (const uint8_t *)wire->getBytesNoCopy();
++			unsigned int n = wire->getLength();
++			IOLog("SWEET HID: wire %d len %u\n", wire_dumps, n);
++			for (unsigned int i = 0; i < n; i += 16) {
++				char line[16 * 3 + 1];
++				unsigned int k = 0;
++				for (unsigned int j = i; j < i + 16 && j < n; j++) {
++					k += snprintf(line + k, sizeof(line) - k, " %02x", b[j]);
++				}
++				IOLog("SWEET HID: %04x:%s\n", i, line);
++			}
++			wire->release();
++		}
++		wire_dumps++;
+ 	}
+ 	dispatchEvent(collection);
+ 	collection->release();

@@ -1,0 +1,111 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -45,6 +45,7 @@
+ #define NVT_PARAMS_LEN   15u
+ #define NVT_CHIP_ID      0x08u
+ #define NVT_RECORD       6u
++#define NVT_EMPTY_RELEASE 3u  /* empty frames before an unannounced release */
+ 
+ /* Per-board wiring of the touch bus; the GENI SE programming is common. */
+ struct touch_board {
+@@ -672,44 +673,90 @@
+ static int
+ touch_novatek(void)
+ {
++	/*
++	 * Frames read on beryllium came back torn about half the time (all 0xff,
++	 * or shifted by a byte) while a finger was down: the bit-banged read of
++	 * all 10 records took ~20 ms and both IRQ edges trigger one, so many reads
++	 * hit a buffer the IC had consumed or was rewriting. Each of those was
++	 * taken as "finger lifted", and SpringBoard's home swipe broke off.
++	 * Now: read only the records that can be in use (highest active slot + 1,
++	 * at least 2; record i carries slot i + 1),
++	 * drop torn frames, and release a contact only on its release record or
++	 * after NVT_EMPTY_RELEASE empty frames in a row.
++	 */
++	static unsigned empty_frames;
+ 	uint8_t buf[NVT_RECORD * TOUCH_MAX];
+ 	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+-	uint32_t mask = 0;
+-	int err = touch_read(NVT_ADDR, 0, false, buf, NVT_RECORD * nvt_max);
++	uint32_t mask = 0, released = 0;
++	unsigned bad = 0;
++	/* record i carries slot i + 1: cover the highest active slot and one more */
++	unsigned n = st.active ? 32u - (unsigned)__builtin_clz(st.active) + 1u : 2u;
++	n = n < 2u ? 2u : (n > nvt_max ? nvt_max : n);
++	memset(buf, 0xff, sizeof(buf));
++	int err = touch_read(NVT_ADDR, 0, false, buf, NVT_RECORD * n);
+ 	if (err) {
+ 		return err;
+ 	}
+-	for (unsigned i = 0; i < nvt_max; ++i) {
++	for (unsigned i = 0; i < n; ++i) {
+ 		const uint8_t *p = buf + NVT_RECORD * i;
+ 		if (p[0] == 0xffu) {
+ 			continue;
+ 		}
+ 		unsigned slot = p[0] >> 3, type = p[0] & 7u;
+-		if (slot < 1 || slot > nvt_max) {
++		if (slot < 1 || slot > nvt_max || (type != 1u && type != 2u && type != 3u)) {
++			bad++;
+ 			continue;
+ 		}
+ 		if (type == 3u) {
+-			continue; /* release */
+-		}
+-		if (type != 1u && type != 2u) {
++			released |= 1u << (slot - 1);
+ 			continue;
+ 		}
+ 		unsigned px = ((unsigned)p[1] << 4) | (p[3] >> 4);
+ 		unsigned py = ((unsigned)p[2] << 4) | (p[3] & 15u);
+ 		if (px >= tb->w || py >= tb->h) {
+-			continue; /* one bad record, not a bad frame */
++			bad++;
++			continue;
+ 		}
+ 		mask |= 1u << (slot - 1);
+ 		x[slot - 1] = (int)px;
+ 		y[slot - 1] = (int)py;
+ 	}
++	char verdict = 'r';            /* reported */
++	if (bad) {
++		verdict = 'b';          /* torn frame: ignore it */
++	} else if (st.active && !(st.active & ~mask & ~released)) {
++		empty_frames = 0;       /* every lost contact has a release record */
++	} else if (st.active & ~mask & ~released) {
++		/* a contact vanished without a release record: wait for more frames */
++		if (++empty_frames < NVT_EMPTY_RELEASE) {
++			verdict = 'w';
++		} else {
++			empty_frames = 0;
++		}
++	} else {
++		empty_frames = 0;
++	}
+ 	if (touch_trace) {
+ 		uint64_t ns;
+ 		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
+-		printf("TT %llu %c m=%x %d,%d | %02x %02x %02x %02x %02x %02x | %02x %02x %02x\n",
+-		    ns / 1000000ull, touch_trace_why, mask, x[0], y[0],
++		printf("TT %llu %c%c n=%u m=%x %d,%d | %02x %02x %02x %02x %02x %02x | %02x %02x %02x\n",
++		    ns / 1000000ull, touch_trace_why, verdict, n, mask, x[0], y[0],
+ 		    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]);
+ 	}
++	if (verdict == 'b') {
++		return 0;
++	}
++	if (verdict == 'w') {
++		/* keep the vanished contacts where they were; report the rest */
++		uint32_t keep = st.active & ~mask & ~released;
++		for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++			if (keep & (1u << id)) {
++				x[id] = st.x[id];
++				y[id] = st.y[id];
++			}
++		}
++		mask |= keep;
++	}
+ 	touch_report(mask, x, y);
+ 	return 0;
+ }

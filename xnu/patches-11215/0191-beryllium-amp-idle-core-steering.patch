@@ -1,0 +1,215 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 954b5fc..1ca3f56 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -48,6 +48,12 @@
+  *   sweetcpufreq_log=<seconds>         time-in-state summary period (default
+  *                                      10, 0 = none)
+  *   sweetcpufreq_force=1               also act when ENABLE bit 0 is clear
++ *   sweetamp=0|1                       idle-core steering in the scheduler (default 1)
++ *   sweetamp_prio=<n>                  base_pri threshold (default 31)
++ * Core-class steering (independent of the cpufreq mode): once all CPUs are up,
++ * osfmk/kern/sched_prim.c is told which CPUs are A75 (MPIDR Aff1 >= 4) and which A55;
++ * choose_processor() then gives user threads with base_pri >= sweetamp_prio an idle A75
++ * first and all other threads (low QoS, kernel threads) an idle A55 first.
+  * The closest LUT entry to the percentage is used (100 = highest index).
+  * Starts once every selected CPU is up (after iokit/Kernel/arm/SweetCPU.cpp's
+  * SMP bring-up). All logs start with "SWEET CPUFREQ:".
+@@ -55,7 +61,8 @@
+  * sysctl kern.sweet_cpufreq (read-only string, stable format "v1", for the
+  * Bergamota metrics panel). Lines are separated by '\n'; each line is a
+  * sequence of space-separated key=value words:
+- *   line 1:  sweet_cpufreq v1 mode=<gov|fixed|off> period_ms=<sample period>
++ *   line 1:  sweet_cpufreq v1 mode=<gov|fixed|off> period_ms=<sample period> amp=<on|off>
++ *            amp_big=<A75 cpu mask, hex> amp_pri=<base_pri threshold>
+  *   line 2:  cluster0 name=A55 cpus=0-3 state=<applied|off|skipped|pending>
+  *            mode=<gov|fixed|off> idx=<current LUT index> cur_khz=<current>
+  *            min_khz=<lowest LUT> max_khz=<highest LUT> cap_khz=<policy max,
+@@ -81,6 +88,7 @@
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern uint64_t sweet_processor_idle_time(int cpu);
++extern void sweet_amp_enable(uint64_t big, uint64_t little, int pri);
+ extern kern_return_t thread_terminate(thread_t);
+ extern boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ void sweet_cpufreq_max(void);
+@@ -135,6 +143,10 @@ static int cf_mode = MODE_OFF;
+ static unsigned cf_ncpus;
+ static unsigned cf_log_secs = 10;
+ static int cf_force;
++static int cf_amp = 1;
++static int cf_amp_pri = 31;             /* BASEPRI_DEFAULT */
++static uint64_t cf_amp_big;
++static bool cf_amp_on;
+ 
+ static inline uint32_t
+ cf_rd(const struct cf_domain *d, uint32_t off)
+@@ -365,6 +377,31 @@ cf_log_summary(unsigned id, struct cf_domain *d)
+ 	printf("%s\n", line);
+ }
+ 
++/* Core-class steering of the scheduler's idle-CPU choice (osfmk/kern/sched_prim.c). */
++static void
++cf_amp_setup(void)
++{
++	const ml_topology_info_t *topo = ml_get_topology_info();
++	uint64_t big = 0, little = 0;
++
++	for (unsigned i = 0; i < topo->num_cpus && i < 8; i++) {
++		if (topo->cpus[i].phys_id >= 0x400u) {  /* MPIDR Aff1 4-7: Cortex-A75 */
++			big |= 1ULL << topo->cpus[i].cpu_id;
++		} else {
++			little |= 1ULL << topo->cpus[i].cpu_id;
++		}
++	}
++	if (big == 0 || little == 0) {
++		printf("SWEET AMP: only one core class online (big 0x%llx little 0x%llx), steering off\n", big, little);
++		return;
++	}
++	sweet_amp_enable(big, little, cf_amp_pri);
++	cf_amp_big = big;
++	cf_amp_on = true;
++	printf("SWEET AMP: idle-core steering on: A75 mask 0x%llx, A55 mask 0x%llx, base_pri >= %d takes an A75 first\n",
++	    big, little, cf_amp_pri);
++}
++
+ static void
+ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ {
+@@ -389,6 +426,12 @@ cf_thread(void *arg __unused, wait_result_t wr __unused)
+ 		}
+ 		cf_sleep_ms(100);
+ 	}
++	if (cf_amp) {
++		cf_amp_setup();
++	}
++	if (cf_mode == MODE_OFF) {
++		goto out;
++	}
+ 	printf("SWEET CPUFREQ: %u CPUs up; mode %s; A55 %d%%, A75 %d%% of max\n", cf_ncpus,
+ 	    cf_mode == MODE_GOV ? "gov" : "fixed", cf_dom[0].percent, cf_dom[1].percent);
+ 	for (unsigned i = 0; i < 2; i++) {
+@@ -460,10 +503,15 @@ sweet_cpufreq_max(void)
+ 	}
+ 	cf_started = true;
+ 	(void)PE_parse_boot_argn("sweetcpufreq", arg, sizeof(arg));
++	(void)PE_parse_boot_argn("sweetamp", &cf_amp, sizeof(cf_amp));
++	(void)PE_parse_boot_argn("sweetamp_prio", &cf_amp_pri, sizeof(cf_amp_pri));
+ 	if (!strcmp(arg, "off") || !strcmp(arg, "0")) {
+ 		cf_mode = MODE_OFF;
+ 		cf_dom[0].state = cf_dom[1].state = CF_OFF;
+ 		printf("SWEET CPUFREQ: off (sweetcpufreq=%s), frequencies left as the firmware set them\n", arg);
++		if (cf_amp) {
++			goto start;     /* the thread only does the core steering */
++		}
+ 		return;
+ 	}
+ 	if (!strcmp(arg, "fixed")) {
+@@ -482,6 +530,7 @@ sweet_cpufreq_max(void)
+ 	(void)PE_parse_boot_argn("sweetcpufreq_log", &v, sizeof(v));
+ 	cf_log_secs = v < 0 ? 0 : (unsigned)v;
+ 	(void)PE_parse_boot_argn("sweetcpufreq_force", &cf_force, sizeof(cf_force));
++start:
+ 	if (kernel_thread_start((thread_continue_t)cf_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	} else {
+@@ -512,8 +561,9 @@ cf_sysctl SYSCTL_HANDLER_ARGS
+ 	size_t n = 0;
+ 	const char *modes[] = { "off", "gov", "fixed" };
+ 
+-	n = cf_cat(buf, sizeof(buf), n, "sweet_cpufreq v1 mode=%s period_ms=%u\n", modes[cf_mode],
+-	    cf_mode == MODE_GOV ? GOV_PERIOD_MS : FIXED_PERIOD_MS);
++	n = cf_cat(buf, sizeof(buf), n, "sweet_cpufreq v1 mode=%s period_ms=%u amp=%s amp_big=0x%llx amp_pri=%d\n",
++	    modes[cf_mode], cf_mode == MODE_GOV ? GOV_PERIOD_MS : FIXED_PERIOD_MS,
++	    cf_amp_on ? "on" : "off", cf_amp_big, cf_amp_pri);
+ 	for (unsigned i = 0; i < 2; i++) {
+ 		const struct cf_domain *d = &cf_dom[i];
+ 		const char *st = d->state == CF_OFF ? "off" : d->state == CF_PENDING ? "pending" :
+diff --git a/osfmk/kern/sched_prim.c b/osfmk/kern/sched_prim.c
+index 7b2a377..a52b50f 100644
+--- a/osfmk/kern/sched_prim.c
++++ b/osfmk/kern/sched_prim.c
+@@ -5248,6 +5248,46 @@ choose_next_pset(
+ 	return nset;
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Poco F1 (SDM845): CPU 0-3 are Cortex-A55, CPU 4-7 Cortex-A75, but the ADT/topology
++ * publishes one SMP cluster (MAX_CPU_CLUSTERS == 1, no __ARM_AMP__, so the Clutch SMP
++ * scheduler: the Edge/AMP scheduler is a compile-time choice). This steers the choice
++ * among IDLE processors in choose_processor(): user threads with base_pri >= sweet_amp_pri
++ * (default BASEPRI_DEFAULT: default QoS and above) take an idle A75 first, everything
++ * else (low QoS, kernel threads) an idle A55 first; the other class is still used when
++ * the preferred one has no idle core. Masks stay 0 (= stock behaviour) until
++ * bsd/dev/sweet_cpufreq.c enables them after the SMP bring-up (boot-arg sweetamp=0 keeps
++ * them off). Only idle-processor selection is affected; running threads are not moved.
++ */
++uint64_t sweet_amp_big_mask;
++uint64_t sweet_amp_little_mask;
++int sweet_amp_pri = BASEPRI_DEFAULT;
++
++void sweet_amp_enable(uint64_t big, uint64_t little, int pri);
++void
++sweet_amp_enable(uint64_t big, uint64_t little, int pri)
++{
++	sweet_amp_pri = pri;
++	os_atomic_store(&sweet_amp_little_mask, little, relaxed);
++	os_atomic_store(&sweet_amp_big_mask, big, release);
++}
++
++/* CPUs the thread should use first, 0 if the steering is off. */
++static inline uint64_t
++sweet_amp_wanted_map(thread_t thread)
++{
++	uint64_t big = os_atomic_load(&sweet_amp_big_mask, acquire);
++	if (big == 0) {
++		return 0;
++	}
++	if (thread->base_pri >= sweet_amp_pri && get_threadtask(thread) != kernel_task) {
++		return big;
++	}
++	return os_atomic_load(&sweet_amp_little_mask, relaxed);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ /*
+  *	choose_processor:
+  *
+@@ -5328,7 +5368,15 @@ choose_processor(
+ 					 * If the rotation bitmask to force a migration is set for this core and there's an idle core that
+ 					 * that needn't be avoided, don't continue running on the same core.
+ 					 */
+-					if (!(bit_test(processor->processor_set->perfcontrol_cpu_migration_bitmask, processor->cpu_id) && non_avoided_idle_primary_map != 0)) {
++					bool keep_hint = true;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++					/* Wrong core class for this thread and an idle core of the right class exists. */
++					uint64_t amp_want = sweet_amp_wanted_map(thread);
++					if (amp_want != 0 && !bit_test(amp_want, processor->cpu_id) && (idle_primary_map & amp_want) != 0) {
++						keep_hint = false;
++					}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++					if (keep_hint && !(bit_test(processor->processor_set->perfcontrol_cpu_migration_bitmask, processor->cpu_id) && non_avoided_idle_primary_map != 0)) {
+ 						return processor;
+ 					}
+ 				}
+@@ -5490,6 +5538,19 @@ no_available_cpus:
+ 		/* there shouldn't be a pending AST if the processor is idle */
+ 		assert((idle_primary_map & pset->pending_AST_URGENT_cpu_mask) == 0);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/* Idle cores of the class this thread should use first (round robin). */
++		uint64_t amp_want_idle = idle_primary_map & sweet_amp_wanted_map(thread);
++		if (amp_want_idle != 0) {
++			int amp_cpu = lsb_next(amp_want_idle, pset->cpu_preferred_last_chosen);
++			if (amp_cpu < 0) {
++				amp_cpu = lsb_first(amp_want_idle);
++			}
++			pset->cpu_preferred_last_chosen = amp_cpu;
++			return processor_array[amp_cpu];
++		}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ 		/*
+ 		 * Look at the preferred cores first.
+ 		 */

@@ -1,0 +1,22 @@
+diff --git a/bsd/dev/sweet_charger.c b/bsd/dev/sweet_charger.c
+index 72cab593bdb4bfe8b86b8c1bca8367ffdab21870..1e08d937ca1ed6756678ab67c4ff10ea21cea292 100644
+--- a/bsd/dev/sweet_charger.c
++++ b/bsd/dev/sweet_charger.c
+@@ -293,11 +293,15 @@ sc_temp_name(const struct sc_snap *s)
+ 	return "ok";
+ }
+ 
+-/* hot / cold / soft limit / battery OV / safety timer: no raising, give back what we changed */
++/*
++ * Too hot / too cold / battery OV / safety timer: no raising, give back what we changed (0223). The JEITA soft limits (warm,
++ * cool) are not a reason to hold: the charger's own JEITA compensation lowers FCC/FV there (Linux smb2 charges through
++ * them), and this phone's thermistor reads warm while charging, which held every charge at 500 mA.
++ */
+ static bool
+ sc_unsafe(const struct sc_snap *s)
+ {
+-	return (s->st2 & 0x6fu) != 0 || (s->st7 & 0x0fu) != 0;
++	return (s->st2 & 0x63u) != 0 || (s->st7 & 0x0cu) != 0;
+ }
+ 
+ /*

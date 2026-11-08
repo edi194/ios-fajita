@@ -1,0 +1,74 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -199,6 +199,8 @@ public:
+ 	bool          fHw, fHwOn, fHwPE, fBorderFix, fLmPending;
+ 	uint32_t      fHwStride, fHwDstW, fHwDstH, fHwDstX, fHwDstY;
+ 	uint32_t      fQseedVer, fLastFlush;
++	uint32_t      fHwFilter;        /* sweetfb_hwfilter: QSEED3 Y/RGB filter mode, see hwProgram */
++	bool          fHwDump;          /* sweetfb_hwdump=1: read the scaler registers back */
+ 	uint32_t      fBorder0, fBorder1;
+ 	bool          hwSetup(void);
+ 	void          hwProgram(void);
+@@ -819,6 +821,19 @@ AppleCLCD::hwSetup(void)
+ 	int pe = 1;
+ 	PE_parse_boot_argn("sweetfb_hwpe", &pe, sizeof(pe));
+ 	fHwPE = pe != 0;
++	/*
++	 * sweetfb_hwfilter (patch 0129): 1 (default) = bilinear, QSEED3 Y/RGB filter field 3 =
++	 * Linux DPU_SCALE_BIL (the enum is 2D_4X4=0, CIR=1, SEP=2, BIL=3: 0126 wrote 1 = circular
++	 * LUT filter with no LUT loaded). 0 = field 0 (2D 4x4, edge directed), 2 = field 2 (1D
++	 * separable), 3 = field 1 (circular); all three read coefficient RAM that nobody loads
++	 * (Linux uploads nothing for the default bilinear), so they are diagnostics only.
++	 */
++	int hf = 1;
++	PE_parse_boot_argn("sweetfb_hwfilter", &hf, sizeof(hf));
++	fHwFilter = (hf < 0 || hf > 3) ? 1u : (uint32_t)hf;
++	int hd = 0;
++	PE_parse_boot_argn("sweetfb_hwdump", &hd, sizeof(hd));
++	fHwDump = hd != 0;
+ 	/* the margins of a fit come from the mixer's border colour: must be black */
+ 	fBorderFix = (fHwDstW < fWidth || fHwDstH < fHeight) && (fBorder0 | fBorder1) != 0;
+ 	IOLog("SWEET FB: hw scaler: canvas %ux%u (stride %u) -> %ux%u at %u,%u in the %ux%u panel, phase step 0x%x/0x%x, qseed3 v0x%x, PE regs %s, border fix %s\n",
+@@ -878,8 +893,10 @@ AppleCLCD::hwProgram(void)
+ 	mdp_wr(q, QSEED3_SRC_SIZE_Y_RGB_A, src);
+ 	mdp_wr(q, QSEED3_SRC_SIZE_UV, src);
+ 	mdp_wr(q, QSEED3_DST_SIZE, dst);
++	/* op_mode bits 17:16 = y_rgb_filter_cfg: enum dpu_hw_filter_yuv 2D_4X4 0, CIR 1, 1D_SEP 2, BIL 3 */
++	static const uint32_t filterField[4] = { 0, 3, 2, 1 };  /* sweetfb_hwfilter 0..3 */
+ 	uint32_t op = (1u << 0) |                       /* enable */
+-	    (1u << 16) |                                /* Y/RGB filter: bilinear (DPU_SCALE_BIL) */
++	    (filterField[fHwFilter] << 16) |
+ 	    (1u << 14) |                                /* not a DX format */
+ 	    (1u << 31);                                 /* blend_cfg */
+ 	if (alpha) {
+@@ -897,6 +914,29 @@ AppleCLCD::hwProgram(void)
+ 		IOLog("SWEET FB: hw scaler programmed: src %ux%u dst %ux%u at %u,%u, qseed3 op 0x%x steps 0x%x/0x%x%s\n",
+ 		    fLogicalW, fLogicalH, fHwDstW, fHwDstH, fHwDstX, fHwDstY, op, stepx, stepy,
+ 		    alpha ? " (alpha)" : "");
++		IOLog("SWEET FB: qseed3 written (v0x%x, hwfilter %u = Y/RGB field %u%s): SRC_SIZE 0x%08x OUT_SIZE 0x%08x OUT_XY 0x%08x PE %s (c0/c12/c3 LR 0 TB 0 REQ 0x%08x)\n",
++		    fQseedVer, fHwFilter, filterField[fHwFilter],
++		    fHwFilter == 1 ? ", bilinear" : " (no LUT loaded: diagnostic)", src, dst,
++		    (fHwDstY << 16) | fHwDstX, fHwPE ? "written" : "untouched", src);
++		IOLog("SWEET FB: qseed3 written: PHASE_INIT 0 (all, Y_H/Y_V/UV_H/UV_V%s) STEP_Y 0x%06x/0x%06x STEP_UV 0x%06x/0x%06x PRELOAD 0x%08x SRC_Y 0x%08x SRC_UV 0x%08x DST 0x%08x OP 0x%08x (en 1, filter %u<<16, non-DX, blend 1, dir_en 0, DE off, lut_flag 0%s)\n",
++		    fQseedVer == 0x1002 ? " via PHASE_INIT" : "", stepx, stepy, stepx, stepy,
++		    4u | (3u << 8) | (4u << 16) | (3u << 24), src, src, dst, op, filterField[fHwFilter],
++		    alpha ? (fQseedVer == 0x1002 ? ", alpha bilinear bit30" : ", alpha bilinear bit29") : ", no alpha");
++		if (fHwDump) {
++			static const uint32_t regs[] = { 0x00, 0x04, 0x08, 0x0c, 0x10, 0x14, 0x18, 0x1c, 0x20,
++			    0x24, 0x28, 0x2c, 0x30, 0x34, 0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50,
++			    0x90, 0x94, 0x98, 0x9c };
++			for (unsigned i = 0; i < sizeof(regs) / sizeof(regs[0]); i++) {
++				IOLog("SWEET FB: qseed3 readback +0x%02x = 0x%08x\n", regs[i], mdp_rd(q, regs[i]));
++			}
++			/* first words of the five coefficient tables (Linux off_tbl region 0): is the LUT RAM populated? */
++			static const uint32_t luts[5] = { 0x000, 0x320, 0x500, 0x380, 0x560 };
++			for (unsigned i = 0; i < 5; i++) {
++				IOLog("SWEET FB: qseed3 lut%u @0x%03x: %08x %08x %08x %08x\n", i, 0x100 + luts[i],
++				    mdp_rd(q, 0x100 + luts[i]), mdp_rd(q, 0x104 + luts[i]),
++				    mdp_rd(q, 0x108 + luts[i]), mdp_rd(q, 0x10c + luts[i]));
++			}
++		}
+ 	}
+ }
+ 

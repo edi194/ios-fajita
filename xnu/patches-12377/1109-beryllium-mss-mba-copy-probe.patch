@@ -1,0 +1,43 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -1412,13 +1412,38 @@
+ 	if (!ms_step(3, "copy MBA into its carve-out (before any MSS power: Linux q6v5_load order)")) {
+ 		goto out;
+ 	}
++	/*
++	 * Boot 35 froze in this copy too, with the modem untouched (sweetmssstep=3). Probe the carve-out one
++	 * access at a time, each logged and flushed first, so the last line tells whether it cannot be
++	 * read, cannot be written, or only part of it is protected.
++	 */
+ 	vm_offset_t mba_va = ml_io_map_wcomb(MSS_MBA_PA, MSS_MBA_SIZE);
+ 	if (!mba_va) {
+ 		printf("SWEET MSS: MBA carve-out mapping failed\n");
+ 		goto out;
+ 	}
+-	memcpy((void *)mba_va, mba, mba_len);
++	printf("SWEET MSS: 3a: MBA carve-out %#llx+%#x mapped write-combined at %#lx; next: read word 0\n",
++	    MSS_MBA_PA, MSS_MBA_SIZE, (unsigned long)mba_va);
++	sweet_log_sync();
++	wl_sleep(1500);
++	uint32_t w0 = *(volatile uint32_t *)mba_va;
++	printf("SWEET MSS: 3b: word 0 reads %#x; next: write word 0\n", w0);
++	sweet_log_sync();
++	wl_sleep(1500);
++	*(volatile uint32_t *)mba_va = *(const uint32_t *)mba;
+ 	__asm__ volatile ("dsb sy" ::: "memory");
++	printf("SWEET MSS: 3c: word 0 written, reads back %#x (want %#x); next: copy in 64 KiB pieces\n",
++	    *(volatile uint32_t *)mba_va, *(const uint32_t *)mba);
++	sweet_log_sync();
++	wl_sleep(1500);
++	for (uint32_t off = 0; off < mba_len; off += 0x10000u) {
++		uint32_t n = mba_len - off < 0x10000u ? mba_len - off : 0x10000u;
++		printf("SWEET MSS: 3d: copy %#x+%#x\n", off, n);
++		sweet_log_sync();
++		wl_sleep(300);
++		memcpy((void *)(mba_va + off), (const uint8_t *)mba + off, n);
++		__asm__ volatile ("dsb sy" ::: "memory");
++	}
+ 	ml_io_unmap(mba_va, MSS_MBA_SIZE);      /* no kernel mapping may exist once the Q6 owns it */
+ 	mba_va = 0;
+ 	printf("SWEET MSS: MBA copied to %#llx (%u bytes)\n", MSS_MBA_PA, mba_len);

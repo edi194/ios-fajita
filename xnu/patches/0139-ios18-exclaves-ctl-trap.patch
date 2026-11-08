@@ -1,0 +1,50 @@
+--- a/osfmk/kern/syscall_sw.c
++++ b/osfmk/kern/syscall_sw.c
+@@ -102,6 +102,9 @@
+ #include <mach/mk_timer.h>
+ 
+ 
++/* iOS 18 trap 88, see below */
++kern_return_t sweet_exclaves_ctl_trap(struct kern_invalid_args *args);
++
+ const mach_trap_t       mach_trap_table[MACH_TRAP_TABLE_COUNT] = {
+ /* 0 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
+ /* 1 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
+@@ -195,7 +198,7 @@
+ /* 85 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
+ /* 86 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
+ /* 87 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
+-/* 88 */ MACH_TRAP(kern_invalid, 0, 0, NULL),
++/* 88 */ MACH_TRAP(sweet_exclaves_ctl_trap, 0, 0, NULL),
+ /* 89 */ MACH_TRAP(mach_timebase_info_trap, 1, 1, munge_w),
+ /* 90 */ MACH_TRAP(mach_wait_until_trap, 1, 2, munge_l),
+ /* 91 */ MACH_TRAP(mk_timer_create_trap, 0, 0, NULL, .mach_trap_returns_port = 1),
+@@ -332,7 +335,7 @@
+ /* 85 */ "kern_invalid",
+ /* 86 */ "kern_invalid",
+ /* 87 */ "kern_invalid",
+-/* 88 */ "kern_invalid",
++/* 88 */ "exclaves_ctl_trap",
+ /* 89 */ "mach_timebase_info_trap",
+ /* 90 */ "mach_wait_until_trap",
+ /* 91 */ "mk_timer_create_trap",
+@@ -378,6 +381,19 @@
+ };
+ 
+ const int mach_trap_count = (sizeof(mach_trap_table) / sizeof(mach_trap_table[0]));
++
++/*
++ * iOS 18 (xnu-11215) trap 88 is exclaves_ctl_trap. launchd's exclaves-boot task calls it; on
++ * devices without exclaves the kernel answers KERN_NOT_SUPPORTED and launchd goes on, while
++ * kern_invalid here raises EXC_SYSCALL -> SIGSYS and pid 1 dies (namespace 2 subcode 0xc).
++ * Nothing in the iOS 16 userland uses trap 88.
++ */
++kern_return_t
++sweet_exclaves_ctl_trap(
++	__unused struct kern_invalid_args *args)
++{
++	return KERN_NOT_SUPPORTED;
++}
+ 
+ kern_return_t
+ kern_invalid(

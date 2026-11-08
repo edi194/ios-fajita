@@ -1,0 +1,104 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -103,11 +103,17 @@ void
+ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+     bool capable, bool charging, bool full, bool measured, bool currentValid)
+ {
+-	/* Use consistent mAh units (DT nominal=5020). powerd computes C*100/M. */
++	/*
++	 * Patch 0130: iOS' AppleSmartBattery publishes the UI state of charge as
++	 * CurrentCapacity (0..100) with MaxCapacity 100; the mAh values live in
++	 * AppleRaw*Capacity / NominalChargeCapacity. Consumers that read
++	 * CurrentCapacity as a percentage (BatteryCenter, SpringBoard's status bar
++	 * item, powerd's "Current Capacity") saw 5020 here. DT nominal = 5020 mAh.
++	 */
+ 	const unsigned capacity = (5020u * percent + 50u) / 100u;
+ 	setBatteryInstalled(true);
+-	setCurrentCapacity(capacity);
+-	setMaxCapacity(5020);
++	setCurrentCapacity(percent);
++	setMaxCapacity(100);
+ 	setExternalConnected(external);
+ 	setExternalChargeCapable(capable);
+ 	setIsCharging(charging);
+@@ -116,9 +122,78 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	setAtCriticalLevel(false);
+ 	setVoltage(mv);
+ 	setAmperage(ma);
+-	setTimeRemaining(-1); /* Unknown; never publish zero minutes on error. */
++	setTimeRemaining(0xffff); /* Unknown (AppleSmartBattery's 65535); never zero minutes. */
+ 	setCycleCount(0);     /* Placeholder: cycle learning is not implemented. */
+ 	putBool("FullyCharged", full);
++	putBool("built-in", true);
++	putBool("CapacityEstimated", !measured);
++	putNumber("NominalChargeCapacity", 5020);
++	putNumber("AppleRawBatteryVoltage", mv);
++	putNumber("DesignCycleCount9C", 500);
++	putNumber("PermanentFailureStatus", 0);
++	putNumber("AvgTimeToEmpty", 0xffff);
++	putNumber("AvgTimeToFull", 0xffff);
++	putNumber("InstantTimeToEmpty", 0xffff);
++	putNumber("BatteryCellDisconnectCount", 0);
++	putNumber("UpdateTime", 0);
++	{
++		/* thermalmonitord/powerd read "BatteryData" (a dictionary) and logged "batteryData NULL". */
++		const OSSymbol *bdKey = OSSymbol::withCString("BatteryData");
++		OSDictionary *bd = OSDictionary::withCapacity(8);
++		if (bdKey && bd) {
++			struct { const char *k; UInt32 v; } items[] = {
++				{"CycleCount", 0}, {"DesignCapacity", 5020}, {"StateOfCharge", percent},
++				{"Voltage", mv}, {"MaxCapacity", 5020}, {"NominalChargeCapacity", 5020},
++				{"Flags", 0}, {"ResScale", 1},
++			};
++			for (unsigned i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
++				OSNumber *n = OSNumber::withNumber(items[i].v, 32);
++				if (n) {
++					bd->setObject(items[i].k, n);
++					n->release();
++				}
++			}
++			setPSProperty(bdKey, bd);
++		}
++		OSSafeReleaseNULL(bd);
++		OSSafeReleaseNULL(bdKey);
++	}
++	{
++		/* "AdapterDetails": USB host 5 V / 500 mA while external (locationd/safetyalertsd logged "none"/nil). */
++		const OSSymbol *adKey = OSSymbol::withCString("AdapterDetails");
++		if (adKey) {
++			if (external) {
++				OSDictionary *ad = OSDictionary::withCapacity(6);
++				if (ad) {
++					struct { const char *k; UInt32 v; } items[] = {
++						{"AdapterVoltage", 5000}, {"Current", 500}, {"Watts", 3},
++						{"Source", 0}, {"IsWireless", 0}, {"FamilyCode", 0xe0004001u},
++					};
++					for (unsigned i = 0; i < sizeof(items) / sizeof(items[0]); i++) {
++						OSNumber *n = OSNumber::withNumber(items[i].v, 32);
++						if (n) {
++							ad->setObject(items[i].k, n);
++							n->release();
++						}
++					}
++					OSString *d = OSString::withCString("usb host");
++					if (d) {
++						ad->setObject("Description", d);
++						d->release();
++					}
++					setPSProperty(adKey, ad);
++					ad->release();
++				}
++			} else {
++				if (properties->getObject(adKey)) {
++					properties->removeObject(adKey);
++					removeProperty(adKey);
++					settingsChangedSinceUpdate = true;
++				}
++			}
++			adKey->release();
++		}
++	}
+ 	putBool("AppleRawExternalConnected", external);
+ 	putNumber("AppleRawCurrentCapacity", capacity);
+ 	putNumber("AppleRawMaxCapacity", 5020);

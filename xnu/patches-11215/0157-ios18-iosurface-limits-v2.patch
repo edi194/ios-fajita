@@ -1,0 +1,37 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 0c165b8b9a68cfbf3f84c2c3e106e318c9213538..b085b06d643dc28679b6f288fe00e71f23573499 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1431,12 +1431,30 @@ IOSurfaceRootUserClient::externalMethod(uint32_t selector, IOExternalMethodArgum
+ 
+ 	switch (selector) {
+ 	case kSweetSurfaceLimits: {
+-		uint8_t limits[0x18] = { 0 };
++		/*
++		 * iOS 16 asked for 0x18 bytes (version byte at 0x16). IOSurface.framework 22H352 asks for 0x28 bytes
++		 * and checks the u16 at 0x22 == 1, otherwise logs "IOSurface.framework versus IOSurface.kext version
++		 * mismatch" and closes the connection (every IOSurface create then fails: "IOSurface open failed").
++		 * Layout read from the client (_IOSurfaceClientGetPropertyAlignment / ...Maximum):
++		 *   +0x00 u32 alignment-1 for Offset / PlaneOffset / PlaneBase
++		 *   +0x04 u32 alignment-1 for BytesPerRow / PlaneBytesPerRow
++		 *   +0x08 u64 max BytesPerRow   +0x10 u64 max Width   +0x18 u64 max Height
++		 *   +0x20 u8 flag               +0x22 u16 version (1)
++		 */
++		uint8_t limits[0x28] = { 0 };
+ 		put32(limits, 0x0, SWEET_SURFACE_ROW_ALIGN - 1);
+ 		put32(limits, 0x4, SWEET_SURFACE_ROW_ALIGN - 1);
++		put64(limits, 0x08, 0x10000000ULL);
++		put64(limits, 0x10, 0x10000ULL);
++		put64(limits, 0x18, 0x10000ULL);
+ 		limits[0x16] = 1;
++		limits[0x22] = 1;
++		printf("SWEET SURF: limits sel 13 out %u desc %d\n", args->structureOutputSize,
++		    args->structureOutputDescriptor != NULL);
+ 		sweet_surf_log_once("sel", selector);
+-		return sweet_struct_out(args, limits, sizeof(limits));
++		return sweet_struct_out(args, limits,
++		    (args->structureOutputDescriptor == NULL && args->structureOutputSize < sizeof(limits)) ?
++		    args->structureOutputSize : (uint32_t)sizeof(limits));
+ 	}
+ 	case kSweetSurfaceCreate:
+ 		return create(args);

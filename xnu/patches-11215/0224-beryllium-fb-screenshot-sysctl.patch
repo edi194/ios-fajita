@@ -1,0 +1,179 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -15,6 +15,8 @@
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <sys/sysctl.h>
++#include <sys/kauth.h>
++#include <kern/kalloc.h>
+ #include <string.h>
+ 
+ #define SWEET_FB_TEXT_MAX 1024
+@@ -61,6 +63,57 @@
+ SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hud, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_hud, 0,
+     "Poco F1 on-screen performance HUD (0 off, 1 on); needs the copy scan-out path");
+ 
++/*
++ * sysctl kern.sweet_fb_shot (patch 0224): a screenshot of what the panel scans now, for testing over SSH
++ * (tools/sweetnet/sweetshot). Root only. 16-byte header, little endian: 'SHOT' (0x544f4853), width, height,
++ * bytes per row (width * 4); then BGRA rows. kern.sweet_fb_shot_scale (2..8, default 3) keeps every n-th pixel
++ * in both directions: 375x812 from the 1125x2436 canvas at 3.
++ */
++int sweet_fb_shot_copy(uint8_t *dst, size_t cap, uint32_t scale, uint32_t *ow, uint32_t *oh);
++
++static unsigned int sweet_fb_shot_scale = 3;
++SYSCTL_UINT(_kern, OID_AUTO, sweet_fb_shot_scale, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_shot_scale, 0,
++    "Poco F1 screenshot downscale (kern.sweet_fb_shot), 2..8");
++
++#define SWEET_FB_SHOT_MAXW 1280
++#define SWEET_FB_SHOT_MAXH 2560
++
++static int sweet_fb_shot_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	uint32_t scale = sweet_fb_shot_scale, w = 0, h = 0;
++	if (scale < 2 || scale > 8) {
++		scale = 3;
++	}
++	size_t cap = 16 + (size_t)(SWEET_FB_SHOT_MAXW / scale) * (SWEET_FB_SHOT_MAXH / scale) * 4;
++
++	if (req->oldptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, NULL, cap);      /* size query */
++	}
++	if (req->newptr != USER_ADDR_NULL) {
++		return EPERM;
++	}
++	if (!kauth_cred_issuser(kauth_cred_get())) {
++		return EPERM;
++	}
++	uint8_t *buf = kalloc_data(cap, Z_WAITOK);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	int err = sweet_fb_shot_copy(buf + 16, cap - 16, scale, &w, &h);
++	if (err == 0) {
++		uint32_t hdr[4] = { 0x544f4853u, w, h, w * 4 };
++		memcpy(buf, hdr, sizeof(hdr));
++		err = SYSCTL_OUT(req, buf, 16 + (size_t)w * h * 4);
++	}
++	kfree_data(buf, cap);
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_shot,
++    CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_fb_shot_sysctl, "S",
++    "Poco F1 screenshot of the scanned frame: 16-byte header + BGRA (see bsd/dev/sweet_fb.c)");
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_fb_sysctl, "A",
+     "Poco F1 display path statistics, key=value string (see bsd/dev/sweet_fb.c)");
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -48,6 +48,8 @@
+ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sweet_smmu.c, read only */
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ extern "C" int sweet_fb_hud;                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
++class AppleCLCD;
++static AppleCLCD *sweet_fb_shot_fb;             /* the framebuffer kern.sweet_fb_shot reads (patch 0224) */
+ extern "C" unsigned char iso_font[256 * 16];    /* osfmk/console/iso_font.c: the 8x16 console font */
+ extern "C" void sweet_gpu_hud_state(unsigned *mhz, unsigned *level, unsigned *busy_pct, int *gov, int *state); /* bsd/dev/sweet_a630.c */
+ extern "C" void sweet_cpufreq_hud_mhz(unsigned *a55_mhz, unsigned *a75_mhz);    /* bsd/dev/sweet_cpufreq.c */
+@@ -69,6 +71,7 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
++#include <sys/errno.h>
+ 
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+@@ -229,6 +232,7 @@
+ 	 */
+ 	bool          fZc, fZcOK, fZcFront;
+ 	SweetSurface *fZcHeld[4];
++	uint32_t      fShotId;          /* IOSurface id of the newest zero-copy frame (kern.sweet_fb_shot, patch 0224) */
+ 	uint32_t      fZcCount, fZcNo[8], fZcNoNext, fZcWhySeen;
+ 	uint64_t      fZcFrames, fCopyFrames;
+ 	bool          zcPresent(const uint8_t *rec, uint32_t mask);
+@@ -669,12 +673,72 @@
+ 	setProperty("external", false);
+ 	setProperty("DisplayPipePlaneBaseAlignment", 64ULL, 32);
+ 	registerService();
++	__atomic_store_n(&sweet_fb_shot_fb, this, __ATOMIC_RELEASE);     /* kern.sweet_fb_shot (patch 0224) */
+ 	IOLog("SWEET FB: AppleCLCD %ux%u stride %u at 0x%llx, default surface %u, presented as %ux%u, vsync %u us, copy every %u, scale %u (pad %d,%d), direct %d early %d\n",
+ 	    fWidth, fHeight, fRowBytes, fPhys, fSurface->id, fLogicalW, fLogicalH, fVsyncUS, fFlushTicks,
+ 	    fScale, fPadX, fPadY, fDirect ? 1 : 0, fEarly ? 1 : 0);
+ 	return true;
+ }
++
++/*
++ * Screenshot of what the panel scans now (patch 0224): sysctl kern.sweet_fb_shot (bsd/dev/sweet_fb.c) asks for a
++ * copy, every scale-th pixel in both directions, BGRA, rows of *ow * 4 bytes. The source is the pooled surface of
++ * the newest zero-copy frame (held by a reference while it is read), else the page-flip frame on the panel (the
++ * canvas when the hardware scaler is on, the panel-sized frame otherwise; frame 0 is ABL's), else the boot
++ * framebuffer. Reads race the next frame: a screenshot may mix two frames, nothing worse.
++ */
++extern "C" int sweet_fb_shot_copy(uint8_t *dst, size_t cap, uint32_t scale, uint32_t *ow, uint32_t *oh);
++
++int
++sweet_fb_shot_copy(uint8_t *dst, size_t cap, uint32_t scale, uint32_t *ow, uint32_t *oh)
++{
++	AppleCLCD *fb = __atomic_load_n(&sweet_fb_shot_fb, __ATOMIC_ACQUIRE);
++	SweetSurface *s = NULL;
++	uintptr_t src = 0;
++	uint32_t w, h, stride;
+ 
++	if (fb == NULL || scale == 0) {
++		return ENODEV;
++	}
++	uint32_t id = __atomic_load_n(&fb->fShotId, __ATOMIC_ACQUIRE);
++	if (fb->fZcFront && id != 0 && (s = sweet_surface_copy(id)) != NULL && s != fb->fSurface &&
++	    s->kernelAddress() != 0 && s->width >= fb->fLogicalW && s->height >= fb->fLogicalH) {
++		src = s->kernelAddress() + s->offset;
++		w = fb->fLogicalW;
++		h = fb->fLogicalH;
++		stride = s->bytesPerRow;
++	} else {
++		OSSafeReleaseNULL(s);
++		uint32_t f = fb->fFlip ? fb->fFront : 0;
++		src = f < 3 && fb->fFlip ? fb->fBufVA[f] : fb->fPixels;
++		if (f != 0 && fb->fHw) {
++			w = fb->fLogicalW;
++			h = fb->fLogicalH;
++			stride = fb->fHwStride;
++		} else {
++			w = fb->fWidth;
++			h = fb->fHeight;
++			stride = fb->fRowBytes;
++		}
++	}
++	uint32_t dw = w / scale, dh = h / scale;
++	if (src == 0 || dw == 0 || dh == 0 || (uint64_t)dw * dh * 4 > cap) {
++		OSSafeReleaseNULL(s);
++		return src == 0 ? ENODEV : ENOSPC;
++	}
++	for (uint32_t y = 0; y < dh; y++) {
++		const uint32_t *in = (const uint32_t *)(src + (uintptr_t)y * scale * stride);
++		uint32_t *out = (uint32_t *)(dst + (size_t)y * dw * 4);
++		for (uint32_t x = 0; x < dw; x++) {
++			out[x] = in[x * scale];
++		}
++	}
++	OSSafeReleaseNULL(s);
++	*ow = dw;
++	*oh = dh;
++	return 0;
++}
++
+ void
+ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ {
+@@ -1914,6 +1978,7 @@
+ 	sweet_hold(s, true);
+ 	fZcHeld[fZcCount++] = s;        /* keeps the reference sweet_surface_copy gave */
+ 	scanAddr((uint32_t)(s->poolPA + s->offset), s->bytesPerRow, true);
++	__atomic_store_n(&fShotId, id, __ATOMIC_RELEASE);
+ 	fZcFront = true;
+ 	uint64_t tzd = mach_absolute_time() - tz0;
+ 	fSt.zc++;

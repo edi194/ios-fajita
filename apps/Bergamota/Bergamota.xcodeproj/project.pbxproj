@@ -1,0 +1,497 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		00E1F2BA24558405C7543157 /* RemoteControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = 24B936B85666259BB68E2523 /* RemoteControl.swift */; };
+		03AF35A3C4F3936768133087 /* Activity.swift in Sources */ = {isa = PBXBuildFile; fileRef = D04C3C713F599A5893B08F2A /* Activity.swift */; };
+		0E57166CFACCBAF0FD41B0DE /* DesignPreview.swift in Sources */ = {isa = PBXBuildFile; fileRef = F0F772443A7DFAE30D9B18C6 /* DesignPreview.swift */; };
+		18F55A1A9E0A6771EFAD4933 /* MetricsViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = 38BE0EBD954A629D19871354 /* MetricsViews.swift */; };
+		1A2DE60BC9DD25D4E35E44C9 /* Archivo-OFL.txt in Resources */ = {isa = PBXBuildFile; fileRef = 33362E11AA3494AA7B2901BA /* Archivo-OFL.txt */; };
+		1AFD9BEBEC8D77117666AABB /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = B0B92F02006A156A7A40A6A7 /* Assets.xcassets */; };
+		246CA0151193F5F83DE55484 /* ActivityBannerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1287FE4F58266A0E0CB225D8 /* ActivityBannerView.swift */; };
+		27224D0BE64A7F5BDEB9C419 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2E0006BEE820A89BEF4C071C /* ContentView.swift */; };
+		34DD3CF051770AF035AB8A55 /* Bergamota.icon in Resources */ = {isa = PBXBuildFile; fileRef = 46A04B88F77F978BD19ABF5B /* Bergamota.icon */; };
+		3622277176025B99932F6D24 /* CIView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E9BB85C4769A7EEEB93854A /* CIView.swift */; };
+		3FE85DF37181E833C1FB0430 /* Notifier.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4EA4729BAD7FDDE0D68743AA /* Notifier.swift */; };
+		633D6E56FD67DFDB7FB12FE2 /* LogStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA529915B5B2FC1CC115AF32 /* LogStore.swift */; };
+		69A53AED3C801FA285035F6B /* StateRail.swift in Sources */ = {isa = PBXBuildFile; fileRef = F73E92FFF87E3A945DE16CB7 /* StateRail.swift */; };
+		7102CC1B82D052FB3EF09B49 /* DashboardView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB6E1461BFF3858229E88FC2 /* DashboardView.swift */; };
+		7669F747ECECA4DDC3B8F292 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A566265151DD90D00679BB5 /* AppModel.swift */; };
+		7A0AAC06E703B069426948A0 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8F680F8CC74E2C42A62FDAF5 /* AppSettings.swift */; };
+		7A1C883BBF4FCC6E8C1CFB32 /* JetBrainsMono-OFL.txt in Resources */ = {isa = PBXBuildFile; fileRef = 0B400FF6CE083DA768067292 /* JetBrainsMono-OFL.txt */; };
+		82421DAF0E6B0833E6401B0C /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEB3E800D879EDC27FA5C2A7 /* Theme.swift */; };
+		8C6AB67C5E307BC48A5C44BF /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9689CF0534145D62FF6FDCCE /* SettingsView.swift */; };
+		93B49DF7DDA26400BCA18E8E /* Metrics.swift in Sources */ = {isa = PBXBuildFile; fileRef = AF9B4B1EB51DD61060567508 /* Metrics.swift */; };
+		969B6F0992415FC91C9A1EB1 /* CIModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C3DACBCD7340496B4654CED4 /* CIModel.swift */; };
+		A914B655C8FC74AB45CB9BD4 /* Shell.swift in Sources */ = {isa = PBXBuildFile; fileRef = 935046D9F93402D85B583C91 /* Shell.swift */; };
+		AE2A3922C3A39D6470DBACE8 /* PhoneMonitor.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7CD4C58E6D1931CF4B158745 /* PhoneMonitor.swift */; };
+		AE6DA8C5C8B1AED24B85A5DA /* LogView.swift in Sources */ = {isa = PBXBuildFile; fileRef = D56F9CEB69DEBE9F6E432BBB /* LogView.swift */; };
+		C3AF0529071671B9D29374D6 /* BuildModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 559A25AF93EAE71251215417 /* BuildModel.swift */; };
+		C81FD2B791A0DA05DEBE42DD /* AppsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 20B70646D2F6E0947A6481F1 /* AppsView.swift */; };
+		CF88251BE1C9E840043116E2 /* archivo.woff2 in Resources */ = {isa = PBXBuildFile; fileRef = C0F3E84D57748D99C115834D /* archivo.woff2 */; };
+		D6404BCC6AA46B334D2A5569 /* BergamotaApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = D15B777B99E2D7E58AA383A1 /* BergamotaApp.swift */; };
+		D74B8D75BDD83E28B429AB4D /* jetbrains-mono.woff2 in Resources */ = {isa = PBXBuildFile; fileRef = A72B096F94767A562BBE74A2 /* jetbrains-mono.woff2 */; };
+		D9217A35E2DCCA2571765771 /* BootQueue.swift in Sources */ = {isa = PBXBuildFile; fileRef = 76903B852A256F83045809A3 /* BootQueue.swift */; };
+		D98F285E66ED92FFE9DCC6DC /* MediaView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C336382D40088FEC32DFE355 /* MediaView.swift */; };
+		EBC91199213853269848A876 /* PhoneTools.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0357E193A87BD78D0EDAC7C /* PhoneTools.swift */; };
+		EEE0A5DBD1FAB99B2D8F268B /* UserdataFlash.swift in Sources */ = {isa = PBXBuildFile; fileRef = B6828D58FB3900E94C33ABDD /* UserdataFlash.swift */; };
+		F83F2C8569B4DB540DCF9592 /* ControlPlaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 47A42F44F37DC3FEED5F3D41 /* ControlPlaneView.swift */; };
+		F90B61A234ED8970DEC85954 /* FlashUserdataView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 299DD6841170662BFEDCE97C /* FlashUserdataView.swift */; };
+		F9E63E038DABF4B851EF1680 /* BootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 703EEA9F919721AD4D98E5B8 /* BootView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		0B400FF6CE083DA768067292 /* JetBrainsMono-OFL.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "JetBrainsMono-OFL.txt"; sourceTree = "<group>"; };
+		1287FE4F58266A0E0CB225D8 /* ActivityBannerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityBannerView.swift; sourceTree = "<group>"; };
+		20B70646D2F6E0947A6481F1 /* AppsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppsView.swift; sourceTree = "<group>"; };
+		24B936B85666259BB68E2523 /* RemoteControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RemoteControl.swift; sourceTree = "<group>"; };
+		299DD6841170662BFEDCE97C /* FlashUserdataView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlashUserdataView.swift; sourceTree = "<group>"; };
+		2E0006BEE820A89BEF4C071C /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		33362E11AA3494AA7B2901BA /* Archivo-OFL.txt */ = {isa = PBXFileReference; lastKnownFileType = text; path = "Archivo-OFL.txt"; sourceTree = "<group>"; };
+		38BE0EBD954A629D19871354 /* MetricsViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MetricsViews.swift; sourceTree = "<group>"; };
+		46A04B88F77F978BD19ABF5B /* Bergamota.icon */ = {isa = PBXFileReference; lastKnownFileType = wrapper.icon; path = Bergamota.icon; sourceTree = "<group>"; };
+		47A42F44F37DC3FEED5F3D41 /* ControlPlaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ControlPlaneView.swift; sourceTree = "<group>"; };
+		48D311CBC40367F62751677D /* Bergamota.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Bergamota.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		4A566265151DD90D00679BB5 /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
+		4EA4729BAD7FDDE0D68743AA /* Notifier.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Notifier.swift; sourceTree = "<group>"; };
+		559A25AF93EAE71251215417 /* BuildModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BuildModel.swift; sourceTree = "<group>"; };
+		703EEA9F919721AD4D98E5B8 /* BootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootView.swift; sourceTree = "<group>"; };
+		76903B852A256F83045809A3 /* BootQueue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootQueue.swift; sourceTree = "<group>"; };
+		7CD4C58E6D1931CF4B158745 /* PhoneMonitor.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneMonitor.swift; sourceTree = "<group>"; };
+		8F680F8CC74E2C42A62FDAF5 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
+		935046D9F93402D85B583C91 /* Shell.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Shell.swift; sourceTree = "<group>"; };
+		9689CF0534145D62FF6FDCCE /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		9E9BB85C4769A7EEEB93854A /* CIView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CIView.swift; sourceTree = "<group>"; };
+		A72B096F94767A562BBE74A2 /* jetbrains-mono.woff2 */ = {isa = PBXFileReference; path = "jetbrains-mono.woff2"; sourceTree = "<group>"; };
+		AF9B4B1EB51DD61060567508 /* Metrics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Metrics.swift; sourceTree = "<group>"; };
+		B0B92F02006A156A7A40A6A7 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		B6828D58FB3900E94C33ABDD /* UserdataFlash.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UserdataFlash.swift; sourceTree = "<group>"; };
+		BB6E1461BFF3858229E88FC2 /* DashboardView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DashboardView.swift; sourceTree = "<group>"; };
+		C0F3E84D57748D99C115834D /* archivo.woff2 */ = {isa = PBXFileReference; path = archivo.woff2; sourceTree = "<group>"; };
+		C336382D40088FEC32DFE355 /* MediaView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaView.swift; sourceTree = "<group>"; };
+		C3DACBCD7340496B4654CED4 /* CIModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CIModel.swift; sourceTree = "<group>"; };
+		CA529915B5B2FC1CC115AF32 /* LogStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogStore.swift; sourceTree = "<group>"; };
+		D0357E193A87BD78D0EDAC7C /* PhoneTools.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhoneTools.swift; sourceTree = "<group>"; };
+		D04C3C713F599A5893B08F2A /* Activity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Activity.swift; sourceTree = "<group>"; };
+		D15B777B99E2D7E58AA383A1 /* BergamotaApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BergamotaApp.swift; sourceTree = "<group>"; };
+		D56F9CEB69DEBE9F6E432BBB /* LogView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LogView.swift; sourceTree = "<group>"; };
+		DEB3E800D879EDC27FA5C2A7 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		F0F772443A7DFAE30D9B18C6 /* DesignPreview.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DesignPreview.swift; sourceTree = "<group>"; };
+		F73E92FFF87E3A945DE16CB7 /* StateRail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StateRail.swift; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		4FD37635AC71406C56304CC9 /* Resources */ = {
+			isa = PBXGroup;
+			children = (
+				F3A87B0B39968C1F6D1EBAC3 /* Fonts */,
+			);
+			path = Resources;
+			sourceTree = "<group>";
+		};
+		60EA8C1FE156A161B01332F3 = {
+			isa = PBXGroup;
+			children = (
+				A48FB9144D7FF765B21529C0 /* Bergamota */,
+				FB87D134EE3C6887A4B80452 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		7659941D7DF3AD77C6D4C32B /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				D04C3C713F599A5893B08F2A /* Activity.swift */,
+				4A566265151DD90D00679BB5 /* AppModel.swift */,
+				8F680F8CC74E2C42A62FDAF5 /* AppSettings.swift */,
+				76903B852A256F83045809A3 /* BootQueue.swift */,
+				559A25AF93EAE71251215417 /* BuildModel.swift */,
+				C3DACBCD7340496B4654CED4 /* CIModel.swift */,
+				F0F772443A7DFAE30D9B18C6 /* DesignPreview.swift */,
+				CA529915B5B2FC1CC115AF32 /* LogStore.swift */,
+				AF9B4B1EB51DD61060567508 /* Metrics.swift */,
+				4EA4729BAD7FDDE0D68743AA /* Notifier.swift */,
+				7CD4C58E6D1931CF4B158745 /* PhoneMonitor.swift */,
+				D0357E193A87BD78D0EDAC7C /* PhoneTools.swift */,
+				24B936B85666259BB68E2523 /* RemoteControl.swift */,
+				935046D9F93402D85B583C91 /* Shell.swift */,
+				B6828D58FB3900E94C33ABDD /* UserdataFlash.swift */,
+			);
+			path = Core;
+			sourceTree = "<group>";
+		};
+		A48FB9144D7FF765B21529C0 /* Bergamota */ = {
+			isa = PBXGroup;
+			children = (
+				B0B92F02006A156A7A40A6A7 /* Assets.xcassets */,
+				46A04B88F77F978BD19ABF5B /* Bergamota.icon */,
+				D15B777B99E2D7E58AA383A1 /* BergamotaApp.swift */,
+				7659941D7DF3AD77C6D4C32B /* Core */,
+				4FD37635AC71406C56304CC9 /* Resources */,
+				E1AB4D115EE1173B0A28987E /* Views */,
+			);
+			path = Bergamota;
+			sourceTree = "<group>";
+		};
+		E1AB4D115EE1173B0A28987E /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				1287FE4F58266A0E0CB225D8 /* ActivityBannerView.swift */,
+				20B70646D2F6E0947A6481F1 /* AppsView.swift */,
+				703EEA9F919721AD4D98E5B8 /* BootView.swift */,
+				9E9BB85C4769A7EEEB93854A /* CIView.swift */,
+				2E0006BEE820A89BEF4C071C /* ContentView.swift */,
+				47A42F44F37DC3FEED5F3D41 /* ControlPlaneView.swift */,
+				BB6E1461BFF3858229E88FC2 /* DashboardView.swift */,
+				299DD6841170662BFEDCE97C /* FlashUserdataView.swift */,
+				D56F9CEB69DEBE9F6E432BBB /* LogView.swift */,
+				C336382D40088FEC32DFE355 /* MediaView.swift */,
+				38BE0EBD954A629D19871354 /* MetricsViews.swift */,
+				9689CF0534145D62FF6FDCCE /* SettingsView.swift */,
+				F73E92FFF87E3A945DE16CB7 /* StateRail.swift */,
+				DEB3E800D879EDC27FA5C2A7 /* Theme.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		F3A87B0B39968C1F6D1EBAC3 /* Fonts */ = {
+			isa = PBXGroup;
+			children = (
+				33362E11AA3494AA7B2901BA /* Archivo-OFL.txt */,
+				C0F3E84D57748D99C115834D /* archivo.woff2 */,
+				A72B096F94767A562BBE74A2 /* jetbrains-mono.woff2 */,
+				0B400FF6CE083DA768067292 /* JetBrainsMono-OFL.txt */,
+			);
+			path = Fonts;
+			sourceTree = "<group>";
+		};
+		FB87D134EE3C6887A4B80452 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				48D311CBC40367F62751677D /* Bergamota.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		10F69A2DB998B8FEA001BF4F /* Bergamota */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 0B9283843670B35D6F7DD89F /* Build configuration list for PBXNativeTarget "Bergamota" */;
+			buildPhases = (
+				C72AB349FB237A600A97FD56 /* Sources */,
+				67FB8ACB8B263C5922F411C1 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = Bergamota;
+			packageProductDependencies = (
+			);
+			productName = Bergamota;
+			productReference = 48D311CBC40367F62751677D /* Bergamota.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		FEC9D52DAC708386DFAEAE48 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+					10F69A2DB998B8FEA001BF4F = {
+						DevelopmentTeam = "";
+						ProvisioningStyle = Manual;
+					};
+				};
+			};
+			buildConfigurationList = 75ACA140B7CDEA4CFDEB7FE8 /* Build configuration list for PBXProject "Bergamota" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 60EA8C1FE156A161B01332F3;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = FB87D134EE3C6887A4B80452 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				10F69A2DB998B8FEA001BF4F /* Bergamota */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		67FB8ACB8B263C5922F411C1 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1A2DE60BC9DD25D4E35E44C9 /* Archivo-OFL.txt in Resources */,
+				1AFD9BEBEC8D77117666AABB /* Assets.xcassets in Resources */,
+				34DD3CF051770AF035AB8A55 /* Bergamota.icon in Resources */,
+				7A1C883BBF4FCC6E8C1CFB32 /* JetBrainsMono-OFL.txt in Resources */,
+				CF88251BE1C9E840043116E2 /* archivo.woff2 in Resources */,
+				D74B8D75BDD83E28B429AB4D /* jetbrains-mono.woff2 in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		C72AB349FB237A600A97FD56 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				03AF35A3C4F3936768133087 /* Activity.swift in Sources */,
+				246CA0151193F5F83DE55484 /* ActivityBannerView.swift in Sources */,
+				7669F747ECECA4DDC3B8F292 /* AppModel.swift in Sources */,
+				7A0AAC06E703B069426948A0 /* AppSettings.swift in Sources */,
+				C81FD2B791A0DA05DEBE42DD /* AppsView.swift in Sources */,
+				D6404BCC6AA46B334D2A5569 /* BergamotaApp.swift in Sources */,
+				D9217A35E2DCCA2571765771 /* BootQueue.swift in Sources */,
+				F9E63E038DABF4B851EF1680 /* BootView.swift in Sources */,
+				C3AF0529071671B9D29374D6 /* BuildModel.swift in Sources */,
+				969B6F0992415FC91C9A1EB1 /* CIModel.swift in Sources */,
+				3622277176025B99932F6D24 /* CIView.swift in Sources */,
+				27224D0BE64A7F5BDEB9C419 /* ContentView.swift in Sources */,
+				F83F2C8569B4DB540DCF9592 /* ControlPlaneView.swift in Sources */,
+				7102CC1B82D052FB3EF09B49 /* DashboardView.swift in Sources */,
+				0E57166CFACCBAF0FD41B0DE /* DesignPreview.swift in Sources */,
+				F90B61A234ED8970DEC85954 /* FlashUserdataView.swift in Sources */,
+				633D6E56FD67DFDB7FB12FE2 /* LogStore.swift in Sources */,
+				AE6DA8C5C8B1AED24B85A5DA /* LogView.swift in Sources */,
+				D98F285E66ED92FFE9DCC6DC /* MediaView.swift in Sources */,
+				93B49DF7DDA26400BCA18E8E /* Metrics.swift in Sources */,
+				18F55A1A9E0A6771EFAD4933 /* MetricsViews.swift in Sources */,
+				3FE85DF37181E833C1FB0430 /* Notifier.swift in Sources */,
+				AE2A3922C3A39D6470DBACE8 /* PhoneMonitor.swift in Sources */,
+				EBC91199213853269848A876 /* PhoneTools.swift in Sources */,
+				00E1F2BA24558405C7543157 /* RemoteControl.swift in Sources */,
+				8C6AB67C5E307BC48A5C44BF /* SettingsView.swift in Sources */,
+				A914B655C8FC74AB45CB9BD4 /* Shell.swift in Sources */,
+				69A53AED3C801FA285035F6B /* StateRail.swift in Sources */,
+				82421DAF0E6B0833E6401B0C /* Theme.swift in Sources */,
+				EEE0A5DBD1FAB99B2D8F268B /* UserdataFlash.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		064C777366EE40627482185A /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = Bergamota;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Bergamota;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "ios-beryllium control panel";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Bergamota talks to the phone over USB Ethernet (ping, SSH, kernel log on UDP 5140).";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = br.com.zesmoi.Bergamota;
+				PRODUCT_NAME = Bergamota;
+				SDKROOT = macosx;
+			};
+			name = Release;
+		};
+		22B782420DDFC744AFE41773 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = Bergamota;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 1;
+				ENABLE_PREVIEWS = YES;
+				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_CFBundleDisplayName = Bergamota;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.developer-tools";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "ios-beryllium control panel";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "Bergamota talks to the phone over USB Ethernet (ping, SSH, kernel log on UDP 5140).";
+				INFOPLIST_KEY_NSPrincipalClass = NSApplication;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = br.com.zesmoi.Bergamota;
+				PRODUCT_NAME = Bergamota;
+				SDKROOT = macosx;
+			};
+			name = Debug;
+		};
+		6C6E1CB4B028DF3C96930491 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_ENTITLEMENTS = "";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				OTHER_SWIFT_FLAGS = "-enable-bare-slash-regex";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		84FE687A7E5C49D7B979F326 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				CODE_SIGN_ENTITLEMENTS = "";
+				CODE_SIGN_IDENTITY = "-";
+				CODE_SIGN_STYLE = Manual;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = "";
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = NO;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 26.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				OTHER_SWIFT_FLAGS = "-enable-bare-slash-regex";
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = macosx;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		0B9283843670B35D6F7DD89F /* Build configuration list for PBXNativeTarget "Bergamota" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				22B782420DDFC744AFE41773 /* Debug */,
+				064C777366EE40627482185A /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+		75ACA140B7CDEA4CFDEB7FE8 /* Build configuration list for PBXProject "Bergamota" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				6C6E1CB4B028DF3C96930491 /* Debug */,
+				84FE687A7E5C49D7B979F326 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = FEC9D52DAC708386DFAEAE48 /* Project object */;
+}

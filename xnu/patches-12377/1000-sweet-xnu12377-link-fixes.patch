@@ -1,0 +1,49 @@
+diff --git a/osfmk/arm64/sweet_platform_stubs.c b/osfmk/arm64/sweet_platform_stubs.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..09814e0e55e1e754acd4177b69eacf28f95c7afc
+--- /dev/null
++++ b/osfmk/arm64/sweet_platform_stubs.c
+@@ -0,0 +1,17 @@
++/*
++ * SWEET: machine routines that xnu-12377 expects from Apple's closed per-SoC support library
++ * (KDK KernelSupport/lib<SoC>.os.<config>.a, machine_routines_apple.o), which SWEET does not link.
++ */
++#include <arm/machine_routines.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * kern_mib.c: hw.features/engineering-sample sysctls. A Poco F1 has no Apple fuses; answer like the
++ * ADT does (/chosen certificate-production-status 0): not production fused.
++ */
++boolean_t
++ml_device_is_prod_fused(void)
++{
++	return FALSE;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/osfmk/conf/files.arm64 b/osfmk/conf/files.arm64
+index 0915133002909e902eb7039aa4d0886ee963f98d..712d7b26494411d2a89bbab8e148709290f1c8aa 100644
+--- a/osfmk/conf/files.arm64
++++ b/osfmk/conf/files.arm64
+@@ -54,6 +54,7 @@ osfmk/arm/arm_timer.c		standard
+ osfmk/arm/arm_init.c	optional config_pmap_ppl
+ osfmk/arm64/arm_vm_init.c	optional config_pmap_ppl
+ osfmk/arm64/sweet_early.c	standard
++osfmk/arm64/sweet_platform_stubs.c	standard
+ osfmk/arm64/arm64_hypercall.c	standard
+ osfmk/arm/io_map.c		standard
+ osfmk/arm64/loose_ends.c	standard
+diff --git a/osfmk/kern/exclaves.c b/osfmk/kern/exclaves.c
+index 6247d2982c455a027e25d1d206b9b4a6f7a843dd..40284b8d4c97216beee99f2a439943a8498e630e 100644
+--- a/osfmk/kern/exclaves.c
++++ b/osfmk/kern/exclaves.c
+@@ -3328,7 +3328,8 @@ STARTUP(TUNABLES, STARTUP_RANK_MIDDLE, exclaves_requirement_startup);
+ 
+ #endif /* CONFIG_EXCLAVES */
+ 
+-#if __has_include(<Tightbeam/tightbeam.h>)
++/* SWEET: the KDK ships the Tightbeam headers, but libTightbeam is only linked for exclaves configs. */
++#if __has_include(<Tightbeam/tightbeam.h>) && !defined(ARM64_BOARD_CONFIG_SWEET)
+ 
+ #include <Tightbeam/tightbeam.h>
+ 

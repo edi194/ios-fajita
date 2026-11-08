@@ -1,0 +1,97 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -2211,6 +2211,8 @@
+ 	uint32_t node;                  /* the modem's QRTR node, learned from its packets */
+ 	bool hello_seen, announced, tftp, pdm, wlfw_seen;
+ 	unsigned pdm_reqs;
++	char notes[1536];               /* the stage's key events, printed again at the end (ipc_note) */
++	uint32_t notes_len;
+ 	uint64_t open_ms;
+ 	vm_offset_t win;                /* kernel window over the rmtfs buffer */
+ 	uint64_t win_base, win_len;
+@@ -2220,6 +2222,25 @@
+ 	unsigned rx_pkts, tx_pkts, reads, writes, iovec_logged;
+ 	uint64_t read_bytes, write_bytes;
+ } ipc;
++
++/*
++ * The USB console drops kernel lines while userspace is busy (boot 42 lost most pd-mapper and service lines), so
++ * the key events are also kept here and printed again by ms_ipc_run when the stage ends.
++ */
++static void ipc_note(const char *fmt, ...) __printflike(1, 2);
++static void
++ipc_note(const char *fmt, ...)
++{
++	va_list ap;
++	uint32_t room = (uint32_t)sizeof(ipc.notes) - ipc.notes_len;
++	if (room < 2) {
++		return;
++	}
++	va_start(ap, fmt);
++	int n = vsnprintf(ipc.notes + ipc.notes_len, room, fmt, ap);
++	va_end(ap);
++	ipc.notes_len += n < 0 ? 0 : MIN((uint32_t)n, room - 1);
++}
+ 
+ /* ---- GLINK SMEM pipes: descriptor words tx tail @0, tx head @4, rx tail @8, rx head @12 */
+ static void
+@@ -2940,7 +2961,7 @@
+ 	uint8_t *data;
+ 	uint32_t len;
+ } tftp_rw[TFTP_RW_FILES];
+-static uint32_t tftp_next_port = QRTR_TFTP_PORT + 1;
++static uint32_t tftp_next_port = 0x4010u;  /* transfer ports, clear of the fixed server ports 0x4000-0x4002 */
+ static uint64_t tftp_seq;
+ static uint8_t *tftp_blk;               /* one block + 4 */
+ 
+@@ -3171,6 +3192,7 @@
+ tftp_close(struct tftp_client *c, const char *why)
+ {
+ 	printf("SWEET IPC: tftp %s %s: %s, %llu bytes\n", c->writer ? "write" : "read", c->path, why, c->sent);
++	ipc_note(" tftp-%c %s %llu (%s);", c->writer ? 'w' : 'r', c->path, c->sent, why);
+ 	c->used = false;
+ }
+ 
+@@ -3547,10 +3569,12 @@
+ 		}
+ 		printf("SWEET IPC: pd-mapper: \"%s\" offset %u -> %u of %u domains%s%s\n", name, offset, cnt, ndom,
+ 		    cnt ? ": " : "", list);
++		ipc_note(" pdm %s+%u->%u/%u;", name, offset, cnt, ndom);
+ 		break;
+ 	}
+ 	case PDM_PFR:                   /* service (TLV 1) and reason (TLV 2) of a protection-domain crash */
+ 		printf("SWEET IPC: pd-mapper: PD failure report from %s: \"%s\"\n", name, reason);
++		ipc_note(" PFR %s \"%s\";", name, reason);
+ 		r[n] = 2;
+ 		memcpy(r + n + 1, &four, 2);
+ 		memcpy(r + n + 3, &res, 2);
+@@ -3559,6 +3583,7 @@
+ 		break;
+ 	default:
+ 		printf("SWEET IPC: pd-mapper: unknown request %#x (%u bytes)\n", msg, len);
++		ipc_note(" pdm-unknown %#x;", msg);
+ 		return;
+ 	}
+ 	uint16_t body = (uint16_t)(n - 7);
+@@ -3620,6 +3645,7 @@
+ 			printf("SWEET IPC: qrtr: %s service %u (%#x) version %u instance %u at %u:%#x\n",
+ 			    type == Q_NEW_SERVER ? "modem offers" : "modem removes", s[1], s[1], s[2] & 0xff, s[2] >> 8, s[3],
+ 			    s[4]);
++			ipc_note(" %csvc %#x/%u@%u:%#x;", type == Q_NEW_SERVER ? '+' : '-', s[1], s[2] >> 8, s[3], s[4]);
+ 			if (s[1] == WLFW_SERVICE && type == Q_NEW_SERVER) {
+ 				ipc.wlfw_seen = true;
+ 				printf("SWEET IPC: WLFW is up at %u:%#x: the WLAN PD runs\n", s[3], s[4]);
+@@ -3736,6 +3762,12 @@
+ 	    ipc.version_acked ? "versioned" : "no version-ack", ipc.open_acked ? "open" : "not open",
+ 	    ipc.hello_seen ? "seen" : "not seen", ipc.rx_pkts, ipc.tx_pkts, ipc.reads, ipc.read_bytes, ipc.writes,
+ 	    ipc.write_bytes, ipc.pdm_reqs, ipc.wlfw_seen ? "up" : "not seen");
++	/* the events again, in console-sized lines */
++	for (uint32_t o = 0, k = 0; o < ipc.notes_len; o += 160, k++) {
++		printf("SWEET IPC: events %u:%.*s\n", k, (int)MIN(160u, ipc.notes_len - o), ipc.notes + o);
++		sweet_log_sync();
++		wl_sleep(50);
++	}
+ 	sweet_log_sync();
+ 	return alive;
+ }

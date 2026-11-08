@@ -1,0 +1,165 @@
+# SweetSurface: IOSurfaceClientRelease (trap 4 then 5) drops one view, not two; a lookup between the traps
+# gets a view of its own; the state page of the last 256 released views stays mapped.
+# Ported from MakrSas/ios-topaz (branch topaz) 0135 (trap 4 detaches only), 0136 (detached view, racing lookup),
+# 0137 (zombie state pages; adapted: only the IOMemoryMap of the state page is kept, so the pixel memory of a
+# released surface is not pinned by 256 zombies); third-party source, reviewed and re-written.
+# Our own addRef/existing logic (no count for a lookup of a held surface) is kept.
+
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -357,8 +357,9 @@ public:
+ 	IOMemoryMap  *data;
+ 	IOMemoryMap  *state;
+ 	uint32_t      count;
++	bool          detached;     /* trap 4 seen: the framework is releasing this view */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { detached = false; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ };
+ 
+@@ -405,8 +406,9 @@ class IOSurfaceRootUserClient : public IOUserClient {
+ 	task_t   fTask;
+ 	IOLock  *fLock;
+ 	OSArray *fRefs;
++	OSArray *fZombies;      /* state-page mappings of released views, oldest first */
+ 
+-	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index);
++	SweetSurfaceRef *findRef(uint32_t id, unsigned int *index, bool detached = false);
+ 	IOReturn addRef(SweetSurface *s, SweetSurfaceRef **refOut, bool *existing);
+ 	IOReturn returnSurface(SweetSurface *s, IOExternalMethodArguments *args);
+ 	IOReturn create(IOExternalMethodArguments *args);
+@@ -424,6 +426,8 @@ public:
+ 	IOReturn trapLock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapUnlock(void *id, void *options, void *seedOut, void *, void *, void *);
+ 	IOReturn trapRelease(void *id, void *, void *, void *, void *, void *);
++	IOReturn trapDetach(void *id, void *, void *, void *, void *, void *);
++	IOReturn dropView(uint32_t id, bool detachedFirst);
+ };
+ 
+ OSDefineMetaClassAndStructors(IOSurfaceRootUserClient, IOUserClient);
+@@ -452,13 +456,15 @@ IOSurfaceRootUserClient::initWithTask(task_t owningTask, void *securityID, UInt3
+ 	fTask = owningTask;
+ 	fLock = IOLockAlloc();
+ 	fRefs = OSArray::withCapacity(16);
+-	return fLock != NULL && fRefs != NULL;
++	fZombies = OSArray::withCapacity(16);
++	return fLock != NULL && fRefs != NULL && fZombies != NULL;
+ }
+ 
+ void
+ IOSurfaceRootUserClient::free()
+ {
+ 	OSSafeReleaseNULL(fRefs);
++	OSSafeReleaseNULL(fZombies);
+ 	if (fLock != NULL) {
+ 		IOLockFree(fLock);
+ 		fLock = NULL;
+@@ -471,6 +477,9 @@ IOSurfaceRootUserClient::clientClose(void)
+ {
+ 	IOLockLock(fLock);
+ 	fRefs->flushCollection();
++	if (fZombies != NULL) {
++		fZombies->flushCollection();
++	}
+ 	IOLockUnlock(fLock);
+ 	terminate();
+ 	return kIOReturnSuccess;
+@@ -478,11 +487,11 @@ IOSurfaceRootUserClient::clientClose(void)
+ 
+ /* Lock held. */
+ SweetSurfaceRef *
+-IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index)
++IOSurfaceRootUserClient::findRef(uint32_t id, unsigned int *index, bool detached)
+ {
+ 	for (unsigned int i = 0; i < fRefs->getCount(); i++) {
+ 		SweetSurfaceRef *ref = (SweetSurfaceRef *)fRefs->getObject(i);
+-		if (ref->surface->id == id) {
++		if (ref->surface->id == id && ref->detached == detached) {
+ 			if (index != NULL) {
+ 				*index = i;
+ 			}
+@@ -641,7 +650,7 @@ IOSurfaceRootUserClient::returnSurface(SweetSurface *s, IOExternalMethodArgument
+ 	}
+ 	if (ret != kIOReturnSuccess && !existing) {
+ 		/* The caller never learns the id: undo this create/lookup. */
+-		trapRelease((void *)(uintptr_t)s->id, NULL, NULL, NULL, NULL, NULL);
++		dropView(s->id, false);
+ 	}
+ 	return ret;
+ }
+@@ -848,14 +857,62 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	return ret;
+ }
+ 
++/*
++ * After ios-topaz 0135/0136: IOSurfaceClientRelease calls trap 4 and then trap 5
++ * for one release, 4 under the framework's cache lock. 4 only marks the view
++ * (the framework is about to drop it); 5 drops it. A lookup between the two
++ * must get a view of its own (not "you have it already", -1): trap 5 then
++ * takes the detached view away, not the new one. Releasing at both traps
++ * dropped two references and unmapped surfaces still in use (backboardd
++ * crashed in IOSurfaceClientGetSeed reading an unmapped state page).
++ */
++IOReturn
++IOSurfaceRootUserClient::trapDetach(void *id, void *, void *, void *, void *, void *)
++{
++	IOLockLock(fLock);
++	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, NULL);
++	if (ref != NULL) {
++		ref->detached = true;
++	}
++	IOLockUnlock(fLock);
++	return kIOReturnSuccess;
++}
++
++#define SWEET_SURFACE_ZOMBIES   256
++
++/* Trap 5: drop the detached view of id (else the live one). */
+ IOReturn
+ IOSurfaceRootUserClient::trapRelease(void *id, void *, void *, void *, void *, void *)
++{
++	return dropView((uint32_t)(uintptr_t)id, true);
++}
++
++/* Drop one count of a view of id: the detached one first if asked, else only the live one. */
++IOReturn
++IOSurfaceRootUserClient::dropView(uint32_t id, bool detachedFirst)
+ {
+ 	unsigned int index;
+ 	IOLockLock(fLock);
+-	SweetSurfaceRef *ref = findRef((uint32_t)(uintptr_t)id, &index);
++	SweetSurfaceRef *ref = detachedFirst ? findRef(id, &index, true) : NULL;
++	if (ref == NULL) {
++		ref = findRef(id, &index);
++	}
+ 	if (ref != NULL && --ref->count == 0) {
+-		fRefs->removeObject(index);     /* unmaps and drops the user count */
++		/*
++		 * After ios-topaz 0137: the pixels are unmapped now, the read-only state
++		 * page stays mapped for the last 256 released views (16 KB each, oldest
++		 * first out): in backboardd another IOSurface object can still hold a
++		 * framework client of the same surface after this one is released, and
++		 * reading its seed from an unmapped page crashed. Unlike topaz this keeps
++		 * only the IOMemoryMap (which retains the state page), not the
++		 * SweetSurfaceRef, so the pixel memory of the surface is freed at once.
++		 */
++		if (ref->state != NULL && fZombies != NULL && fZombies->setObject(ref->state)) {
++			if (fZombies->getCount() > SWEET_SURFACE_ZOMBIES) {
++				fZombies->removeObject(0);
++			}
++		}
++		fRefs->removeObject(index);     /* unmaps the pixels and drops the user count */
+ 	}
+ 	IOLockUnlock(fLock);
+ 	return ref != NULL ? kIOReturnSuccess : kIOReturnNotFound;
+@@ -866,7 +923,8 @@ static IOExternalTrap sweet_surface_traps[] = {
+ 	[kSweetSurfaceTrapDecrementUse]  = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUseCount },
+ 	[kSweetSurfaceTrapLock]          = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapLock },
+ 	[kSweetSurfaceTrapUnlock]        = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapUnlock },
+-	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
++	/* 4 only detaches (see trapDetach); 5 releases. */
++	[kSweetSurfaceTrapRelease]       = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapDetach },
+ 	[kSweetSurfaceTrapReleaseFailed] = { NULL, (IOTrap) & IOSurfaceRootUserClient::trapRelease },
+ };
+ 

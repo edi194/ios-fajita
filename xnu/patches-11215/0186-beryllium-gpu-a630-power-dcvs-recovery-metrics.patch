@@ -1,0 +1,1301 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -52,6 +52,8 @@
+ #include <sys/vnode_internal.h>
+ #include <sys/kauth.h>
+ #include <sys/uio.h>
++#include <sys/sysctl.h>
++#include <stdarg.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+@@ -71,6 +73,36 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+ extern void sweet_log_sync(void);               /* sweet_ufs.c */
++
++/*
++ * Power management (idle slumber, governor) repeats the whole GMU/HFI/CP bring-up on every wake. While a630_quiet is
++ * set only lines that report a failure are printed and the UFS log sync is skipped; everything else of a wake is silent.
++ */
++static int a630_quiet;
++static void a630_printf(const char *fmt, ...) __printflike(1, 2);
++static void
++a630_printf(const char *fmt, ...)
++{
++	char buf[352];
++	va_list ap;
++	static const char *const keep[] = { "TIMED OUT", "FAIL", "fail", "LOST", "FAULT", "no reply", "NOT ", "error", "refused", "not " };
++
++	va_start(ap, fmt);
++	vsnprintf(buf, sizeof(buf), fmt, ap);
++	va_end(ap);
++	if (a630_quiet) {
++		bool wanted = false;
++		for (unsigned i = 0; i < sizeof(keep) / sizeof(keep[0]); i++) {
++			wanted |= strnstr(buf, keep[i], sizeof(buf)) != NULL;
++		}
++		if (!wanted) {
++			return;
++		}
++	}
++	printf("%s", buf);
++}
++#define printf a630_printf
++#define sweet_log_sync() (a630_quiet ? (void)0 : (sweet_log_sync)())
+ extern vnode_t rootvnode;
+ extern bool sweet_a630_zap_load(void);          /* sweet_a630_pas.c */
+ extern bool sweet_a630_zap_shutdown(void);
+@@ -268,6 +300,19 @@
+ static vm_offset_t gcc, cc, gmu, gpu_regs, smmu_base;
+ static int a630_mode;
+ 
++/* Boot-args (all off/default unless given; docs/GPU_KERNEL.md "Power") */
++static uint32_t a630_idle_ms;           /* sweetgpuidle=MS: slumber after this long without a submission (0 = never) */
++static uint32_t a630_hwcg;              /* sweetgpuhwcg=1: hardware clock gating tables */
++static uint32_t a630_ubwc;              /* sweetgpuubwc=1: program the UBWC/bank registers (hbb 15) */
++static uint32_t a630_hb_s;              /* sweetgpuhb=SECONDS: heartbeat line with GPU + USB clock state */
++static uint32_t a630_recover_max = 3;   /* sweetgpurecover=N: resets after a fault/hang before "lost until reboot" */
++static uint32_t a630_bw_linux;          /* sweetgpubw=linux: the fixed Linux a630 BCM addresses instead of cmd-db's */
++static int a630_gov;                    /* sweetgpufreq=gov */
++static unsigned a630_level = 1;         /* current GX level (index into gpu_levels) */
++static unsigned a630_level_max = 7;     /* sweetgpumax=N */
++static void *gmu_fw;                    /* kept for warm re-boots (stage 8 only) */
++static size_t gmu_fw_size;
++
+ static uint32_t
+ gpu_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -702,7 +747,10 @@
+ 	printf("SWEET GPU: CX GDSC on: gdscr 0x%08x hw status 0x%08x\n",
+ 	    gpu_rd(cc, GPUCC_CX_GDSCR), gpu_rd(cc, GPUCC_CX_GDS_HW_CTRL));
+ 
+-	gpu_wr(gcc, GCC_GPU_GPLL0_VOTE, gpu_rd(gcc, GCC_GPU_GPLL0_VOTE) | GCC_GPU_GPLL0 | GCC_GPU_GPLL0_DIV);
++	if ((gpu_rd(gcc, GCC_GPU_GPLL0_VOTE) & (GCC_GPU_GPLL0 | GCC_GPU_GPLL0_DIV)) != (GCC_GPU_GPLL0 | GCC_GPU_GPLL0_DIV)) {
++		/* shared vote register (also USB/UFS/WLAN): never rewrite it when our bits are already set */
++		gpu_wr(gcc, GCC_GPU_GPLL0_VOTE, gpu_rd(gcc, GCC_GPU_GPLL0_VOTE) | GCC_GPU_GPLL0 | GCC_GPU_GPLL0_DIV);
++	}
+ 	delay(10);      /* BRANCH_HALT_DELAY: no status bit */
+ 
+ 	gpu_wr(cc, GPUCC_GMU_CFG_RCGR, GMU_RCG_CFG_200MHZ);
+@@ -1484,7 +1532,6 @@
+ #define PERF_TBL_DW             (3 + 2 * MAX_GX_LEVELS + 2 * MAX_CX_LEVELS)
+ #define BW_TBL_DW               160             /* hfi_bwtable_cmd: 6 + 6 + 12 + 8 + 16 * 8 */
+ #define ARC_VOTE(pri, sec, vlvl) ((((vlvl) & 0xffffu) << 16) | (((sec) & 0xffu) << 8) | ((pri) & 0xffu))
+-#define GX_BOOT_LEVEL           1               /* lowest non-zero level */
+ 
+ /*
+  * GPU levels of the live DT qcom,gpu-pwrlevels (index 0 is the 0 Hz level,
+@@ -1577,27 +1624,52 @@
+ static void
+ gpu_bw_table(uint32_t *m)
+ {
+-	static const uint32_t ddr_addrs[3] = { 0x50000, 0x5005c, 0x5000c };
+-	static const uint32_t cnoc_addrs[3] = { 0x50034, 0x5007c, 0x5004c };
++	/* Linux a630 constants (a Pixel-3-era cmd-db). On this phone cmd-db says SH0 0x5003c, SH2 0x50034, CN0 0x500a8, so
++	 * 0x5005c/0x50034/0x5007c/0x5004c would name other BCMs (0x50034 is SH2 here). */
++	uint32_t ddr_addrs[3] = { 0x50000, 0x5005c, 0x5000c };
++	uint32_t cnoc_addrs[3] = { 0x50034, 0x5007c, 0x5004c };
++	unsigned ncnoc = 3;
+ 
++	if (!a630_bw_linux) {
++		uint32_t sh0 = 0, mc0 = 0, acv = 0, cn0 = 0;
++		if (cmddb_lookup("SH0", &sh0, NULL, 0, NULL) == (int)CMDDB_SLAVE_BCM &&
++		    cmddb_lookup("MC0", &mc0, NULL, 0, NULL) == (int)CMDDB_SLAVE_BCM &&
++		    cmddb_lookup("ACV", &acv, NULL, 0, NULL) == (int)CMDDB_SLAVE_BCM &&
++		    cmddb_lookup("CN0", &cn0, NULL, 0, NULL) == (int)CMDDB_SLAVE_BCM) {
++			ddr_addrs[0] = sh0;
++			ddr_addrs[1] = mc0;
++			ddr_addrs[2] = acv;
++			cnoc_addrs[0] = cn0;
++			ncnoc = 1;
++		}
++	}
++	printf("SWEET GPU: BW table BCMs: ddr %#x %#x %#x, cnoc %u x %#x%s\n", ddr_addrs[0], ddr_addrs[1], ddr_addrs[2], ncnoc,
++	    cnoc_addrs[0], ncnoc == 3 ? " (Linux constants)" : " (cmd-db SH0, MC0, ACV, CN0)");
+ 	bzero(m, 4 * BW_TBL_DW);
+ 	m[0] = MSG_HDR(H2F_MSG_BW_VOTE_TBL, BW_TBL_DW, 0);
+ 	m[1] = 1;               /* bw_level_num */
+-	m[2] = 3;               /* cnoc_cmds_num */
++	m[2] = ncnoc;           /* cnoc_cmds_num */
+ 	m[3] = 3;               /* ddr_cmds_num */
+-	m[4] = 0x05;            /* cnoc_wait_bitmask */
++	m[4] = ncnoc == 3 ? 0x05 : 0x01;        /* cnoc_wait_bitmask */
+ 	m[5] = 0x07;            /* ddr_wait_bitmask */
+ 	for (unsigned i = 0; i < 3; i++) {
+-		m[6 + i] = cnoc_addrs[i];
+ 		m[24 + i] = ddr_addrs[i];
+-		m[32 + i] = 0x40000000;                         /* ddr_cmds_data[0][i] */
++		m[32 + i] = 0x40000000;                         /* ddr_cmds_data[0][i]: commit, vote 0 */
+ 	}
+-	m[12 + 0] = 0x40000000;                                 /* cnoc_cmds_data[0][0..2] */
+-	m[12 + 1] = 0x00000000;
+-	m[12 + 2] = 0x40000000;
+-	m[18 + 0] = 0x60000001;                                 /* cnoc_cmds_data[1][0..2] */
+-	m[18 + 1] = 0x20000001;
+-	m[18 + 2] = 0x60000001;
++	for (unsigned i = 0; i < ncnoc; i++) {
++		m[6 + i] = cnoc_addrs[i];
++	}
++	if (ncnoc == 3) {
++		m[12 + 0] = 0x40000000;                         /* cnoc_cmds_data[0][0..2] */
++		m[12 + 1] = 0x00000000;
++		m[12 + 2] = 0x40000000;
++		m[18 + 0] = 0x60000001;                         /* cnoc_cmds_data[1][0..2] */
++		m[18 + 1] = 0x20000001;
++		m[18 + 2] = 0x60000001;
++	} else {
++		m[12] = 0x40000000;
++		m[18] = 0x60000001;
++	}
+ }
+ 
+ /* Log what cmd-db says about the neighbouring BCMs so a mismatch with the fixed table shows up. */
+@@ -1730,13 +1802,13 @@
+ static bool
+ gpu_gx_rail_on(void)
+ {
+-	uint32_t vote = gx_votes[GX_BOOT_LEVEL];
++	uint32_t vote = gx_votes[a630_level];
+ 
+ 	gpu_wr(gmu, GMU_BOOT_SLUMBER_OPTION, OOB_BOOT_OPTION);
+ 	gpu_wr(gmu, GMU_GX_VOTE_IDX, vote & 0xff);
+ 	gpu_wr(gmu, GMU_MX_VOTE_IDX, (vote >> 8) & 0xff);
+ 	printf("SWEET GPU: GX rail on at level %u (%u MHz): gfx ARC %u, mx ARC %u\n",
+-	    GX_BOOT_LEVEL, gx_khz[GX_BOOT_LEVEL] / 1000, vote & 0xff, (vote >> 8) & 0xff);
++	    a630_level, gx_khz[a630_level] / 1000, vote & 0xff, (vote >> 8) & 0xff);
+ 	return gmu_oob_set(OOB_BOOT_SLUMBER, "boot_slumber (boot)");
+ }
+ 
+@@ -1793,6 +1865,7 @@
+ #define SCRATCH_TS              0x110u
+ #define SCRATCH_FENCE           0x200u          /* kernel interface: last completed submission (CACHE_FLUSH_TS target) */
+ #define SCRATCH_FILL            0x400u          /* stage 8 fill test: 64 dwords */
++#define SCRATCH_TIMES           0x600u          /* 64 x {start, end} CP_ALWAYS_ON stamps of the last submissions (busy time) */
+ #define CP_RB_CNTL_VALUE        ((1u << 27) | (2u << 8) | 12u)  /* NO_UPDATE, 32 byte blocks, 32 KiB ring */
+ 
+ #define CP_NOP                  16
+@@ -1801,6 +1874,8 @@
+ #define CP_EVENT_WRITE          70
+ #define CP_SET_SECURE_MODE      102
+ #define CP_INDIRECT_BUFFER      63
++#define CP_REG_TO_MEM           62
++#define CP_WAIT_FOR_IDLE        38
+ #define PC_CCU_INVALIDATE_DEPTH 24
+ #define PC_CCU_INVALIDATE_COLOR 25
+ #define CACHE_FLUSH_TS          4
+@@ -2035,6 +2110,136 @@
+ 	sweet_log_sync();
+ }
+ 
++/* a630 hardware clock gating (Linux a6xx_catalog.c a630_hwcg: data, 105 writes), then RBBM_CLOCK_CNTL; GMU CGC regs */
++static const struct {
++	uint16_t reg;
++	uint32_t val;
++} a630_hwcg_tbl[] = {
++	{ 0x000b0, 0x22222222 },	/* RBBM_CLOCK_CNTL_SP0 */
++	{ 0x000b1, 0x22222222 },	/* RBBM_CLOCK_CNTL_SP1 */
++	{ 0x000b2, 0x22222222 },	/* RBBM_CLOCK_CNTL_SP2 */
++	{ 0x000b3, 0x22222222 },	/* RBBM_CLOCK_CNTL_SP3 */
++	{ 0x000b4, 0x02022220 },	/* RBBM_CLOCK_CNTL2_SP0 */
++	{ 0x000b5, 0x02022220 },	/* RBBM_CLOCK_CNTL2_SP1 */
++	{ 0x000b6, 0x02022220 },	/* RBBM_CLOCK_CNTL2_SP2 */
++	{ 0x000b7, 0x02022220 },	/* RBBM_CLOCK_CNTL2_SP3 */
++	{ 0x000b8, 0x00000080 },	/* RBBM_CLOCK_DELAY_SP0 */
++	{ 0x000b9, 0x00000080 },	/* RBBM_CLOCK_DELAY_SP1 */
++	{ 0x000ba, 0x00000080 },	/* RBBM_CLOCK_DELAY_SP2 */
++	{ 0x000bb, 0x00000080 },	/* RBBM_CLOCK_DELAY_SP3 */
++	{ 0x000bc, 0x0000f3cf },	/* RBBM_CLOCK_HYST_SP0 */
++	{ 0x000bd, 0x0000f3cf },	/* RBBM_CLOCK_HYST_SP1 */
++	{ 0x000be, 0x0000f3cf },	/* RBBM_CLOCK_HYST_SP2 */
++	{ 0x000bf, 0x0000f3cf },	/* RBBM_CLOCK_HYST_SP3 */
++	{ 0x000c0, 0x02222222 },	/* RBBM_CLOCK_CNTL_TP0 */
++	{ 0x000c1, 0x02222222 },	/* RBBM_CLOCK_CNTL_TP1 */
++	{ 0x000c2, 0x02222222 },	/* RBBM_CLOCK_CNTL_TP2 */
++	{ 0x000c3, 0x02222222 },	/* RBBM_CLOCK_CNTL_TP3 */
++	{ 0x000c4, 0x22222222 },	/* RBBM_CLOCK_CNTL2_TP0 */
++	{ 0x000c5, 0x22222222 },	/* RBBM_CLOCK_CNTL2_TP1 */
++	{ 0x000c6, 0x22222222 },	/* RBBM_CLOCK_CNTL2_TP2 */
++	{ 0x000c7, 0x22222222 },	/* RBBM_CLOCK_CNTL2_TP3 */
++	{ 0x000c8, 0x22222222 },	/* RBBM_CLOCK_CNTL3_TP0 */
++	{ 0x000c9, 0x22222222 },	/* RBBM_CLOCK_CNTL3_TP1 */
++	{ 0x000ca, 0x22222222 },	/* RBBM_CLOCK_CNTL3_TP2 */
++	{ 0x000cb, 0x22222222 },	/* RBBM_CLOCK_CNTL3_TP3 */
++	{ 0x000cc, 0x00022222 },	/* RBBM_CLOCK_CNTL4_TP0 */
++	{ 0x000cd, 0x00022222 },	/* RBBM_CLOCK_CNTL4_TP1 */
++	{ 0x000ce, 0x00022222 },	/* RBBM_CLOCK_CNTL4_TP2 */
++	{ 0x000cf, 0x00022222 },	/* RBBM_CLOCK_CNTL4_TP3 */
++	{ 0x000e0, 0x77777777 },	/* RBBM_CLOCK_HYST_TP0 */
++	{ 0x000e1, 0x77777777 },	/* RBBM_CLOCK_HYST_TP1 */
++	{ 0x000e2, 0x77777777 },	/* RBBM_CLOCK_HYST_TP2 */
++	{ 0x000e3, 0x77777777 },	/* RBBM_CLOCK_HYST_TP3 */
++	{ 0x000e4, 0x77777777 },	/* RBBM_CLOCK_HYST2_TP0 */
++	{ 0x000e5, 0x77777777 },	/* RBBM_CLOCK_HYST2_TP1 */
++	{ 0x000e6, 0x77777777 },	/* RBBM_CLOCK_HYST2_TP2 */
++	{ 0x000e7, 0x77777777 },	/* RBBM_CLOCK_HYST2_TP3 */
++	{ 0x000e8, 0x77777777 },	/* RBBM_CLOCK_HYST3_TP0 */
++	{ 0x000e9, 0x77777777 },	/* RBBM_CLOCK_HYST3_TP1 */
++	{ 0x000ea, 0x77777777 },	/* RBBM_CLOCK_HYST3_TP2 */
++	{ 0x000eb, 0x77777777 },	/* RBBM_CLOCK_HYST3_TP3 */
++	{ 0x000ec, 0x00077777 },	/* RBBM_CLOCK_HYST4_TP0 */
++	{ 0x000ed, 0x00077777 },	/* RBBM_CLOCK_HYST4_TP1 */
++	{ 0x000ee, 0x00077777 },	/* RBBM_CLOCK_HYST4_TP2 */
++	{ 0x000ef, 0x00077777 },	/* RBBM_CLOCK_HYST4_TP3 */
++	{ 0x000d0, 0x11111111 },	/* RBBM_CLOCK_DELAY_TP0 */
++	{ 0x000d1, 0x11111111 },	/* RBBM_CLOCK_DELAY_TP1 */
++	{ 0x000d2, 0x11111111 },	/* RBBM_CLOCK_DELAY_TP2 */
++	{ 0x000d3, 0x11111111 },	/* RBBM_CLOCK_DELAY_TP3 */
++	{ 0x000d4, 0x11111111 },	/* RBBM_CLOCK_DELAY2_TP0 */
++	{ 0x000d5, 0x11111111 },	/* RBBM_CLOCK_DELAY2_TP1 */
++	{ 0x000d6, 0x11111111 },	/* RBBM_CLOCK_DELAY2_TP2 */
++	{ 0x000d7, 0x11111111 },	/* RBBM_CLOCK_DELAY2_TP3 */
++	{ 0x000d8, 0x11111111 },	/* RBBM_CLOCK_DELAY3_TP0 */
++	{ 0x000d9, 0x11111111 },	/* RBBM_CLOCK_DELAY3_TP1 */
++	{ 0x000da, 0x11111111 },	/* RBBM_CLOCK_DELAY3_TP2 */
++	{ 0x000db, 0x11111111 },	/* RBBM_CLOCK_DELAY3_TP3 */
++	{ 0x000dc, 0x00011111 },	/* RBBM_CLOCK_DELAY4_TP0 */
++	{ 0x000dd, 0x00011111 },	/* RBBM_CLOCK_DELAY4_TP1 */
++	{ 0x000de, 0x00011111 },	/* RBBM_CLOCK_DELAY4_TP2 */
++	{ 0x000df, 0x00011111 },	/* RBBM_CLOCK_DELAY4_TP3 */
++	{ 0x0010b, 0x22222222 },	/* RBBM_CLOCK_CNTL_UCHE */
++	{ 0x0010c, 0x22222222 },	/* RBBM_CLOCK_CNTL2_UCHE */
++	{ 0x0010d, 0x22222222 },	/* RBBM_CLOCK_CNTL3_UCHE */
++	{ 0x0010e, 0x00222222 },	/* RBBM_CLOCK_CNTL4_UCHE */
++	{ 0x00110, 0x00000004 },	/* RBBM_CLOCK_HYST_UCHE */
++	{ 0x0010f, 0x00000002 },	/* RBBM_CLOCK_DELAY_UCHE */
++	{ 0x000f0, 0x22222222 },	/* RBBM_CLOCK_CNTL_RB0 */
++	{ 0x000f1, 0x22222222 },	/* RBBM_CLOCK_CNTL_RB1 */
++	{ 0x000f2, 0x22222222 },	/* RBBM_CLOCK_CNTL_RB2 */
++	{ 0x000f3, 0x22222222 },	/* RBBM_CLOCK_CNTL_RB3 */
++	{ 0x000f4, 0x00002222 },	/* RBBM_CLOCK_CNTL2_RB0 */
++	{ 0x000f5, 0x00002222 },	/* RBBM_CLOCK_CNTL2_RB1 */
++	{ 0x000f6, 0x00002222 },	/* RBBM_CLOCK_CNTL2_RB2 */
++	{ 0x000f7, 0x00002222 },	/* RBBM_CLOCK_CNTL2_RB3 */
++	{ 0x000f8, 0x00002220 },	/* RBBM_CLOCK_CNTL_CCU0 */
++	{ 0x000f9, 0x00002220 },	/* RBBM_CLOCK_CNTL_CCU1 */
++	{ 0x000fa, 0x00002220 },	/* RBBM_CLOCK_CNTL_CCU2 */
++	{ 0x000fb, 0x00002220 },	/* RBBM_CLOCK_CNTL_CCU3 */
++	{ 0x00100, 0x00040f00 },	/* RBBM_CLOCK_HYST_RB_CCU0 */
++	{ 0x00101, 0x00040f00 },	/* RBBM_CLOCK_HYST_RB_CCU1 */
++	{ 0x00102, 0x00040f00 },	/* RBBM_CLOCK_HYST_RB_CCU2 */
++	{ 0x00103, 0x00040f00 },	/* RBBM_CLOCK_HYST_RB_CCU3 */
++	{ 0x00104, 0x05022022 },	/* RBBM_CLOCK_CNTL_RAC */
++	{ 0x00105, 0x00005555 },	/* RBBM_CLOCK_CNTL2_RAC */
++	{ 0x00106, 0x00000011 },	/* RBBM_CLOCK_DELAY_RAC */
++	{ 0x00107, 0x00445044 },	/* RBBM_CLOCK_HYST_RAC */
++	{ 0x00108, 0x04222222 },	/* RBBM_CLOCK_CNTL_TSE_RAS_RBBM */
++	{ 0x00114, 0x00222222 },	/* RBBM_CLOCK_MODE_GPC */
++	{ 0x00111, 0x00002222 },	/* RBBM_CLOCK_MODE_VFD */
++	{ 0x0010a, 0x00000000 },	/* RBBM_CLOCK_HYST_TSE_RAS_RBBM */
++	{ 0x00116, 0x04104004 },	/* RBBM_CLOCK_HYST_GPC */
++	{ 0x00113, 0x00000000 },	/* RBBM_CLOCK_HYST_VFD */
++	{ 0x0011c, 0x00000000 },	/* RBBM_CLOCK_DELAY_HLSQ */
++	{ 0x00109, 0x00004000 },	/* RBBM_CLOCK_DELAY_TSE_RAS_RBBM */
++	{ 0x00115, 0x00000200 },	/* RBBM_CLOCK_DELAY_GPC */
++	{ 0x00112, 0x00002222 },	/* RBBM_CLOCK_DELAY_VFD */
++	{ 0x00117, 0x00000002 },	/* RBBM_CLOCK_DELAY_HLSQ_2 */
++	{ 0x0011b, 0x00002222 },	/* RBBM_CLOCK_MODE_HLSQ */
++	{ 0x00118, 0x00000222 },	/* RBBM_CLOCK_CNTL_GMU_GX */
++	{ 0x00119, 0x00000111 },	/* RBBM_CLOCK_DELAY_GMU_GX */
++	{ 0x0011a, 0x00000555 },	/* RBBM_CLOCK_HYST_GMU_GX */
++};
++
++static void
++gpu_hwcg(void)
++{
++	uint32_t sp = gpu_rd(gmu, GMU_GX_SPTPRAC_CLOCK_CONTROL);
++
++	gpu_wr(gmu, GMU_GX_SPTPRAC_CLOCK_CONTROL, sp & ~1u);    /* SP clock off while the gating tables are written */
++	for (unsigned i = 0; i < sizeof(a630_hwcg_tbl) / sizeof(a630_hwcg_tbl[0]); i++) {
++		gpu_w(a630_hwcg_tbl[i].reg, a630_hwcg_tbl[i].val);
++	}
++	gpu_wr(gmu, GMU_GX_SPTPRAC_CLOCK_CONTROL, sp | 1u);
++	gpu_w(0x00ae, 0x8aa8aa02);                              /* RBBM_CLOCK_CNTL, a630 */
++	gpu_wr(gmu, R(0x9309), 0x00020202);                     /* GPU_GMU_AO_GMU_CGC_MODE_CNTL */
++	gpu_wr(gmu, R(0x930a), 0x00010111);                     /* ..._DELAY_CNTL */
++	gpu_wr(gmu, R(0x930b), 0x00005555);                     /* ..._HYST_CNTL */
++	printf("SWEET GPU: hardware clock gating on (%u writes), RBBM_CLOCK_CNTL %#x\n",
++	    (unsigned)(sizeof(a630_hwcg_tbl) / sizeof(a630_hwcg_tbl[0])), gpu_r(0x00ae));
++}
++
+ /*
+  * The Linux hw_init subset a NOP test needs: no clock gating, no CP protect,
+  * no UBWC and no RBBM_SECVID writes (secure registers, nothing here needs
+@@ -2084,6 +2289,17 @@
+ 	gpu_w(A6XX_CP_AHB_CNTL, 1);
+ 	gpu_w(A6XX_RBBM_INTERFACE_HANG_INT_CNTL, (1u << 30) | 0x1fffff);
+ 	gpu_w(A6XX_UCHE_CLIENT_PF, (1u << 7) | 1);
++	if (a630_hwcg) {
++		gpu_hwcg();
++	}
++	if (a630_ubwc) {
++		/* UBWC 2.0, highest bank bit 15 (field 2), no level-2 swizzle disable, macrotile 4 channels (Linux a6xx_set_ubwc_config) */
++		gpu_w(0x8e08, 0x4);             /* RB_NC_MODE_CNTL */
++		gpu_w(0xb604, 0x4);             /* TPL1_NC_MODE_CNTL */
++		gpu_w(0xae02, 0x4);             /* SP_NC_MODE_CNTL */
++		gpu_w(0x0e01, 0x00400000);      /* UCHE_MODE_CNTL */
++		gpu_w(0x0534, 0);               /* RBBM_NC_MODE_CNTL */
++	}
+ 	/* Ring and SQE; RBBM_INT_0_MASK stays 0: completion is polled. */
+ 	gpu_w64(A6XX_CP_SQE_INSTR_BASE, SQE_VA);
+ 	gpu_w64(A6XX_CP_RB_BASE, RING_VA);
+@@ -2247,6 +2463,12 @@
+ 	uint64_t bytes_mapped;
+ } a630_dev;
+ static bool a630_kept;
++static uint32_t a630_suspends, a630_resumes, a630_recoveries;
++static uint64_t a630_last_active;
++static bool a630_awake;
++static uint32_t a630_timed;      /* last submission whose stamps were added to the busy time */
++static bool gpu_resume(void);
++bool sweet_gpu_recover(const char *why);
+ 
+ static vm_offset_t ptp;
+ static uint64_t ptp_pa;
+@@ -2478,9 +2700,12 @@
+ 	    gpu_rd(b, SMMU_CB_FAR + 4), gpu_rd(b, SMMU_CB_FAR), gpu_rd(b, SMMU_CB_FSYNR0));
+ 	gpu_wr(b, SMMU_CB_FSR, fsr);
+ 	if (!a630_dev.lost) {
+-		a630_dev.lost = true;
+ 		a630_dev.hangs++;
+-		sweet_gpu_report("GPU LOST (SMMU fault)");
++		sweet_gpu_report("GPU FAULT (SMMU)");
++		if (!sweet_gpu_recover("SMMU fault")) {
++			a630_dev.lost = true;
++			sweet_gpu_report("GPU LOST (SMMU fault, not recovered)");
++		}
+ 	}
+ 	return true;
+ }
+@@ -2523,7 +2748,7 @@
+ 	case 1:  *value = 630; return true;                     /* GPU_ID */
+ 	case 2:  *value = 0x100000; return true;                /* GMEM_SIZE */
+ 	case 3:  *value = 0x06030001; return true;              /* CHIP_ID */
+-	case 4:  *value = 710000000ull; return true;            /* MAX_FREQ (the GPU runs at 257 MHz: docs/GPU_KERNEL.md) */
++	case 4:  *value = (uint64_t)gpu_levels[a630_level_max].mhz * 1000000ull; return true;   /* MAX_FREQ (sweetgpumax cap) */
+ 	case 5:  /* TIMESTAMP: the GMU always-on counter (19.2 MHz), what Linux a6xx_get_timestamp reads; the CP's own
+ 	          * copy read over AHB did not advance on hardware (docs/GPU_KERNEL.md) */
+ 		*value = (uint64_t)gpu_rd(gmu, GMU_AO_COUNTER_L) | ((uint64_t)gpu_rd(gmu, GMU_AO_COUNTER_H) << 32);
+@@ -2531,8 +2756,11 @@
+ 	case 6:  *value = 0x100000; return true;                /* GMEM_BASE */
+ 	case 7:  *value = 1; return true;                       /* PRIORITIES */
+ 	case 8:  *value = 0; return true;                       /* PP_PGTABLE */
+-	case 9:  *value = 0; return true;                       /* FAULTS */
+-	case 10: *value = 0; return true;                       /* SUSPENDS */
++	case 9:  *value = a630_dev.hangs; return true;          /* FAULTS */
++	case 10: *value = a630_suspends; return true;           /* SUSPENDS */
++	case 16: *value = 15; return true;                      /* HIGHEST_BANK_BIT (SDM845: UBWC 2.0, hbb 15) */
++	case 18: *value = 6; return true;                       /* UBWC_SWIZZLE (Linux qcom_ubwc_config sdm845: 0x6) */
++	case 19: *value = 0; return true;                       /* MACROTILE_MODE (4 channels) */
+ 	case 14: *value = GVM_BASE; return true;                /* VA_START */
+ 	case 15: *value = GVM_END - GVM_BASE; return true;      /* VA_SIZE */
+ 	default: return false;
+@@ -2644,12 +2872,27 @@
+ sweet_gpu_mark_lost(void)
+ {
+ 	if (!a630_dev.lost) {
+-		a630_dev.lost = true;
+ 		a630_dev.hangs++;
+-		sweet_gpu_report("GPU LOST (no completion)");
++		sweet_gpu_report("GPU HANG (no completion)");
++		if (!sweet_gpu_recover("hang")) {
++			a630_dev.lost = true;
++			sweet_gpu_report("GPU LOST (not recovered)");
++		}
+ 	}
+ }
+ 
++/* CP writes CP_ALWAYS_ON (19.2 MHz) to the stamp slot of this submission: end 0 = start, 1 = end. */
++static void
++ring_time(uint32_t seq, unsigned end)
++{
++	uint64_t va = SCRATCH_VA + SCRATCH_TIMES + 16u * (seq % 64) + 8u * end;
++
++	ring_emit(pkt7(CP_REG_TO_MEM, 3));
++	ring_emit(A6XX_CP_ALWAYS_ON_COUNTER | (2u << 18) | (1u << 30));
++	ring_emit((uint32_t)va);
++	ring_emit((uint32_t)(va >> 32));
++}
++
+ /*
+  * One submission: invalidate the CCU, run each indirect buffer, then write the
+  * sequence number with CACHE_FLUSH_TS (the tail of Linux a6xx_submit). Returns
+@@ -2658,11 +2901,15 @@
+ uint32_t
+ sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count)
+ {
+-	unsigned need = 16 + 4 * count, room = 0;
++	unsigned need = 32 + 4 * count, room = 0;
+ 
+ 	if (!sweet_gpu_ready() || count == 0 || count > 128) {
+ 		return 0;
+ 	}
++	a630_last_active = mach_absolute_time();
++	if (!a630_awake && !gpu_resume()) {
++		return 0;
++	}
+ 	/* GPU registers are only touched while GX is on and the AHB fence allows them (never a hang, never a silent drop). */
+ 	if (!(gpu_rd(cc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) || (gpu_rd(cc, gpucc_cbcr[CC_GX_GFX3D].off) & CBCR_CLK_OFF)) {
+ 		sweet_gpu_report("submit refused: GX is off");
+@@ -2698,6 +2945,7 @@
+ 	if (++a630_dev.seqno == 0) {
+ 		a630_dev.seqno = 1;
+ 	}
++	ring_time(a630_dev.seqno, 0);
+ 	ring_emit(pkt7(CP_EVENT_WRITE, 1));
+ 	ring_emit(PC_CCU_INVALIDATE_DEPTH);
+ 	ring_emit(pkt7(CP_EVENT_WRITE, 1));
+@@ -2708,6 +2956,8 @@
+ 		ring_emit((uint32_t)(ib_iova[i] >> 32));
+ 		ring_emit(ib_dwords[i]);
+ 	}
++	ring_emit(pkt7(CP_WAIT_FOR_IDLE, 0));           /* the end stamp is the pipeline's, not the CP's (it runs ahead) */
++	ring_time(a630_dev.seqno, 1);
+ 	ring_emit(pkt7(CP_EVENT_WRITE, 4));
+ 	ring_emit(CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
+ 	ring_emit((uint32_t)(SCRATCH_VA + SCRATCH_FENCE));
+@@ -2730,6 +2980,8 @@
+  * Clears the boot-slumber OOB like Linux after HFI start, forbids GX collapse
+  * and sets up the address space for client buffers. Leaves OOB_GPU set.
+  */
++static void sweet_gpu_pm_start(void);
++
+ static bool
+ gpu_keep_up(void)
+ {
+@@ -2742,6 +2994,9 @@
+ 	*(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) = 0;
+ 	a630_dev.seqno = 0;
+ 	a630_dev.ready = true;
++	a630_awake = true;
++	a630_last_active = mach_absolute_time();
++	sweet_gpu_pm_start();
+ 	printf("SWEET GPU: KEPT UP: GX on (OOB_GPU held, GMU keep-alive), ring %u dwords at RPTR=WPTR=%u, client VA 0x%llx-0x%llx, %u table pages\n",
+ 	    RING_SIZE / 4, ring_wptr, GVM_BASE, GVM_END, PTP_PAGES);
+ 	sweet_log_sync();
+@@ -2816,6 +3071,337 @@
+ }
+ 
+ /* ------------------------------------------------------------------ */
++/* Stage 8 power: lock, slumber/wake, recovery, DCVS, metrics          */
++/* ------------------------------------------------------------------ */
++
++/*
++ * One lock for everything above (taken by the IOKit side around every call, and by the PM thread). Wake from slumber
++ * re-runs the stage-5/7 sequence that is known to work (GMU cold boot from the kept firmware, HFI, GX rail, SPTPRAC,
++ * OOB, CP hw_init + SQE + ME_INIT, CP_SET_SECURE_MODE 0; the zap stays authenticated in the secure world, as in Linux).
++ */
++static void gpu_gmu_reset(void);
++
++static LCK_GRP_DECLARE(a630_lck_grp, "sweetgpu");
++static LCK_MTX_DECLARE(a630_mtx, &a630_lck_grp);
++
++void
++sweet_gpu_lock(void)
++{
++	lck_mtx_lock(&a630_mtx);
++}
++
++void
++sweet_gpu_unlock(void)
++{
++	lck_mtx_unlock(&a630_mtx);
++}
++
++static uint64_t
++ns_since(uint64_t t)
++{
++	uint64_t ns;
++	absolutetime_to_nanoseconds(mach_absolute_time() - t, &ns);
++	return ns;
++}
++
++static bool
++gpu_cp_idle_now(void)
++{
++	return gpu_r(A6XX_CP_RB_RPTR) == ring_wptr && sweet_gpu_fence_done(a630_dev.seqno);
++}
++
++/* GX off through the GMU, then the GMU into reset (the stage-5 end, hardware verified). Lock held, GPU awake. */
++static bool
++gpu_suspend(bool quiet)
++{
++	a630_quiet = quiet;
++	gpu_wr(gmu, GMU_PWR_COL_KEEPALIVE, 0);
++	gmu_oob_clear(OOB_GPU);
++	gpu_gx_slumber();
++	uint32_t st = gpu_rd(gmu, GMU_RPMH_POWER_STATE);
++	gpu_gmu_reset();
++	a630_awake = false;
++	a630_suspends++;
++	a630_quiet = 0;
++	if (st != GPU_HW_SLUMBER) {
++		printf("SWEET GPU: suspend: RPMH_POWER_STATE %#x is NOT slumber\n", st);
++		return false;
++	}
++	return true;
++}
++
++static bool
++gpu_resume(void)
++{
++	bool ok = false;
++
++	a630_quiet = a630_resumes >= 2;
++	if (a630_resumes < 2) {
++		printf("SWEET GPU: waking from slumber (resume %u)\n", a630_resumes + 1);
++	}
++	if (gpu_rd(gmu, GMU_CM3_SYSRESET) != 1) {
++		gpu_wr(gmu, GMU_CM3_SYSRESET, 1);
++		delay(10);
++	}
++	gpu_hfi_table();
++	ok = gmu_fw && gpu_gmu_boot((const uint32_t *)gmu_fw, gmu_fw_size, false) && gpu_gx_rail_on() && gpu_sptprac(true) &&
++	    gpu_hfi_start() && gmu_oob_set(OOB_GPU, "gpu") && gpu_cp_hw_init() && gpu_cp_start();
++	if (ok) {
++		ring_emit(pkt7(CP_SET_SECURE_MODE, 1));
++		ring_emit(0);
++		ring_flush();
++		ok = ring_wait_idle("resume CP_SET_SECURE_MODE 0");
++	}
++	if (ok) {
++		gmu_oob_clear(OOB_BOOT_SLUMBER);
++		gpu_wr(gmu, GMU_PWR_COL_KEEPALIVE, 1);
++		a630_awake = true;
++		a630_resumes++;
++		a630_last_active = mach_absolute_time();
++	}
++	a630_quiet = 0;
++	if (!ok) {
++		printf("SWEET GPU: resume FAILED\n");
++		a630_dev.lost = true;
++		sweet_gpu_report("GPU LOST (resume failed)");
++	}
++	return ok;
++}
++
++/*
++ * Reset after a fault or hang: halt the CP, power GX down through the GMU, reset the GMU, wake again; every outstanding
++ * submission is reported complete (its results are garbage) and clients see the changed epoch. Lock held. A failed
++ * wake leaves the GPU lost.
++ */
++bool
++sweet_gpu_recover(const char *why)
++{
++	if (!a630_dev.ready || a630_recoveries >= a630_recover_max) {
++		return false;
++	}
++	a630_recoveries++;
++	printf("SWEET GPU: RECOVERY %u/%u (%s)\n", a630_recoveries, a630_recover_max, why);
++	if (a630_awake) {
++		uint32_t gx = gpu_rd(cc, GPUCC_GX_GDSCR);
++		if ((gx & GDSC_PWR_ON) && !(gpu_rd(cc, gpucc_cbcr[CC_GX_GFX3D].off) & CBCR_CLK_OFF)) {
++			gpu_w(A6XX_CP_SQE_CNTL, 3);     /* halt the SQE first (Linux a6xx_recover) */
++		}
++		gpu_wr(gmu, GMU_PWR_COL_KEEPALIVE, 0);
++		gmu_oob_clear(OOB_GPU);
++		gpu_gx_slumber();
++		gpu_gmu_reset();
++		a630_awake = false;
++	}
++	{
++		vm_offset_t b = smmu_base + SMMU_CB(CP_CB);
++		gpu_wr(b, SMMU_CB_FSR, gpu_rd(b, SMMU_CB_FSR));
++	}
++	*(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) = a630_dev.seqno;
++	a630_timed = a630_dev.seqno;
++	a630_dev.lost = false;
++	if (!gpu_resume()) {
++		return false;
++	}
++	printf("SWEET GPU: recovered; submissions up to %u are void\n", a630_dev.seqno);
++	return true;
++}
++
++uint32_t
++sweet_gpu_epoch(void)
++{
++	return a630_recoveries;
++}
++
++/* ---- DCVS ---- */
++
++static bool
++gpu_set_level(unsigned lvl)
++{
++	uint32_t m[4] = { MSG_HDR(30 /* H2F_MSG_GX_BW_PERF_VOTE */, 4, 0), 1 /* blocking ack */, lvl, 0 }, ack[19];
++
++	a630_quiet = 1;
++	bool ok = hfi_cmd("GX_BW_PERF_VOTE", m, 4, ack, 19);
++	a630_quiet = 0;
++	if (ok) {
++		a630_level = lvl;
++	} else {
++		printf("SWEET GPU: GX level vote %u failed; governor off\n", lvl);
++		a630_gov = 0;
++	}
++	return ok;
++}
++
++static uint64_t gov_win_start, gov_busy_pct, res_ns[8];
++static unsigned gov_low_windows;
++
++/* Busy ticks (19.2 MHz) of the submissions completed since the last call, from the CP's own stamps. */
++static uint64_t
++gpu_busy_collect(void)
++{
++	volatile uint32_t *fw = (volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE);
++	volatile uint32_t *t = (volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_TIMES);
++	uint32_t done = *fw, from = a630_timed;
++	uint64_t busy = 0;
++
++	if (done - from > 64) {
++		from = done - 64;
++	}
++	while (from != done) {
++		from++;
++		uint32_t slot = from % 64;
++		uint64_t st = ((uint64_t)t[4 * slot + 1] << 32) | t[4 * slot], en = ((uint64_t)t[4 * slot + 3] << 32) | t[4 * slot + 2];
++		if (en > st && en - st < 19200000ull * 5) {
++			busy += en - st;
++		}
++	}
++	a630_timed = done;
++	return busy;
++}
++
++static void
++gpu_gov_tick(void)
++{
++	if (gov_win_start == 0) {
++		gov_win_start = mach_absolute_time();
++		(void)gpu_busy_collect();
++		return;
++	}
++	uint64_t ns = ns_since(gov_win_start);
++	if (ns < 60 * NSEC_PER_MSEC) {
++		return;
++	}
++	uint64_t ticks = ns * 192 / 10000, busy = gpu_busy_collect();
++	gov_busy_pct = MIN(100, busy * 100 / (ticks ? ticks : 1));
++	gov_win_start = mach_absolute_time();
++	unsigned lvl = a630_level;
++	if (gov_busy_pct >= 80) {
++		lvl = gov_busy_pct >= 95 ? a630_level_max : MIN(a630_level + 1, a630_level_max);
++		gov_low_windows = 0;
++	} else if (gov_busy_pct < 30) {
++		if (++gov_low_windows >= 2 && lvl > 1) {        /* hysteresis: two quiet windows per step down */
++			lvl--;
++			gov_low_windows = 0;
++		}
++	} else {
++		gov_low_windows = 0;
++	}
++	if (lvl != a630_level) {
++		(void)gpu_set_level(lvl);
++	}
++}
++
++/* ---- metrics: sysctl kern.sweet_gpu (one line of key=value) ---- */
++
++extern void SweetAdrenoClients(char *buf, size_t size, uint32_t *count);
++
++static int
++sweet_gpu_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[640], pids[96];
++	uint32_t clients = 0;
++	const char *state = !a630_dev.ready ? "off" : a630_dev.lost ? "lost" : a630_awake ? "on" : "slumber";
++	unsigned lvl = a630_awake ? a630_level : 0;
++	uint64_t tot = 0, now_in = 0;
++	int n;
++
++	pids[0] = 0;
++	SweetAdrenoClients(pids, sizeof(pids), &clients);
++	if (a630_dev.ready) {
++		now_in = 0;
++	}
++	for (unsigned i = 0; i < 8; i++) {
++		tot += res_ns[i];
++	}
++	n = snprintf(buf, sizeof(buf),
++	    "state=%s level=%u mhz=%u max_level=%u freq=%s busy_pct=%llu clients=%u pids=%s submitted=%u completed=%u "
++	    "suspends=%u resumes=%u recoveries=%u hangs=%u idle_ms=%u hwcg=%u total_ms=%llu res_ms=",
++	    state, lvl, lvl ? gpu_levels[lvl].mhz : 0, a630_level_max, a630_gov ? "gov" : "fixed", gov_busy_pct, clients, pids,
++	    a630_dev.seqno, a630_dev.ready && cp_memory ? *(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) : 0,
++	    a630_suspends, a630_resumes, a630_recoveries, a630_dev.hangs, a630_idle_ms, a630_hwcg, tot / NSEC_PER_MSEC);
++	(void)now_in;
++	for (unsigned i = 0; i < 8 && n > 0 && (size_t)n < sizeof(buf); i++) {
++		if (i) {
++			n += snprintf(buf + n, sizeof(buf) - n, ",L%u:%llu", i, res_ns[i] / NSEC_PER_MSEC);
++		} else {
++			n += snprintf(buf + n, sizeof(buf) - n, "slumber:%llu", res_ns[0] / NSEC_PER_MSEC);
++		}
++	}
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_gpu_sysctl, "A",
++    "Adreno 630 metrics: key=value line (docs/GPU_KERNEL.md)");
++
++/* ---- the PM thread: idle slumber, governor, residency, heartbeat ---- */
++
++static void
++a630_pm_thread(void *arg, wait_result_t wr)
++{
++	uint64_t last = mach_absolute_time(), summary = last, hb = last;
++
++	(void)arg;
++	(void)wr;
++	for (;;) {
++		sleep_ms(20);
++		sweet_gpu_lock();
++		uint64_t now = mach_absolute_time(), dt;
++		absolutetime_to_nanoseconds(now - last, &dt);
++		last = now;
++		if (a630_dev.ready && !a630_dev.lost) {
++			res_ns[a630_awake ? MIN(a630_level, 7u) : 0] += dt;
++			if (a630_awake) {
++				if (a630_gov) {
++					gpu_gov_tick();
++				}
++				if (a630_idle_ms && ns_since(a630_last_active) >= (uint64_t)a630_idle_ms * NSEC_PER_MSEC && gpu_cp_idle_now()) {
++					bool first = a630_suspends == 0;
++					if (first) {
++						printf("SWEET GPU: idle for %u ms: slumber\n", a630_idle_ms);
++					}
++					(void)gpu_suspend(!first);
++					gov_win_start = 0;
++				}
++			}
++		}
++		if (a630_dev.ready && (a630_gov || a630_idle_ms) && ns_since(summary) >= 30 * NSEC_PER_SEC) {
++			uint64_t tot = 1;
++			for (unsigned i = 0; i < 8; i++) {
++				tot += res_ns[i];
++			}
++			summary = now;
++			printf("SWEET GPU: pm: %s level %u busy %llu%% | time in level (%%): slumber %llu, 257 %llu, 342 %llu, 414 %llu, 520 %llu, 596 %llu, 675 %llu, 710 %llu | suspends %u resumes %u recoveries %u submits %u\n",
++			    a630_awake ? "on" : "slumber", a630_level, gov_busy_pct, res_ns[0] * 100 / tot, res_ns[1] * 100 / tot, res_ns[2] * 100 / tot,
++			    res_ns[3] * 100 / tot, res_ns[4] * 100 / tot, res_ns[5] * 100 / tot, res_ns[6] * 100 / tot, res_ns[7] * 100 / tot,
++			    a630_suspends, a630_resumes, a630_recoveries, a630_dev.submissions);
++		}
++		if (a630_hb_s && gcc && ns_since(hb) >= (uint64_t)a630_hb_s * NSEC_PER_SEC) {
++			hb = now;
++			printf("SWEET GPU: hb: %s level %u | GCC usb30 gdscr %#x master %#x sleep %#x utmi %#x cfg-noc %#x aggre %#x ahb2phy %#x clkref %#x gpll0-vote %#x memnoc_gfx %#x ddrss_gpu_axi %#x\n",
++			    a630_awake ? "on" : "slumber", a630_level, gpu_rd(gcc, 0x0f004), gpu_rd(gcc, 0x0f010), gpu_rd(gcc, 0x0f014),
++			    gpu_rd(gcc, 0x0f018), gpu_rd(gcc, 0x0502c), gpu_rd(gcc, 0x8201c), gpu_rd(gcc, 0x6a004), gpu_rd(gcc, 0x8c010),
++			    gpu_rd(gcc, GCC_GPU_GPLL0_VOTE), gpu_rd(gcc, GCC_GPU_MEMNOC_GFX_CBCR), gpu_rd(gcc, GCC_DDRSS_GPU_AXI_CBCR));
++		}
++		sweet_gpu_unlock();
++	}
++}
++
++static void
++sweet_gpu_pm_start(void)
++{
++	thread_t thread;
++
++	if (a630_idle_ms == 0 && !a630_gov && a630_hb_s == 0) {
++		return;
++	}
++	if (kernel_thread_start((thread_continue_t)a630_pm_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("SWEET GPU: PM thread: idle %u ms, %s, max level %u, hwcg %u, recover %u\n", a630_idle_ms, a630_gov ? "governor" : "fixed level",
++		    a630_level_max, a630_hwcg, a630_recover_max);
++	}
++}
++
++/* ------------------------------------------------------------------ */
+ /* Driver                                                              */
+ /* ------------------------------------------------------------------ */
+ 
+@@ -2897,7 +3483,12 @@
+ 	}
+ 	gpu_hfi_table();
+ 	bool booted = gpu_gmu_boot((const uint32_t *)fw, fwsize, false);
+-	sweet_a630_fw_put(fw, fwsize);
++	if (mode >= 8) {
++		gmu_fw = fw;    /* kept: every wake from slumber boots the GMU again */
++		gmu_fw_size = fwsize;
++	} else {
++		sweet_a630_fw_put(fw, fwsize);
++	}
+ 	bool rail = false, gx = false;
+ 	if (booted && mode >= 5) {
+ 		rail = gpu_gx_rail_on();
+@@ -2972,6 +3563,42 @@
+ 		mode = 8;
+ 	}
+ 	a630_mode = mode;
++	{
++		int v = 0;
++		char fb[16] = "";
++
++		if (PE_parse_boot_argn("sweetgpuidle", &v, sizeof(v)) && v > 0) {
++			a630_idle_ms = (uint32_t)MIN(v, 600000);
++		}
++		if (PE_parse_boot_argn("sweetgpuhwcg", &v, sizeof(v))) {
++			a630_hwcg = v != 0;
++		}
++		if (PE_parse_boot_argn("sweetgpuubwc", &v, sizeof(v))) {
++			a630_ubwc = v != 0;
++		}
++		if (PE_parse_boot_argn("sweetgpuhb", &v, sizeof(v)) && v > 0) {
++			a630_hb_s = (uint32_t)MIN(v, 3600);
++		}
++		if (PE_parse_boot_argn("sweetgpurecover", &v, sizeof(v)) && v >= 0) {
++			a630_recover_max = (uint32_t)MIN(v, 100);
++		}
++		if (PE_parse_boot_argn("sweetgpubw", fb, sizeof(fb)) && fb[0] == 'l') {
++			a630_bw_linux = 1;
++		}
++		if (PE_parse_boot_argn("sweetgpumax", &v, sizeof(v)) && v >= 1 && v < (int)GPU_NLEVELS) {
++			a630_level_max = (unsigned)v;
++		} else {
++			a630_level_max = GPU_NLEVELS - 1;
++		}
++		fb[0] = 0;
++		if (PE_parse_boot_argn("sweetgpufreq", fb, sizeof(fb))) {
++			if (fb[0] == 'g') {
++				a630_gov = 1;                   /* starts at the lowest level, the governor moves it */
++			} else if (fb[0] >= '1' && fb[0] <= '9') {
++				a630_level = (unsigned)MIN((unsigned)(fb[0] - '0'), a630_level_max);
++			}                                       /* "off": fixed lowest level (default) */
++		}
++	}
+ 	if (mode <= 2) {
+ 		a630_run(mode);         /* no firmware, no waiting */
+ 		return;
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -48,6 +48,9 @@
+ bool sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly);
+ void sweet_gpu_vm_unmap(uint64_t iova, uint64_t size);
+ void sweet_gpu_vm_flush(void);
++void sweet_gpu_lock(void);
++void sweet_gpu_unlock(void);
++uint32_t sweet_gpu_epoch(void);
+ bool sweet_gpu_check_fault(void);
+ void sweet_gpu_cache_sync(void *va, size_t len);
+ uint32_t sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count);
+@@ -70,8 +73,11 @@
+ #define IOVA_UNSET              0
+ #define GPU_PAGE                0x1000ull       /* SMMU granule; never PAGE_SIZE (16 KiB) */
+ 
+-static IOLock *gAdrenoLock;
+-static uint32_t gAdrenoClients;
++static IOLock *gClientsLock;           /* only the pid list below; the device lock is sweet_gpu_lock() */
++static struct {
++	int32_t pid;
++	uint32_t count;
++} gClientPids[32];
+ 
+ struct sweet_gem {
+ 	IOMemoryDescriptor       *md;           /* NULL: free slot */
+@@ -97,6 +103,7 @@
+ 	OSDeclareDefaultStructors(SweetAdrenoUserClient);
+ 
+ 	task_t            fTask;
++	int32_t           fPid;
+ 	struct sweet_gem *fGems;
+ 	uint32_t          fNextGem;
+ 	uint64_t          fQueues;      /* bit n = submitqueue id n open (id 0 = default, always) */
+@@ -141,7 +148,35 @@
+ 
+ /* ------------------------------------------------------------------ */
+ 
++/* "pid,pid" of the open clients (with a trailing "+" when the list is cut) and their number; for kern.sweet_gpu. */
+ extern "C" void
++SweetAdrenoClients(char *buf, size_t size, uint32_t *count)
++{
++	size_t n = 0;
++
++	buf[0] = 0;
++	*count = 0;
++	if (gClientsLock == NULL) {
++		strlcpy(buf, "-", size);
++		return;
++	}
++	IOLockLock(gClientsLock);
++	for (unsigned i = 0; i < 32; i++) {
++		if (gClientPids[i].count) {
++			*count += gClientPids[i].count;
++			int w = snprintf(buf + n, size - n, "%s%d", n ? "," : "", gClientPids[i].pid);
++			if (w > 0 && n + (size_t)w < size) {
++				n += (size_t)w;
++			}
++		}
++	}
++	IOLockUnlock(gClientsLock);
++	if (n == 0) {
++		strlcpy(buf, "-", size);
++	}
++}
++
++extern "C" void
+ SweetAdrenoPublish(void)
+ {
+ 	uint32_t agx = 0;
+@@ -149,10 +184,10 @@
+ 	if (!sweet_gpu_ready()) {
+ 		return;
+ 	}
+-	if (gAdrenoLock == NULL) {
+-		gAdrenoLock = IOLockAlloc();
++	if (gClientsLock == NULL) {
++		gClientsLock = IOLockAlloc();
+ 	}
+-	if (gAdrenoLock == NULL) {
++	if (gClientsLock == NULL) {
+ 		return;
+ 	}
+ 	(void)PE_parse_boot_argn("sweetgpuuc", &agx, sizeof(agx));
+@@ -182,10 +217,28 @@
+ 	if (!IOUserClient::initWithTask(owningTask, securityID, type)) {
+ 		return false;
+ 	}
+-	if (!sweet_gpu_ready() || gAdrenoLock == NULL) {
++	if (!sweet_gpu_ready() || gClientsLock == NULL) {
+ 		return false;
+ 	}
+ 	fTask = owningTask;
++	fPid = proc_selfpid();
++	IOLockLock(gClientsLock);
++	int slot = -1;
++	for (int i = 0; i < 32 && slot < 0; i++) {
++		if (gClientPids[i].count && gClientPids[i].pid == fPid) {
++			slot = i;
++		}
++	}
++	for (int i = 0; i < 32 && slot < 0; i++) {
++		if (!gClientPids[i].count) {
++			slot = i;
++			gClientPids[i].pid = fPid;
++		}
++	}
++	if (slot >= 0) {
++		gClientPids[slot].count++;
++	}
++	IOLockUnlock(gClientsLock);
+ 	fGems = (struct sweet_gem *)IOMallocZeroData(sizeof(struct sweet_gem) * GEM_MAX);
+ 	return fGems != NULL;
+ }
+@@ -203,9 +256,17 @@
+ IOReturn
+ SweetAdrenoUserClient::clientClose(void)
+ {
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	if (!fClosed) {
+ 		fClosed = true;
++		IOLockLock(gClientsLock);
++		for (unsigned i = 0; i < 32; i++) {
++			if (gClientPids[i].count && gClientPids[i].pid == fPid) {
++				gClientPids[i].count--;
++				break;
++			}
++		}
++		IOLockUnlock(gClientsLock);
+ 		if (fGems != NULL) {
+ 			for (uint32_t i = 0; i < GEM_MAX; i++) {
+ 				if (fGems[i].md != NULL) {
+@@ -214,7 +275,7 @@
+ 			}
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	terminate();
+ 	return kIOReturnSuccess;
+ }
+@@ -261,6 +322,7 @@
+ SweetAdrenoUserClient::waitFence(uint32_t fence, uint64_t ns)
+ {
+ 	uint64_t began = mach_absolute_time(), limit, cap, early;
++	uint32_t epoch = sweet_gpu_epoch();
+ 
+ 	if (fence == 0 || sweet_gpu_fence_done(fence)) {
+ 		return true;
+@@ -276,6 +338,9 @@
+ 		if (sweet_gpu_fence_done(fence)) {
+ 			return true;
+ 		}
++		if (epoch != sweet_gpu_epoch()) {
++			return false;                   /* the GPU was reset under this wait: the work is void */
++		}
+ 		if (sweet_gpu_check_fault() || !sweet_gpu_ready()) {
+ 			return false;                   /* the CP faulted: fail now instead of waiting for the timeout */
+ 		}
+@@ -290,13 +355,13 @@
+ 			}
+ 			return false;
+ 		}
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		if (waited < early) {           /* short jobs: spin; longer ones: sleep a millisecond at a time */
+ 			delay_for_interval(100, NSEC_PER_USEC);
+ 		} else {
+ 			IOSleep(1);
+ 		}
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 	}
+ }
+ 
+@@ -397,7 +462,7 @@
+ 	bzero(kva, (size_t)size);
+ 	sweet_gpu_cache_sync(kva, (size_t)size);
+ 
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	IOReturn ret = kIOReturnNoResources;
+ 	if (!sweet_gpu_ready()) {
+ 		ret = kIOReturnNotReady;
+@@ -421,7 +486,7 @@
+ 			}
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	if (ret != kIOReturnSuccess) {
+ 		buf->release();
+ 	}
+@@ -431,7 +496,7 @@
+ IOReturn
+ SweetAdrenoUserClient::gemInfo(struct sweet_msm_gem_info *r)
+ {
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	struct sweet_gem *g = gem(r->handle);
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+@@ -482,14 +547,14 @@
+ 			break;
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	return ret;
+ }
+ 
+ IOReturn
+ SweetAdrenoUserClient::cpuPrep(struct sweet_msm_gem_cpu_prep *r)
+ {
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	struct sweet_gem *g = gem(r->handle);
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+@@ -508,7 +573,7 @@
+ 			ret = kIOReturnBusy;
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	return ret;
+ }
+ 
+@@ -574,7 +639,7 @@
+ 		}
+ 	}
+ 
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	if (!sweet_gpu_ready()) {
+ 		ret = kIOReturnNotReady;
+ 		goto unlock;
+@@ -644,7 +709,7 @@
+ 		ret = kIOReturnSuccess;
+ 	}
+ unlock:
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ out:
+ 	if (bos != NULL) {
+ 		IOFreeData(bos, bosSize);
+@@ -664,7 +729,7 @@
+ IOReturn
+ SweetAdrenoUserClient::waitFenceCall(struct sweet_msm_wait_fence *r)
+ {
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	IOReturn ret;
+ 
+ 	if (r->queueid >= QUEUE_IDS || (r->queueid != 0 && !(fQueues & (1ull << r->queueid)))) {
+@@ -674,9 +739,11 @@
+ 	} else {
+ 		uint64_t ns = (r->timeout.tv_sec < 0 || r->timeout.tv_nsec < 0) ? 0 :
+ 		    (uint64_t)r->timeout.tv_sec * NSEC_PER_SEC + (uint64_t)r->timeout.tv_nsec;
+-		ret = waitFence(r->fence, ns) ? kIOReturnSuccess : (sweet_gpu_ready() ? kIOReturnTimeout : kIOReturnIOError);
++		uint32_t epoch = sweet_gpu_epoch();
++		ret = waitFence(r->fence, ns) && epoch == sweet_gpu_epoch() ? kIOReturnSuccess :
++		    ((sweet_gpu_ready() && epoch == sweet_gpu_epoch()) ? kIOReturnTimeout : kIOReturnIOError);
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	return ret;
+ }
+ 
+@@ -711,7 +778,7 @@
+ 		s->release();
+ 		return kIOReturnBadArgument;
+ 	}
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	ret = kIOReturnNoResources;
+ 	if (!sweet_gpu_ready()) {
+ 		ret = kIOReturnNotReady;
+@@ -739,7 +806,7 @@
+ 			}
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	if (s != NULL) {
+ 		s->release();
+ 	}
+@@ -749,7 +816,7 @@
+ IOReturn
+ SweetAdrenoUserClient::boSync(struct sweet_gpu_bo_sync *r)
+ {
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	struct sweet_gem *g = gem(r->handle);
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+@@ -764,7 +831,7 @@
+ 			ret = kIOReturnSuccess;
+ 		}
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	return ret;
+ }
+ 
+@@ -773,7 +840,7 @@
+ {
+ 	IOReturn ret = kIOReturnBadArgument;
+ 
+-	IOLockLock(gAdrenoLock);
++	sweet_gpu_lock();
+ 	struct sweet_gem *g = gem(type);
+ 	if (g != NULL) {
+ 		g->md->retain();
+@@ -781,7 +848,7 @@
+ 		*options = 0;
+ 		ret = kIOReturnSuccess;
+ 	}
+-	IOLockUnlock(gAdrenoLock);
++	sweet_gpu_unlock();
+ 	return ret;
+ }
+ 
+@@ -840,9 +907,9 @@
+ 	switch (selector) {
+ 	case SWEET_GPU_SEL_GET_PARAM:
+ 		NEED(struct sweet_msm_param);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		ret = sweet_gpu_param(r.param.param, &r.param.value) ? kIOReturnSuccess : kIOReturnUnsupported;
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		outLen = sizeof(r.param);
+ 		break;
+ 	case SWEET_GPU_SEL_GEM_NEW:
+@@ -861,9 +928,9 @@
+ 		break;
+ 	case SWEET_GPU_SEL_GEM_CPU_FINI:
+ 		NEED(struct sweet_msm_gem_cpu_fini);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		ret = gem(r.cpuFini.handle) != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		__asm__ volatile ("dsb sy" ::: "memory");       /* CPU stores through the WC mapping reach memory */
+ 		break;
+ 	case SWEET_GPU_SEL_GEM_SUBMIT:
+@@ -877,15 +944,15 @@
+ 		break;
+ 	case SWEET_GPU_SEL_GEM_MADVISE:
+ 		NEED(struct sweet_msm_gem_madvise);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		ret = gem(r.madvise.handle) != NULL ? kIOReturnSuccess : kIOReturnBadArgument;
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		r.madvise.retained = 1;
+ 		outLen = sizeof(r.madvise);
+ 		break;
+ 	case SWEET_GPU_SEL_GEM_CLOSE:
+ 		NEED(struct sweet_gem_close);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		{
+ 			struct sweet_gem *g = gem(r.close.handle);
+ 			if (g == NULL) {
+@@ -894,11 +961,11 @@
+ 				releaseGem(g);
+ 			}
+ 		}
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		break;
+ 	case SWEET_GPU_SEL_SUBMITQUEUE_NEW:
+ 		NEED(struct sweet_msm_submitqueue);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		ret = kIOReturnNoResources;
+ 		if (r.queue.prio != 0 || r.queue.flags != 0) {
+ 			ret = kIOReturnBadArgument;
+@@ -912,22 +979,22 @@
+ 				}
+ 			}
+ 		}
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		outLen = sizeof(r.queue);
+ 		break;
+ 	case SWEET_GPU_SEL_SUBMITQUEUE_CLOSE:
+ 		NEED(uint32_t);
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		if (r.queueId == 0 || r.queueId >= QUEUE_IDS || !(fQueues & (1ull << r.queueId))) {
+ 			ret = kIOReturnBadArgument;
+ 		} else {
+ 			fQueues &= ~(1ull << r.queueId);
+ 		}
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		break;
+ 	case SWEET_GPU_SEL_INFO: {
+ 		uint64_t v = 0;
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		r.info.abi_version = SWEET_GPU_ABI_VERSION;
+ 		r.info.flags = sweet_gpu_ready() ? 1u : 2u;
+ 		r.info.gpu_id = 630;
+@@ -935,7 +1002,7 @@
+ 		r.info.va_start = sweet_gpu_param(SWEET_MSM_PARAM_VA_START, &v) ? v : 0;
+ 		r.info.va_size = sweet_gpu_param(SWEET_MSM_PARAM_VA_SIZE, &v) ? v : 0;
+ 		r.info.last_fence = sweet_gpu_ready() ? sweet_gpu_fence_last() : 0;
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		outLen = sizeof(r.info);
+ 		break;
+ 	}
+@@ -945,9 +1012,9 @@
+ 		outLen = sizeof(r.surface);
+ 		break;
+ 	case SWEET_GPU_SEL_DEBUG:
+-		IOLockLock(gAdrenoLock);
++		sweet_gpu_lock();
+ 		sweet_gpu_debug(r.debug.w);
+-		IOLockUnlock(gAdrenoLock);
++		sweet_gpu_unlock();
+ 		outLen = sizeof(r.debug);
+ 		break;
+ 	case SWEET_GPU_SEL_BO_SYNC:

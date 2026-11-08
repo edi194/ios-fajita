@@ -1,0 +1,368 @@
+diff --git a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+--- a/osfmk/console/video_console.c
++++ b/osfmk/console/video_console.c
+@@ -2872,6 +2872,335 @@
+ 	}
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * Bergamota boot log (boot-arg -v). The loader starts the kernel in graphics mode (v_display=1), where xnu's text
++ * console never draws, so this is a text renderer of its own: a thread call drains the console ring (sweet_log_copy:
++ * every printf and kprintf) every 33 ms and draws the lines over the dimmed Bergamota logo, ISO font scaled 2x
++ * (boot-arg sweetbootlog_scale=1..4), with a drop shadow, coloured by severity, newest line at the bottom.
++ * Below the notch a fixed header shows the time since boot and the battery (SweetBattery's percent and current).
++ * It only draws until the GUI presents its first frame (sweet_bootlog_stop, from AppleCLCD); it never mutes the
++ * console, and a panic still draws through the normal console.
++ */
++extern uint32_t sweet_log_copy(uint64_t *pos, char *out, uint32_t max);    /* bsd/dev/sweet_ufs.c */
++extern int sweet_battery_hud(int *percent, int *ma);                        /* iokit/Kernel/arm/SweetBattery.cpp */
++void sweet_bootlog_stop(void);
++
++#define BL_MAXCOLS      200
++#define BL_MAXROWS      200
++#define BL_TOP_MARGIN   112             /* the Poco F1 notch */
++#define BL_HEADER_PAD   12              /* above and below the header text */
++/* tools/identity: a lime header band with ink text; paper-coloured lines on black, Bergamota's own in lime */
++#define BL_COL_HEADER   0x00d7e98a      /* header band: the lime ground */
++#define BL_COL_HDR_INK  0x00161616
++#define BL_COL_HDR_DIM  0x005d6638      /* ink at 55 % over the lime */
++#define BL_COL_HDR_LEAF 0x001a5933
++#define BL_COL_HDR_RED  0x00b3261e
++#define BL_COL_HDR_AMBER 0x008a5a00
++#define BL_COL_DIM      0x008c8b84
++#define BL_COL_TEXT     0x00f4f3ec      /* paper */
++#define BL_COL_ERROR    0x00ff7a66
++#define BL_COL_WARN     0x00f2c14e
++#define BL_COL_OURS     0x00d7e98a      /* Bergamota's own drivers (sweet*, beryllium, Rootstock): the lime */
++
++static char             bl_text[BL_MAXROWS][BL_MAXCOLS];
++static uint8_t          bl_len[BL_MAXROWS];
++static int              bl_rows, bl_cols, bl_scale, bl_left, bl_top, bl_cur, bl_header_y;
++static boolean_t        bl_scrolled;
++static uint64_t         bl_pos;
++static thread_call_t    bl_call;
++static volatile int     bl_stopped;
++static boolean_t        bl_started;
++
++static boolean_t
++bl_has(const char *t, int n, const char *w)
++{
++	int wl = (int)strlen(w);
++	for (int i = 0; i + wl <= n; i++) {
++		int k = 0;
++		while (k < wl) {
++			char c = t[i + k];
++			if (c >= 'A' && c <= 'Z') {
++				c = (char)(c - 'A' + 'a');
++			}
++			if (c != w[k]) {
++				break;
++			}
++			k++;
++		}
++		if (k == wl) {
++			return TRUE;
++		}
++	}
++	return FALSE;
++}
++
++static uint32_t
++bl_line_color(const char *t, int n)
++{
++	if (bl_has(t, n, "panic") || bl_has(t, n, "error") || bl_has(t, n, "fail") || bl_has(t, n, "fatal")) {
++		return BL_COL_ERROR;
++	}
++	if (bl_has(t, n, "warn") || bl_has(t, n, "timeout") || bl_has(t, n, "timed out")) {
++		return BL_COL_WARN;
++	}
++	if (bl_has(t, n, "sweet") || bl_has(t, n, "beryllium") || bl_has(t, n, "bergamota") || bl_has(t, n, "rootstock")) {
++		return BL_COL_OURS;
++	}
++	return BL_COL_TEXT;
++}
++
++static inline uint32_t
++bl_back(int x0, int y0, boolean_t logo, unsigned int px, unsigned int py)
++{
++	return logo ? vc_logo_back(x0, y0, px, py) : 0;
++}
++
++/* glyph bit (gx, gy) of ch; outside the cell is 0 */
++static inline int
++bl_bit(unsigned char ch, int gx, int gy)
++{
++	if (gx < 0 || gy < 0 || gx >= ISO_CHAR_WIDTH || gy >= ISO_CHAR_HEIGHT) {
++		return 0;
++	}
++	return (iso_font[ch * ISO_CHAR_HEIGHT + gy] >> gx) & 1;
++}
++
++/*
++ * Pixel lines [py0, py1): the background (logo or band), and the text t[0..n) whose cell row starts at pixel y ty,
++ * from pixel x bl_left; colours per character (cols) or one for all (fg).
++ */
++static void
++bl_draw_text(unsigned int py0, unsigned int py1, int ty, const char *t, int n, const uint32_t *cols, uint32_t fg,
++    uint32_t band, boolean_t logo, int x0, int y0)
++{
++	int cw = ISO_CHAR_WIDTH * bl_scale;
++
++	for (unsigned int py = py0; py < py1 && !bl_stopped; py++) {
++		uint32_t *line = (uint32_t *)(vinfo.v_baseaddr + py * vinfo.v_rowbytes);
++		int gy = ((int)py - ty) / bl_scale;
++		for (unsigned int px = 0; px < vinfo.v_width; px++) {
++			uint32_t v = band ? band : bl_back(x0, y0, logo, px, py);
++			int rx = (int)px - bl_left;
++			if (n && (int)py >= ty && rx >= 0 && rx < n * cw) {
++				int ci = rx / cw;
++				unsigned char ch = (unsigned char)t[ci];
++				int gx = (rx % cw) / bl_scale;
++				if (bl_bit(ch, gx, gy)) {
++					v = cols ? cols[ci] : fg;
++				} else if (bl_bit(ch, gx - 1, gy - 1)) {
++					v = (v >> 2) & 0x003f3f3f;              /* shadow: keep a quarter of the background */
++				}
++			}
++			line[px] = v;
++		}
++	}
++}
++
++static void
++bl_draw_row(int row, boolean_t logo, int x0, int y0)
++{
++	int ty = bl_top + row * ISO_CHAR_HEIGHT * bl_scale;
++	int n = bl_len[row];
++
++	bl_draw_text((unsigned int)ty, (unsigned int)(ty + ISO_CHAR_HEIGHT * bl_scale), ty, bl_text[row], n, NULL,
++	    n ? bl_line_color(bl_text[row], n) : BL_COL_TEXT, 0, logo, x0, y0);
++}
++
++static void
++bl_put_str(char *t, uint32_t *cols, int *n, int max, const char *str, uint32_t col)
++{
++	while (*str && *n < max) {
++		cols[*n] = col;
++		t[(*n)++] = *str++;
++	}
++}
++
++/* "Bergamota   verbose boot          12.345 s   84%  +412 mA", the right part flush with the log's right edge */
++static void
++bl_draw_header(void)
++{
++	char t[BL_MAXCOLS], num[48];
++	uint32_t cols[BL_MAXCOLS];
++	int n = 0, pct = 0, ma = 0;
++	uint64_t ns;
++	char right[64];
++	uint32_t rcols[64];
++	int rn = 0;
++
++	absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++	bl_put_str(t, cols, &n, bl_cols, "BERGAMOTA", BL_COL_HDR_INK);
++	bl_put_str(t, cols, &n, bl_cols, "  verbose boot", BL_COL_HDR_DIM);
++
++	snprintf(num, sizeof(num), "%llu.%03llu s", ns / 1000000000ull, (ns / 1000000ull) % 1000ull);
++	bl_put_str(right, rcols, &rn, (int)sizeof(right), num, BL_COL_HDR_INK);
++	if (sweet_battery_hud(&pct, &ma)) {
++		snprintf(num, sizeof(num), "   %d%%", pct);
++		bl_put_str(right, rcols, &rn, (int)sizeof(right), num,
++		    pct <= 15 ? BL_COL_HDR_RED : pct <= 30 ? BL_COL_HDR_AMBER : BL_COL_HDR_LEAF);
++		snprintf(num, sizeof(num), " %s%d mA", ma > 0 ? "+" : "", ma);
++		bl_put_str(right, rcols, &rn, (int)sizeof(right), num, BL_COL_HDR_DIM);
++	} else {
++		bl_put_str(right, rcols, &rn, (int)sizeof(right), "   battery --", BL_COL_HDR_DIM);
++	}
++	while (n < bl_cols - rn) {
++		cols[n] = BL_COL_HDR_INK;
++		t[n++] = ' ';
++	}
++	for (int k = 0; k < rn && n < bl_cols; k++) {
++		cols[n] = rcols[k];
++		t[n++] = right[k];
++	}
++
++	int ty = bl_header_y + BL_HEADER_PAD;
++	bl_draw_text((unsigned int)bl_header_y, (unsigned int)(ty + ISO_CHAR_HEIGHT * bl_scale + BL_HEADER_PAD), ty, t, n, cols,
++	    BL_COL_HDR_INK, BL_COL_HEADER, FALSE, 0, 0);
++}
++
++static void
++bl_newline(void)
++{
++	if (bl_cur < bl_rows - 1) {
++		bl_cur++;
++	} else {
++		/* whole-array pointers: the kernel's checked memmove sees bl_text[0] as a 200-byte object (panicked) */
++		memmove((char *)bl_text, (char *)bl_text + sizeof(bl_text[0]), sizeof(bl_text[0]) * (size_t)(bl_rows - 1));
++		memmove(bl_len, bl_len + 1, sizeof(bl_len[0]) * (size_t)(bl_rows - 1));
++		bl_scrolled = TRUE;
++	}
++	bl_len[bl_cur] = 0;
++}
++
++static void
++bl_put(char c)
++{
++	unsigned char u = (unsigned char)c;
++
++	if (c == '\n') {
++		bl_newline();
++		return;
++	}
++	if (c == '\t') {
++		do {
++			bl_put(' ');
++		} while (bl_len[bl_cur] % 4);
++		return;
++	}
++	if (u < 0x20 || u == 0x7f) {
++		return;                                         /* \r and other controls */
++	}
++	if (u >= 0x80 && u < 0xc0) {
++		return;                                         /* UTF-8 continuation byte */
++	}
++	if (u >= 0xc0) {
++		u = '?';                                        /* one '?' per non-ASCII character */
++	}
++	if (bl_len[bl_cur] >= bl_cols) {
++		bl_newline();
++	}
++	bl_text[bl_cur][bl_len[bl_cur]++] = (char)u;
++}
++
++static void
++bl_tick(__unused thread_call_param_t p0, __unused thread_call_param_t p1)
++{
++	static boolean_t painted;
++	char buf[512];
++	uint32_t n;
++	int x0 = 0, y0 = 0, first = bl_cur;
++	boolean_t logo;
++
++	if (bl_stopped) {
++		return;
++	}
++	logo = vc_logo_ready && vinfo.v_depth == 32;
++	if (logo) {
++		x0 = ((int)vinfo.v_width - CONSOLE_LOGO_W) / 2;
++		y0 = ((int)vinfo.v_height - CONSOLE_LOGO_H) / 2;
++	}
++	bl_scrolled = FALSE;
++	while (!bl_stopped && (n = sweet_log_copy(&bl_pos, buf, sizeof(buf))) > 0) {
++		for (uint32_t i = 0; i < n; i++) {
++			bl_put(buf[i]);
++		}
++	}
++	if (!painted) {
++		/* the loader's splash goes: background over the whole screen once, text rows below */
++		bl_draw_text(0, (unsigned int)bl_top, 0, NULL, 0, NULL, 0, 0, logo, x0, y0);
++		bl_draw_text((unsigned int)(bl_top + bl_rows * ISO_CHAR_HEIGHT * bl_scale), (unsigned int)vinfo.v_height, 0, NULL, 0,
++		    NULL, 0, 0, logo, x0, y0);
++		bl_scrolled = TRUE;
++		painted = TRUE;
++	}
++	for (int r = bl_scrolled ? 0 : first; r <= bl_cur && !bl_stopped; r++) {
++		bl_draw_row(r, logo, x0, y0);
++	}
++	if (bl_scrolled) {
++		for (int r = bl_cur + 1; r < bl_rows && !bl_stopped; r++) {
++			bl_draw_row(r, logo, x0, y0);
++		}
++	}
++	bl_draw_header();
++	if (!bl_stopped) {
++		uint64_t deadline;
++		clock_interval_to_deadline(33, 1000 * 1000 /*ms scale*/, &deadline);
++		thread_call_enter_delayed(bl_call, deadline);
++	}
++}
++
++static void
++sweet_bootlog_start(boolean_t graphics)
++{
++	int verbose = 0, scale = 2;
++
++	if (bl_started || !graphics || vinfo.v_depth != 32 || !vinfo.v_baseaddr || bl_stopped) {
++		return;
++	}
++	if (!PE_parse_boot_argn("-v", &verbose, sizeof(verbose))) {
++		return;
++	}
++	PE_parse_boot_argn("sweetbootlog_scale", &scale, sizeof(scale));
++	if (scale < 1 || scale > 4) {
++		scale = 2;
++	}
++	bl_scale = scale;
++	bl_cols = (int)(vinfo.v_width / (ISO_CHAR_WIDTH * scale)) - 1;
++	bl_header_y = BL_TOP_MARGIN;
++	/* below the notch: the header band, an 8 px gap, the log rows, 16 px at the bottom */
++	bl_rows = (int)((vinfo.v_height - BL_TOP_MARGIN - 2 * BL_HEADER_PAD - 8 - 16) / (ISO_CHAR_HEIGHT * scale)) - 1;
++	if (bl_cols > BL_MAXCOLS) {
++		bl_cols = BL_MAXCOLS;
++	}
++	if (bl_rows > BL_MAXROWS) {
++		bl_rows = BL_MAXROWS;
++	}
++	if (bl_cols < 8 || bl_rows < 2) {
++		return;
++	}
++	bl_left = ((int)vinfo.v_width - bl_cols * ISO_CHAR_WIDTH * scale) / 2;
++	bl_top = (int)vinfo.v_height - 16 - bl_rows * ISO_CHAR_HEIGHT * scale;
++	bl_cur = 0;
++	bl_len[0] = 0;
++	bl_pos = 0;                                             /* from the first byte the kernel logged */
++	if (!vc_logo_ready) {
++		vc_logo_decode();
++	}
++	bl_call = thread_call_allocate_with_priority(bl_tick, NULL, THREAD_CALL_PRIORITY_KERNEL);
++	if (bl_call == NULL) {
++		return;
++	}
++	bl_started = TRUE;
++	thread_call_enter(bl_call);
++}
++
++/* AppleCLCD, on the GUI's first frame: the boot log stops drawing for good */
++void
++sweet_bootlog_stop(void)
++{
++	bl_stopped = 1;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
++
+ void
+ initialize_screen(PE_Video * boot_vinfo, unsigned int op)
+ {
+@@ -3048,6 +3377,9 @@
+ 		gc_enable( !graphics_now );
+ 		gc_acquired = TRUE;
+ 		gc_desire_text = FALSE;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_bootlog_start(graphics_now);
++#endif
+ 		break;
+ 
+ 	case kPEDisableScreen:
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -40,6 +40,7 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void sweet_bootlog_stop(void);     /* osfmk/console/video_console.c: the -v boot log stops at the first frame */
+ extern "C" void (*sweet_fb_panic_hook)(void);   /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cpp (boot-arg sweetbusy=N) */
+@@ -2775,6 +2776,7 @@
+ {
+ 	if (!fConsolePaused) {
+ 		int quiet = 0;
++		sweet_bootlog_stop();
+ 		fConsolePaused = true;
+ 		if (PE_parse_boot_argn("sweetfb_noconsole", &quiet, sizeof(quiet)) && quiet != 0) {
+ 			/* Not PE_initialize_console(kPEDisableScreen): its console switch

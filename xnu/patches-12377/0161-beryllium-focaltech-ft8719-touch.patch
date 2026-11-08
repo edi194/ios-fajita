@@ -1,0 +1,218 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index e7f397fbe3300517f6ad5abe6e7069768b4990fd..1ae50ee1b9723dbc4d13beb45637d0fc5817b0f2 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -9,6 +9,12 @@
+  * QUP wrap1 SE6 @0xa98000, IRQ TLMM 31, reset TLMM 32, SDA/SCL 33/34
+  * (function qup14). Its rails (L14A, PMI8998 LAB/IBB) belong to the panel
+  * and are on after ABL: no RPMh vote. Protocol as Linux novatek-nvt-ts.c.
++ *
++ * Poco F1, EBBG panel: Focaltech FT8719 TDDI at 0x38 on the same bus and pins
++ * (Android dmesg: chip id 0x8719, reg 0xa3 reads 0x87, IRQ TLMM 31 falling
++ * edge, 1080x2246). Probed first, without a reset: the TDDI shares its reset
++ * pin with the display. Standard Focaltech frame: reg 0 mode, reg 2 point
++ * count, 6-byte records from reg 3.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -39,6 +45,16 @@ void sweet_touch_init(void);
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
+ #define TOUCH_NVT        3
++#define TOUCH_FT8719     4
++/* FT8719 (Focaltech TDDI, EBBG Poco F1) */
++#define FT_ADDR          0x38u
++#define FT_ID_REG        0xa3u  /* chip id high: 0x87 */
++#define FT_ID2_REG       0x9fu  /* chip id low (logged only) */
++#define FT_ID_HI         0x87u
++#define FT_HEAD          3u
++#define FT_RECORD        6u
++#define FT_HOLD_FRAMES   3u     /* frames before an unannounced release */
++#define FT_BAD_RELEASE   20u    /* torn frames in a row before a forced release */
+ /* NT36672A (Linux novatek-nvt-ts.c) */
+ #define NVT_ADDR         0x01u
+ #define NVT_PARAMS_REG   0x78u
+@@ -774,6 +790,103 @@ touch_novatek(void)
+ 	return 0;
+ }
+ 
++/* boot-arg sweettouchrst=1: pulse the reset pin if the FT8719 is silent (may blink the display) */
++static unsigned touch_ft_rst;
++
++/*
++ * FT8719 frame (vendor ftxxxx layout): reg 0 device mode (0 = working),
++ * reg 1 gesture id, reg 2 low nibble = point count, then 6-byte records:
++ *   [0] event(7:6) 0 down / 1 up / 2 contact | X high (3:0)
++ *   [1] X low   [2] track id (7:4, 0xf = unused) | Y high (3:0)   [3] Y low
++ *   [4] pressure   [5] area
++ * Only as many records as can be in use are read (the bus is bit-banged);
++ * torn frames are dropped, and a contact that disappears without an UP
++ * record is held for FT_HOLD_FRAMES frames, as for the NT36672A.
++ */
++static int
++touch_ft8719(void)
++{
++	static unsigned hold_frames, bad_run;
++	uint8_t buf[FT_HEAD + FT_RECORD * TOUCH_MAX];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0, released = 0, seen = 0;
++	unsigned n = 0, cnt = (unsigned)__builtin_popcount(st.active) + 1u;
++	bool bad = false;
++	cnt = cnt < 2u ? 2u : (cnt > TOUCH_MAX ? TOUCH_MAX : cnt);
++	for (;;) {
++		memset(buf, 0xff, sizeof(buf));
++		int err = touch_read(FT_ADDR, 0, false, buf, FT_HEAD + FT_RECORD * cnt);
++		if (err) {
++			return err;
++		}
++		n = buf[2] & 15u;
++		if ((buf[0] & 0x70u) || n > TOUCH_MAX) {
++			bad = true;
++			break;
++		}
++		if (n <= cnt) {
++			break;
++		}
++		cnt = n; /* more contacts than we asked for: read again, longer */
++	}
++	for (unsigned i = 0; !bad && i < cnt; ++i) {
++		const uint8_t *p = buf + FT_HEAD + FT_RECORD * i;
++		unsigned id = p[2] >> 4, event = p[0] >> 6;
++		if (id >= TOUCH_MAX) {
++			break; /* unused-record sentinel */
++		}
++		if ((seen & (1u << id)) || event == 3u) {
++			bad = true;
++			break;
++		}
++		seen |= 1u << id;
++		if (event == 1u) {
++			released |= 1u << id;
++			continue;
++		}
++		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
++		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
++		if (px >= tb->w || py >= tb->h) {
++			bad = true;
++			break;
++		}
++		mask |= 1u << id;
++		x[id] = (int)px;
++		y[id] = (int)py;
++	}
++	if (touch_trace) {
++		uint64_t ns;
++		absolutetime_to_nanoseconds(mach_absolute_time(), &ns);
++		printf("FT %llu %c%c n=%u m=%x %d,%d | %02x %02x %02x | %02x %02x %02x %02x %02x %02x\n",
++		    ns / 1000000ull, touch_trace_why, bad ? 'b' : 'r', n, mask, x[0], y[0],
++		    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]);
++	}
++	if (bad) {
++		if (st.active && ++bad_run >= FT_BAD_RELEASE) {
++			printf("SWEET TOUCH: %u torn FT8719 frames while touched; releasing\n", bad_run);
++			bad_run = 0;
++			hold_frames = 0;
++			touch_report(0, x, y);
++		}
++		return 0;
++	}
++	bad_run = 0;
++	uint32_t keep = st.active & ~mask & ~released;
++	if (keep && ++hold_frames < FT_HOLD_FRAMES) {
++		for (unsigned id = 0; id < TOUCH_MAX; ++id) {
++			if (keep & (1u << id)) {
++				x[id] = st.x[id];
++				y[id] = st.y[id];
++			}
++		}
++		mask |= keep;
++	} else {
++		hold_frames = 0;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
+ static int
+ touch_nvt_params(void)
+ {
+@@ -823,6 +936,32 @@ touch_beryllium_start(void)
+ 	touch_gpio(tb->rst, 0, 0, 0, true, true);         /* reset released (pin high) */
+ 	touch_wait(100);
+ 	st.probing = true;
++	/* EBBG panel: Focaltech FT8719 at 0x38. Probe it first and without a
++	 * reset (TDDI: the reset pin is shared with the display); the NT36672A
++	 * probe below pulses reset when silent. */
++	uint8_t fid1 = 0, fid2 = 0;
++	int fe = touch_read(FT_ADDR, FT_ID_REG, false, &fid1, 1);
++	if (fe || fid1 != FT_ID_HI) {
++		touch_wait(100);
++		fe = touch_read(FT_ADDR, FT_ID_REG, false, &fid1, 1);
++	}
++	if ((fe || fid1 != FT_ID_HI) && touch_ft_rst) {
++		printf("SWEET TOUCH: FT8719 silent (%d); pulsing reset (sweettouchrst=1)\n", fe);
++		touch_gpio(tb->rst, 0, 0, 0, true, false);
++		touch_wait(10);
++		touch_gpio(tb->rst, 0, 0, 0, true, true);
++		touch_wait(300);
++		fe = touch_read(FT_ADDR, FT_ID_REG, false, &fid1, 1);
++	}
++	if (!fe) {
++		(void)touch_read(FT_ADDR, FT_ID2_REG, false, &fid2, 1);
++	}
++	printf("SWEET TOUCH: probe FT8719 at %#x: err=%d chip-id=%02x:%02x\n", FT_ADDR, fe, fid1, fid2);
++	if (!fe && fid1 == FT_ID_HI) {
++		st.probing = false;
++		st.kind = TOUCH_FT8719;
++		return true;
++	}
+ 	int err = touch_nvt_params();
+ 	if (err) {
+ 		printf("SWEET TOUCH: nvt silent (%d); pulsing reset\n", err);
+@@ -978,7 +1117,8 @@ touch_thread(void *arg, wait_result_t result)
+ 	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+ selected:
+ 	printf("SWEET TOUCH: selected %s, %ux%u, poll=%ums i2c-half=%uus irq-hint=%d\n",
+-	    st.kind == TOUCH_NVT ? "NT36672A" : st.kind == TOUCH_GOODIX ? "GT9896 Yellowstone" : "Focaltech 54:52",
++	    st.kind == TOUCH_NVT ? "NT36672A" : st.kind == TOUCH_FT8719 ? "Focaltech FT8719" :
++	    st.kind == TOUCH_GOODIX ? "GT9896 Yellowstone" : "Focaltech 54:52",
+ 	    tb->w, tb->h, touch_poll_ms, bb_half_us, st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+@@ -998,7 +1138,10 @@ selected:
+ 		 * Its report buffer keeps the last frame, so an unprompted read
+ 		 * replays old contacts as new touches (ghost taps).
+ 		 */
+-		bool periodic = st.kind != TOUCH_NVT && (++ticks % 10u) == 0;
++		bool periodic = st.kind == TOUCH_FT8719 ? (++ticks % 50u) == 0 :
++		    (st.kind != TOUCH_NVT && (++ticks % 10u) == 0);
++		/* slow bit-banged readers: IRQ edge or finger down only */
++		bool paced = st.kind == TOUCH_NVT || st.kind == TOUCH_FT8719;
+ 		/*
+ 		 * While a finger is down read on every IRQ edge (a new frame) and at
+ 		 * least every ~8 ms, so a missed edge cannot leave a stuck contact;
+@@ -1006,13 +1149,14 @@ selected:
+ 		 * bit-banged transfer.
+ 		 */
+ 		static unsigned since_read;
+-		bool active_due = st.active && (st.kind != TOUCH_NVT || touch_poll_ms >= 8 ||
++		bool active_due = st.active && (!paced || touch_poll_ms >= 8 ||
+ 		    ++since_read * touch_poll_ms >= 8);
+ 		if (!st.irq_hint || active_due || pending || periodic) {
+ 			since_read = 0;
+ 			touch_trace_why = pending ? 'e' : 'a';
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
+-			    st.kind == TOUCH_NVT ? touch_novatek() : touch_focaltech();
++			    st.kind == TOUCH_NVT ? touch_novatek() :
++			    st.kind == TOUCH_FT8719 ? touch_ft8719() : touch_focaltech();
+ 			if (err) {
+ 				/* At most one line a minute: bad frames are frequent and harmless */
+ 				static uint64_t last_log;
+@@ -1072,6 +1216,7 @@ sweet_touch_init(void)
+ 	}
+ 	(void)PE_parse_boot_argn("sweettouchbb", &bb_half_us, sizeof(bb_half_us));
+ 	(void)PE_parse_boot_argn("sweettouchlog", &touch_trace, sizeof(touch_trace));
++	(void)PE_parse_boot_argn("sweettouchrst", &touch_ft_rst, sizeof(touch_ft_rst));
+ 	if (bb_half_us < 2 || bb_half_us > 10) {
+ 		bb_half_us = 5;
+ 	}

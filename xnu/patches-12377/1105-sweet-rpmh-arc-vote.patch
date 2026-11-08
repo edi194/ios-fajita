@@ -1,0 +1,208 @@
+diff --git a/bsd/dev/sweet_rpmh.c b/bsd/dev/sweet_rpmh.c
+index 2d88a344fd3a07f81f5afda97e4930a6b99deb96..6ae963652c311fdf264f91c6f294e4496734dad2 100644
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -14,6 +14,7 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int sweet_rpmh_vreg_enable(const char *res, unsigned mv);
+ int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
++int sweet_rpmh_arc_vote(const char *res, bool max);
+ 
+ /* Live downstream DT has two positional reg entries, no reg-names. */
+ #define RH_RSC_PA       0x18220000u
+@@ -55,7 +56,9 @@ int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
+ #define RH_DB_HEADER    144u
+ #define RH_DB_ENTRY     24u
+ #define RH_DB_MAX       0x100000u /* policy bound, not a DT size */
++#define RH_ARC          3u
+ #define RH_VRM          4u
++#define RH_ARC_LEVELS   16u      /* RPMH_ARC_MAX_LEVELS */
+ #define RH_TIMEOUT_US   100000u
+ 
+ static vm_offset_t rh_rsc, rh_tcs, rh_dict, rh_db;
+@@ -173,8 +176,9 @@ rh_map(void)
+ 	return 0;
+ }
+ 
++/* want = RH_VRM or RH_ARC; aux/aux_len (optional) return the entry's aux data window */
+ static int
+-rh_lookup(const char *res, uint32_t *address)
++rh_lookup_slave(const char *res, unsigned want, uint32_t *address, uint32_t *aux_out, uint32_t *aux_len)
+ {
+ 	uint32_t key[2] = {0, 0};
+ 	for (unsigned i = 0; i < 8 && res[i]; ++i) {
+@@ -201,12 +205,18 @@ rh_lookup(const char *res, uint32_t *address)
+ 				continue;
+ 			}
+ 			uint32_t addr = rh_read(rh_db, e + 16);
+-			if (slave != RH_VRM || (addr >> 16) != RH_VRM || (addr & 15u) ||
++			if (slave != want || (addr >> 16) != want || (addr & 15u) ||
+ 			    !rh_range(aux + rh_db16(e + 22), rh_db16(e + 20))) {
+-				printf("SWEET RPMH: invalid VRM entry for %s\n", res);
++				printf("SWEET RPMH: invalid %s entry for %s\n", want == RH_ARC ? "ARC" : "VRM", res);
+ 				return EINVAL;
+ 			}
+ 			*address = addr;
++			if (aux_out) {
++				*aux_out = aux + rh_db16(e + 22);
++			}
++			if (aux_len) {
++				*aux_len = rh_db16(e + 20);
++			}
+ 			++matches;
+ 			printf("SWEET RPMH: %s addr=%#x slave=%u aux-version=%#x priority=%#x:%#x\n",
+ 			    res, addr, slave, rh_db16(h + 8),
+@@ -220,6 +230,12 @@ rh_lookup(const char *res, uint32_t *address)
+ 	return 0;
+ }
+ 
++static int
++rh_lookup(const char *res, uint32_t *address)
++{
++	return rh_lookup_slave(res, RH_VRM, address, NULL, NULL);
++}
++
+ static bool
+ rh_free(unsigned t)
+ {
+@@ -233,10 +249,14 @@ rh_free(unsigned t)
+ 	    !(rh_read(rh_tcs, RH_IRQ_STATUS) & (1u << t));
+ }
+ 
+-/* enable=false: a single ENABLE=0 command (voltage and mode stay as they were). */
++/* Up to 3 commands (addresses absolute) in one ACTIVE AMC request, each with a write-ack. */
+ static int
+-rh_send(uint32_t address, unsigned mv, bool enable)
++rh_cmds(const uint32_t *addrs, const uint32_t *vals, unsigned ncmd)
+ {
++	if (ncmd == 0 || ncmd > 3) {
++		return EINVAL;
++	}
++	uint32_t address = addrs[0] & ~15u;
+ 	int chosen = -1;
+ 	for (unsigned t = 0; t < RH_ACTIVE_N; ++t) {
+ 		uint32_t b = t * RH_TCS_STRIDE;
+@@ -282,19 +302,13 @@ rh_send(uint32_t address, unsigned mv, bool enable)
+ 	}
+ 	/* From here an uncertain write/timeout quarantines our slot for this boot. */
+ 	rh_poisoned = true;
+-	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
+-	const uint32_t offsets[3] = {0, 8, 4};
+-	const uint32_t values[3] = {mv, 7, 1};
+-	const unsigned ncmd = enable ? 3 : 1;
+ 	const uint32_t cmdmask = (1u << ncmd) - 1u;
+-	printf("SWEET RPMH: TCS%u ACTIVE %u mV mode=7 enable=%d irq-enable=%#x\n", t, mv, enable, irq_en);
++	printf("SWEET RPMH: TCS%u ACTIVE %u command(s) at %#x irq-enable=%#x\n", t, ncmd, address, irq_en);
+ 	for (unsigned c = 0; c < ncmd; ++c) {
+ 		uint32_t cmd = b + c * RH_CMD_STRIDE;
+-		uint32_t off = enable ? offsets[c] : 4u;
+-		uint32_t val = enable ? values[c] : 0u;
+ 		if (!rh_sync(cmd + RH_MSGID, RH_WRITE_ACK) ||
+-		    !rh_sync(cmd + RH_ADDR, address + off) ||
+-		    !rh_sync(cmd + RH_DATA, val)) {
++		    !rh_sync(cmd + RH_ADDR, addrs[c]) ||
++		    !rh_sync(cmd + RH_DATA, vals[c])) {
+ 			return EIO;
+ 		}
+ 	}
+@@ -344,6 +358,19 @@ rh_send(uint32_t address, unsigned mv, bool enable)
+ 	return 0;
+ }
+ 
++/* VRM: enable=false sends a single ENABLE=0 command (voltage and mode stay as they were). */
++static int
++rh_send(uint32_t address, unsigned mv, bool enable)
++{
++	/* HPM (raw 7) is supported by this PMIC5 LDO; enable comes last. */
++	const uint32_t on_addr[3] = { address + 0, address + 8, address + 4 };
++	const uint32_t on_val[3] = { mv, 7, 1 };
++	const uint32_t off_addr[1] = { address + 4 };
++	const uint32_t off_val[1] = { 0 };
++	printf("SWEET RPMH: VRM %#x %u mV mode=7 enable=%d\n", address, mv, enable);
++	return enable ? rh_cmds(on_addr, on_val, 3) : rh_cmds(off_addr, off_val, 1);
++}
++
+ /*
+  * Poco F1 WCN3990 rails (mainline sdm845-xiaomi-beryllium-common.dtsi):
+  * l5a 0.8 V (cx/mx), l7a 1.8 V (xo), l17a 1.304 V (rfa), l23a 3.3 V (ch1),
+@@ -444,4 +471,80 @@ out:
+ 	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
+ 	return error;
+ }
++
++/*
++ * ARC power-domain level vote for the modem boot (docs/WIFI_IOS26.md, P3): the
++ * three domains the MSS needs (Linux sdm845 mss power-domains cx/mx/mss). max=true
++ * votes the highest hlvl of the cmd-db level map, as Linux's
++ * dev_pm_genpd_set_performance_state(pd, INT_MAX) for proxy votes does; max=false
++ * votes hlvl 0 (off). Active set only, like the VRM votes above.
++ */
++int
++sweet_rpmh_arc_vote(const char *res, bool max)
++{
++	static const char *const allowed[] = { "cx.lvl", "mx.lvl", "mss.lvl" };
++	unsigned i;
++	if (!sweet_board_beryllium() || !res) {
++		return EINVAL;
++	}
++	for (i = 0; i < sizeof(allowed) / sizeof(allowed[0]); ++i) {
++		if (!strcmp(res, allowed[i])) {
++			break;
++		}
++	}
++	if (i == sizeof(allowed) / sizeof(allowed[0])) {
++		printf("SWEET RPMH: %s is not an allowed ARC resource\n", res);
++		return EINVAL;
++	}
++	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
++		return EBUSY;
++	}
++	int error = EIO;
++	uint32_t address = 0, aux = 0, aux_len = 0;
++	if (rh_poisoned) {
++		printf("SWEET RPMH: previous uncertain transaction; refusing further access\n");
++		goto out;
++	}
++	error = rh_map();
++	if (!error) {
++		error = rh_lookup_slave(res, RH_ARC, &address, &aux, &aux_len);
++	}
++	if (!error) {
++		unsigned count = aux_len / 2;
++		uint16_t vl[RH_ARC_LEVELS];
++		if (count == 0 || count > RH_ARC_LEVELS) {
++			printf("SWEET RPMH: %s level map has %u entries\n", res, count);
++			error = EINVAL;
++			goto out;
++		}
++		for (unsigned k = 0; k < count; ++k) {
++			vl[k] = (uint16_t)rh_db16(aux + 2 * k);
++			if (k > 0 && vl[k] == 0) {      /* zero padding ends the map */
++				count = k;
++				break;
++			}
++		}
++		/*
++		 * Never an off vote for cx/mx: an apps-DRV vote replaces ABL's vote through this DRV, and
++		 * CX/MX feed the display, UFS and memory (Linux clamps to the top level before sync_state;
++		 * an ldoa7 off vote panicked boot 0116hw). Only mss.lvl, which nothing else on the AP uses,
++		 * is voted back to 0.
++		 */
++		if (!max && strcmp(res, "mss.lvl")) {
++			printf("SWEET RPMH: %s off vote refused (kept at the top level)\n", res);
++			error = 0;
++			goto out;
++		}
++		uint32_t hlvl = max ? count - 1 : 0;
++		printf("SWEET RPMH: %s ARC %#x: %u levels, vote hlvl %u (vlvl %u)\n", res, address, count, hlvl,
++		    vl[hlvl]);
++		error = rh_cmds(&address, &hlvl, 1);
++	}
++out:
++	if (error) {
++		printf("SWEET RPMH: %s ARC vote failed errno=%d\n", res, error);
++	}
++	__atomic_store_n(&rh_lock, 0, __ATOMIC_RELEASE);
++	return error;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

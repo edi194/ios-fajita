@@ -1,0 +1,223 @@
+#!/bin/bash
+# CLI for the Bergamota app's file-based API (no network). Needs python3 for JSON only.
+#   bergamota enqueue IMG [--label L] [--no-arm] [--wait]
+#   bergamota build --name N --kernel K --adt A (--preset P | --cmdline C) [--label L] [--no-enqueue] [--no-arm] [--wait]
+#   bergamota flash-userdata IMG [--partition userdata|boot|logo] [--then-boot BOOTIMG] [--full|--delta] [--via abl|bergamota|auto]
+#                            [--label L] [--no-arm] [--wait]   (default userdata = replaces iOS; boot = Enxerto's boot.img; logo = splash)
+#                            main route = Bergamota fastboot, delta for userdata (only changed blocks); --via abl = ABL fastboot, full
+#   bergamota orangefox on|off
+#   bergamota install IPA [--wait]
+#   bergamota upload [--dest photos|/phone/folder] FILE... [--wait]
+#   bergamota reboot fastboot|bergamota|recovery [--wait]     (iOS up; SSH sweetreboot; fastboot = ABL, bergamota = Bergamota fastboot)
+#   bergamota enter-bergamota [--wait]     (ABL fastboot -> Bergamota fastboot: fastboot boot bergamota-fastboot.img)
+#   bergamota metrics [--json]     (live phone metrics from status.json phone.metrics: CPU clusters, GPU, renderer, battery)
+#   bergamota status
+#   bergamota stop
+# Requests are written to ~/Library/Application Support/Bergamota/inbox/ ; results land in inbox/done or inbox/failed.
+set -eu
+BASE="$HOME/Library/Application Support/Bergamota"
+INBOX="$BASE/inbox"
+
+die() { echo "bergamota: $*" >&2; exit 1; }
+usage() { sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+
+# submit KIND JSON [wait]: write atomically (tmp name is not *.json), optionally wait for the result.
+submit() {
+	local json=$1 wait=${2:-0}
+	mkdir -p "$INBOX/done" "$INBOX/failed"
+	local id; id="$(date +%s)-$$-$RANDOM.json"
+	printf '%s\n' "$json" > "$INBOX/.$id.tmp"
+	mv "$INBOX/.$id.tmp" "$INBOX/$id"
+	echo "submitted $id"
+	[ "$wait" = 1 ] || return 0
+	local i=0
+	while [ $i -lt 1800 ]; do
+		for d in done failed; do
+			if [ -f "$INBOX/$d/$id" ]; then
+				python3 -c 'import json,sys
+d=json.load(open(sys.argv[1])); print(d.get("error") and "ERROR: "+d["error"] or "OK: "+str(d.get("result","")))
+sys.exit(1 if d.get("error") else 0)' "$INBOX/$d/$id"
+				return $?
+			fi
+		done
+		sleep 1; i=$((i+1))
+	done
+	die "timed out waiting for the app (is Bergamota running?)"
+}
+
+abspath() { # keep repo-relative paths as they are, absolutize ones that exist relative to cwd
+	if [ -e "$1" ]; then python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$1"; else printf '%s' "$1"; fi
+}
+
+cmd=${1:-}; [ -n "$cmd" ] || usage 1; shift || true
+case "$cmd" in
+enqueue)
+	img=""; label=""; arm=true; wait=0
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--label) label=$2; shift 2 ;;
+		--no-arm) arm=false; shift ;;
+		--wait) wait=1; shift ;;
+		-h|--help) usage ;;
+		*) [ -z "$img" ] || die "unexpected argument $1"; img=$1; shift ;;
+		esac
+	done
+	[ -n "$img" ] || die "enqueue needs an image"
+	json=$(python3 -c 'import json,sys; print(json.dumps({"kind":"enqueue","image":sys.argv[1],"label":sys.argv[2],"arm":sys.argv[3]=="true"}))' "$(abspath "$img")" "$label" "$arm")
+	submit "$json" $wait ;;
+build)
+	name=""; kernel=""; adt=""; preset=""; cmdline=""; label=""; enq=true; arm=true; wait=0
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--name) name=$2; shift 2 ;;
+		--kernel) kernel=$2; shift 2 ;;
+		--adt) adt=$2; shift 2 ;;
+		--preset) preset=$2; shift 2 ;;
+		--cmdline) cmdline=$2; shift 2 ;;
+		--label) label=$2; shift 2 ;;
+		--no-enqueue) enq=false; shift ;;
+		--no-arm) arm=false; shift ;;
+		--wait) wait=1; shift ;;
+		-h|--help) usage ;;
+		*) die "unexpected argument $1" ;;
+		esac
+	done
+	[ -n "$name" ] && [ -n "$kernel" ] && [ -n "$adt" ] || die "build needs --name, --kernel and --adt"
+	{ [ -n "$preset" ] || [ -n "$cmdline" ]; } || die "build needs --preset or --cmdline"
+	json=$(python3 -c 'import json,sys
+n,k,a,p,c,l,e,r=sys.argv[1:9]
+d={"kind":"build","name":n,"kernel":k,"adt":a,"enqueue":e=="true","arm":r=="true"}
+if c: d["cmdline"]=c
+else: d["preset"]=p
+if l: d["label"]=l
+print(json.dumps(d))' "$name" "$(abspath "$kernel")" "$(abspath "$adt")" "$preset" "$cmdline" "$label" "$enq" "$arm")
+	submit "$json" $wait ;;
+install)
+	ipa=""; wait=0
+	while [ $# -gt 0 ]; do
+		case $1 in --wait) wait=1; shift ;; -h|--help) usage ;; *) ipa=$1; shift ;; esac
+	done
+	[ -n "$ipa" ] || die "install needs an .ipa"
+	submit "$(python3 -c 'import json,sys; print(json.dumps({"kind":"install_ipa","path":sys.argv[1]}))' "$(abspath "$ipa")")" $wait ;;
+upload)
+	dest=photos; wait=0; files=()
+	while [ $# -gt 0 ]; do
+		case $1 in --dest) dest=$2; shift 2 ;; --wait) wait=1; shift ;; -h|--help) usage ;; *) files+=("$(abspath "$1")"); shift ;; esac
+	done
+	[ ${#files[@]} -gt 0 ] || die "upload needs at least one file"
+	submit "$(python3 -c 'import json,sys; print(json.dumps({"kind":"upload","dest":sys.argv[1],"paths":sys.argv[2:]}))' "$dest" "${files[@]}")" $wait ;;
+flash-userdata)
+	# The CLI invocation is the explicit act: it adds "confirm":"userdata" itself. Enqueues; the app flashes on the next fastboot appearance.
+	img=""; boot=""; label=""; arm=true; wait=0; part=userdata; mode=""; via=""
+	while [ $# -gt 0 ]; do
+		case $1 in
+		--then-boot) boot=$2; shift 2 ;;
+		--partition) part=$2; shift 2; case $part in userdata|boot|logo) ;; *) die "--partition must be userdata, boot or logo" ;; esac ;;
+		--full) mode=full; shift ;;
+		--delta) mode=delta; shift ;;
+		--via) via=${2:-}; shift 2; case $via in abl|bergamota|auto) ;; *) die "--via must be abl, bergamota or auto" ;; esac ;;
+		--label) label=$2; shift 2 ;;
+		--no-arm) arm=false; shift ;;
+		--wait) wait=1; shift ;;
+		-h|--help) usage ;;
+		*) [ -z "$img" ] || die "unexpected argument $1"; img=$1; shift ;;
+		esac
+	done
+	[ -n "$img" ] || die "flash-userdata needs an image (.simg or .img)"
+	[ -z "$boot" ] || boot=$(abspath "$boot")
+	json=$(python3 -c 'import json,sys
+i,b,l,a,p,m,v=sys.argv[1:8]
+d={"kind":"flash_userdata","path":i,"partition":p,"confirm":p,"arm":a=="true"}
+if b: d["then_boot"]=b
+if l: d["label"]=l
+if m: d["mode"]=m
+if v: d["via"]=v
+print(json.dumps(d))' "$(abspath "$img")" "$boot" "$label" "$arm" "$part" "$mode" "$via")
+	submit "$json" $wait ;;
+orangefox)
+	case ${1:-} in on) v=true ;; off) v=false ;; *) die "orangefox on|off" ;; esac
+	submit "{\"kind\":\"orangefox_reboot\",\"enabled\":$v}" ${2:+1} ;;
+reboot)
+	case ${1:-} in fastboot|bergamota|recovery) to=$1 ;; *) die "reboot fastboot|bergamota|recovery [--wait]" ;; esac
+	submit "{\"kind\":\"reboot\",\"to\":\"$to\"}" $([ "${2:-}" = --wait ] && echo 1 || echo 0) ;;
+enter-bergamota)
+	submit '{"kind":"enter_bergamota"}' $([ "${1:-}" = --wait ] && echo 1 || echo 0) ;;
+stop)
+	submit '{"kind":"stop"}' $([ "${1:-}" = --wait ] && echo 1 || echo 0) ;;
+status)
+	[ -f "$BASE/status.json" ] || die "no status.json (is Bergamota running?)"
+	python3 - "$BASE/status.json" <<'PY'
+import json, sys, datetime
+d = json.load(open(sys.argv[1]))
+def age(s):
+    try:
+        t = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return f"{(datetime.datetime.now(datetime.timezone.utc) - t).total_seconds():.0f}s ago"
+    except Exception: return s
+p = d["phone"]; q = d["queue"]; l = d["liveLog"]
+print(f"updated   {d['updated']} ({age(d['updated'])})")
+print(f"phone     {p['state']} (since {p.get('since','?')})" + (f"  [{p['fastbootKind'].upper()} fastboot {p.get('fastbootVersion','')}]" if p.get('fastbootKind') else ""))
+ios = p.get("ios")
+if ios:
+    print(f"  ios     battery={ios.get('battery','?')}% charging={ios.get('charging','?')} uptime={ios.get('uptime','?')}s")
+    print(f"          {ios.get('kernel','')}")
+print(f"queue     {'ARMED' if q['armed'] else 'stopped'}  remote-start={'allowed' if q.get('remoteStartAllowed') else 'denied'}  orangefox-reboot={q.get('orangefoxReboot')}")
+print(f"          {q.get('status','')}")
+print(f"          auto-reboot-to-fastboot={q.get('autoRebootToFastboot')} {q.get('autoRebootStatus') or ''}")
+for it in q["items"]:
+    print(f"  [{it['state']:7}] {it['label']}  {it['image']}" + (f"  sent {it['sentAt']}" if it.get('sentAt') else "") + ("  NEEDS MANUAL FASTBOOT" if it.get('needsManualFastboot') else ""))
+    if it.get("flashUserdata"): print(f"             flashes {it.get('flashPartition','userdata')}: {it['flashUserdata']}  (via {it.get('flashVia','?')}, {it.get('flashMode','?')})")
+    if it["state"] in ("sent", "failed") and it.get("result"):
+        for line in it["result"].strip().splitlines()[-3:]: print("             " + line)
+fl = d.get("flash", {})
+if fl.get("active"):
+    ph = fl.get("phase") or "-"
+    dl = fl.get("deltaBytes")
+    print(f"flash     FLASHING {str(fl.get('partition','userdata')).upper()} {fl.get('progress')}  {fl.get('file')}")
+    print(f"          route={fl.get('route')} mode={fl.get('mode')} phase={ph} {fl.get('phaseDoneBytes',0)}/{fl.get('phaseTotalBytes',0)} bytes" + (f" delta={dl} of {fl.get('imageBytes')} bytes" if dl is not None else ""))
+elif fl.get("last"): print(f"flash     {fl['last']['result']} {fl['last']['at']}  {fl['last']['message']}")
+print(f"liveLog   listening={l['listening']} saving={l.get('savingTo')} {l.get('linesPerSecond')} lines/s")
+b = d.get("build", {})
+print(f"build     {'RUNNING' if b.get('building') else 'idle'}  last={b.get('last')}")
+if d.get("lastRequest"): print(f"request   {d['lastRequest']}")
+PY
+	;;
+metrics)
+	[ -f "$BASE/status.json" ] || die "no status.json (is Bergamota running?)"
+	python3 - "$BASE/status.json" "${1:-}" <<'PY'
+import json, sys, datetime
+d = json.load(open(sys.argv[1])); p = d["phone"]; m = p.get("metrics")
+if not m:
+    print("no metrics: " + (p.get("metricsError") or f"phone state is {p['state']} (metrics need iOS up and /usr/local/bin/sweetmetrics on the phone)"))
+    sys.exit(1)
+if sys.argv[2] == "--json":
+    print(json.dumps(m, indent=2)); sys.exit(0)
+def khz(v): return "unknown" if v is None else (f"{v/1e6:.2f} GHz" if v >= 1e6 else f"{v/1e3:.0f} MHz")
+def pct(v): return "--" if v is None else f"{v:.0f}%"
+try: age = f"{(datetime.datetime.now(datetime.timezone.utc) - datetime.datetime.fromisoformat(m['fetched'].replace('Z','+00:00'))).total_seconds():.0f}s ago"
+except Exception: age = "?"
+print(f"sample    {m.get('fetched')} ({age}), schema {m.get('schema')}")
+cpu = m.get("cpu", {})
+for c in cpu.get("clusters", []):
+    mode = c.get("mode", "unknown")
+    extra = {"static": f"capped at {c['capPercent']}%" if c.get("capPercent") is not None else "fixed", "governor": "governor " + str(c.get("governor")), "unknown": "unknown (fixed by bootloader)"}.get(mode, mode)
+    rng = f" min {khz(c['minKhz'])} max {khz(c['maxKhz'])}" if c.get("minKhz") or c.get("maxKhz") else ""
+    print(f"cpu       {c['name']:4} cpu{c['cpus'][0] if c.get('cpus') else '?'}-{c['cpus'][-1] if c.get('cpus') else '?'}  {khz(c.get('curKhz')):>9}  load {pct(c.get('loadPct')):>4}  {extra}{rng}")
+if cpu.get("loadPct"): print("          per-CPU load " + " ".join(f"{x:.0f}" for x in cpu["loadPct"]))
+g = m.get("gpu", {})
+mhz = g.get("mhz")
+print(f"gpu       {g.get('state','?'):8}  " + (f"level {g.get('level')}/{g.get('levels')}  " if g.get("level") is not None else "") + ("level/MHz/busy not reported (waiting on kern.sweet_gpu)" if mhz is None and g.get("busyPct") is None else f"{khz(None if mhz is None else mhz*1000)}  busy {pct(g.get('busyPct'))}") + f"  clients {g.get('clients',0)}")
+r = m.get("renderer", {})
+print(f"renderer  {r.get('label')}  (requested {r.get('requested')} by {r.get('requestedBy')}, injected {r.get('injected')}, backboardd GPU client {'yes' if r.get('gpuClientOpen') else 'no'})")
+b = m.get("battery", {})
+if b.get("present"):
+    ma = b.get("currentMa"); mv = b.get("voltageMv")
+    print(f"battery   {pct(b.get('percent'))}  {'charging' if b.get('charging') else 'not charging'}  " + ("mA unknown" if ma is None else f"{ma:+.0f} mA") + "  " + ("" if mv is None else f"{mv/1000:.2f} V"))
+else: print("battery   not present")
+if m.get("thermal"): print(f"thermal   battery {m['thermal'].get('batteryC')} C")
+for e in m.get("errors", []): print("note      " + e)
+PY
+	;;
+-h|--help|help) usage ;;
+*) die "unknown command $cmd (try --help)" ;;
+esac

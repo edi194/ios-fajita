@@ -1,0 +1,52 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index fb3ac6e4c7db89ad5605e0e3f9e657a8cacecf6e..1f39e2959463b4cd1645a4328fdac51404c70566 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -892,17 +892,38 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 		}
+ 	}
+ 
+-	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++	/*
++	 * Device controller soft reset (PHY and global setup stay as ABL left them).
++	 * SDM845: ABL runs fastboot at SuperSpeed through the QMP PHY; the
++	 * soft reset also resets the USB3 pipe side, nobody re-initialises the
++	 * QMP PHY, and every endpoint command then times out (boots 0084-0088).
++	 * There the running controller is only halted and taken over instead.
++	 * Boot-arg sweetusbreset=1 forces the reset, 0 skips it on any board.
++	 */
+ 	uint32_t gctl_abl = dwc_rd(GCTL);
+-	dwc_wr(DCTL, DCTL_CSFTRST);
++	int do_reset = sweet_board_beryllium() ? 0 : 1;
++	PE_parse_boot_argn("sweetusbreset", &do_reset, sizeof(do_reset));
+ 	int i;
+-	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+-		delay(1000);
+-	}
+-	printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
+-	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+-	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+-		return;
++	if (do_reset) {
++		dwc_wr(DCTL, DCTL_CSFTRST);
++		for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
++			delay(1000);
++		}
++		printf("SWEET USB: soft reset %s after %d ms, GCTL 0x%08x DCFG 0x%08x\n",
++		    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
++		if (dwc_rd(DCTL) & DCTL_CSFTRST) {
++			return;
++		}
++	} else {
++		uint32_t dsts0 = dwc_rd(DSTS);
++		dwc_wr(DEVTEN, 0);
++		dwc_wr(DCTL, dwc_rd(DCTL) & ~DCTL_RUN_STOP);
++		for (i = 0; i < 500 && !(dwc_rd(DSTS) & DSTS_DEVCTRLHLT); i++) {
++			delay(1000);
++		}
++		dwc_wr(DALEPENA, 0);
++		printf("SWEET USB: no soft reset: ABL DSTS 0x%08x (speed %u), halted %s after %d ms, DSTS 0x%08x\n",
++		    dsts0, dsts0 & 7u, (dwc_rd(DSTS) & DSTS_DEVCTRLHLT) ? "yes" : "NO", i, dwc_rd(DSTS));
+ 	}
+ 	/*
+ 	 * SDM845 (DWC3 3.00a, USB3-capable): the soft reset reloads GCTL with

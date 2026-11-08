@@ -1,0 +1,161 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -312,6 +312,14 @@
+ 	 * next 120 frames are copied on the CPU (fScanGpuRest) and then the GPU is tried again. */
+ 	bool          fScanGpu, fScanGpuWin, fScanGpuOff;
+ 	uint32_t      fScanGpuFails, fScanGpuRest;
++	/* 0241: the blit in flight. The swap is complete as soon as it is queued (anything CoreAnimation submits later runs
++	 * after it on the GPU ring, so its surface is read before it can be drawn again); scanBlitPoll scans buffer
++	 * fScanBlitT once the fence has passed. -1: none. */
++	int           fScanBlitT;
++	uint32_t      fScanBlitFence, fScanBlitId;
++	uint64_t      fScanBlitAbs;
++	void          scanBlitPoll(void);
++	bool          scanGpuActive(void) const { return fScanCopy && !fScanFailed && fScanGpu && !fScanGpuOff && fScanGpuRest == 0; }
+ 	IOMemoryMap  *fScanMap[3];
+ 	uint64_t      fScanPA[3];
+ 	uint32_t      fScanStride;
+@@ -710,6 +718,7 @@
+ 				PE_parse_boot_argn("sweetfb_scancopy", &sc, sizeof(sc));
+ 				fScanCopy = fEarly && sc != 0;
+ 				fScanGpu = fScanCopy && sc == 2;
++				fScanBlitT = -1;
+ 				fScanPanel = fScanQueued = -1;
+ 				if (fScanCopy) {
+ 					IOLog("SWEET FB: scan-out copy on (0235): frames are copied to three framebuffer-owned buffers, a swap is complete when copied\n");
+@@ -989,13 +998,15 @@
+ 		return;         /* the vsync tick runs the backlight ramp and redraws on power on */
+ 	}
+ 	fb->zcPoll();           /* 0216: also kicked by SwapWait when it saw the latch, so the frame it waited for is released now */
++	fb->scanBlitPoll();     /* 0241: a GPU scan-out copy whose fence passed is scanned now */
+ 	fb->latchWatch();       /* 0217: while a frame is queued this timer comes back every 500 us */
+ 	IOLockLock(fb->fLock);
+ 	if (!fb->fDirty) {
+ 		IOLockUnlock(fb->fLock);
+ 		return;
+ 	}
+-	if (!fb->gpuGateOpen(mach_absolute_time())) {
++	/* 0241: the GPU scan-out copy needs no hold: it is queued behind the frame's own GPU work on the same ring */
++	if (!fb->scanGpuActive() && !fb->gpuGateOpen(mach_absolute_time())) {
+ 		IOLockUnlock(fb->fLock);
+ 		fb->fSwapTimer->setTimeoutUS(250);      /* 0229: the GPU is still drawing what was submitted before this swap */
+ 		return;
+@@ -2187,6 +2198,38 @@
+  * three buffers from the low pool; if that fails the scan-out copy stays off for the rest of the boot (fScanFailed) and
+  * frames are scanned in place again. Work loop, like zcPresent. True: the frame is queued and its swap complete.
+  */
++/*
++ * 0241: scan the GPU scan-out copy in flight once its fence has passed (work loop: swapFired). After 100 ms it is
++ * scanned anyway (a lost GPU must not freeze the panel) and counted as a fallback.
++ */
++void
++AppleCLCD::scanBlitPoll(void)
++{
++	if (fScanBlitT < 0) {
++		return;
++	}
++	if (!sweet_gpu_fence_passed(fScanBlitFence)) {
++		uint64_t lim;
++		nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &lim);
++		if (mach_absolute_time() - fScanBlitAbs < lim) {
++			fSwapTimer->setTimeoutUS(250);
++			return;
++		}
++		fSt.scanGpuFallbacks++;
++	}
++	int t = fScanBlitT;
++	fScanBlitT = -1;
++	if (fScanQueued >= 0 && latchedNow()) {
++		fScanPanel = fScanQueued;
++		fScanQueued = -1;
++	}
++	scanAddr((uint32_t)fScanPA[t], fScanStride, true);
++	fScanForeign = false;
++	fScanQueued = t;
++	fScanFront = true;
++	__atomic_store_n(&fShotId, fScanBlitId, __ATOMIC_RELEASE);
++}
++
+ bool
+ AppleCLCD::scanCopyPresent(SweetSurface *s, uint32_t id)
+ {
+@@ -2225,6 +2268,10 @@
+ 	int t = 0;
+ 	while (t == fScanPanel || t == fScanQueued) {
+ 		t++;
++	}
++	if (fScanBlitT >= 0) {
++		t = fScanBlitT;         /* 0241: a copy still in flight: this one is queued after it into the same buffer, and it is never shown */
++		fSt.coalesced++;
+ 	}
+ 	if (fScanQueued >= 0) {
+ 		fSt.coalesced++;        /* the queued copy is replaced before its vsync: never shown, now free */
+@@ -2256,20 +2303,35 @@
+ 			}
+ 			s->cpuWritesSeen = cw;
+ 			uint32_t fence = sweet_gpu_blit(s->poolPA + s->offset, s->bytesPerRow, fScanPA[t], fScanStride, fLogicalW, fLogicalH);
+-			uint64_t limit;
+-			nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &limit);
+-			while (fence != 0 && !sweet_gpu_fence_passed(fence)) {
+-				if (mach_absolute_time() - t0 > limit) {
+-					fence = 0;
+-					break;
+-				}
+-				IODelay(50);
+-			}
+-			viaGpu = fence != 0;
+-			if (viaGpu) {
++			if (fence != 0) {
++				/*
++				 * 0241: queued. The swap completes now and the frame is scanned when the copy has landed (scanBlitPoll):
++				 * CoreAnimation starts its next frame while the GPU still draws and copies this one.
++				 */
+ 				fScanGpuFails = 0;
+ 				fSt.scanGpuCopies++;
+-			} else {
++				fScanBlitT = t;
++				fScanBlitFence = fence;
++				fScanBlitId = id;
++				fScanBlitAbs = t0;
++				if ((int32_t)(fCurSwapID - __atomic_load_n(&fSwapDone, __ATOMIC_ACQUIRE)) > 0) {
++					__atomic_store_n(&fSwapDone, fCurSwapID, __ATOMIC_RELEASE);
++					if (struct sweet_fb_trace_rec *tr = sweet_fb_trace_of(fCurSwapID)) {
++						tr->done = mach_absolute_time();
++					}
++				}
++				uint64_t d = mach_absolute_time() - t0;
++				fSt.scanCopies++;
++				fSt.scanCopyAbs += d;
++				if (d > fSt.scanCopyMaxAbs) {
++					fSt.scanCopyMaxAbs = d;
++				}
++				fSt.zc++;
++				fSwapTimer->setTimeoutUS(250);
++				return true;
++			}
++			viaGpu = false;
++			{
+ 				fSt.scanGpuFallbacks++;
+ 				if (++fScanGpuFails >= 3) {
+ 					fScanGpuFails = 0;
+@@ -2280,6 +2342,19 @@
+ 		}
+ 	}
+ 	if (!viaGpu) {
++		if (fScanGpu && !fScanGpuOff) {
++			/* 0241: swapFired did not hold this swap for the GPU (it expected a GPU copy): wait for its work here */
++			uint64_t lim;
++			nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &lim);
++			while (!sweet_gpu_fence_passed(fPendFence) && mach_absolute_time() - t0 < lim) {
++				IODelay(50);
++			}
++			/* a GPU copy still in flight into this buffer would land on top of the CPU's: let it finish, and drop its scan */
++			while (fScanBlitT >= 0 && !sweet_gpu_fence_passed(fScanBlitFence) && mach_absolute_time() - t0 < 2 * lim) {
++				IODelay(50);
++			}
++			fScanBlitT = -1;
++		}
+ 		if (sweet_lowpool_cacheable()) {
+ 			/* the GPU wrote DRAM behind this write-back mapping; a CPU draw may sit dirty in it (civac keeps that) */
+ 			sweet_dma_sync_va((const void *)src, (size_t)span);

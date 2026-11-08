@@ -1,0 +1,41 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index a3bed7edacab0a36ad7b28a40cb502966a1dd828..fa501356b8ed0ffd24c660badf5d883f347c9876 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -1782,12 +1782,33 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		break;
+ 	case kSweetFBSwapEnd: {
+ 		uint8_t rec[SWEET_FB_SWAP_REC_SIZE];
+-		if (args->structureInputDescriptor != NULL ||
+-		    args->structureInputSize < SWEET_FB_SWAP_REC_SIZE) {
++		/*
++		 * iOS 18 IOMobileFramebuffer sends a 0x514 byte record (client+0x18) whose fields sit 0x48 bytes later than
++		 * the iOS 16 record this driver was written for (read from IOMobileFramebufferSwapSetLayer/SwapBegin):
++		 *   +0x98 swap id, +0x9c + 4*i surface id, +0xac + 16*i source rect (x, y, w, h), +0x10c + 16*i dest rect,
++		 *   +0x15c + 4*i layer flags; there is no layer mask (a layer is in use when its surface id != 0).
++		 * Translate into the legacy layout (id 0x50/0x54, rects 0x64/0xc4, mask 0x104) so nothing else changes.
++		 * Without this every swap looked empty (mask 0): backboardd presented 5000 frames and the panel stayed black.
++		 */
++		const uint8_t *in = (const uint8_t *)args->structureInput;
++		if (args->structureInputDescriptor != NULL || args->structureInputSize < 0x514) {
+ 			ret = kIOReturnBadArgument;
+ 			break;
+ 		}
+-		memcpy(rec, args->structureInput, sizeof(rec));
++		bzero(rec, sizeof(rec));
++		uint32_t lmask = 0;
++		memcpy(rec + 0x50, in + 0x98, 4);
++		for (uint32_t i = 0; i < 4; i++) {
++			uint32_t id;
++			memcpy(&id, in + 0x9c + 4 * i, 4);
++			memcpy(rec + 0x54 + 4 * i, &id, 4);
++			memcpy(rec + 0x64 + 16 * i, in + 0xac + 16 * i, 16);
++			memcpy(rec + 0xc4 + 16 * i, in + 0x10c + 16 * i, 16);
++			if (id != 0) {
++				lmask |= 1u << i;
++			}
++		}
++		memcpy(rec + 0x104, &lmask, 4);
+ 		fFB->swap(rec);
+ 		break;
+ 	}

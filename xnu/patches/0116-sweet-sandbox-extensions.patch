@@ -1,0 +1,104 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -360,14 +360,84 @@
+  * (backboardd cannot reach mobilegestalt or iohideventsystem; tccd:
+  * "profile not found"). SWEET runs without a sandbox: operations succeed
+  * (checks allow, profile init is accepted); the few that must return
+- * data (container paths, extension tokens) fail with ENOENT. The first
+- * use of each operation number is logged.
++ * data (container paths) fail with ENOENT. The first use of each operation
++ * number is logged.
++ *
++ * Extensions (ops 5 issue, 6 consume, 7 release): there is nothing to
++ * enforce, but callers need a token to hand around. tccd grants Photos,
++ * Contacts, ... access and then issues a sandbox extension for the service
++ * (sandbox_extension_issue_generic("com.apple.tcc.kTCCServicePhotos")); when
++ * that failed with ENOENT it answered "server error: Failed to issue Sandbox
++ * Extension" (kTCCErrorDomain 6) even though access was granted, and
++ * assetsd died with "assetsd requires TCCPhotosService access". Issue now
++ * returns an opaque token and consume a handle. docs/CSOPS.md.
+  */
+ static uint64_t sweet_sandbox_seen;
+ 
++#define SWEET_SBX_OP_EXT_ISSUE          5
++#define SWEET_SBX_OP_EXT_CONSUME        6
++#define SWEET_SBX_EXT_LOG_MAX           8
++
++static uint64_t _Atomic sweet_sandbox_ext_serial;
++static int _Atomic sweet_sandbox_ext_logged;
++
++/*
++ * libsystem_sandbox __sandbox_extension_issue passes seven 64-bit words:
++ * [0] class or path (C string), [1] extension type, [2] target pid or audit
++ * token (0 for self), [3] flags, [4] output buffer (0x800 bytes) for the
++ * token string, [5] and [6] unused here. Returns 0 with the token stored.
++ */
+ static int
+-sweet_sandbox_syscall(struct proc *p, int call, __unused user_addr_t arg)
++sweet_sandbox_extension_issue(struct proc *p, user_addr_t arg)
++{
++	uint64_t a[7];
++	int error = copyin(arg, a, sizeof(a));
++	if (error != 0) {
++		return error;
++	}
++	if (a[4] == 0) {
++		return EINVAL;
++	}
++	char name[96] = "";
++	size_t done = 0;
++	if (a[0] != 0) {
++		/* a longer name is cut (ENAMETOOLONG): the token only carries a prefix */
++		(void)copyinstr((user_addr_t)a[0], name, sizeof(name), &done);
++		name[sizeof(name) - 1] = '\0';
++	}
++	uint64_t serial = os_atomic_inc_orig(&sweet_sandbox_ext_serial, relaxed) + 1;
++	char token[160];
++	snprintf(token, sizeof(token), "SWEET-%llu;%llu;%s",
++	    (unsigned long long)serial, (unsigned long long)a[1], name);
++	if (os_atomic_load(&sweet_sandbox_ext_logged, relaxed) < SWEET_SBX_EXT_LOG_MAX &&
++	    os_atomic_inc_orig(&sweet_sandbox_ext_logged, relaxed) < SWEET_SBX_EXT_LOG_MAX) {
++		char pname[32];
++		proc_name(proc_pid(p), pname, sizeof(pname));
++		printf("SWEET Sandbox: %s issued extension type %llu '%s'\n", pname,
++		    (unsigned long long)a[1], name);
++	}
++	return copyout(token, (user_addr_t)a[4], strlen(token) + 1);
++}
++
++/* Consume: { token string, length incl. NUL, int64_t *handle }. Handles are never 0 or -1. */
++static int
++sweet_sandbox_extension_consume(user_addr_t arg)
+ {
++	uint64_t a[3];
++	int error = copyin(arg, a, sizeof(a));
++	if (error != 0) {
++		return error;
++	}
++	if (a[0] == 0 || a[2] == 0) {
++		return EINVAL;
++	}
++	uint64_t handle = os_atomic_inc_orig(&sweet_sandbox_ext_serial, relaxed) + 1;
++	return copyout(&handle, (user_addr_t)a[2], sizeof(handle));
++}
++
++static int
++sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
++{
+ 	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+ 		sweet_sandbox_seen |= 1ULL << call;
+ 		char name[32];
+@@ -375,9 +445,11 @@
+ 		printf("SWEET Sandbox: %s op %d\n", name, call);
+ 	}
+ 	switch (call) {
++	case SWEET_SBX_OP_EXT_ISSUE:
++		return sweet_sandbox_extension_issue(p, arg);
++	case SWEET_SBX_OP_EXT_CONSUME:
++		return sweet_sandbox_extension_consume(arg);
+ 	case 4:         /* container path (audit token / pid) */
+-	case 5:         /* extension issue */
+-	case 6:         /* extension consume */
+ 	case 0x43:      /* container expected */
+ 		return ENOENT;
+ 	default:

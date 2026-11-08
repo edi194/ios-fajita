@@ -1,0 +1,84 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -337,6 +337,7 @@
+ 		uint64_t swapWaits, swapWaitAbs, swapWaitTimeouts;      /* SwapWait calls that had to wait, their time, those that gave up */
+ 		uint64_t gpuHolds, gpuHoldTimeouts;                     /* 0229: pending swaps held for the GPU, held past 50 ms */
+ 		uint64_t replaceWaits, replaceTimeouts;                 /* 0220: frames that waited for the previous one's latch / gave up */
++		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
+ 	} fSt, fStPrev;
+ 	/*
+ 	 * Direct scanout (sweetfb_direct=1, patch 0211): hw scaler + page flipping + zero-copy
+@@ -429,6 +430,7 @@
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	uint32_t      fVsyncUS;       /* vsync period */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
++	bool          fEmptyBlackArmed;       /* 0233: the next layerless swap may blank (boot, and once after each power on) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -1052,7 +1054,8 @@
+ 	    "copy_us=%u.%02u copy_us_max=%llu zc_us=%u.%02u zc_us_max=%llu clean_us=%u.%02u cleans=%llu clean_skips=%llu "
+ 	    "latch_waits=%llu latch_wait_us=%u.%02u latch_timeouts=%llu vsync_s=%u.%02u "
+ 	    "pool_used=%u pool_total=%u pool_surfaces=%llu pool_fallbacks=%llu "
+-	    "swapsync=%d swap_waits=%llu swap_wait_us=%u.%02u swap_wait_timeouts=%llu replace_waits=%llu replace_timeouts=%llu\n",
++	    "swapsync=%d swap_waits=%llu swap_wait_us=%u.%02u swap_wait_timeouts=%llu replace_waits=%llu replace_timeouts=%llu "
++	    "gpu_holds=%llu gpu_hold_timeouts=%llu empty_swaps=%llu empty_kept=%llu\n",
+ 	    mode, hz, fFlushTicks, fHw ? 1 : 0, fFlip ? 1 : 0, smmu, fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : (fZcCleanMode == 2 ? "auto" : "tracked")),
+ 	    sweet_abs_us(now) / 1000000, winUS / 1000,
+ 	    swaps, SW_F2(PER_S(dSwaps)), coalesced, SW_F2(PER_S(dCoal)),
+@@ -1060,7 +1063,8 @@
+ 	    SW_F2(copyAvg), sweet_abs_us(c.copyMaxAbs), SW_F2(zcAvg), sweet_abs_us(c.zcMaxAbs), SW_F2(clAvg), c.cleans, c.cleanSkips,
+ 	    c.latchWaits, SW_F2(lwAvg), c.latchTimeouts, SW_F2(PER_S(dTicks)),
+ 	    used, total, pallocs, pfails,
+-	    fSwapSync ? 1 : 0, c.swapWaits, SW_F2(swAvg), c.swapWaitTimeouts, c.replaceWaits, c.replaceTimeouts);
++	    fSwapSync ? 1 : 0, c.swapWaits, SW_F2(swAvg), c.swapWaitTimeouts, c.replaceWaits, c.replaceTimeouts,
++	    c.gpuHolds, c.gpuHoldTimeouts, c.emptySwaps, c.emptyKept);
+ 	#undef PER_S
+ 	sweet_fb_stats_publish(line);
+ 	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
+@@ -1585,6 +1589,7 @@
+ 	sweet_fb_panic_hook = sweet_fb_restore_boot_scanout;
+ 	fLastFlush = sweet_mdp_pipes[fPipe].flush | SWEET_MDP_CTL_BIT;
+ 	fFront = 0;
++	fEmptyBlackArmed = true;      /* 0233: the first swap after boot may blank */
+ 	fFlip = true;
+ 	IOLog("SWEET FB: page flipping on %s: frames 0x%llx 0x%llx 0x%llx (%llu bytes each back buffer, %u restore regs)%s\n",
+ 	    sweet_mdp_pipes[fPipe].name, fBufPA[0], fBufPA[1], fBufPA[2], bytes, sweet_mdp_restore.n,
+@@ -2810,8 +2815,28 @@
+ 	quietConsole();
+ 
+ 	if (fZc && zcPresent(rec, mask)) {
++		fEmptyBlackArmed = false;
+ 		return;         /* scanned in place */
++	}
++	/*
++	 * 0233: 0227 blanks on a layerless swap, meant for the first swap after a wake. With the Metal compositor such swaps
++	 * also come mid-session; blanking then left the screen black until something redrew it (the power button). Only
++	 * the first swap after boot or a power on may blank now; any other layerless swap keeps the frame that is shown.
++	 */
++	bool hasLayer = false;
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
++			hasLayer = true;
++		}
++	}
++	if (!hasLayer) {
++		fSt.emptySwaps++;
++		if (!fEmptyBlackArmed) {
++			fSt.emptyKept++;
++			return;
++		}
+ 	}
++	fEmptyBlackArmed = false;
+ 	uint64_t tcp0 = mach_absolute_time(), tlw0 = fSt.latchWaitAbs, thd0 = fHudDrawAbs;
+ 	uint32_t back = 0;
+ 	if (fFlip) {
+@@ -3126,6 +3151,7 @@
+ 			IOLockLock(fFB->fLock);
+ 			if (off != fFB->fPowerOff) {
+ 				fFB->fPowerOff = off;
++				fFB->fEmptyBlackArmed = !off;   /* 0233: the first swap after the display comes on may be layerless: black */
+ 				fFB->fFadeStep = 0;
+ 				fFB->fBlackDone = false;
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */

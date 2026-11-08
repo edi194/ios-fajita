@@ -1,0 +1,416 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -56,6 +56,7 @@
+ #include <vm/vm_kern.h>
+ #include <vm/vm_kern_xnu.h>
+ #include "sweet_board.h"
++#include "sweet_wlan.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -579,6 +580,7 @@
+ 
+ static int wl_gate(const char *name);
+ static void svc_echo_event(const uint8_t *t, uint32_t len);
++static void scan_flush_notify(const char *why);
+ 
+ /* the GENI UART and the HCI state of the stage: held by the RX loop per poll and by every TX */
+ static LCK_GRP_DECLARE(wl_hw_grp, "sweet_bt_uart");
+@@ -3677,6 +3679,7 @@
+ wf_fail(const char *why, uint16_t err)
+ {
+ 	printf("SWEET IPC: wlfw: %s (error %u): client stops in state %s\n", why, err, wf_state_name[wf.state]);
++	scan_flush_notify(why);
+ 	ipc_note(" wlfw FAIL %s/%u in %s;", why, err, wf_state_name[wf.state]);
+ 	wf.state = WS_FAILED;
+ 	wf.pending = 0;
+@@ -4372,14 +4375,23 @@
+ 	bool htt_conf, started, completed, vdev;
+ 	uint8_t htt_major, htt_minor;
+ 	uint32_t reason;
++	unsigned count;                 /* scans started since WMI READY */
+ 	struct {
+ 		uint8_t bssid[6];
+ 		uint16_t mhz;
+ 		int8_t rssi;
+ 		uint8_t ssid_len;
+-		char ssid[33];
++		char ssid[33];          /* printable copy for the log */
++		uint8_t raw_ssid[32];
++		uint16_t beacon_int, cap, ie_len;
+ 	} bss[SCAN_MAX_BSS];
+ } scan;
++/* the BSS cache's IEs (SCAN_MAX_BSS x SWEET_WLAN_IE_MAX) and the lock between the service thread and ioctls */
++static uint8_t *scan_ie;
++static LCK_GRP_DECLARE(scan_grp, "sweet_wlan_scan");
++static LCK_MTX_DECLARE(scan_lock, &scan_grp);
++static volatile bool scan_req;          /* sweet_80211 asked for a scan (WL2) */
++static volatile bool scan_notify;       /* tell sweet_80211 when the running scan completes */
+ 
+ /* one WMI command: u32 id, then one TLV {u16 len, u16 tag} (more TLVs appended by the caller) */
+ static uint32_t
+@@ -4542,7 +4554,7 @@
+ 	case 8: {                               /* START_SCAN, passive, ath10k defaults */
+ 		uint32_t s[25];
+ 		memset(s, 0, sizeof(s));
+-		s[0] = 0xa000;                  /* scan_id */
++		s[0] = 0xa000 | (scan.count & 0xfff);   /* scan_id (ATH10K_SCAN_ID 0 for the first) */
+ 		s[1] = 0xa001;                  /* scan_req_id */
+ 		s[2] = 0;                       /* vdev */
+ 		s[3] = 1;                       /* priority low */
+@@ -4577,8 +4589,13 @@
+ 	if (!wce.wmi_credits || !wce_send(1, wce.wmi_eid, c, n)) {
+ 		return false;                   /* no credit yet: try again on the next poll */
+ 	}
+-	printf("SWEET IPC: scan: %s (%u bytes)\n", what, n);
+-	ipc_note(" scan %s;", what);
++	if (scan.step == 8) {
++		scan.count++;
++	}
++	if (scan.count <= 1) {
++		printf("SWEET IPC: scan: %s (%u bytes)\n", what, n);
++		ipc_note(" scan %s;", what);
++	}
+ 	scan.step++;
+ 	scan.step_ms = ms_now_ms();
+ 	wf.sent_ms = ms_now_ms();               /* each step gets its own 30 s */
+@@ -4622,7 +4639,15 @@
+ 		printf("SWEET IPC: scan: COMPLETED reason %u after %u channel visits: %u beacons/probe responses, %u BSS\n",
+ 		    e[1], scan.foreign, scan.beacons, scan.nbss);
+ 		ipc_note(" scan done r%u: %u ch, %u frames, %u bss;", e[1], scan.foreign, scan.beacons, scan.nbss);
++		/* state and notice together under the cache lock (sweet_wlan_scan_request reads them under it) */
++		lck_mtx_lock(&scan_lock);
+ 		wf.state = WS_SCAN_DONE;
++		bool notify = scan_notify;
++		scan_notify = false;
++		lck_mtx_unlock(&scan_lock);
++		if (notify) {
++			sweet80211_scan_done();         /* WL2: sweet_80211 posts SCAN_DONE to wifid */
++		}
+ 	}
+ }
+ 
+@@ -4665,18 +4690,36 @@
+ 	    5000 + 5 * hd[0]);
+ 	int rssi = (int)hd[1] - 95;
+ 	const uint8_t *bssid = fr + 16;
++	if (!scan_ie && !(scan_ie = kalloc_data(SCAN_MAX_BSS * SWEET_WLAN_IE_MAX, Z_WAITOK | Z_ZERO))) {
++		return;
++	}
++	lck_mtx_lock(&scan_lock);
+ 	for (unsigned k = 0; k < scan.nbss; k++) {
+ 		if (memcmp(scan.bss[k].bssid, bssid, 6) == 0) {
++			scan.bss[k].rssi = (int8_t)MAX(-128, MIN(127, rssi));   /* the latest signal */
++			lck_mtx_unlock(&scan_lock);
+ 			return;
+ 		}
+ 	}
+ 	if (scan.nbss >= SCAN_MAX_BSS) {
++		lck_mtx_unlock(&scan_lock);
+ 		return;
+ 	}
+ 	unsigned k = scan.nbss++;
+ 	memcpy(scan.bss[k].bssid, bssid, 6);
+ 	scan.bss[k].mhz = mhz;
+ 	scan.bss[k].rssi = (int8_t)MAX(-128, MIN(127, rssi));
++	memcpy(&scan.bss[k].beacon_int, fr + 24 + 8, 2);   /* fixed fields: timestamp 8, interval 2, capability 2 */
++	memcpy(&scan.bss[k].cap, fr + 24 + 10, 2);
++	uint32_t iel = 0;                       /* whole elements only, at most one cache slot */
++	while (36 + iel + 2 <= frl && iel + 2u + fr[36 + iel + 1] <= SWEET_WLAN_IE_MAX &&
++	    36 + iel + 2u + fr[36 + iel + 1] <= frl) {
++		iel += 2u + fr[36 + iel + 1];
++	}
++	scan.bss[k].ie_len = (uint16_t)iel;
++	memcpy(scan_ie + k * SWEET_WLAN_IE_MAX, fr + 36, scan.bss[k].ie_len);
++	scan.bss[k].ssid_len = 0;
++	scan.bss[k].ssid[0] = 0;
+ 	/* IEs after timestamp (8), interval (2), capabilities (2): SSID = element 0 */
+ 	for (uint32_t o = 36; o + 2 <= frl;) {
+ 		uint8_t id = fr[o], l = fr[o + 1];
+@@ -4685,6 +4728,7 @@
+ 		}
+ 		if (id == 0) {
+ 			scan.bss[k].ssid_len = MIN(l, 32);
++			memcpy(scan.bss[k].raw_ssid, fr + o + 2, scan.bss[k].ssid_len);
+ 			for (unsigned i = 0; i < scan.bss[k].ssid_len; i++) {
+ 				uint8_t ch = fr[o + 2 + i];
+ 				scan.bss[k].ssid[i] = ch >= 0x20 && ch < 0x7f ? (char)ch : '?';
+@@ -4694,6 +4738,10 @@
+ 		}
+ 		o += 2u + l;
+ 	}
++	lck_mtx_unlock(&scan_lock);
++	if (scan.count > 1) {
++		return;                         /* each network is logged during the first scan only */
++	}
+ 	printf("SWEET IPC: scan: bss %u %02x:%02x:%02x:%02x:%02x:%02x %u MHz %d dBm \"%s\"%s\n", k, bssid[0], bssid[1],
+ 	    bssid[2], bssid[3], bssid[4], bssid[5], mhz, rssi, scan.bss[k].ssid, scan.bss[k].ssid_len ? "" : " (hidden)");
+ }
+@@ -5518,6 +5566,85 @@
+ }
+ 
+ /*
++ * ---- WL2: scans on request from sweet_80211 (sweet80211=3) and the BSS cache of the last scan. Only the
++ * service thread touches the chip; a request sets a flag the service picks up when the previous scan is done.
++ */
++int
++sweet_wlan_scan_request(void)
++{
++	int err = ENXIO;
++	lck_mtx_lock(&scan_lock);
++	if (wl.service && ipc.scan && wce.rings && !mw.fatal && (wf.state == WS_SCAN_DONE ||
++	    wf.state == WS_SCAN_SETUP || wf.state == WS_SCANNING)) {
++		scan_notify = true;
++		if (wf.state == WS_SCAN_DONE) {
++			scan_req = true;        /* a new scan; a running one just reports when it ends */
++		}
++		err = 0;
++	}
++	lck_mtx_unlock(&scan_lock);
++	return err;
++}
++
++/* a scan that will not complete (failure, modem down): still tell sweet_80211 so wifid does not wait forever */
++static void
++scan_flush_notify(const char *why)
++{
++	lck_mtx_lock(&scan_lock);
++	bool notify = scan_notify;
++	scan_notify = false;
++	scan_req = false;
++	lck_mtx_unlock(&scan_lock);
++	if (notify) {
++		printf("SWEET IPC: scan: completing the pending request without a scan (%s)\n", why);
++		sweet80211_scan_done();
++	}
++}
++
++int
++sweet_wlan_bss_get(unsigned i, struct sweet_wlan_bss *out)
++{
++	int err = ENOENT;
++	lck_mtx_lock(&scan_lock);
++	if (i < scan.nbss && scan_ie) {
++		memset(out, 0, sizeof(*out));
++		memcpy(out->bssid, scan.bss[i].bssid, 6);
++		out->mhz = scan.bss[i].mhz;
++		out->rssi = scan.bss[i].rssi;
++		out->noise = -95;               /* ATH10K_DEFAULT_NOISE_FLOOR */
++		out->beacon_int = scan.bss[i].beacon_int;
++		out->cap = scan.bss[i].cap;
++		out->ssid_len = scan.bss[i].ssid_len;
++		memcpy(out->ssid, scan.bss[i].raw_ssid, scan.bss[i].ssid_len);
++		out->ie_len = scan.bss[i].ie_len;
++		memcpy(out->ie, scan_ie + i * SWEET_WLAN_IE_MAX, scan.bss[i].ie_len);
++		err = 0;
++	}
++	lck_mtx_unlock(&scan_lock);
++	return err;
++}
++
++/* service thread: start a requested scan once the previous one is done and the WMI credit is back */
++static void
++svc_scan(void)
++{
++	if (!scan_req || wf.state != WS_SCAN_DONE || !wce.wmi_credits) {
++		return;
++	}
++	lck_mtx_lock(&scan_lock);
++	scan_req = false;
++	scan.nbss = 0;
++	wf.state = WS_SCAN_SETUP;
++	lck_mtx_unlock(&scan_lock);
++	scan.beacons = 0;
++	scan.foreign = 0;
++	scan.started = false;
++	scan.completed = false;
++	scan.step = 8;                          /* START_SCAN only: the setup steps are done */
++	wf.sent_ms = ms_now_ms();
++}
++
++/*
+  * ---- the long-lived service (sweetwlan=5, WL1): no hold time, adaptive polling (1 ms while anything moves,
+  * 20 ms when idle), a status line every 60 s with a WMI ECHO round trip (cmd 0x1d001 tag 149 -> event 0x1d001
+  * tag 54, ath10k_wmi_tlv_op_gen_echo) to show the firmware still answers.
+@@ -5646,6 +5773,7 @@
+ 			continue;
+ 		}
+ 		svc_tick(t0);
++		svc_scan();
+ 		if (svc_busy()) {
+ 			svc.busy_loops++;
+ 			wl_sleep(1);
+@@ -5668,6 +5796,7 @@
+ 		    wce.mac[4], wce.mac[5]);
+ 	}
+ 	scan_summary();
++	scan_flush_notify(alive ? "service stopping" : "modem down");
+ 	if (alive) {
+ 		wf_shutdown();
+ 	} else {
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -20,6 +20,11 @@
+  * "Bergamota-test" on channel 6, to every scan (joining it fails: no radio). Every ioctl type is logged once per direction
+  * ("SWEET 80211: get type 12 (len 1316) -> 0"), so a boot shows what wifid asks for. The
+  * WCN3990 backend (docs/WIFI_BT_PLAN.md) plugs in behind sweet80211_power/scan later.
++ *
++ * Stage 3 (sweet80211=3, docs/WIFI_IOS26_PHASE2.md WL2) is that backend for scans: SCAN_REQ asks the WLAN
++ * service (beryllium_wlan.c, sweetwlan=5) for a passive scan, SCAN_DONE is posted when the firmware reports
++ * it complete (sweet80211_scan_done), and SCAN_RESULT walks the service's BSS cache (sweet_wlan.h). Before
++ * the service is up (the first ~90 s after boot) a scan completes at once with no networks.
+  *
+  * Types and events are the IO80211 framework's own numbering (IO80211.framework 1565.3,
+  * iOS 26.6.2). Struct layouts are the classic Apple80211 ones (versioned, version 1); a
+@@ -47,6 +52,7 @@
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
+ #include "sweet_board.h"
++#include "sweet_wlan.h"
+ 
+ void sweet80211_init(void);
+ 
+@@ -298,7 +304,73 @@
+ 	return err;
+ }
+ 
++/* sweet80211=3: network s8.scan_next of the WLAN service's last scan, in the same layout as the fake one */
+ static int
++s8_real_result(struct sweet80211_req *req)
++{
++	struct sweet_wlan_bss *b = kalloc_data(sizeof(*b), Z_WAITOK | Z_ZERO);
++	struct s8_scan_result *r = kalloc_data(sizeof(struct s8_scan_result), Z_WAITOK | Z_ZERO);
++	int err = ENOMEM;
++	if (b == NULL || r == NULL) {
++		goto out;
++	}
++	if (sweet_wlan_bss_get(s8.scan_next, b) != 0) {
++		err = EIO;                              /* no more results: the framework stops here */
++		goto out;
++	}
++	bool g5 = b->mhz > 4900;
++	r->version = 1;
++	r->ch_version = 1;
++	r->ch_channel = b->mhz == 2484 ? 14 : g5 ? (b->mhz - 5000) / 5 : (b->mhz - 2407) / 5;
++	r->ch_flags = (g5 ? C_FLAG_5GHZ : C_FLAG_2GHZ) | C_FLAG_20MHZ | C_FLAG_ACTIVE;
++	r->unk = 1;
++	r->noise = b->noise;
++	r->rssi = b->rssi;
++	r->snr = (int16_t)(b->rssi - b->noise);
++	r->beacon_int = b->beacon_int;
++	r->cap = b->cap;
++	memcpy(r->bssid, b->bssid, 6);
++	r->ssid_len = MIN(b->ssid_len, 32);
++	memcpy(r->ssid, b->ssid, r->ssid_len);
++	/* rates in Mb/s from Supported Rates (1) and Extended Supported Rates (50), 500 kb/s units */
++	for (uint32_t o = 0; o + 2 <= b->ie_len;) {
++		uint8_t id = b->ie[o], l = b->ie[o + 1];
++		if (o + 2u + l > b->ie_len) {
++			break;
++		}
++		for (unsigned i = 0; (id == 1 || id == 50) && i < l && r->nrates < 15; i++) {
++			uint8_t v = b->ie[o + 2 + i] & 0x7f;
++			if (v >= 0x7b) {
++				continue;       /* membership selectors (HT 0xff, VHT 0xfe, SAE H2E 0xfb), not rates */
++			}
++			r->rates[r->nrates++] = v / 2;
++		}
++		o += 2u + l;
++	}
++	r->ie_len = MIN(b->ie_len, (uint16_t)sizeof(r->ie));
++	memcpy(r->ie, b->ie, r->ie_len);
++	s8.scan_next++;
++	err = s8_reply(req, r, sizeof(*r));
++out:
++	if (b) {
++		kfree_data(b, sizeof(*b));
++	}
++	if (r) {
++		kfree_data(r, sizeof(struct s8_scan_result));
++	}
++	return err;
++}
++
++/* called by the WLAN service thread when a scan it was asked for has completed */
++void
++sweet80211_scan_done(void)
++{
++	if (s8.stage == 3) {
++		s8_post_event(M_SCAN_DONE, NULL, 0);
++	}
++}
++
++static int
+ s8_get(struct sweet80211_req *req)
+ {
+ 	switch (req->type) {
+@@ -308,7 +380,8 @@
+ 		return s8_reply(req, &v, sizeof(v));
+ 	}
+ 	case IOC_DRIVER_VERSION:
+-		return s8_reply_string(req, "Bergamota sweet80211 1 (null backend)");
++		return s8_reply_string(req, s8.stage == 3 ? "Bergamota sweet80211 2 (WCN3990 scan backend)" :
++		    "Bergamota sweet80211 1 (null backend)");
+ 	case IOC_HARDWARE_VERSION:
+ 		return s8_reply_string(req, "Qualcomm WCN3990");
+ 	case IOC_POWER: {
+@@ -365,6 +438,9 @@
+ 		return s8_reply(req, &d, sizeof(d));
+ 	}
+ 	case IOC_SCAN_RESULT:
++		if (s8.stage == 3) {
++			return s8_real_result(req);
++		}
+ 		if (s8.stage >= 2) {
+ 			return s8_fake_result(req);
+ 		}
+@@ -412,6 +488,9 @@
+ 	{
+ 		uint64_t deadline;
+ 		s8.scan_next = 0;
++		if (s8.stage == 3 && sweet_wlan_scan_request() == 0) {
++			return 0;                       /* the WLAN service posts SCAN_DONE when the firmware is done */
++		}
+ 		clock_interval_to_deadline(300, NSEC_PER_MSEC, &deadline);    /* "scan" takes 300 ms */
+ 		thread_call_enter_delayed(s8.scan_done, deadline);
+ 		return 0;
+diff --git a/bsd/dev/sweet_wlan.h b/bsd/dev/sweet_wlan.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wlan.h
+@@ -0,0 +1,33 @@
++/*
++ * SWEET: the interface between the iOS-facing Wi-Fi stand-in (sweet_80211.c) and the WCN3990 WLAN service
++ * (beryllium_wlan.c, sweetwlan=5). docs/WIFI_IOS26_PHASE2.md WL2.
++ */
++#ifndef _SWEET_WLAN_H_
++#define _SWEET_WLAN_H_
++
++#include <stdint.h>
++
++#define SWEET_WLAN_IE_MAX       1024u
++
++/* one network from the last scan, as the firmware reported it (beacon or probe response) */
++struct sweet_wlan_bss {
++	uint8_t  bssid[6];
++	uint16_t mhz;
++	int8_t   rssi;                  /* dBm */
++	int8_t   noise;                 /* dBm */
++	uint16_t beacon_int;            /* TU */
++	uint16_t cap;                   /* 802.11 capability field */
++	uint8_t  ssid_len;
++	uint8_t  ssid[32];              /* raw bytes */
++	uint16_t ie_len;
++	uint8_t  ie[SWEET_WLAN_IE_MAX]; /* the frame's information elements, from the SSID element on */
++};
++
++/* beryllium_wlan.c: 0 = scan queued (or already running), ENXIO = the service is not up (yet) */
++int sweet_wlan_scan_request(void);
++/* beryllium_wlan.c: network i of the last completed scan; ENOENT past the end */
++int sweet_wlan_bss_get(unsigned i, struct sweet_wlan_bss *out);
++/* sweet_80211.c: called by the WLAN service when a requested scan has completed */
++void sweet80211_scan_done(void);
++
++#endif /* _SWEET_WLAN_H_ */

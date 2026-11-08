@@ -1,0 +1,16 @@
+From: Bergamota
+Subject: [PATCH] sweet: touch collections carry childEventMask like IOHIDEventAppendEvent
+
+---
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -614,6 +614,9 @@
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerRange, any);
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerTouch, any);
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, cmask);
++	/* IOHIDEventAppendEvent ORs each child's mask into the parent's childEventMask; backboardd reads the
++	 * collection's child mask to see touch-down/up/move, and ours stayed 0, so no touch ever began. */
++	collection->setIntegerValue(kIOHIDEventFieldDigitizerChildEventMask, cmask);
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerButtonMask, any ? 1 : 0);
+ 	IOLockUnlock(fLock);
+ 

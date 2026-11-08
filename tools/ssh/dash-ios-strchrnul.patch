@@ -1,0 +1,12 @@
+--- a/src/system.h
++++ b/src/system.h
+@@ -71,6 +71,9 @@
+ #endif
+ 
+ #ifndef HAVE_STRCHRNUL
++/* ios-beryllium: the iOS SDK declares strchrnul as iOS 18.4+; use dash's own */
++#include <string.h>
++#define strchrnul dash_strchrnul
+ char *strchrnul(const char *, int);
+ #endif
+ 

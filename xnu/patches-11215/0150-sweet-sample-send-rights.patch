@@ -1,0 +1,67 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index cfab787c0475ac432289d4d936d82b17e2944e01..ac2e29ad1c74270fa7e75577d139dbe9b13ff278 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1179,6 +1179,62 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 			printf("SMP %s R 0x%x %u/%u %u/%u/%u %u/%u/%u\n", name, rr[i].name, rr[i].msgs, rr[i].seqno,
+ 			    rr[i].srights, rr[i].mscount, rr[i].sorights, rr[i].knote, rr[i].nsreq, rr[i].kot);
+ 		}
++
++		/*
++		 * Send rights held by the task: "SMP name S 0xname -> pid P 0xrecvname msgs/seqno knote" (up to 80),
++		 * i.e. which process really owns the destination of each service right a client holds. A client's
++		 * right for com.apple.mobile.usermanagerd.xpc that points at launchd (pid 1) or at a port whose
++		 * seqno stays 0 shows where its requests go.
++		 */
++		{
++			struct {
++				mach_port_name_t name, rname;
++				int pid;
++				uint32_t msgs, seqno;
++				uint8_t knote;
++			} sr[80];
++			int ns = 0;
++
++			if (space != IS_NULL) {
++				is_read_lock(space);
++				if (is_active(space)) {
++					ipc_entry_table_t table = is_active_table(space);
++					ipc_entry_num_t tsize = ipc_entry_table_count(table);
++					for (mach_port_index_t index = 1; index < tsize && ns < 80; index++) {
++						ipc_entry_t entry = ipc_entry_table_get_nocheck(table, index);
++						ipc_entry_bits_t bits = entry->ie_bits;
++						if (!(IE_BITS_TYPE(bits) & MACH_PORT_TYPE_SEND) || entry->ie_object == IO_NULL ||
++						    io_otype(entry->ie_object) != IOT_PORT) {
++							continue;
++						}
++						ipc_port_t port = ip_object_to_port(entry->ie_object);
++						if (!ip_active(port) || port->ip_receiver_name == MACH_PORT_NULL) {
++							continue;
++						}
++						void *rsp = ptrauth_strip(*(void **)&port->ip_receiver,
++						    ptrauth_key_process_independent_data);
++						ipc_space_t rs = (ipc_space_t)rsp;
++						if (rs == IS_NULL || rs == space ||
++						    rs == ipc_space_kernel || rs == ipc_space_reply) {
++							continue;
++						}
++						sr[ns].pid = (rs->is_task != TASK_NULL) ? task_pid(rs->is_task) : -1;
++						sr[ns].name = MACH_PORT_MAKE(index, IE_BITS_GEN(bits));
++						sr[ns].rname = port->ip_receiver_name;
++						sr[ns].msgs = port->ip_messages.imq_msgcount;
++						sr[ns].seqno = port->ip_messages.imq_seqno;
++						sr[ns].knote = SLIST_FIRST(&port->ip_klist) != NULL;
++						ns++;
++					}
++				}
++				is_read_unlock(space);
++			}
++			printf("SMP %s SENDS listed %d\n", name, ns);
++			for (int i = 0; i < ns; i++) {
++				printf("SMP %s S 0x%x -> pid %d 0x%x %u/%u %u\n", name, sr[i].name, sr[i].pid,
++				    sr[i].rname, sr[i].msgs, sr[i].seqno, sr[i].knote);
++			}
++		}
+ 	}
+ }
+ 

@@ -1,0 +1,229 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 35e5c9add88d24751b123fb9264db559fd973634..3d3dbcaede42215bf957f2a146e079869d39d8ca 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -38,6 +38,7 @@
+ #include <arm64/machine_machdep.h>
+ #include <arm64/monotonic.h>
+ #include <arm64/instructions.h>
++#include <arm64/sweet_fjcvtzs.h>
+ 
+ #include <kern/debug.h>
+ #include <kern/restartable.h>
+@@ -168,6 +169,9 @@ static void handle_uncategorized(arm_saved_state_t *);
+ 
+ static void handle_kernel_breakpoint(arm_saved_state_t *, uint64_t);
+ 
++/* kern_exec.c: boot-arg sweetarm64e=1 (iOS 18 arm64e userland on a CPU without PAuth/JSCVT) */
++extern bool sweet_arm64e_enabled(void);
++
+ static void handle_breakpoint(arm_saved_state_t *, uint64_t) __dead2;
+ 
+ typedef void (*abort_inspector_t)(uint32_t, fault_status_t *, vm_prot_t *);
+@@ -1077,6 +1081,46 @@ sleh_synchronous(arm_context_t *context, uint64_t esr, vm_offset_t far, __unused
+ #endif
+ }
+ 
++/*
++ * SWEET: emulate FJCVTZS Wd, Dn (ARMv8.3-JSCVT, absent on SDM845's Kryo 385) for
++ * 64-bit EL0 threads; used by the iOS 18 JavaScriptCore/WebCore (docs/IOS18_PORT.md).
++ * Dn is read from the thread's saved NEON state, Wd is written zero-extended,
++ * PSTATE.{N,Z,C,V} = {0, exact, 0, 0}, FPSR cumulative bits are updated and the
++ * PC moves past the instruction. Returns false (nothing changed) if the thread
++ * has no usable NEON state, in which case the caller raises the usual SIGILL.
++ */
++static bool
++sweet_emulate_fjcvtzs(arm_saved_state_t *state, uint32_t instr)
++{
++	static uint32_t sweet_fjcvtzs_logged = 0;
++	thread_t thread = current_thread();
++	arm_neon_saved_state_t *ns = thread->machine.uNeon;
++
++	if (ns == NULL || !is_neon_saved_state64(ns)) {
++		return false;
++	}
++
++	arm_neon_saved_state64_t *ns64 = neon_state64(ns);
++	const uint32_t rd = SWEET_FJCVTZS_RD(instr);
++	const uint32_t rn = SWEET_FJCVTZS_RN(instr);
++	uint32_t result = 0, fpsr_or = 0;
++	bool z = sweet_fjcvtzs_convert((uint64_t)ns64->v.q[rn], ns64->fpcr, &result, &fpsr_or);
++
++	if (rd != 31) {
++		set_saved_state_reg(state, rd, (register_t)result);     /* Wd: upper 32 bits zero */
++	}
++	ns64->fpsr |= fpsr_or;
++	set_saved_state_cpsr(state, (get_saved_state_cpsr(state) & ~(PSR64_N | PSR64_Z | PSR64_C | PSR64_V)) |
++	    (z ? PSR64_Z : 0));
++	set_saved_state_pc(state, get_saved_state_pc(state) + 4);
++
++	if (os_atomic_inc_orig(&sweet_fjcvtzs_logged, relaxed) == 0) {
++		printf("SWEET: emulating FJCVTZS (first at pc=0x%llx, w%u <- d%u)\n",
++		    (unsigned long long)(get_saved_state_pc(state) - 4), rd, rn);
++	}
++	return true;
++}
++
+ /*
+  * Uncategorized exceptions are a catch-all for general execution errors.
+  * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
+@@ -1154,6 +1198,14 @@ handle_uncategorized(arm_saved_state_t *state)
+ 		}
+ 	}
+ 
++	/*
++	 * sweetarm64e=1: FJCVTZS is not implemented by this CPU, emulate it.
++	 */
++	if (sweet_is_fjcvtzs(instr) && PSR64_IS_USER64(get_saved_state_cpsr(state)) &&
++	    sweet_arm64e_enabled() && sweet_emulate_fjcvtzs(state, instr)) {
++		return;
++	}
++
+ 	/*
+ 	 * Check for GDB breakpoint via illegal opcode.
+ 	 */
+diff --git a/osfmk/arm64/sweet_fjcvtzs.h b/osfmk/arm64/sweet_fjcvtzs.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..599717c7c2b6f757f3e54c1d64ff09d13b47b38c
+--- /dev/null
++++ b/osfmk/arm64/sweet_fjcvtzs.h
+@@ -0,0 +1,139 @@
++/*
++ * SWEET (Poco F1, SDM845 Kryo 385 = ARMv8.2): software FJCVTZS (ARMv8.3-JSCVT).
++ *
++ * iOS 18's JavaScriptCore/WebCore use FJCVTZS Wd, Dn (0x1E7E0000 | Rn << 5 | Rd)
++ * unconditionally in a few hundred places; this CPU raises an undefined
++ * instruction exception for it. sleh.c (handle_uncategorized) emulates it for
++ * EL0 threads when the boot-arg sweetarm64e=1 is set.
++ *
++ * This header is plain C with no kernel dependency so that the conversion can be
++ * unit-tested on the host (see the scratchpad test fjcvtzs_test.c).
++ */
++#ifndef _ARM64_SWEET_FJCVTZS_H_
++#define _ARM64_SWEET_FJCVTZS_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++
++#define SWEET_FJCVTZS_MASK      0xFFFFFC00u
++#define SWEET_FJCVTZS_OPCODE    0x1E7E0000u
++#define SWEET_FJCVTZS_RD(i)     ((i) & 0x1fu)
++#define SWEET_FJCVTZS_RN(i)     (((i) >> 5) & 0x1fu)
++
++/* FPSR cumulative exception bits */
++#define SWEET_FPSR_IOC          (1u << 0)
++#define SWEET_FPSR_IXC          (1u << 4)
++#define SWEET_FPSR_IDC          (1u << 7)
++/* FPCR.FZ */
++#define SWEET_FPCR_FZ           (1u << 24)
++
++static inline bool
++sweet_is_fjcvtzs(uint32_t instr)
++{
++	return (instr & SWEET_FJCVTZS_MASK) == SWEET_FJCVTZS_OPCODE;
++}
++
++/*
++ * Exact ARM FPToFixedJS semantics (round toward zero, result modulo 2^32).
++ *   bits      raw IEEE-754 double (low 64 bits of Dn)
++ *   fpcr      FPCR of the thread (FZ: denormal inputs are flushed to zero, IDC set)
++ *   *result   Wd (ToInt32 of the value; NaN and infinities give 0)
++ *   *fpsr_or  FPSR cumulative flags to OR in (IOC: NaN/Inf/out of int32 range,
++ *             IXC: inexact in range, IDC: flushed denormal input)
++ * Returns the PSTATE.Z value: true iff the conversion was exact, in the int32
++ * range and the input was not -0.0 (what JS engines test with b.ne).
++ */
++static inline bool
++sweet_fjcvtzs_convert(uint64_t bits, uint32_t fpcr, uint32_t *result, uint32_t *fpsr_or)
++{
++	const uint64_t frac = bits & 0x000FFFFFFFFFFFFFULL;
++	const uint32_t exp = (uint32_t)((bits >> 52) & 0x7FF);
++	const bool neg = (bits >> 63) != 0;
++	uint32_t flags = 0;
++	bool z = true;
++	uint32_t r = 0;
++
++	if (exp == 0x7FF) {
++		/* NaN or infinity: result 0, invalid operation */
++		*result = 0;
++		*fpsr_or = SWEET_FPSR_IOC;
++		return false;
++	}
++
++	if (exp == 0) {
++		/*
++		 * Zero or denormal: |value| < 1, truncates to 0. A denormal (with FZ: flushed,
++		 * IDC) is inexact; zero is exact except that -0.0 clears Z.
++		 */
++		if (frac != 0) {
++			if (fpcr & SWEET_FPCR_FZ) {
++				flags |= SWEET_FPSR_IDC;
++				z = !neg ? true : false;      /* flushed to a signed zero */
++			} else {
++				flags |= SWEET_FPSR_IXC;
++				z = false;
++			}
++		} else if (neg) {
++			z = false;
++		}
++		*result = 0;
++		*fpsr_or = flags;
++		return z;
++	}
++
++	/* normal number: value = (2^52 | frac) * 2^(exp - 1075) */
++	const uint64_t mant = (1ULL << 52) | frac;
++	const int e = (int)exp - 1075;
++
++	if (e <= -53) {
++		/* |value| < 1: truncates to 0 (+0, inexact; the value is never zero here) */
++		r = 0;
++		flags |= SWEET_FPSR_IXC;
++		z = false;
++	} else if (e < 0) {
++		/* has a fractional part of -e bits */
++		const unsigned sh = (unsigned)(-e);
++		const uint64_t ip = mant >> sh;
++		const bool inexact = (mant & ((1ULL << sh) - 1)) != 0;
++		/* ip < 2^53 */
++		r = (uint32_t)(neg ? (0u - (uint32_t)ip) : (uint32_t)ip);
++		const bool in_range = neg ? (ip <= 0x80000000ULL) : (ip <= 0x7FFFFFFFULL);
++		if (!in_range) {
++			flags |= SWEET_FPSR_IOC;
++			z = false;
++		} else if (inexact) {
++			flags |= SWEET_FPSR_IXC;
++			z = false;
++		}
++	} else {
++		/* integer valued: mant * 2^e, e >= 0 */
++		if (e >= 32 + 11) {
++			/* low 32 bits of the integer are all zero, magnitude >= 2^63: out of range */
++			r = 0;
++			flags |= SWEET_FPSR_IOC;
++			z = false;
++		} else {
++			/* mant < 2^53, e <= 42: shifted value modulo 2^64 is exact in the low 32 bits */
++			const uint64_t ip = (e >= 11) ? 0 : (mant << e);   /* only used for the range test */
++			const uint32_t lo = (e >= 32) ? 0u : (uint32_t)(mant << e);
++			r = neg ? (0u - lo) : lo;
++			bool in_range;
++			if (e >= 11) {
++				/* |value| >= 2^52 * 2^11 = 2^63 > int32 range, except nothing */
++				in_range = false;
++			} else {
++				in_range = neg ? (ip <= 0x80000000ULL) : (ip <= 0x7FFFFFFFULL);
++			}
++			if (!in_range) {
++				flags |= SWEET_FPSR_IOC;
++				z = false;
++			}
++		}
++	}
++
++	*result = r;
++	*fpsr_or = flags;
++	return z;
++}
++
++#endif /* _ARM64_SWEET_FJCVTZS_H_ */

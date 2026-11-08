@@ -1,0 +1,97 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 3bb99d57e80a3130d0b97a2d02dd05b2666bac48..1a16f3fbeb1d9358dd10b1909b41adba56804995 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -216,20 +216,25 @@ class IOAcceleratorES : public IOService {
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
+ 
+ /*
+- * 0243: the backlight service iOS's brightness stack looks for. backboardd (CoreBrightness, BLControl) matches
+- * IOPropertyMatch { backlight-control = true } and found nothing here, so the slider and auto-brightness reached no
+- * hardware. This publishes one under the framebuffer, advertises IODisplayParameters brightness 0..4095 (the WLED's
+- * 12 bits), logs every property iOS sets on it (what it sends is not documented), and hands a brightness it
+- * recognises to the framebuffer, whose vsync timer writes the WLED (blReqApply).
++ * 0243/0245: the backlight service iOS's brightness stack looks for. backboardd (CoreBrightness, BLControl) matches
++ * IOPropertyMatch { backlight-control = true }, but CoreBrightness (-[CBDisplayContaineriOS addDisplayService:], iOS 18)
++ * then only takes it as the built-in display when IOObjectConformsTo(service, "AppleARMBacklight") holds: that is
++ * OSMetaClass::getMetaClassWithName("AppleARMBacklight") in this kernel, so the class has to be registered under
++ * exactly that name (a class called SweetBacklight made CB log "unsupported service", never start its display module
++ * nor the libEDR server, while QuartzCore - which only checks that *a* backlight-control service exists - did create
++ * its libEDR clients: every one of them timed out against the missing server, 5 s a time, in the render server).
++ * This publishes one under the framebuffer, advertises IODisplayParameters brightness 0..4095 (the WLED's 12 bits),
++ * logs every property iOS sets on it (first 64), and hands a brightness it recognises to the framebuffer, whose vsync
++ * timer writes the WLED (blReqApply). CB sends "brightness-nits" = nits * 65536 (SInt32, IOFixed).
+  */
+-class SweetBacklight : public IOService {
+-	OSDeclareDefaultStructors(SweetBacklight);
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
+ public:
+ 	AppleCLCD *fFB;
+ 	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
+ };
+ 
+-OSDefineMetaClassAndStructors(SweetBacklight, IOService);
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
+ 
+ class IOMobileFramebufferUserClient;
+ 
+@@ -469,9 +474,9 @@ public:
+ 	bool          blStep(int dir);
+ 	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
+ 	bool          fBlOffFailed;     /* 0242: this power-off could not darken the WLED: black frame instead, for this off only */
+-	/* 0243: brightness iOS asked for through SweetBacklight (0..4095), and the one written; applied on the vsync timer */
++	/* 0243: brightness iOS asked for through AppleARMBacklight (0..4095), and the one written; applied on the vsync timer */
+ 	uint32_t      fBlReq, fBlReqApplied;
+-	SweetBacklight *fBacklight;
++	AppleARMBacklight *fBacklight;
+ 	void          blRequest(uint32_t level) { __atomic_store_n(&fBlReq, level | 0x80000000u, __ATOMIC_RELEASE); }
+ 	void          blackout(void);
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+@@ -780,9 +785,9 @@ AppleCLCD::start(IOService *provider)
+ 		PE_parse_boot_argn("sweetfb_blfade", &blfade, sizeof(blfade));
+ 		if (blfade) {
+ 			blInit();
+-			int blsvc = 0;  /* test: the 0243 service off unless sweetfb_blsvc=1 */
++			int blsvc = 0;  /* 0249: off until CoreBrightness can take it (it crashed backboardd); sweetfb_blsvc=1 on */
+ 			PE_parse_boot_argn("sweetfb_blsvc", &blsvc, sizeof(blsvc));
+-			if (blsvc && (fBacklight = OSTypeAlloc(SweetBacklight)) != NULL && fBacklight->init() && fBacklight->attach(this)) {
++			if (blsvc && (fBacklight = OSTypeAlloc(AppleARMBacklight)) != NULL && fBacklight->init() && fBacklight->attach(this)) {
+ 				fBacklight->fFB = this;
+ 				fBacklight->setProperty("backlight-control", true);
+ 				OSDictionary *dp = OSDictionary::withCapacity(1), *br = OSDictionary::withCapacity(3);
+@@ -2540,7 +2545,7 @@ AppleCLCD::blInit(void)
+  */
+ /* 0243: what iOS sets on the backlight service, logged (first 64 calls), and the brightness taken from it. */
+ IOReturn
+-SweetBacklight::setProperties(OSObject *properties)
++AppleARMBacklight::setProperties(OSObject *properties)
+ {
+ 	static uint32_t logged;
+ 	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
+@@ -2556,6 +2561,25 @@ SweetBacklight::setProperties(OSObject *properties)
+ 		}
+ 		OSSafeReleaseNULL(ser);
+ 	}
++	/*
++	 * CoreBrightness' own request: "brightness-nits" = nits * 65536 as a SInt32 (it also sets IOMFBBrightnessLevel on
++	 * the framebuffer, result ignored). Map nits linearly onto the WLED range; sweetfb_blnits = the panel's peak nits
++	 * (default 500). Digital dimming below the backlight minimum is CB's business (it only engages when the request is
++	 * under the minimum it read from the service; this service advertises none).
++	 */
++	OSNumber *nits = OSDynamicCast(OSNumber, d->getObject("brightness-nits"));
++	if (nits != NULL && fFB != NULL) {
++		static uint32_t peak;
++		if (peak == 0) {
++			int v = 500;
++			PE_parse_boot_argn("sweetfb_blnits", &v, sizeof(v));
++			peak = (v >= 50 && v <= 2000) ? (uint32_t)v : 500;
++		}
++		int32_t fx = (int32_t)nits->unsigned32BitValue();
++		uint64_t lvl = fx > 0 ? (((uint64_t)fx * 4095ULL) + ((uint64_t)peak << 15)) / ((uint64_t)peak << 16) : 0;
++		fFB->blRequest(lvl > 4095 ? 4095 : (uint32_t)lvl);
++		return kIOReturnSuccess;
++	}
+ 	OSNumber *n = OSDynamicCast(OSNumber, d->getObject("brightness"));
+ 	if (n == NULL) {
+ 		OSDictionary *dp = OSDynamicCast(OSDictionary, d->getObject("IODisplayParameters"));

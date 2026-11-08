@@ -1,0 +1,102 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -341,7 +341,11 @@
+  * the bus is bit-banged on its own pins as plain GPIOs: open drain by
+  * switching output enable (the board pulls SDA/SCL up), ~100 kHz.
+  */
+-#define BB_HALF_US 5u
++/* Half clock period in us: 5 = ~100 kHz (default); boot-arg sweettouchbb=2..5 is faster */
++static unsigned bb_half_us = 5u;
++#define BB_HALF_US bb_half_us
++/* Poll period of the touch thread in ms (IRQ latch check; reads only on edges or while down) */
++static unsigned touch_poll_ms = 10u;
+ static void
+ bb_line(unsigned pin, bool high)
+ {
+@@ -903,9 +907,9 @@
+ 	}
+ 	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+ selected:
+-	printf("SWEET TOUCH: selected %s, %ux%u, poll=10ms irq-hint=%d\n",
++	printf("SWEET TOUCH: selected %s, %ux%u, poll=%ums i2c-half=%uus irq-hint=%d\n",
+ 	    st.kind == TOUCH_NVT ? "NT36672A" : st.kind == TOUCH_GOODIX ? "GT9896 Yellowstone" : "Focaltech 54:52",
+-	    tb->w, tb->h, st.irq_hint);
++	    tb->w, tb->h, touch_poll_ms, bb_half_us, st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+@@ -925,7 +929,17 @@
+ 		 * replays old contacts as new touches (ghost taps).
+ 		 */
+ 		bool periodic = st.kind != TOUCH_NVT && (++ticks % 10u) == 0;
+-		if (!st.irq_hint || st.active || pending || periodic) {
++		/*
++		 * While a finger is down read on every IRQ edge (a new frame) and at
++		 * least every ~8 ms, so a missed edge cannot leave a stuck contact;
++		 * at a 2 ms poll, reading on every pass would keep a CPU busy in the
++		 * bit-banged transfer.
++		 */
++		static unsigned since_read;
++		bool active_due = st.active && (st.kind != TOUCH_NVT || touch_poll_ms >= 8 ||
++		    ++since_read * touch_poll_ms >= 8);
++		if (!st.irq_hint || active_due || pending || periodic) {
++			since_read = 0;
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
+ 			    st.kind == TOUCH_NVT ? touch_novatek() : touch_focaltech();
+ 			if (err) {
+@@ -950,7 +964,7 @@
+ 				errors = 0;
+ 			}
+ 		}
+-		touch_wait(10);
++		touch_wait(touch_poll_ms);
+ 	}
+ 	touch_report(0, st.x, st.y);
+ out:
+@@ -973,6 +987,22 @@
+ 	}
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
++	/*
++	 * A fast swipe up from the bottom edge (home gesture) was lost: with a
++	 * 10 ms sleep plus a ~6 ms bit-banged frame read the first sample came
++	 * too late, already outside the edge zone. Poll the IRQ latch every 2 ms.
++	 */
++	if (sweet_board_beryllium()) {
++		touch_poll_ms = 2;
++	}
++	(void)PE_parse_boot_argn("sweettouchms", &touch_poll_ms, sizeof(touch_poll_ms));
++	if (touch_poll_ms < 1 || touch_poll_ms > 20) {
++		touch_poll_ms = 10;
++	}
++	(void)PE_parse_boot_argn("sweettouchbb", &bb_half_us, sizeof(bb_half_us));
++	if (bb_half_us < 2 || bb_half_us > 10) {
++		bb_half_us = 5;
++	}
+ 	if (!enabled) {
+ 		printf("SWEET TOUCH: disabled (sweettouch=0)\n");
+ 		return;
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -380,6 +380,12 @@
+  * app-switcher gesture.
+  */
+ #define SWEET_TOUCH_EDGE_PX 48
++/*
++ * The bottom edge (home / app-switcher swipe) gets a wider band, about the
++ * iPhone X home-indicator area: our first sample of a fast flick arrives
++ * several ms after touch-down, when the finger has already left 48 px.
++ */
++#define SWEET_TOUCH_EDGE_BOTTOM_PX 110
+ class SweetHIDTouch : public IOHIDEventService {
+ 	OSDeclareDefaultStructors(SweetHIDTouch);
+ public:
+@@ -544,7 +550,7 @@
+ 	}
+ 	if (!was && down) {
+ 		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_PX;
++		    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_BOTTOM_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);

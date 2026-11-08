@@ -1,0 +1,23 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -731,14 +731,16 @@
+ 	    tb->rst, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->rst)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)),
+ 	    tb->irq, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)));
+-	touch_gpio(tb->irq, 0, 1, 0, false, false);       /* input, pull-down (rising IRQ) */
++	touch_gpio(tb->irq, 0, 3, 0, false, false);       /* input, pull-up (falling IRQ, irq-type 1) */
+ 	if (st.bitbang) {
+ 		/* GPIO function, inputs (released) until a bit is driven low */
+ 		touch_gpio(tb->sda, 0, 0, 0, false, false);
+ 		touch_gpio(tb->scl, 0, 0, 0, false, false);
+-		/* Latch rising edges of the IRQ line in the TLMM status bit
+-		 * (RAW_STATUS_EN, edge, active high) without routing it to the GIC. */
+-		touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 8u, (1u << 4) | (1u << 2) | (1u << 1));
++		/* Latch both edges of the IRQ line in the TLMM status bit
++		 * (RAW_STATUS_EN, INTR_DECT_CTL 3 = dual edge) without routing it to
++		 * the GIC. The NT36672A reports irq-type 1 (falling): a rising-only
++		 * latch missed pulses, most visibly the frames releasing a finger. */
++		touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 8u, (1u << 4) | (3u << 2) | (1u << 1));
+ 		touch_wr(st.gpio, TOUCH_GPIO_CFG(tb->irq) + 0xcu, 0);
+ 	} else {
+ 		touch_gpio(tb->sda, tb->mux, 0, 0, false, false); /* qup14, 2 mA, no pull */

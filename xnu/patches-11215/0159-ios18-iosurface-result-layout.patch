@@ -1,0 +1,88 @@
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index b085b06d643dc28679b6f288fe00e71f23573499..d14de2923757d725c954f8c4a3318370d2aeeb90 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -75,7 +75,7 @@ enum {
+ 	kSweetSurfaceTrapReleaseFailed  = 5,
+ };
+ 
+-#define SWEET_SURFACE_RESULT_SIZE       0xa68
++#define SWEET_SURFACE_RESULT_SIZE       0xc68   /* iOS 18: 0x88 header + 20 planes * 0x98 */
+ #define SWEET_SURFACE_MAX_ID            4096
+ #define SWEET_SURFACE_MAX_DIM           16384
+ #define SWEET_SURFACE_MAX_ALLOC         (256u << 20)
+@@ -903,7 +903,18 @@ put64(uint8_t *p, uint32_t off, uint64_t v)
+ 	memcpy(p + off, &v, 8);
+ }
+ 
+-/* IOSurface.framework's lock result (copied to IOSurfaceClient + 0x68). */
++/*
++ * IOSurface.framework's lock result. iOS 18 (22H352) copies it to IOSurfaceClient + 0x70 (iOS 16: + 0x68), layout read from
++ * the client getters (IOSurfaceClientGet*):
++ *   0x00 base address    0x08 state page   0x10 timestamps (5 x u64)   0x18 id (u32)
++ *   0x20 allocSize u64   0x28 width u64    0x30 height u64   0x38 bytesPerRow u64   0x40 offset (added to the base) u64
++ *   0x48 pixelFormat u32 0x58 planeCount u32  0x60 bytesPerElement u16  0x62 elementWidth u8  0x63 elementHeight u8
++ *   0x64 cacheMode u32   0x70 parentID u32    0x74 slice count (u32, <= 1 means 1)
++ *   0x88 + i * 0x98: plane i: +0 width u64, +8 height u64, +0x18 offset u64, +0x20 bytesPerRow u64, +0x28 size u64,
++ *                    +0x30 bytesPerElement u16, +0x32 elementWidth u8, +0x33 elementHeight u8, +0x6c u8 compressed flag
++ * The iOS 16 layout put 32-bit fields at 0x1c.., so the client read width/height/rowbytes as garbage and CoreUI wrote
++ * past the surface (SpringBoard SIGSEGV in vImageDeepmap2Decode, destination = base + bytesPerElement).
++ */
+ static void
+ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ {
+@@ -912,31 +923,30 @@ sweet_surface_fill_result(SweetSurface *s, SweetSurfaceRef *ref, uint8_t *out)
+ 	put64(out, 0x08, ref->state->getAddress());
+ 	put64(out, 0x10, ref->state->getAddress() + SWEET_SURFACE_TIMESTAMPS);
+ 	put32(out, 0x18, s->id);
+-	put32(out, 0x1c, s->allocSize);
+-	put32(out, 0x20, s->width);
+-	put32(out, 0x24, s->height);
+-	put32(out, 0x28, s->bytesPerRow);
+-	put32(out, 0x2c, s->offset);
+-	put32(out, 0x30, s->pixelFormat);
+-	put32(out, 0x34, s->allocSize);
+-	put32(out, 0x38, s->planeCount);
+-	memcpy(out + 0x40, &s->bytesPerElement, 2);
+-	out[0x42] = s->elementWidth;
+-	out[0x43] = s->elementHeight;
+-	put32(out, 0x44, s->cacheMode);
+-	put32(out, 0x50, s->parentID);
+-	put32(out, 0x54, 1);
+-	for (uint32_t i = 0; i < s->planeCount; i++) {
+-		uint8_t *p = out + 0x68 + i * 0x80;
++	put64(out, 0x20, s->allocSize);
++	put64(out, 0x28, s->width);
++	put64(out, 0x30, s->height);
++	put64(out, 0x38, s->bytesPerRow);
++	put64(out, 0x40, s->offset);
++	put32(out, 0x48, s->pixelFormat);
++	put32(out, 0x58, s->planeCount);
++	memcpy(out + 0x60, &s->bytesPerElement, 2);
++	out[0x62] = s->elementWidth;
++	out[0x63] = s->elementHeight;
++	put32(out, 0x64, s->cacheMode);
++	put32(out, 0x70, s->parentID);
++	put32(out, 0x74, 1);
++	for (uint32_t i = 0; i < s->planeCount && i < 20; i++) {
++		uint8_t *p = out + 0x88 + i * 0x98;
+ 		const struct sweet_surface_plane *pl = &s->planes[i];
+-		put32(p, 0x00, pl->width);
+-		put32(p, 0x04, pl->height);
+-		put32(p, 0x08, pl->bytesPerRow);
+-		put32(p, 0x0c, pl->offset);
+-		put32(p, 0x14, pl->size);
+-		memcpy(p + 0x18, &pl->bytesPerElement, 2);
+-		p[0x1a] = pl->elementWidth;
+-		p[0x1b] = pl->elementHeight;
++		put64(p, 0x00, pl->width);
++		put64(p, 0x08, pl->height);
++		put64(p, 0x18, pl->offset);
++		put64(p, 0x20, pl->bytesPerRow);
++		put64(p, 0x28, pl->size);
++		memcpy(p + 0x30, &pl->bytesPerElement, 2);
++		p[0x32] = pl->elementWidth;
++		p[0x33] = pl->elementHeight;
+ 	}
+ }
+ 

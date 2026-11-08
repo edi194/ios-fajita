@@ -1,0 +1,25 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -488,6 +488,21 @@
+ 	IOAcceleratorES *accel = accelOn ? OSTypeAlloc(IOAcceleratorES) : NULL;
+ 	if (accel != NULL && accel->init()) {
+ 		accel->setName("sgx");
++		/*
++		 * Patch 0232: boot-arg chlorophyll=1 makes this the system's Metal device. iOS 18 Metal
++		 * (MTLIOAccelServiceGlobalContext) reads MetalPluginName from every IOAcceleratorES, loads
++		 * /System/Library/Extensions/<name>.bundle, takes MetalPluginClassName (a _MTLDevice subclass) and
++		 * calls [[class alloc] initWithAcceleratorPort:] in each process that asks for a device. Chlorophyll's
++		 * CHLDevice declines (nil: no device, as without the properties) when the GPU is not ready, when
++		 * /System/Library/Extensions/Chlorophyll.bundle/chlorophyll.off exists, or for processes in /System/Library/Extensions/Chlorophyll.bundle/chlorophyll.deny.
++		 */
++		uint32_t chlorophyll = 0;
++		(void)PE_parse_boot_argn("chlorophyll", &chlorophyll, sizeof(chlorophyll));
++		if (chlorophyll) {
++			accel->setProperty("MetalPluginName", "Chlorophyll");
++			accel->setProperty("MetalPluginClassName", "CHLDevice");
++			IOLog("SWEET FB: IOAcceleratorES names Chlorophyll.bundle as the Metal driver (chlorophyll=1)\n");
++		}
+ 		if (accel->attach(this)) {
+ 			accel->registerService();
+ 			IOLog("SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)\n");

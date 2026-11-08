@@ -1,0 +1,580 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -1144,7 +1144,7 @@
+ 		printf("SWEET MSS: no SCM buffer\n");
+ 		return false;
+ 	}
+-	if (nsrc == 0 || nsrc > 2 || ndst == 0 || ndst > 2) {
++	if (nsrc == 0 || nsrc > 3 || ndst == 0 || ndst > 3) {
+ 		return false;
+ 	}
+ 	bzero(buf, PAGE_SIZE);
+@@ -1169,16 +1169,13 @@
+ 		printf("SWEET MSS: hyp-assign %s %#llx+%#llx vmid %u -> %u perm %u\n", what, pa, size, src[0],
+ 		    dst[0], perm[0]);
+ 	} else {
+-		char from[16], to[32];
+-		if (nsrc > 1) {
+-			snprintf(from, sizeof(from), "%u+%u", src[0], src[1]);
+-		} else {
+-			snprintf(from, sizeof(from), "%u", src[0]);
++		char from[24], to[64];
++		uint32_t fl = 0, tl = 0;
++		for (unsigned k = 0; k < nsrc; k++) {
++			fl += (uint32_t)snprintf(from + fl, sizeof(from) - fl, "%s%u", k ? "+" : "", src[k]);
+ 		}
+-		if (ndst > 1) {
+-			snprintf(to, sizeof(to), "%u perm %u + %u perm %u", dst[0], perm[0], dst[1], perm[1]);
+-		} else {
+-			snprintf(to, sizeof(to), "%u perm %u", dst[0], perm[0]);
++		for (unsigned k = 0; k < ndst; k++) {
++			tl += (uint32_t)snprintf(to + tl, sizeof(to) - tl, "%s%u perm %u", k ? " + " : "", dst[k], perm[k]);
+ 		}
+ 		printf("SWEET MSS: hyp-assign %s %#llx+%#llx vmid %s -> %s\n", what, pa, size, from, to);
+ 	}
+@@ -2209,9 +2206,9 @@
+ 	bool intent_asked;
+ 	uint32_t next_liid;
+ 	uint32_t node;                  /* the modem's QRTR node, learned from its packets */
+-	bool hello_seen, announced, tftp, pdm, wlfw_seen;
++	bool hello_seen, announced, tftp, pdm, wlfw_seen, wlfw;
+ 	unsigned pdm_reqs;
+-	char notes[1536];               /* the stage's key events, printed again at the end (ipc_note) */
++	char notes[3072];               /* the stage's key events, printed again at the end (ipc_note) */
+ 	uint32_t notes_len;
+ 	uint64_t open_ms;
+ 	vm_offset_t win;                /* kernel window over the rmtfs buffer */
+@@ -3591,8 +3588,471 @@
+ 	(void)ipc_qrtr_send(Q_DATA, QRTR_PDM_PORT, node, port, r, n);
+ 	sweet_log_sync();
+ }
++
++/*
++ * ---- WLFW client (sweetwlfw=1): the host side of QMI service 0x45 that the modem's WLAN PD offers, in the
++ * order of Linux drivers/net/wireless/ath/ath10k/qmi.c (mainline, beryllium sets qcom,snoc-host-cap-skip-quirk):
++ * IND_REGISTER -> MSA_INFO -> hyp-assign of the MSA regions -> MSA_READY -> CAP; on the MSA_READY indication
++ * the board data (bdwlan.* from the modem partition, read-only) -> CAL_REPORT; then the FW_READY indication.
++ * It stops there: WLAN_CFG + mode ON need the copy engines (next step). The WCN3990 rails are voted on first
++ * (ath10k_hw_power_on at probe); like the Bluetooth stage, they are never voted off.
++ */
++#define WLFW_PORT_LOCAL         0x4003u         /* our client socket (qmi_handle_init) */
++#define WLFW_MSA_PA             0x8e300000ull   /* beryllium wlan_msa_mem */
++#define WLFW_MSA_SIZE           0x100000u
++#define WLFW_CLIENT_ID          0x4b4e454cu     /* ATH10K_QMI_CLIENT_ID */
++#define WLFW_MAX_DATA           6144u           /* QMI_WLFW_MAX_DATA_SIZE_V01 */
++#define WLFW_TIMEOUT_MS         30000u         /* ATH10K_QMI_TIMEOUT */
++#define SCM_VMID_WLAN           0x18u
++#define SCM_VMID_WLAN_CE        0x19u
++enum { WF_IND_REGISTER = 0x20, WF_FW_READY_IND = 0x21, WF_CAP = 0x24, WF_BDF_DOWNLOAD = 0x25, WF_CAL_REPORT = 0x26,
++       WF_MSA_READY_IND = 0x2b, WF_MSA_INFO = 0x2d, WF_MSA_READY = 0x2e };
++enum { WS_OFF, WS_IND, WS_MSA_INFO, WS_MSA_READY, WS_CAP, WS_WAIT_MSA_IND, WS_BDF, WS_CAL, WS_WAIT_FW_READY, WS_READY,
++       WS_FAILED };
++static const char *const wf_state_name[] = { "off", "ind-register", "msa-info", "msa-ready", "cap", "wait msa-ready-ind",
++	                                     "bdf", "cal-report", "wait fw-ready-ind", "FW READY", "failed" };
+ 
++static struct {
++	int state;
++	uint32_t node, port;            /* the WLFW server */
++	uint16_t txn;
++	uint16_t pending;               /* message id of the outstanding request, 0 = none */
++	uint64_t sent_ms;
++	bool msa_ind, fw_ready;
++	unsigned nreg;
++	struct {
++		uint64_t addr;
++		uint32_t size;
++		uint8_t secure;
++		bool assigned;
++	} reg[2];
++	uint32_t chip_id, chip_family, board_id, soc_id, fw_version;
++	char timestamp[33], build_id[129], bdf_name[16];
++	uint8_t *bdf, *buf;
++	uint32_t bdf_len, bdf_seg, bdf_off;
++} wf;
++
+ static void
++wf_tlv(uint8_t *b, uint32_t *n, uint8_t type, const void *v, uint16_t len)
++{
++	b[*n] = type;
++	memcpy(b + *n + 1, &len, 2);
++	memcpy(b + *n + 3, v, len);
++	*n += 3u + len;
++}
++
++/* one request from our client port; the response is matched by message id and transaction */
++static void
++wf_request(uint16_t msg, uint8_t *b, uint32_t n, int next)
++{
++	uint16_t body = (uint16_t)(n - 7);
++	wf.txn = (uint16_t)(wf.txn + 1);
++	if (wf.txn == 0) {
++		wf.txn = 1;
++	}
++	b[0] = 0;                       /* QMI_REQUEST */
++	memcpy(b + 1, &wf.txn, 2);
++	memcpy(b + 3, &msg, 2);
++	memcpy(b + 5, &body, 2);
++	wf.pending = msg;
++	wf.sent_ms = ms_now_ms();
++	wf.state = next;
++	if (!ipc_qrtr_send(Q_DATA, WLFW_PORT_LOCAL, wf.node, wf.port, b, n)) {
++		printf("SWEET IPC: wlfw: request %#x not sent\n", msg);
++		wf.state = WS_FAILED;
++	}
++}
++
++static void
++wf_fail(const char *why, uint16_t err)
++{
++	printf("SWEET IPC: wlfw: %s (error %u): client stops in state %s\n", why, err, wf_state_name[wf.state]);
++	ipc_note(" wlfw FAIL %s/%u in %s;", why, err, wf_state_name[wf.state]);
++	wf.state = WS_FAILED;
++	wf.pending = 0;
++}
++
++/* the WCN3990 rails of the beryllium &wifi node, in ath10k's vreg order */
++static bool
++wf_rails(void)
++{
++	static const struct { const char *res; unsigned mv; } r[] = {
++		{ "ldoa5", 800 }, { "ldoa7", 1800 }, { "ldoa17", 1304 }, { "ldoa25", 3300 }, { "ldoa23", 3300 },
++	};
++	char log[96];
++	uint32_t lp = 0;
++	bool ok = true;
++	for (unsigned k = 0; ok && k < sizeof(r) / sizeof(r[0]); k++) {
++		int err = sweet_rpmh_vreg_set(r[k].res, r[k].mv, true);
++		lp += (uint32_t)snprintf(log + lp, sizeof(log) - lp, " %s=%d", r[k].res, err);
++		lp = MIN(lp, (uint32_t)sizeof(log) - 1);
++		ok = err == 0;
++		wl_sleep(2);
++	}
++	printf("SWEET IPC: wlfw: WCN3990 rails voted on:%s%s\n", log, ok ? "" : ": FAILED, no WLFW client (ath10k probe fails)");
++	return ok;
++}
++
++static void
++wf_ind_register(void)
++{
++	uint8_t one = 1, *b = wf.buf;
++	uint32_t n = 7, id = WLFW_CLIENT_ID;
++	wf_tlv(b, &n, 0x10, &one, 1);   /* fw_ready_enable */
++	wf_tlv(b, &n, 0x13, &one, 1);   /* msa_ready_enable */
++	wf_tlv(b, &n, 0x15, &id, 4);    /* client_id */
++	wf_request(WF_IND_REGISTER, b, n, WS_IND);
++}
++
++/* board data: bdwlan.bNN (id < 0xff), bdwlan.NNN (3 hex digits), else or when missing bdwlan.bin (cnss naming) */
++static bool
++wf_bdf_load(void)
++{
++	char path[32];
++	uint32_t cl = 0, size = 0;
++	if (wf.board_id < 0xff) {
++		snprintf(wf.bdf_name, sizeof(wf.bdf_name), "bdwlan.b%02x", wf.board_id);
++	} else if (wf.board_id > 0xff && wf.board_id <= 0xfff) {
++		snprintf(wf.bdf_name, sizeof(wf.bdf_name), "bdwlan.%03x", wf.board_id);
++	} else {
++		strlcpy(wf.bdf_name, "bdwlan.bin", sizeof(wf.bdf_name));
++	}
++	snprintf(path, sizeof(path), "image/%s", wf.bdf_name);
++	if (fat_open(&ms_fat, path, &cl, &size)) {
++		printf("SWEET IPC: wlfw: %s not in the modem partition, using bdwlan.bin\n", wf.bdf_name);
++		strlcpy(wf.bdf_name, "bdwlan.bin", sizeof(wf.bdf_name));
++		if (fat_open(&ms_fat, "image/bdwlan.bin", &cl, &size)) {
++			return false;
++		}
++	}
++	if (size == 0 || size > 0x40000 || !(wf.bdf = kalloc_data(size, Z_WAITOK))) {
++		return false;
++	}
++	if (fat_read_chain(&ms_fat, cl, 0, wf.bdf, size)) {
++		kfree_data(wf.bdf, size);
++		wf.bdf = NULL;
++		return false;
++	}
++	wf.bdf_len = size;
++	return true;
++}
++
++/* ath10k_qmi_bdf_dnld_send_sync(): segments of 6144 bytes, file_id 0, end on the last one */
++static void
++wf_bdf_next(void)
++{
++	uint8_t one = 1, *b = wf.buf;
++	uint32_t n = 7, zero = 0;
++	uint32_t left = wf.bdf_len - wf.bdf_off;
++	uint16_t len = (uint16_t)MIN(left, WLFW_MAX_DATA);
++	uint8_t end = left <= WLFW_MAX_DATA;
++	wf_tlv(b, &n, 0x01, &one, 1);           /* valid */
++	wf_tlv(b, &n, 0x10, &zero, 4);          /* file_id (enum, s32) */
++	wf_tlv(b, &n, 0x11, &wf.bdf_len, 4);    /* total_size */
++	wf_tlv(b, &n, 0x12, &wf.bdf_seg, 4);    /* seg_id */
++	b[n] = 0x13;                            /* data: u16 length, then the bytes */
++	uint16_t tl = (uint16_t)(2 + len);
++	memcpy(b + n + 1, &tl, 2);
++	memcpy(b + n + 3, &len, 2);
++	memcpy(b + n + 5, wf.bdf + wf.bdf_off, len);
++	n += 5u + len;
++	wf_tlv(b, &n, 0x14, &end, 1);           /* end */
++	wf_request(WF_BDF_DOWNLOAD, b, n, WS_BDF);
++}
++
++static void
++wf_bdf_start(void)
++{
++	if (!wf_bdf_load()) {
++		wf_fail("no board data file", 0);
++		return;
++	}
++	printf("SWEET IPC: wlfw: board id %#x -> %s (%u bytes) from the modem partition\n", wf.board_id, wf.bdf_name,
++	    wf.bdf_len);
++	ipc_note(" wlfw bdf %s %u;", wf.bdf_name, wf.bdf_len);
++	wf.bdf_seg = 0;
++	wf.bdf_off = 0;
++	wf_bdf_next();
++}
++
++/* qcom_scm_assign_mem() of one MSA region: HLOS -> MSS_MSA + WLAN (+ WLAN_CE unless secure), and back */
++static bool
++wf_msa_assign(unsigned k, bool to_wlan)
++{
++	uint32_t h = SCM_VMID_HLOS, rw = SCM_PERM_RW;
++	uint32_t vm[3] = { SCM_VMID_MSS_MSA, SCM_VMID_WLAN, SCM_VMID_WLAN_CE }, perm[3] = { rw, rw, rw };
++	unsigned cnt = wf.reg[k].secure ? 2 : 3;
++	if (to_wlan) {
++		return ms_assign_list("wlan msa", wf.reg[k].addr, wf.reg[k].size, &h, 1, vm, perm, cnt);
++	}
++	return ms_assign_list("wlan msa back", wf.reg[k].addr, wf.reg[k].size, vm, cnt, &h, &rw, 1);
++}
++
++static void
++wf_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
++{
++	if (len < 7 || (p[0] != 2 && p[0] != 4) || node != wf.node || port != wf.port || wf.state == WS_OFF) {
++		printf("SWEET IPC: wlfw: %u-byte message of type %u from %u:%#x ignored\n", len, len ? p[0] : 0, node, port);
++		return;
++	}
++	uint16_t txn, msg, mlen;
++	memcpy(&txn, p + 1, 2);
++	memcpy(&msg, p + 3, 2);
++	memcpy(&mlen, p + 5, 2);
++	const uint8_t *t = p + 7;
++	uint32_t tl = MIN((uint32_t)mlen, len - 7);
++	if (p[0] == 4) {                        /* indications */
++		if (msg == WF_MSA_READY_IND) {
++			printf("SWEET IPC: wlfw: MSA ready indication\n");
++			ipc_note(" wlfw msa-ready-ind;");
++			wf.msa_ind = true;
++			if (wf.state == WS_WAIT_MSA_IND) {
++				wf_bdf_start();
++			}
++		} else if (msg == WF_FW_READY_IND) {
++			printf("SWEET IPC: wlfw: FW READY indication: the WLAN firmware runs (state was %s)\n",
++			    wf_state_name[wf.state]);
++			ipc_note(" wlfw FW-READY;");
++			wf.fw_ready = true;
++			if (!wf.pending && wf.state != WS_FAILED) {
++				wf.state = WS_READY;
++			}
++		} else {
++			printf("SWEET IPC: wlfw: indication %#x (%u bytes)\n", msg, len);
++			ipc_note(" wlfw ind %#x;", msg);
++		}
++		return;
++	}
++	if (msg != wf.pending || txn != wf.txn) {
++		printf("SWEET IPC: wlfw: unexpected response %#x txn %u (waiting for %#x txn %u)\n", msg, txn, wf.pending,
++		    wf.txn);
++		return;
++	}
++	wf.pending = 0;
++	uint16_t l = 0, res = 1, err = 0;
++	const uint8_t *v = qmi_tlv(t, tl, 2, &l);
++	if (v && l >= 4) {
++		memcpy(&res, v, 2);
++		memcpy(&err, v + 2, 2);
++	}
++	switch (msg) {
++	case WF_IND_REGISTER: {
++		uint64_t st = 0;
++		const uint8_t *s = qmi_tlv(t, tl, 0x10, &l);
++		if (s && l >= 8) {
++			memcpy(&st, s, 8);
++		}
++		printf("SWEET IPC: wlfw: ind-register result %u error %u, fw_status %#llx\n", res, err, st);
++		ipc_note(" wlfw ind-reg %u/%u st %#llx;", res, err, st);
++		if (res) {
++			wf_fail("ind-register rejected", err);
++		} else if (st & 0x2) {          /* QMI_WLFW_FW_READY_V01: already up */
++			wf.state = WS_READY;
++		} else {
++			uint8_t *b = wf.buf;
++			uint32_t n = 7, size = WLFW_MSA_SIZE;
++			uint64_t pa = WLFW_MSA_PA;
++			wf_tlv(b, &n, 0x01, &pa, 8);
++			wf_tlv(b, &n, 0x02, &size, 4);
++			wf_request(WF_MSA_INFO, b, n, WS_MSA_INFO);
++		}
++		break;
++	}
++	case WF_MSA_INFO: {
++		const uint8_t *r = qmi_tlv(t, tl, 0x03, &l);
++		unsigned cnt = r && l >= 1 ? r[0] : 0;
++		if (res || !r || cnt > 2 || l < 1 + 13u * cnt) {
++			wf_fail("msa-info rejected or malformed", err);
++			break;
++		}
++		for (unsigned k = 0; k < cnt; k++) {
++			memcpy(&wf.reg[k].addr, r + 1 + 13 * k, 8);
++			memcpy(&wf.reg[k].size, r + 9 + 13 * k, 4);
++			wf.reg[k].secure = r[13 + 13 * k];
++			printf("SWEET IPC: wlfw: msa region %u: %#llx + %#x secure %u\n", k, wf.reg[k].addr, wf.reg[k].size,
++			    wf.reg[k].secure);
++			ipc_note(" wlfw msa %#llx+%#x/%u;", wf.reg[k].addr, wf.reg[k].size, wf.reg[k].secure);
++			if (wf.reg[k].size == 0 || wf.reg[k].size > WLFW_MSA_SIZE || wf.reg[k].addr < WLFW_MSA_PA ||
++			    wf.reg[k].addr - WLFW_MSA_PA > WLFW_MSA_SIZE - wf.reg[k].size) {
++				wf_fail("msa region out of range", 0);
++				return;
++			}
++		}
++		wf.nreg = cnt;
++		wl_sleep(20);                   /* ath10k: the SDM845 XPU update needs a pause after msa-info */
++		for (unsigned k = 0; k < cnt; k++) {
++			if (!wf_msa_assign(k, true)) {
++				wf_fail("msa hyp-assign failed", 0);
++				return;
++			}
++			wf.reg[k].assigned = true;
++		}
++		wf_request(WF_MSA_READY, wf.buf, 7, WS_MSA_READY);
++		break;
++	}
++	case WF_MSA_READY:
++		printf("SWEET IPC: wlfw: msa-ready result %u error %u\n", res, err);
++		if (res) {
++			wf_fail("msa-ready rejected", err);
++		} else {
++			wf_request(WF_CAP, wf.buf, 7, WS_CAP);
++		}
++		break;
++	case WF_CAP: {
++		if (res) {
++			wf_fail("cap rejected", err);
++			break;
++		}
++		const uint8_t *c;
++		wf.chip_id = 0xff;
++		wf.board_id = 0xff;
++		if ((c = qmi_tlv(t, tl, 0x10, &l)) && l >= 8) {
++			memcpy(&wf.chip_id, c, 4);
++			memcpy(&wf.chip_family, c + 4, 4);
++		}
++		if ((c = qmi_tlv(t, tl, 0x11, &l)) && l >= 4) {
++			memcpy(&wf.board_id, c, 4);
++		}
++		if ((c = qmi_tlv(t, tl, 0x12, &l)) && l >= 4) {
++			memcpy(&wf.soc_id, c, 4);
++		}
++		if ((c = qmi_tlv(t, tl, 0x13, &l)) && l >= 5) {
++			memcpy(&wf.fw_version, c, 4);   /* then a nested string: u8 length, characters */
++			memcpy(wf.timestamp, c + 5, MIN((uint32_t)c[4], MIN((uint32_t)l - 5, 32u)));
++		}
++		if ((c = qmi_tlv(t, tl, 0x14, &l))) {
++			memcpy(wf.build_id, c, MIN((uint32_t)l, 128u));
++		}
++		printf("SWEET IPC: wlfw: chip_id %#x chip_family %#x board_id %#x soc_id %#x fw_version %#x \"%s\" \"%s\"\n",
++		    wf.chip_id, wf.chip_family, wf.board_id, wf.soc_id, wf.fw_version, wf.timestamp, wf.build_id);
++		ipc_note(" wlfw cap chip %#x fam %#x board %#x soc %#x fw %#x;", wf.chip_id, wf.chip_family, wf.board_id,
++		    wf.soc_id, wf.fw_version);
++		wf.state = WS_WAIT_MSA_IND;
++		wf.sent_ms = ms_now_ms();
++		if (wf.msa_ind) {
++			wf_bdf_start();
++		}
++		break;
++	}
++	case WF_BDF_DOWNLOAD: {
++		uint32_t seg_len = MIN(wf.bdf_len - wf.bdf_off, WLFW_MAX_DATA);
++		bool end = wf.bdf_off + seg_len >= wf.bdf_len;
++		/* ath10k: a failure on the end segment is the firmware's CRC check, which it still accepts */
++		if (res && !end) {
++			wf_fail("bdf segment rejected", err);
++			break;
++		}
++		if (res) {
++			printf("SWEET IPC: wlfw: bdf end segment: result %u error %u (CRC check; ath10k carries on)\n", res, err);
++		}
++		wf.bdf_off += seg_len;
++		wf.bdf_seg++;
++		if (!end) {
++			wf_bdf_next();
++			break;
++		}
++		printf("SWEET IPC: wlfw: board data sent in %u segments\n", wf.bdf_seg);
++		ipc_note(" wlfw bdf sent %u seg %u/%u;", wf.bdf_seg, res, err);
++		uint8_t zero = 0;
++		uint32_t n = 7;
++		wf_tlv(wf.buf, &n, 0x01, &zero, 1);    /* meta_data: no calibration ids */
++		wf_request(WF_CAL_REPORT, wf.buf, n, WS_CAL);
++		break;
++	}
++	case WF_CAL_REPORT:
++		printf("SWEET IPC: wlfw: cal-report result %u error %u; waiting for FW READY\n", res, err);
++		ipc_note(" wlfw cal %u/%u;", res, err);
++		if (res) {
++			wf_fail("cal-report rejected", err);
++		} else {
++			wf.state = wf.fw_ready ? WS_READY : WS_WAIT_FW_READY;
++			wf.sent_ms = ms_now_ms();
++		}
++		break;
++	default:
++		break;
++	}
++}
++
++/* MSA regions back to HLOS, board data freed; free_buf also drops the request buffer (teardown) */
++static void
++wf_reset(bool free_buf)
++{
++	for (unsigned k = 0; k < wf.nreg; k++) {
++		if (wf.reg[k].assigned && wf_msa_assign(k, false)) {
++			wf.reg[k].assigned = false;
++		}
++	}
++	bool still = false;
++	for (unsigned k = 0; k < wf.nreg; k++) {
++		still = still || wf.reg[k].assigned;
++	}
++	if (wf.bdf) {
++		kfree_data(wf.bdf, wf.bdf_len);
++	}
++	uint8_t *buf = wf.buf;
++	if (free_buf && buf) {
++		kfree_data(buf, 64 + WLFW_MAX_DATA);
++		buf = NULL;
++	}
++	if (still) {
++		/* never assign a region twice: a failed hand-back leaves the client off for this boot */
++		printf("SWEET IPC: wlfw: an MSA region did not come back to HLOS: client disabled\n");
++		ipc.wlfw = false;
++	}
++	memset(&wf, 0, sizeof(wf));
++	wf.buf = buf;
++}
++
++/* NEW_SERVER 0x45: connect and start (ath10k_qmi_new_server + server_arrive) */
++static void
++wf_server(uint32_t node, uint32_t port, bool arrive)
++{
++	if (!ipc.wlfw) {
++		return;
++	}
++	if (!arrive) {
++		/* ath10k_qmi_event_server_exit(): MSA back to HLOS, board data freed, start over on the next arrival */
++		printf("SWEET IPC: wlfw: server left in state %s\n", wf_state_name[wf.state]);
++		ipc_note(" wlfw server left in %s;", wf_state_name[wf.state]);
++		wf_reset(false);
++		return;
++	}
++	if (wf.state != WS_OFF) {
++		return;
++	}
++	if (!wf.buf && !(wf.buf = kalloc_data(64 + WLFW_MAX_DATA, Z_WAITOK))) {
++		return;
++	}
++	wf.node = node;
++	wf.port = port;
++	wf_ind_register();
++}
++
++/* from the service loop: a request or indication that does not come is a stop, not a wait forever */
++static void
++wf_poll(void)
++{
++	if (wf.state == WS_WAIT_FW_READY && wf.fw_ready) {
++		wf.state = WS_READY;
++	}
++	bool waiting = wf.pending || wf.state == WS_WAIT_MSA_IND || wf.state == WS_WAIT_FW_READY;
++	if (ipc.wlfw && waiting && wf.state != WS_FAILED && ms_now_ms() > wf.sent_ms + WLFW_TIMEOUT_MS) {
++		wf_fail(wf.pending ? "no response" : "no indication", wf.pending);
++	}
++}
++
++/*
++ * After the modem stopped (its WLAN PD with it): the MSA regions back to HLOS, as ath10k does when the WLFW
++ * server exits. The WCN3990 itself never got WLAN_CFG / mode ON, so it has no host rings to use the MSA for.
++ */
++static void
++wf_teardown(void)
++{
++	wf_reset(true);
++}
++
++static void
+ ipc_qrtr_rx(const uint8_t *p, uint32_t len)
+ {
+ 	uint32_t h[8], type, snode, sport, confirm, size, dnode, dport, hdrlen;
+@@ -3650,6 +4110,9 @@
+ 				ipc.wlfw_seen = true;
+ 				printf("SWEET IPC: WLFW is up at %u:%#x: the WLAN PD runs\n", s[3], s[4]);
+ 			}
++			if (s[1] == WLFW_SERVICE) {
++				wf_server(s[3], s[4], type == Q_NEW_SERVER);
++			}
+ 		}
+ 		break;
+ 	case Q_DATA:
+@@ -3657,6 +4120,8 @@
+ 			rmtfs_rx(snode, sport, pl, size);
+ 		} else if (ipc.pdm && dport == QRTR_PDM_PORT) {
+ 			pdm_rx(snode, sport, pl, size);
++		} else if (ipc.wlfw && dport == WLFW_PORT_LOCAL) {
++			wf_rx(snode, sport, pl, size);
+ 		} else if (tftp_rx(dport, snode, sport, pl, size)) {
+ 			/* TFTP server or one of its transfers */
+ 		} else {
+@@ -3698,6 +4163,13 @@
+ 	int pdm = 0;
+ 	(void)PE_parse_boot_argn("sweetpdm", &pdm, sizeof(pdm));
+ 	ipc.pdm = pdm == 1;
++	int wlfw = 0;
++	(void)PE_parse_boot_argn("sweetwlfw", &wlfw, sizeof(wlfw));
++	ipc.wlfw = wlfw == 1;
++	memset(&wf, 0, sizeof(wf));
++	if (ipc.wlfw && !wf_rails()) {
++		ipc.wlfw = false;
++	}
+ 	ipc.features = GLINK_FEATURE_REUSE;
+ 	ipc.node = 0;
+ 	ipc.rmtfs_perm = VMBIT(SCM_VMID_HLOS);
+@@ -3743,6 +4215,7 @@
+ 		ipc_rx_poll();
+ 		ipc_flush();
+ 		tftp_pump();
++		wf_poll();
+ 		if (ipc.open_acked && !ipc.announced && ms_now_ms() > ipc.open_ms + 3000) {
+ 			printf("SWEET IPC: qrtr: no hello from the modem 3 s after IPCRTR opened: sending ours\n");
+ 			ipc_qrtr_announce();
+@@ -3762,6 +4235,11 @@
+ 	    ipc.version_acked ? "versioned" : "no version-ack", ipc.open_acked ? "open" : "not open",
+ 	    ipc.hello_seen ? "seen" : "not seen", ipc.rx_pkts, ipc.tx_pkts, ipc.reads, ipc.read_bytes, ipc.writes,
+ 	    ipc.write_bytes, ipc.pdm_reqs, ipc.wlfw_seen ? "up" : "not seen");
++	if (ipc.wlfw) {
++		printf("SWEET IPC: wlfw client: %s; chip %#x board %#x soc %#x fw %#x, %s %u bytes in %u segments\n",
++		    wf_state_name[wf.state], wf.chip_id, wf.board_id, wf.soc_id, wf.fw_version, wf.bdf_name[0] ? wf.bdf_name : "no bdf",
++		    wf.bdf_off, wf.bdf_seg);
++	}
+ 	/* the events again, in console-sized lines */
+ 	for (uint32_t o = 0, k = 0; o < ipc.notes_len; o += 160, k++) {
+ 		printf("SWEET IPC: events %u:%.*s\n", k, (int)MIN(160u, ipc.notes_len - o), ipc.notes + o);
+@@ -3777,6 +4255,7 @@
+ ms_ipc_teardown(void)
+ {
+ 	tftp_teardown();
++	wf_teardown();
+ 	while (ipc.txq_n) {
+ 		ipc.txq_n--;
+ 		kfree_data(ipc.txq[ipc.txq_n].data, ipc.txq[ipc.txq_n].len);

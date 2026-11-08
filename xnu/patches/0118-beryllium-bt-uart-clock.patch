@@ -1,0 +1,606 @@
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -414,6 +414,38 @@
+ #define CBCR_S6         0x17750u
+ #define RCG_S6          0x17754u        /* gcc_qupv3_wrap0_s6_clk_src */
+ #define GPLL0_HZ        600000000ull    /* gcc-sdm845.c gpll0 (UNVERIFIED on hw; table print checks it) */
++#define WL_QUP0_PA      0x008c0000u     /* geniqup wrapper 0 (QUP_HW_VER_REG at +4) */
++#define QUP_HW_VER_REG  0x004u
++#define QUP_SE_VERSION_2_5      0x20050000u     /* qcom-geni-se.h: oversampling halves from here */
++#define XO_HZ           19200000ull
++
++/* GPLL0 (Fabia alpha PLL, clk-alpha-pll.c clk_alpha_pll_regs[FABIA]) */
++#define PLL_MODE        0x00u
++#define PLL_L_VAL       0x04u
++#define PLL_USER_CTL    0x0cu
++#define PLL_FRAC        0x38u
++#define PLL_LOCK_DET    (1u << 31)
++
++/* RCG registers relative to cmd_rcgr (clk-rcg2.c) */
++#define RCG_CMD         0x00u
++#define RCG_CFG         0x04u
++#define RCG_M           0x08u
++#define RCG_N           0x0cu
++#define RCG_D           0x10u
++#define RCG_DFS_ENABLE  0x14u
++#define CMD_UPDATE      (1u << 0)
++#define CMD_ROOT_OFF    (1u << 31)
++#define CFG_SRC_DIV_MASK        0x1fu           /* hid_width = 5 */
++#define CFG_SRC_SEL_SHIFT       8
++#define CFG_SRC_SEL_MASK        (7u << CFG_SRC_SEL_SHIFT)
++#define CFG_MODE_MASK           (3u << 12)
++#define CFG_MODE_DUAL_EDGE      (2u << 12)
++#define CFG_HW_CLK_CTRL         (1u << 20)
++#define RCG_CFG_MASK    (CFG_SRC_DIV_MASK | CFG_SRC_SEL_MASK | CFG_MODE_MASK | CFG_HW_CLK_CTRL)
++#define RCG_MND_MASK    0xffffu                 /* mnd_width = 16 */
++#define P_BI_TCXO       0u                      /* gcc_parent_map_0 */
++#define P_GPLL0_OUT_MAIN        1u
++#define P_GPLL0_OUT_EVEN        6u
+ 
+ /* GENI serial engine (qcom-geni-se.h / qcom_geni_serial.c) */
+ #define SE_FORCE_DEFAULT        0x020u
+@@ -471,14 +503,30 @@
+ #define UART_START_TX           1u
+ #define UART_START_READ         1u
+ #define UART_CTS_MASK           (1u << 1)
+-#define UART_OVERSAMPLING       32u
++#define UART_OVERSAMPLING       32u     /* halved on QUP >= 2.5, see wl.os */
++#define S_CMD_DONE              (1u << 0)
++#define S_RX_FIFO_RD_ERR        (1u << 24)
++#define S_RX_FIFO_WR_ERR        (1u << 25)
++#define S_RX_FIFO_WATERMARK     (1u << 26)
++#define S_RX_FIFO_LAST          (1u << 27)
++#define GENI_M_IRQ_EN           (1u << 2)       /* SE_IRQ_EN */
++#define GENI_S_IRQ_EN           (1u << 3)
++#define DMA_TX_IRQ_EN           (1u << 1)
++#define DMA_RX_IRQ_EN           (1u << 0)
++#define WL_BT_OPER_BAUD         3200000u        /* beryllium dtsi max-speed (hci_qca oper_speed) */
+ 
+ #define QCA_POWER_ON_PULSE      0xfcu   /* btqca.h QCA_WCN3990_POWERON_PULSE */
+ #define QCA_POWER_OFF_PULSE     0xc0u   /* btqca.h QCA_WCN3990_POWEROFF_PULSE */
+ 
+ static struct {
+-	vm_offset_t gcc, tlmm, se, smmu, smem, mutex;
++	vm_offset_t gcc, tlmm, se, smmu, smem, mutex, wrap;
+ 	uint32_t vote_before;           /* GCC_VOTE_WRAP0 before we touched it */
++	unsigned os;                    /* UART oversampling: 32, or 16 on QUP >= 2.5 */
++	int rcg_row;                    /* ftbl row currently programmed, -1 = untouched */
++	bool rcg_saved, pins_saved, se_saved;
++	uint32_t rcg_orig[4];           /* CFG, M, N, D as found */
++	uint32_t pin_orig[4];           /* TLMM gpio45-48 ctl words as found */
++	uint32_t se_orig[3];            /* SE_M_CLK_CFG, SE_S_CLK_CFG, SE_CLK_SEL as found */
+ 	uint32_t tx_depth, rx_depth;
+ 	uint8_t rxq[512];
+ 	unsigned rxn;
+@@ -533,6 +581,9 @@
+ 	if (!wl.mutex) {
+ 		wl.mutex = ml_io_map(WL_MUTEX_PA, 0x4000);
+ 	}
++	if (!wl.wrap) {
++		wl.wrap = ml_io_map(WL_QUP0_PA, 0x1000);        /* optional: version only */
++	}
+ 	return wl.gcc && wl.tlmm && wl.se && wl.smmu && wl.smem && wl.mutex;
+ }
+ 
+@@ -832,14 +883,18 @@
+ 
+ /* ---------------------------------------------------------------- stage 2: Bluetooth */
+ 
+-static void
+-wl_gpio_cfg(unsigned pin, unsigned func, unsigned pull, unsigned drive)
++static void wl_rx_stop(void);
++
++/* write, read back, log; true when (readback & mask) == (val & mask) */
++static bool
++wl_wrv(vm_offset_t base, const char *name, uint32_t off, uint32_t val, uint32_t mask)
+ {
+-	uint32_t off = pin * 0x1000u;
+-	uint32_t cfg = wl_rd(wl.tlmm, off);
+-	cfg &= ~0x3ffu;
+-	cfg |= (func << 2) | pull | (drive << 6);     /* output enable: owned by the function */
+-	wl_wr(wl.tlmm, off, cfg);
++	wl_wr(base, off, val);
++	uint32_t rb = wl_rd(base, off);
++	bool ok = ((rb ^ val) & mask) == 0;
++	printf("SWEET WLAN: write %s+%#x <- %#010x, read back %#010x (mask %#x) %s\n", name, off, val,
++	    rb, mask, ok ? "ok" : "MISMATCH");
++	return ok;
+ }
+ 
+ static bool
+@@ -867,47 +922,321 @@
+ 	wl_wr(wl.gcc, GCC_VOTE_WRAP0, now & ~add);
+ }
+ 
+-/* pick DFS level and GENI divider for a baud rate; 0 on failure */
++/* ------------------------------------------------ TLMM: qup6 UART pins */
++
++/* mainline sdm845.dtsi qup_uart6_4pin (what beryllium.dtsi uses); function qup6 = mux 1 */
++static const struct { unsigned pin, pull, drive; const char *role; } wl_uart_pins[] = {
++	{ 45, 1 /* pull-down */, 0 /* 2 mA */, "CTS" },
++	{ 46, 0 /* bias-disable */, 0, "RFR" },
++	{ 47, 0, 0, "TX" },
++	{ 48, 3 /* pull-up */, 0, "RX" },
++};
++#define WL_QUP6_FUNC    1u
++#define TLMM_FUNC_PULL_DRV_MASK 0x1ffu      /* pull [1:0], func [5:2], drive [8:6]; bit 9 (OE) kept */
++
+ static bool
+-wl_baud(unsigned baud)
++wl_pins_uart(void)
+ {
+-	unsigned best_l = 8, best_div = 0;
+-	uint64_t best_err = ~0ull;
+-	if (!(wl_rd(wl.gcc, RCG_S6 + 0x14) & 1)) {
+-		printf("SWEET WLAN: S6 root clock is not in DFS mode: need RCG programming, aborting\n");
+-		return false;
++	bool ok = true;
++	for (unsigned i = 0; i < 4; i++) {
++		uint32_t off = wl_uart_pins[i].pin * 0x1000u;
++		uint32_t cfg = wl_rd(wl.tlmm, off);
++		if (cfg == 0xffffffffu) {
++			printf("SWEET WLAN: TLMM gpio%u reads all ones: stop\n", wl_uart_pins[i].pin);
++			return false;
++		}
++		wl.pin_orig[i] = cfg;
+ 	}
+-	for (unsigned l = 0; l < 8; l++) {
+-		uint64_t hz = wl_dfs_level_hz(l);
+-		uint64_t unit = (uint64_t)baud * UART_OVERSAMPLING;
+-		if (hz < unit) {
+-			continue;
++	wl.pins_saved = true;
++	for (unsigned i = 0; i < 4; i++) {
++		uint32_t off = wl_uart_pins[i].pin * 0x1000u;
++		uint32_t cfg = (wl.pin_orig[i] & ~TLMM_FUNC_PULL_DRV_MASK) | (WL_QUP6_FUNC << 2) |
++		    wl_uart_pins[i].pull | (wl_uart_pins[i].drive << 6);
++		printf("SWEET WLAN: TLMM gpio%u (%s): was %#x -> func %u pull %u drive %u mA\n",
++		    wl_uart_pins[i].pin, wl_uart_pins[i].role, wl.pin_orig[i], WL_QUP6_FUNC,
++		    wl_uart_pins[i].pull, 2 * (wl_uart_pins[i].drive + 1));
++		ok &= wl_wrv(wl.tlmm, "TLMM", off, cfg, TLMM_FUNC_PULL_DRV_MASK);
++	}
++	return ok;
++}
++
++static void
++wl_pins_restore(void)
++{
++	if (!wl.pins_saved) {
++		return;
++	}
++	for (unsigned i = 0; i < 4; i++) {
++		(void)wl_wrv(wl.tlmm, "TLMM(restore)", wl_uart_pins[i].pin * 0x1000u, wl.pin_orig[i],
++		    TLMM_FUNC_PULL_DRV_MASK);
++	}
++	wl.pins_saved = false;
++}
++
++/* ------------------------------------------------ GCC: S6 RCG (non-DFS) */
++
++/* gcc-sdm845.c ftbl_gcc_qupv3_wrap0_s0_clk_src; hid = 2 * div - 1 as the F() macro stores it */
++static const struct wl_rcg_row {
++	uint32_t hz;
++	uint8_t src, hid;
++	uint16_t m, n;
++} wl_ftbl[] = {
++	{ 7372800, P_GPLL0_OUT_EVEN, 1, 384, 15625 },
++	{ 14745600, P_GPLL0_OUT_EVEN, 1, 768, 15625 },
++	{ 19200000, P_BI_TCXO, 1, 0, 0 },
++	{ 29491200, P_GPLL0_OUT_EVEN, 1, 1536, 15625 },
++	{ 32000000, P_GPLL0_OUT_EVEN, 1, 8, 75 },
++	{ 48000000, P_GPLL0_OUT_EVEN, 1, 4, 25 },
++	{ 64000000, P_GPLL0_OUT_EVEN, 1, 16, 75 },
++	{ 80000000, P_GPLL0_OUT_EVEN, 1, 4, 15 },
++	{ 96000000, P_GPLL0_OUT_EVEN, 1, 8, 25 },
++	{ 100000000, P_GPLL0_OUT_EVEN, 5, 0, 0 },
++	{ 102400000, P_GPLL0_OUT_EVEN, 1, 128, 375 },
++	{ 112000000, P_GPLL0_OUT_EVEN, 1, 28, 75 },
++	{ 117964800, P_GPLL0_OUT_EVEN, 1, 6144, 15625 },
++	{ 120000000, P_GPLL0_OUT_EVEN, 4, 0, 0 },
++	{ 128000000, P_GPLL0_OUT_MAIN, 1, 16, 75 },
++};
++#define WL_NFTBL        (sizeof(wl_ftbl) / sizeof(wl_ftbl[0]))
++
++static uint64_t wl_gpll0_main_hz = GPLL0_HZ, wl_gpll0_even_hz = GPLL0_HZ / 2;
++
++/* Hz a row really produces from the measured GPLL0 */
++static uint64_t
++wl_row_hz(const struct wl_rcg_row *r)
++{
++	uint64_t parent = r->src == P_BI_TCXO ? XO_HZ :
++	    r->src == P_GPLL0_OUT_MAIN ? wl_gpll0_main_hz : wl_gpll0_even_hz;
++	uint64_t hz = parent * 2 / (r->hid + 1);
++	if (r->n) {
++		hz = hz * r->m / r->n;
++	}
++	return hz;
++}
++
++/* Read GPLL0 and the even post-divider; the ftbl rates assume 600 / 300 MHz. */
++static bool
++wl_gpll0_check(void)
++{
++	uint32_t mode = wl_rd(wl.gcc, PLL_MODE), l = wl_rd(wl.gcc, PLL_L_VAL);
++	uint32_t user = wl_rd(wl.gcc, PLL_USER_CTL), frac = wl_rd(wl.gcc, PLL_FRAC) & 0xffffu;
++	unsigned pd = (user >> 8) & 0xf;
++	unsigned div = pd == 0 ? 1 : pd == 1 ? 2 : pd == 3 ? 4 : pd == 7 ? 8 : 0;
++	uint64_t main_hz = XO_HZ * (l & 0xffffu) + ((XO_HZ * frac) >> 16);
++	uint64_t even_hz = div ? main_hz / div : 0;
++	unsigned skip = 0;
++
++	printf("SWEET WLAN: GPLL0 mode %#x (lock %u) L %u frac %#x user-ctl %#x vote 0x52000=%#x -> main %llu Hz, "
++	    "even (post-div %u) %llu Hz\n", mode, mode >> 31, l, frac, user, wl_rd(wl.gcc, 0x52000), main_hz,
++	    div, even_hz);
++	(void)PE_parse_boot_argn("sweetwlanskippll", &skip, sizeof(skip));
++	if (!(mode & PLL_LOCK_DET)) {
++		printf("SWEET WLAN: GPLL0 is not locked: the S6 RCG source is dead, stop\n");
++		return false;
++	}
++	bool main_ok = main_hz > GPLL0_HZ - GPLL0_HZ / 1000 && main_hz < GPLL0_HZ + GPLL0_HZ / 1000;
++	bool even_ok = even_hz > GPLL0_HZ / 2 - GPLL0_HZ / 2000 && even_hz < GPLL0_HZ / 2 + GPLL0_HZ / 2000;
++	if (!main_ok || !even_ok) {
++		if (skip) {
++			printf("SWEET WLAN: GPLL0 rates off the expected 600/300 MHz but sweetwlanskippll=1: using the "
++			    "nominal ftbl anyway (baud will be off)\n");
++			return true;
+ 		}
+-		uint64_t div = (hz + unit / 2) / unit;
+-		if (div == 0 || div > 4095) {
++		printf("SWEET WLAN: GPLL0 is not 600 MHz / even 300 MHz (decode of PLL regs may be wrong; "
++		    "sweetwlanskippll=1 overrides): stop\n");
++		return false;
++	}
++	wl_gpll0_main_hz = main_hz;
++	wl_gpll0_even_hz = even_hz;
++	printf("SWEET WLAN: GPLL0 600 MHz / GPLL0_OUT_EVEN 300 MHz confirmed\n");
++	return true;
++}
++
++/* clk-rcg2.c update_config(): set CMD_UPDATE, wait for the hardware to clear it */
++static bool
++wl_rcg_update(void)
++{
++	uint32_t cmd = wl_rd(wl.gcc, RCG_S6 + RCG_CMD);
++	wl_wr(wl.gcc, RCG_S6 + RCG_CMD, cmd | CMD_UPDATE);
++	for (unsigned i = 0; i < 2000; i++) {
++		if (!(wl_rd(wl.gcc, RCG_S6 + RCG_CMD) & CMD_UPDATE)) {
++			printf("SWEET WLAN: RCG CMD %#x -> UPDATE set (wrote %#x), cleared after %u polls, cmd now %#x\n",
++			    cmd, cmd | CMD_UPDATE, i, wl_rd(wl.gcc, RCG_S6 + RCG_CMD));
++			return true;
++		}
++		delay(10);
++	}
++	printf("SWEET WLAN: RCG UPDATE did not clear: cmd %#x\n", wl_rd(wl.gcc, RCG_S6 + RCG_CMD));
++	return false;
++}
++
++/* clk-rcg2.c __clk_rcg2_configure(): M, N, D, then CFG, then UPDATE */
++static bool
++wl_rcg_write(uint32_t m, uint32_t n, uint32_t d, uint32_t cfg_bits, bool with_mnd)
++{
++	uint32_t cfg;
++	bool ok = true;
++	if (with_mnd) {
++		ok &= wl_wrv(wl.gcc, "GCC", RCG_S6 + RCG_M, m & RCG_MND_MASK, RCG_MND_MASK);
++		ok &= wl_wrv(wl.gcc, "GCC", RCG_S6 + RCG_N, n & RCG_MND_MASK, RCG_MND_MASK);
++		ok &= wl_wrv(wl.gcc, "GCC", RCG_S6 + RCG_D, d & RCG_MND_MASK, RCG_MND_MASK);
++	}
++	cfg = (wl_rd(wl.gcc, RCG_S6 + RCG_CFG) & ~RCG_CFG_MASK) | (cfg_bits & RCG_CFG_MASK);
++	ok &= wl_wrv(wl.gcc, "GCC", RCG_S6 + RCG_CFG, cfg, RCG_CFG_MASK);
++	if (!ok) {
++		return false;
++	}
++	return wl_rcg_update();
++}
++
++static bool
++wl_rcg_save(void)
++{
++	if (wl.rcg_saved) {
++		return true;
++	}
++	if (wl_rd(wl.gcc, RCG_S6 + RCG_DFS_ENABLE) & 1) {
++		printf("SWEET WLAN: S6 RCG is in DFS mode (dfs-cmd %#x): the non-DFS path does not apply, stop\n",
++		    wl_rd(wl.gcc, RCG_S6 + RCG_DFS_ENABLE));
++		return false;
++	}
++	wl.rcg_orig[0] = wl_rd(wl.gcc, RCG_S6 + RCG_CFG);
++	wl.rcg_orig[1] = wl_rd(wl.gcc, RCG_S6 + RCG_M);
++	wl.rcg_orig[2] = wl_rd(wl.gcc, RCG_S6 + RCG_N);
++	wl.rcg_orig[3] = wl_rd(wl.gcc, RCG_S6 + RCG_D);
++	wl.rcg_saved = true;
++	printf("SWEET WLAN: S6 RCG saved: cmd %#x cfg %#x m %#x n %#x d %#x\n", wl_rd(wl.gcc, RCG_S6),
++	    wl.rcg_orig[0], wl.rcg_orig[1], wl.rcg_orig[2], wl.rcg_orig[3]);
++	return true;
++}
++
++static void
++wl_rcg_restore(void)
++{
++	if (!wl.rcg_saved) {
++		return;
++	}
++	printf("SWEET WLAN: restoring the original S6 RCG config\n");
++	/* the saved CFG is written verbatim (HW_CLK_CTRL included): mask = all bits */
++	bool ok = wl_wrv(wl.gcc, "GCC(restore)", RCG_S6 + RCG_M, wl.rcg_orig[1], RCG_MND_MASK);
++	ok &= wl_wrv(wl.gcc, "GCC(restore)", RCG_S6 + RCG_N, wl.rcg_orig[2], RCG_MND_MASK);
++	ok &= wl_wrv(wl.gcc, "GCC(restore)", RCG_S6 + RCG_D, wl.rcg_orig[3], RCG_MND_MASK);
++	ok &= wl_wrv(wl.gcc, "GCC(restore)", RCG_S6 + RCG_CFG, wl.rcg_orig[0], RCG_CFG_MASK);
++	ok &= wl_rcg_update();
++	printf("SWEET WLAN: S6 RCG restore %s (cbcr s6 %#x)\n", ok ? "ok" : "FAILED", wl_rd(wl.gcc, CBCR_S6));
++	wl.rcg_saved = false;
++	wl.rcg_row = -1;
++}
++
++/* qcom_geni_serial.c get_clk_cfg(): first ftbl row that divides baud * oversampling exactly */
++static int
++wl_pick_row(unsigned baud, unsigned *div)
++{
++	uint64_t unit = (uint64_t)baud * wl.os;
++	for (unsigned i = 0; i < WL_NFTBL; i++) {
++		uint64_t hz = wl_ftbl[i].hz;
++		if (hz >= unit && hz % unit == 0 && hz / unit <= 4095) {
++			*div = (unsigned)(hz / unit);
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/* log what each baud of interest needs; no register is touched */
++static void
++wl_baud_plan(void)
++{
++	static const unsigned bauds[] = { 2400, 115200, 3000000, WL_BT_OPER_BAUD };
++	for (unsigned i = 0; i < sizeof(bauds) / sizeof(bauds[0]); i++) {
++		unsigned div = 0;
++		int r = wl_pick_row(bauds[i], &div);
++		if (r < 0) {
++			printf("SWEET WLAN: baud plan %u: NO exact ftbl row (oversampling %u)\n", bauds[i], wl.os);
+ 			continue;
+ 		}
+-		uint64_t got = hz / div;
+-		uint64_t err = got > unit ? got - unit : unit - got;
+-		if (err * 1000 < unit * 5 && err < best_err) {      /* < 0.5 % */
+-			best_err = err;
+-			best_l = l;
+-			best_div = (unsigned)div;
+-		}
++		uint64_t hz = wl_row_hz(&wl_ftbl[r]);
++		printf("SWEET WLAN: baud plan %u: ftbl row %d %u Hz (src %u hid %u m %u n %u, measured %llu Hz) / "
++		    "(div %u * os %u) = %llu baud%s\n", bauds[i], r, wl_ftbl[r].hz, wl_ftbl[r].src,
++		    wl_ftbl[r].hid, wl_ftbl[r].m, wl_ftbl[r].n, hz, div, wl.os, hz / ((uint64_t)div * wl.os),
++		    hz == wl_ftbl[r].hz ? " exact" : " (GPLL0 off nominal)");
+ 	}
+-	if (best_l == 8) {
+-		printf("SWEET WLAN: no DFS level of S6 gives %u baud within 0.5 %%\n", baud);
++}
++
++static bool
++wl_rcg_set_row(int r)
++{
++	const struct wl_rcg_row *f = &wl_ftbl[r];
++	uint32_t cfg = ((uint32_t)f->hid & CFG_SRC_DIV_MASK) | ((uint32_t)f->src << CFG_SRC_SEL_SHIFT);
++	if (f->n && f->m != f->n) {
++		cfg |= CFG_MODE_DUAL_EDGE;
++	}
++	/* M = m, N = ~(n - m), D = ~n (16 bit); HW_CLK_CTRL is cleared like Linux does */
++	printf("SWEET WLAN: S6 RCG -> %u Hz: src %u hid %u m %u n %u cfg %#x\n", f->hz, f->src, f->hid, f->m,
++	    f->n, cfg);
++	if (!wl_rcg_write(f->m, f->n ? ~(uint32_t)(f->n - f->m) : 0, f->n ? ~(uint32_t)f->n : 0, cfg, f->n != 0)) {
+ 		return false;
+ 	}
+-	wl_wr(wl.se, SE_CLK_SEL, best_l);
+-	wl_wr(wl.se, SE_M_CLK_CFG, (best_div << 4) | 1u);
+-	wl_wr(wl.se, SE_S_CLK_CFG, (best_div << 4) | 1u);
+-	printf("SWEET WLAN: UART %u baud: DFS level %u (%llu Hz), divider %u\n", baud, best_l,
+-	    wl_dfs_level_hz(best_l), best_div);
++	if (!cbcr_on(CBCR_S6)) {
++		printf("SWEET WLAN: S6 branch went off after the RCG update (cbcr %#x)\n", wl_rd(wl.gcc, CBCR_S6));
++		return false;
++	}
++	printf("SWEET WLAN: S6 RCG now cmd %#x cfg %#x m %#x n %#x d %#x, cbcr s6 %#x\n", wl_rd(wl.gcc, RCG_S6),
++	    wl_rd(wl.gcc, RCG_S6 + RCG_CFG), wl_rd(wl.gcc, RCG_S6 + RCG_M), wl_rd(wl.gcc, RCG_S6 + RCG_N),
++	    wl_rd(wl.gcc, RCG_S6 + RCG_D), wl_rd(wl.gcc, CBCR_S6));
+ 	return true;
+ }
+ 
++/* program the RCG row and GENI divider for a baud rate (qcom_geni_serial_set_termios) */
++static bool
++wl_baud(unsigned baud)
++{
++	unsigned div = 0;
++	int r = wl_pick_row(baud, &div);
++	if (r < 0) {
++		printf("SWEET WLAN: no exact S6 rate for %u baud (oversampling %u)\n", baud, wl.os);
++		return false;
++	}
++	wl_rx_stop();
++	if (!wl.se_saved) {
++		wl.se_orig[0] = wl_rd(wl.se, SE_M_CLK_CFG);
++		wl.se_orig[1] = wl_rd(wl.se, SE_S_CLK_CFG);
++		wl.se_orig[2] = wl_rd(wl.se, SE_CLK_SEL);
++		wl.se_saved = true;
++		printf("SWEET WLAN: SE6 clock regs saved: m_clk_cfg %#x s_clk_cfg %#x clk_sel %#x\n",
++		    wl.se_orig[0], wl.se_orig[1], wl.se_orig[2]);
++	}
++	if (wl.rcg_row != r) {
++		if (!wl_rcg_set_row(r)) {
++			return false;
++		}
++		wl.rcg_row = r;
++	}
++	uint32_t ser = (div << 4) | 1u;               /* CLK_DIV [15:4], SER_CLK_EN */
++	bool ok = wl_wrv(wl.se, "SE6", SE_CLK_SEL, 0, 0x7);   /* DFS off: level is unused */
++	ok &= wl_wrv(wl.se, "SE6", SE_M_CLK_CFG, ser, 0xfff1u);
++	ok &= wl_wrv(wl.se, "SE6", SE_S_CLK_CFG, ser, 0xfff1u);
++	if (!ok) {
++		return false;
++	}
++	printf("SWEET WLAN: UART %u baud: S6 root %llu Hz (ftbl row %d), GENI divider %u, oversampling %u\n",
++	    baud, wl_row_hz(&wl_ftbl[r]), r, div, wl.os);
++	return true;
++}
++
+ static void
++wl_se_clk_restore(void)
++{
++	if (!wl.se_saved) {
++		return;
++	}
++	(void)wl_wrv(wl.se, "SE6(restore)", SE_M_CLK_CFG, wl.se_orig[0], 0xfff1u);
++	(void)wl_wrv(wl.se, "SE6(restore)", SE_S_CLK_CFG, wl.se_orig[1], 0xfff1u);
++	(void)wl_wrv(wl.se, "SE6(restore)", SE_CLK_SEL, wl.se_orig[2], 0x7);
++	wl.se_saved = false;
++}
++
++static void
+ wl_flow(bool hw)
+ {
+ 	uint32_t v = wl_rd(wl.se, SE_UART_TX_TRANS_CFG);
+@@ -945,6 +1274,17 @@
+ 		printf("SWEET WLAN: SE6 busy (status %#x): stop\n", wl_rd(wl.se, SE_STATUS));
+ 		return false;
+ 	}
++	/* qcom_geni_serial.c: sampling rate is halved for QUP hardware >= 2.5 */
++	wl.os = UART_OVERSAMPLING;
++	if (wl.wrap) {
++		uint32_t ver = wl_rd(wl.wrap, QUP_HW_VER_REG);
++		if (ver != 0 && ver != 0xffffffffu && ver >= QUP_SE_VERSION_2_5) {
++			wl.os = UART_OVERSAMPLING / 2;
++		}
++		printf("SWEET WLAN: QUP wrapper0 HW version %#x -> UART oversampling %u\n", ver, wl.os);
++	} else {
++		printf("SWEET WLAN: QUP wrapper0 not mapped: assuming UART oversampling %u\n", wl.os);
++	}
+ 	wl.tx_depth = (wl_rd(wl.se, SE_HW_PARAM_0) >> 16) & 0x3f;
+ 	wl.rx_depth = (wl_rd(wl.se, SE_HW_PARAM_1) >> 16) & 0x3f;
+ 	if (wl.tx_depth < 8 || wl.rx_depth < 8) {
+@@ -962,7 +1302,9 @@
+ 	wl_wr(wl.se, SE_S_IRQ_CLEAR, 0xffffffffu);
+ 	wl_wr(wl.se, SE_DMA_TX_IRQ_CLR, 0xffffffffu);
+ 	wl_wr(wl.se, SE_DMA_RX_IRQ_CLR, 0xffffffffu);
+-	wl_wr(wl.se, SE_IRQ_EN, wl_rd(wl.se, SE_IRQ_EN) | 0xfu);
++	/* geni_se_io_set_mode(): M/S GENI interrupts on, DMA TX/RX off (FIFO mode) */
++	wl_wr(wl.se, SE_IRQ_EN, (wl_rd(wl.se, SE_IRQ_EN) | GENI_M_IRQ_EN | GENI_S_IRQ_EN) &
++	    ~(DMA_TX_IRQ_EN | DMA_RX_IRQ_EN));
+ 	wl_wr(wl.se, SE_DMA_MODE_EN, wl_rd(wl.se, SE_DMA_MODE_EN) & ~1u);
+ 	wl_packing();
+ 	wl_wr(wl.se, SE_RX_WM, 2);
+@@ -1008,7 +1350,18 @@
+ static void
+ wl_rx_poll(void)
+ {
++	/* qcom_geni_serial_isr(): ack RX events; a completed S command (stale/last) is re-armed */
++	uint32_t irq = wl_rd(wl.se, SE_S_IRQ_STATUS);
+ 	uint32_t st = wl_rd(wl.se, SE_RX_FIFO_STATUS);
++	if (irq & (S_CMD_DONE | S_RX_FIFO_RD_ERR | S_RX_FIFO_WR_ERR | S_RX_FIFO_WATERMARK | S_RX_FIFO_LAST)) {
++		if (irq & (S_RX_FIFO_RD_ERR | S_RX_FIFO_WR_ERR)) {
++			printf("SWEET WLAN: UART RX FIFO error (s_irq %#x)\n", irq);
++		}
++		wl_wr(wl.se, SE_S_IRQ_CLEAR, irq);
++		if ((irq & S_CMD_DONE) && !(wl_rd(wl.se, SE_STATUS) & (1u << 12))) {
++			wl_wr(wl.se, SE_S_CMD0, UART_START_READ << 27);
++		}
++	}
+ 	uint32_t words = st & 0x1ffffffu;
+ 	if (!words) {
+ 		return;
+@@ -1157,35 +1510,39 @@
+ 	unsigned rlen = 0, n = 0;
+ 	int err;
+ 
++	wl.rcg_row = -1;
+ 	if (!wl_clocks_on()) {
+ 		return;
+ 	}
++	if (!wl_gpll0_check() || !wl_rcg_save()) {
++		goto out_clocks;
++	}
+ 	/* pins first (Linux order: pinctrl default state, then the UART probes) */
+-	wl_gpio_cfg(45, 1, 1 /* pull-down */, 0);
+-	wl_gpio_cfg(46, 1, 0, 0);
+-	wl_gpio_cfg(47, 1, 0, 0);
+-	wl_gpio_cfg(48, 1, 3 /* pull-up */, 0);
++	if (!wl_pins_uart()) {
++		printf("SWEET WLAN: UART pin mux did not read back: stop\n");
++		goto out_restore;
++	}
+ 	wl_dump_gpio();
+ 	if (!wl_uart_open()) {
+-		goto out_clocks;
++		goto out_restore;
+ 	}
++	wl_baud_plan();
+ 	for (n = 0; n < sizeof(wl_bt_rails) / sizeof(wl_bt_rails[0]); n++) {
+ 		err = sweet_rpmh_vreg_set(wl_bt_rails[n].res, wl_bt_rails[n].mv, true);
+ 		printf("SWEET WLAN: rail %s %u mV -> %d\n", wl_bt_rails[n].res, wl_bt_rails[n].mv, err);
+ 		if (err) {
+-			goto out_rails;
++			goto out_restore;
+ 		}
+ 		wl_sleep(2);
+ 	}
+ 	wl_sleep(10);
+ 	/* qca_regulator_init(): 2400 baud power-off pulse, then 115200 baud power-on pulse */
+ 	if (!wl_baud(2400)) {
+-		goto out_rails;
++		goto out_restore;
+ 	}
+-	wl_rx_start();
+ 	wl_power_pulse(false, 2400);
+ 	if (!wl_baud(115200)) {
+-		goto out_rails;
++		goto out_restore;
+ 	}
+ 	wl_power_pulse(true, 115200);
+ 	wl_flow(true);
+@@ -1214,34 +1571,25 @@
+ 			wl_print_hex("QCA patch version (product/patch/rom/soc follow the 0x19 header)", rsp, rlen);
+ 		}
+ 	}
+-	/* hci_qca qca_power_off(): 2400 baud power-off pulse, rails off */
++	/* hci_qca qca_power_off(): 2400 baud power-off pulse (the rails are NOT voted off, see below) */
+ 	wl_rx_stop();
+ 	if (wl_baud(2400)) {
+ 		wl_power_pulse(false, 2400);
+ 	}
+-out_rails:
+-	{
+-		/*
+-		 * Leave the rails on by default. An APPS-DRV RPMh "off" vote also
+-		 * drops any "on" vote ABL placed through this DRV: boot 0116hw
+-		 * panicked right after voting ldoa7 (1.8 V) off, so something else
+-		 * on the board needs it. sweetwlankeep=0 turns them off (unsafe).
+-		 */
+-		unsigned keep = 1;
+-		(void)PE_parse_boot_argn("sweetwlankeep", &keep, sizeof(keep));
+-		if (!keep) {
+-			for (unsigned i = n >= sizeof(wl_bt_rails) / sizeof(wl_bt_rails[0]) ?
+-			    (unsigned)(sizeof(wl_bt_rails) / sizeof(wl_bt_rails[0])) : n; i-- > 0;) {
+-				err = sweet_rpmh_vreg_set(wl_bt_rails[i].res, wl_bt_rails[i].mv, false);
+-				printf("SWEET WLAN: rail %s off -> %d\n", wl_bt_rails[i].res, err);
+-				wl_sleep(2);
+-			}
+-		} else {
+-			printf("SWEET WLAN: sweetwlankeep=1: rails left on\n");
+-		}
+-	}
+-out_clocks:
++out_restore:
++	/*
++	 * The rails are never voted off by this stage. An APPS-DRV RPMh "off" vote also
++	 * drops any "on" vote ABL placed through this DRV: boot 0116hw panicked right
++	 * after voting ldoa7 (1.8 V) off, so something else on the board needs it
++	 * (0117 made keep=1 the default; 0118 removes the off path and sweetwlankeep).
++	 */
++	printf("SWEET WLAN: rails left on (%u of %u voted by this stage)\n", n,
++	    (unsigned)(sizeof(wl_bt_rails) / sizeof(wl_bt_rails[0])));
+ 	wl_rx_stop();
++	wl_se_clk_restore();
++	wl_rcg_restore();
++	wl_pins_restore();
++out_clocks:
+ 	wl_clocks_off();
+ 	printf("SWEET WLAN: bluetooth stage done\n");
+ }

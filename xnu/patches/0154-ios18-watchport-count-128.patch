@@ -1,0 +1,16 @@
+--- a/osfmk/mach/mach_param.h
++++ b/osfmk/mach/mach_param.h
+@@ -71,7 +71,12 @@
+ #define TASK_PORT_REGISTER_MAX  3
+ 
+ /* Number of watchport for task */
+-#define TASK_MAX_WATCHPORT_COUNT 32
++/*
++ * xnu-11215 (iOS 18) allows 128: iOS 18 launchd passes every MachService of a job as an
++ * importance watchport, and SpringBoard has more than 32, so posix_spawn failed with EINVAL
++ * (kern_exec.c PSPA_IMP_WATCHPORTS) and SpringBoard and several xpcproxy jobs never started.
++ */
++#define TASK_MAX_WATCHPORT_COUNT 128
+ 
+ /* Number of different task port flavor */
+ #define TASK_SELF_PORT_COUNT 4

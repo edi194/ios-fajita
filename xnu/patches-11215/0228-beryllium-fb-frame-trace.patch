@@ -1,0 +1,165 @@
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -114,6 +114,33 @@
+     CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_fb_shot_sysctl, "S",
+     "Poco F1 screenshot of the scanned frame: 16-byte header + BGRA (see bsd/dev/sweet_fb.c)");
+ 
++/*
++ * sysctl kern.sweet_fb_trace (patch 0228): the last 128 swaps, one line each: when backboardd's swap arrived, was handed to the
++ * MDP, latched, was released as done, and when SwapWait was first called for it and returned. Microseconds from the oldest swap.
++ */
++size_t sweet_fb_trace_text(char *buf, size_t cap);
++
++static int sweet_fb_trace_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	const size_t cap = 16384;
++	if (req->oldptr == USER_ADDR_NULL) {
++		return SYSCTL_OUT(req, NULL, cap);
++	}
++	char *buf = kalloc_data(cap, Z_WAITOK | Z_ZERO);
++	if (buf == NULL) {
++		return ENOMEM;
++	}
++	size_t n = sweet_fb_trace_text(buf, cap - 1);
++	int err = SYSCTL_OUT(req, buf, n + 1);
++	kfree_data(buf, cap);
++	return err;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_fb_trace,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_fb_trace_sysctl, "A",
++    "Poco F1 per-frame display trace: last 128 swaps (see bsd/dev/sweet_fb.c)");
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_fb_sysctl, "A",
+     "Poco F1 display path statistics, key=value string (see bsd/dev/sweet_fb.c)");
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -48,6 +48,61 @@
+ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sweet_smmu.c, read only */
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ extern "C" int sweet_fb_hud;                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
++
++/*
++ * 0228: per-frame trace for frame pacing (sysctl kern.sweet_fb_trace). One record per swap id (ring of 128, index id & 127):
++ * when backboardd's swap arrived, when it was handed to the MDP (address + flush), when its latch was first seen, when it was
++ * released as done (SwapWait answers 0 from then on), and the first SwapWait call for it and that call's return. Times are
++ * mach absolute; written with relaxed stores from the swap path, the work loop and SwapWait, read racily by the sysctl.
++ */
++struct sweet_fb_trace_rec {
++	uint32_t id;
++	uint64_t swap, scan, latch, done, wcall, wret;
++};
++#define SWEET_FB_TRACE_N 128
++static uint64_t sweet_abs_us(uint64_t abs);
++static struct sweet_fb_trace_rec sweet_fb_trace[SWEET_FB_TRACE_N];
++static inline struct sweet_fb_trace_rec *
++sweet_fb_trace_of(uint32_t id)
++{
++	struct sweet_fb_trace_rec *r = &sweet_fb_trace[id & (SWEET_FB_TRACE_N - 1)];
++	return r->id == id ? r : NULL;
++}
++extern "C" size_t sweet_fb_trace_text(char *buf, size_t cap);
++size_t
++sweet_fb_trace_text(char *buf, size_t cap)
++{
++	uint64_t base = UINT64_MAX;
++	for (uint32_t i = 0; i < SWEET_FB_TRACE_N; i++) {
++		if (sweet_fb_trace[i].swap != 0 && sweet_fb_trace[i].swap < base) {
++			base = sweet_fb_trace[i].swap;
++		}
++	}
++	size_t n = (size_t)snprintf(buf, cap, "id swap_us scan_us latch_us done_us wcall_us wret_us (0 = not seen; relative to the oldest swap)\n");
++	if (base == UINT64_MAX) {
++		return n;
++	}
++	/* oldest first: walk the ring by swap time */
++	uint64_t last = 0;
++	for (uint32_t k = 0; k < SWEET_FB_TRACE_N && n < cap; k++) {
++		const struct sweet_fb_trace_rec *best = NULL;
++		for (uint32_t i = 0; i < SWEET_FB_TRACE_N; i++) {
++			const struct sweet_fb_trace_rec *r = &sweet_fb_trace[i];
++			if (r->swap != 0 && r->swap > last && (best == NULL || r->swap < best->swap)) {
++				best = r;
++			}
++		}
++		if (best == NULL) {
++			break;
++		}
++		last = best->swap;
++#define REL(t) ((t) ? sweet_abs_us((t) - base) : 0ull)
++		n += (size_t)snprintf(buf + n, cap - n, "%u %llu %llu %llu %llu %llu %llu\n", best->id, REL(best->swap), REL(best->scan),
++		    REL(best->latch), REL(best->done), REL(best->wcall), REL(best->wret));
++#undef REL
++	}
++	return n < cap ? n : cap;
++}
+ class AppleCLCD;
+ static AppleCLCD *sweet_fb_shot_fb;             /* the framebuffer kern.sweet_fb_shot reads (patch 0224) */
+ extern "C" unsigned char iso_font[256 * 16];    /* osfmk/console/iso_font.c: the 8x16 console font */
+@@ -255,6 +310,7 @@
+ 	uint64_t      fPhaseAbs;        /* a latch (vsync) as observed by SwapWait, abs time; 0 = none yet */
+ 	uint64_t      fPeriodAbs;       /* vsync period, abs units */
+ 	IOReturn      swapWait(uint32_t id);
++	IOReturn      swapWaitInner(uint32_t id);
+ 	bool          swapReady(uint32_t id);
+ 	/*
+ 	 * Display path statistics (patch 0210, sysctl kern.sweet_fb). Totals since
+@@ -1052,6 +1108,12 @@
+ 	IOLockLock(fLock);
+ 	fSt.swaps++;
+ 	__atomic_store_n(&fSwapNewest, get32(rec, 0x50), __ATOMIC_RELEASE);
++	{
++		struct sweet_fb_trace_rec *tr = &sweet_fb_trace[get32(rec, 0x50) & (SWEET_FB_TRACE_N - 1)];
++		bzero(tr, sizeof(*tr));
++		tr->id = get32(rec, 0x50);
++		tr->swap = mach_absolute_time();
++	}
+ 	if (fDirty) {
+ 		fSt.coalesced++;        /* the previous swap never reached the panel */
+ 	}
+@@ -1542,6 +1604,9 @@
+ 	}
+ 	fLatchSeenAbs = 0;      /* a new frame is queued: the release guard starts over at its latch */
+ 	__atomic_store_n(&fSwapScanID, fCurSwapID, __ATOMIC_RELEASE);   /* before the flush: a poller that sees it clear sees this id */
++	if (struct sweet_fb_trace_rec *tr = sweet_fb_trace_of(fCurSwapID)) {
++		tr->scan = mach_absolute_time();
++	}
+ 	__asm__ volatile ("dsb sy" ::: "memory");      /* WC writes of the frame land first */
+ 	p[SSPP_SRC0_ADDR / 4] = pa;
+ 	p[SSPP_YSTRIDE0 / 4] = stride;
+@@ -1721,6 +1786,10 @@
+ 	uint32_t scanned = __atomic_load_n(&fSwapScanID, __ATOMIC_ACQUIRE);
+ 	if ((int32_t)(scanned - fSwapDone) > 0) {
+ 		__atomic_store_n(&fSwapDone, scanned, __ATOMIC_RELEASE);
++		if (struct sweet_fb_trace_rec *tr = sweet_fb_trace_of(scanned)) {
++			tr->done = mach_absolute_time();
++			tr->latch = fLatchSeenAbs ? fLatchSeenAbs : tr->done;
++		}
+ 	}
+ }
+ 
+@@ -1781,6 +1850,20 @@
+ 
+ IOReturn
+ AppleCLCD::swapWait(uint32_t id)
++{
++	struct sweet_fb_trace_rec *tr = sweet_fb_trace_of(id);
++	if (tr != NULL && tr->wcall == 0) {
++		tr->wcall = mach_absolute_time();
++	}
++	IOReturn r = swapWaitInner(id);
++	if (tr != NULL && tr->wret == 0 && r == kIOReturnSuccess && tr->id == id) {
++		tr->wret = mach_absolute_time();
++	}
++	return r;
++}
++
++IOReturn
++AppleCLCD::swapWaitInner(uint32_t id)
+ {
+ 	if (!fSwapSync || !fEarly || fPowerOff || id == 0 || fSwapTimer == NULL) {
+ 		return kIOReturnSuccess;

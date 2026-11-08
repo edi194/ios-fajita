@@ -1,0 +1,706 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 050ff12..0170a21 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_reboot.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
++bsd/dev/sweet_charger.c			standard
+ bsd/dev/sweet_smmu.c			standard
+ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
+diff --git a/bsd/dev/sweet_charger.c b/bsd/dev/sweet_charger.c
+new file mode 100644
+index 0000000..3065edd
+--- /dev/null
++++ b/bsd/dev/sweet_charger.c
+@@ -0,0 +1,668 @@
++/*
++ * Poco F1 (SDM845) charger: PMI8998 SMB2 block on SPMI SID 2 (pmi8998.dtsi:
++ * charger@1000, "qcom,pmi8998-charger"; the block is the one of Linux
++ * drivers/power/supply/qcom_smbx.c and of the downstream qcom smb2 driver,
++ * drivers/power/supply/qcom/{smb-reg.h,smb-lib.c,qpnp-smb2.c}).
++ *
++ *   sweetcharger=0   off
++ *   sweetcharger=1   READ ONLY (default): a thread polls the charger every 30 s,
++ *                    prints one "SWEET CHARGER:" line and keeps it in the sysctl
++ *                    kern.sweet_charger (string, "sweet_charger v1 key=value ...").
++ *   sweetcharger=2   control, conservative: every 3 s, after APSD finished and
++ *                    nothing is hot/cold/faulted, sets
++ *                      DCP 2000 mA, CDP 1500 mA, HVDCP (QC2/QC3 result) 1500 mA
++ *                      USBIN input current limit; SDP / float / OCP: untouched,
++ *                      the hardware limit stays (500 mA USB 2 / 900 mA USB 3);
++ *                      FCC (fast charge current) 2000 mA (the beryllium DTS has
++ *                      no constant-charge-current-max: 2000 mA = 0.5 C of 4000 mAh);
++ *                      float voltage <= 4395 mV (voltage-max-design 4.4 V of the
++ *                      DTS; an unset or higher value is written, a lower one is
++ *                      left alone); charging enabled, USBIN not suspended.
++ *                    Hot / cold / soft-limit / battery-OV / safety-timer bits,
++ *                    unplug, a different APSD result: the registers this file
++ *                    changed go back (never above what they were or what we set).
++ *                    No QC / HVDCP 9 V negotiation, no JEITA or termination
++ *                    changes, no watchdog, no type-C role: SWEET SPMI only lets the
++ *                    seven registers of sweet_spmi.c sp_write_allowed through.
++ *   sweetcharger_icl=<mA>  lowers the ICL ceiling (100..2000), e.g. 1500 = mainline
++ *   sweetcharger_fcc=<mA>  lowers the FCC (500..2000), e.g. 1000 = mainline
++ *
++ * Registers (offsets from the 0x1000 base; SID 2, so SPMI address = 0x1000 + off):
++ *   CHGR   0x1006 STATUS_1 [2:0] state (0 trickle 1 pre 2 fast 3 fullon 4 taper
++ *                 5 terminate 6 inhibit 7 disabled), [5:3] step, [6] CC soft term
++ *          0x1007 STATUS_2 [7] input limited [6] safety timer expired [5] bat OV
++ *                 [4] termination missing [3] hot soft [2] cold soft [1] too hot [0] too cold
++ *          0x100A STATUS_4 charge current after JEITA, 25 mA/LSB
++ *          0x100D STATUS_7 [3] too cold [2] too hot [1] hot soft [0] cold soft (ADC)
++ *          0x1042 CHARGING_ENABLE_CMD [0]   0x1051 CHGR_CFG2 (log only)
++ *          0x1061 FAST_CHARGE_CURRENT_CFG, 25 mA/LSB
++ *          0x1070 FLOAT_VOLTAGE_CFG, 3487.5 mV + 7.5 mV * value (downstream
++ *                 qpnp-smb2.c v1_params fv: min 3487500 max 4400000 step 7500;
++ *                 qcom_smbx.c writes (uV - 3487500) / 7500 + 1 = 122 = 4402.5 mV,
++ *                 2.5 mV over 4.4 V: this file uses 121 = 4395 mV)
++ *          0x1090 JEITA_EN_CFG (log only)
++ *   USBIN  0x1306 INPUT_STATUS (5 V / 9 V / 12 V bands)  0x1307 APSD_STATUS [0] done
++ *          0x1308 APSD_RESULT [6] QC3 [5] QC2 [4] float [3] DCP [2] CDP [1] OCP [0] SDP
++ *          0x130B TYPE_C_STATUS_1   0x130E TYPE_C_STATUS_4 (log only)
++ *          0x1310 INT_RT_STS [4] USBIN plugged in
++ *          0x1340 USBIN_CMD_IL [0] suspend   0x1362 USBIN_OPTIONS_1 [2] HVDCP_EN (log only)
++ *          0x1365 USBIN_LOAD_CFG [4] ICL_OVERRIDE_AFTER_APSD
++ *          0x1366 USBIN_ICL_OPTIONS [0] USBIN_MODE_CHG (1: USBIN_CURRENT_LIMIT_CFG is used)
++ *          0x1370 USBIN_CURRENT_LIMIT_CFG, 25 mA/LSB   0x1380 AICL options [2] AICL_EN
++ *   MISC   0x1607 ICL_STATUS (the limit in force, 25 mA/LSB)  0x160A AICL_STATUS
++ *          0x160B POWER_PATH_STATUS [6] USBIN suspended [4] using USBIN
++ *   RRADC  0x459A USB_IN_I_STS, 0x459C/D USB_IN_I (10 bit, 1.886 * 2.5 A / 1024)
++ *          0x4592 USB_IN_V_STS, 0x4594/5 USB_IN_V (10 bit, 8 * 2.5 V / 1024; the
++ *          hardware only converts it when someone triggers it, so often n/a here)
++ * The ICL sequence is the one of downstream smblib_set_icl_current(): current,
++ * USBIN_MODE_CHG, ICL_OVERRIDE_AFTER_APSD, then un-suspend.
++ *
++ * sysctl kern.sweet_charger, stable format "v1", one line, space separated
++ * key=value words (n/a or -1 = not readable); see sc_format.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <pexpert/pexpert.h>
++#include <stdarg.h>
++#include "sweet_board.h"
++#include "sweet_spmi.h"
++
++extern kern_return_t thread_terminate(thread_t);
++void sweet_charger_start(void);
++
++#define SC_SID                  2u
++#define SC_START_DELAY_S        20u
++#define SC_RO_PERIOD_MS         30000u
++#define SC_CTL_PERIOD_MS        3000u
++#define SC_LOG_PERIOD_MS        30000u
++
++/* limits (mA); the DTS gives voltage-max-design 4.4 V only */
++#define SC_ICL_DCP_MA           2000u
++#define SC_ICL_CDP_MA           1500u
++#define SC_ICL_HVDCP_MA         1500u
++#define SC_ICL_NO_AICL_MA       1500u   /* AICL off: no automatic back-off from a weak adapter */
++#define SC_FCC_MA               2000u
++#define SC_FV_RAW_MAX           121u    /* 3487.5 mV + 121 * 7.5 mV = 4395 mV <= 4400 mV */
++#define SC_STEP_MA              25u
++
++#define R_STATUS1               0x1006u
++#define R_STATUS2               0x1007u
++#define R_STATUS4               0x100au
++#define R_STATUS7               0x100du
++#define R_CHG_EN                0x1042u
++#define R_CHGR_CFG2             0x1051u
++#define R_FCC                   0x1061u
++#define R_FV                    0x1070u
++#define R_JEITA_EN              0x1090u
++#define R_USBIN_STATUS          0x1306u
++#define R_APSD_STATUS           0x1307u
++#define R_APSD_RESULT           0x1308u
++#define R_TYPEC1                0x130bu
++#define R_TYPEC4                0x130eu
++#define R_RT_STS                0x1310u
++#define R_CMD_IL                0x1340u
++#define R_OPTIONS1              0x1362u
++#define R_LOAD_CFG              0x1365u
++#define R_ICL_OPTIONS           0x1366u
++#define R_ICL_CFG               0x1370u
++#define R_AICL_OPTIONS          0x1380u
++#define R_ICL_STATUS            0x1607u
++#define R_AICL_STATUS           0x160au
++#define R_PPATH                 0x160bu
++#define R_RR_V_STS              0x4592u
++#define R_RR_V_LSB              0x4594u
++#define R_RR_I_STS              0x459au
++#define R_RR_I_LSB              0x459cu
++
++#define APSD_QC3                0x40u
++#define APSD_QC2                0x20u
++#define APSD_FLOAT              0x10u
++#define APSD_DCP                0x08u
++#define APSD_CDP                0x04u
++#define APSD_OCP                0x02u
++#define APSD_SDP                0x01u
++
++struct sc_snap {
++	bool core_ok;                   /* every register the control needs was read */
++	bool ok[32];                    /* per register (order of sc_regs) */
++	uint8_t st1, st2, st4, st7, chg_en, cfg2, fcc, fv, jeita;
++	uint8_t usbin, apsd_st, apsd_res, typec1, typec4, rt_sts, cmd_il, opt1, load, icl_opt, icl_cfg, aicl_opt;
++	uint8_t icl_stat, aicl_stat, ppath;
++	bool rr_i_ok, rr_v_ok;
++	unsigned rr_i_ma, rr_v_mv;
++};
++
++static const struct { unsigned addr; unsigned off; bool core; } sc_regs[] = {
++#define SC_REG(name, field, core) { name, __builtin_offsetof(struct sc_snap, field), core }
++	SC_REG(R_STATUS1, st1, true), SC_REG(R_STATUS2, st2, true), SC_REG(R_STATUS4, st4, false),
++	SC_REG(R_STATUS7, st7, true), SC_REG(R_CHG_EN, chg_en, true), SC_REG(R_CHGR_CFG2, cfg2, false),
++	SC_REG(R_FCC, fcc, true), SC_REG(R_FV, fv, true), SC_REG(R_JEITA_EN, jeita, false),
++	SC_REG(R_USBIN_STATUS, usbin, false), SC_REG(R_APSD_STATUS, apsd_st, true),
++	SC_REG(R_APSD_RESULT, apsd_res, true), SC_REG(R_TYPEC1, typec1, false),
++	SC_REG(R_TYPEC4, typec4, false), SC_REG(R_RT_STS, rt_sts, true), SC_REG(R_CMD_IL, cmd_il, true),
++	SC_REG(R_OPTIONS1, opt1, false), SC_REG(R_LOAD_CFG, load, true), SC_REG(R_ICL_OPTIONS, icl_opt, true),
++	SC_REG(R_ICL_CFG, icl_cfg, true), SC_REG(R_AICL_OPTIONS, aicl_opt, true),
++	SC_REG(R_ICL_STATUS, icl_stat, false), SC_REG(R_AICL_STATUS, aicl_stat, false),
++	SC_REG(R_PPATH, ppath, false),
++#undef SC_REG
++};
++#define SC_NREGS (sizeof(sc_regs) / sizeof(sc_regs[0]))
++
++static int sc_mode;                     /* 0 off, 1 read only, 2 control */
++static unsigned sc_icl_cap_ma = SC_ICL_DCP_MA;
++static unsigned sc_fcc_ma = SC_FCC_MA;
++static bool sc_started;
++
++/* what the control did and may undo */
++static struct {
++	bool failed;                    /* gave up writing (refused / not taking effect) */
++	bool saved;
++	uint8_t o_icl, o_opt, o_load, o_fcc;    /* registers before our first write */
++	bool applied;
++	uint8_t applied_res;
++	uint8_t applied_icl_raw, applied_fcc_raw;
++	bool last_plug;
++	uint8_t last_res;
++	unsigned stable, safe, bad;
++	unsigned writes, write_fails, applies, restores;
++	bool event;
++	const char *why;                /* last decision, for the log */
++} cs;
++
++/* double-buffered text for the sysctl; the thread is the only writer */
++static char sc_text[2][1024];
++static volatile unsigned sc_cur;
++
++static void
++sc_sleep_ms(unsigned ms)
++{
++	static int chan;
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static size_t
++sc_cat(char *buf, size_t size, size_t n, const char *fmt, ...) __printflike(4, 5);
++static size_t
++sc_cat(char *buf, size_t size, size_t n, const char *fmt, ...)
++{
++	va_list ap;
++	if (n >= size) {
++		return n;
++	}
++	va_start(ap, fmt);
++	int r = vsnprintf(buf + n, size - n, fmt, ap);
++	va_end(ap);
++	return r < 0 ? n : (n + (size_t)r >= size ? size - 1 : n + (size_t)r);
++}
++
++static bool
++sc_rd(unsigned addr, uint8_t *out)
++{
++	return sweet_spmi_read(SC_SID, addr, out) == 0;
++}
++
++static void
++sc_read_all(struct sc_snap *s)
++{
++	bzero(s, sizeof(*s));
++	s->core_ok = true;
++	for (unsigned i = 0; i < SC_NREGS; i++) {
++		s->ok[i] = sc_rd(sc_regs[i].addr, (uint8_t *)s + sc_regs[i].off);
++		if (!s->ok[i] && sc_regs[i].core) {
++			s->core_ok = false;
++		}
++	}
++	/* RRADC USBIN current / voltage: only meaningful while the status says a conversion exists */
++	uint8_t sts, lo, hi;
++	if (sc_rd(R_RR_I_STS, &sts) && (sts & 3u) && sc_rd(R_RR_I_LSB, &lo) && sc_rd(R_RR_I_LSB + 1, &hi)) {
++		unsigned raw = ((unsigned)lo | ((unsigned)hi << 8)) & 0x3ffu;
++		s->rr_i_ok = true;
++		s->rr_i_ma = raw * 4715u / 1024u;       /* 1.886 * 2.5 A / 2^10 per LSB */
++	}
++	if (sc_rd(R_RR_V_STS, &sts) && (sts & 3u) && sc_rd(R_RR_V_LSB, &lo) && sc_rd(R_RR_V_LSB + 1, &hi)) {
++		unsigned raw = ((unsigned)lo | ((unsigned)hi << 8)) & 0x3ffu;
++		s->rr_v_ok = true;
++		s->rr_v_mv = raw * 20000u / 1024u;      /* 8 * 2.5 V / 2^10 per LSB */
++	}
++}
++
++static bool
++sc_have(const struct sc_snap *s, unsigned addr)
++{
++	for (unsigned i = 0; i < SC_NREGS; i++) {
++		if (sc_regs[i].addr == addr) {
++			return s->ok[i];
++		}
++	}
++	return false;
++}
++
++static const char *
++sc_apsd_name(uint8_t res)
++{
++	res &= 0x7fu;
++	return (res & APSD_QC3) ? "QC3" : (res & APSD_QC2) ? "QC2" : (res & APSD_DCP) ? "DCP" :
++	       (res & APSD_CDP) ? "CDP" : (res & APSD_FLOAT) ? "FLOAT" : (res & APSD_OCP) ? "OCP" :
++	       (res & APSD_SDP) ? "SDP" : "NONE";
++}
++
++static const char *
++sc_state_name(uint8_t st1)
++{
++	static const char *const names[8] = { "TRICKLE", "PRE", "FAST", "FULLON", "TAPER", "TERMINATE", "INHIBIT", "DISABLED" };
++	return names[st1 & 7u];
++}
++
++static const char *
++sc_temp_name(const struct sc_snap *s)
++{
++	if (s->st2 & 0x02u) {
++		return "hot";
++	}
++	if (s->st2 & 0x01u) {
++		return "cold";
++	}
++	if (s->st2 & 0x08u) {
++		return "warm";
++	}
++	if (s->st2 & 0x04u) {
++		return "cool";
++	}
++	if (s->st7 & 0x0fu) {
++		return "adc";
++	}
++	return "ok";
++}
++
++/* hot / cold / soft limit / battery OV / safety timer: no raising, give back what we changed */
++static bool
++sc_unsafe(const struct sc_snap *s)
++{
++	return (s->st2 & 0x6fu) != 0 || (s->st7 & 0x0fu) != 0;
++}
++
++/* input current limit (mA) for an APSD result; 0 = leave the hardware alone */
++static unsigned
++sc_icl_for(uint8_t res)
++{
++	res &= 0x7fu;
++	if (res & (APSD_QC3 | APSD_QC2)) {
++		return SC_ICL_HVDCP_MA;
++	}
++	if (res & APSD_DCP) {
++		return SC_ICL_DCP_MA;
++	}
++	if (res & APSD_CDP) {
++		return SC_ICL_CDP_MA;
++	}
++	return 0;
++}
++
++/* numeric keys: -1 = register not readable */
++#define NA_U(s, addr, expr) (sc_have((s), (addr)) ? (int)(expr) : -1)
++
++static size_t
++sc_cat_hex(char *buf, size_t size, size_t n, const char *key, bool have, uint8_t v)
++{
++	if (have) {
++		return sc_cat(buf, size, n, " %s=0x%02x", key, v);
++	}
++	return sc_cat(buf, size, n, " %s=n/a", key);
++}
++
++static size_t
++sc_format(char *buf, size_t size, const struct sc_snap *s)
++{
++	static const char *const ctl_names[] = { "off", "ro", "idle", "applied", "hold", "failed" };
++	size_t n = 0;
++	unsigned ctl = sc_mode == 2 ? (cs.failed ? 5 : cs.applied ? 3 : (cs.safe == 0 && s->core_ok && sc_unsafe(s)) ? 4 : 2) :
++	    sc_mode == 1 ? 1 : 0;
++	clock_sec_t sec = 0;
++	clock_nsec_t nsec = 0;
++	clock_get_system_nanotime(&sec, &nsec);
++
++	n = sc_cat(buf, size, n, "mode=%d ctl=%s up_s=%u", sc_mode, ctl_names[ctl], (unsigned)sec);
++	if (!s->core_ok) {
++		n = sc_cat(buf, size, n, " spmi=partial");
++	}
++	n = sc_cat(buf, size, n, " plug=%d", sc_have(s, R_RT_STS) ? !!(s->rt_sts & 0x10u) : -1);
++	if (sc_have(s, R_APSD_RESULT)) {
++		n = sc_cat(buf, size, n, " apsd=%s apsd_raw=0x%02x", sc_apsd_name(s->apsd_res), s->apsd_res);
++	} else {
++		n = sc_cat(buf, size, n, " apsd=n/a apsd_raw=n/a");
++	}
++	n = sc_cat(buf, size, n, " apsd_done=%d", NA_U(s, R_APSD_STATUS, s->apsd_st & 1u));
++	if (sc_have(s, R_USBIN_STATUS)) {
++		n = sc_cat(buf, size, n, " usbin_band=%s", (s->usbin & 0x20u) ? "12v" : (s->usbin & 0x18u) ? "9v" :
++		    (s->usbin & 0x01u) ? "5v" : "other");
++	} else {
++		n = sc_cat(buf, size, n, " usbin_band=n/a");
++	}
++	if (s->rr_v_ok) {
++		n = sc_cat(buf, size, n, " usbin_mv=%u", s->rr_v_mv);
++	} else {
++		n = sc_cat(buf, size, n, " usbin_mv=n/a");
++	}
++	if (s->rr_i_ok) {
++		n = sc_cat(buf, size, n, " usbin_ma=%u", s->rr_i_ma);
++	} else {
++		n = sc_cat(buf, size, n, " usbin_ma=n/a");
++	}
++	n = sc_cat(buf, size, n, " icl_cfg_ma=%d icl_now_ma=%d fcc_ma=%d fcc_jeita_ma=%d",
++	    NA_U(s, R_ICL_CFG, s->icl_cfg * SC_STEP_MA), NA_U(s, R_ICL_STATUS, s->icl_stat * SC_STEP_MA),
++	    NA_U(s, R_FCC, s->fcc * SC_STEP_MA), NA_U(s, R_STATUS4, s->st4 * SC_STEP_MA));
++	if (sc_have(s, R_FV)) {
++		n = sc_cat(buf, size, n, " fv_uv=%u fv_raw=%u", 3487500u + 7500u * s->fv, s->fv);
++	} else {
++		n = sc_cat(buf, size, n, " fv_uv=n/a fv_raw=n/a");
++	}
++	if (sc_have(s, R_STATUS1)) {
++		n = sc_cat(buf, size, n, " state=%s step=%u", sc_state_name(s->st1), (s->st1 >> 3) & 7u);
++	} else {
++		n = sc_cat(buf, size, n, " state=n/a step=n/a");
++	}
++	n = sc_cat(buf, size, n, " chg_en=%d usb_susp=%d icl_mode=%d icl_override=%d aicl=%d hvdcp_en=%d",
++	    NA_U(s, R_CHG_EN, s->chg_en & 1u), NA_U(s, R_CMD_IL, s->cmd_il & 1u),
++	    NA_U(s, R_ICL_OPTIONS, s->icl_opt & 1u), NA_U(s, R_LOAD_CFG, !!(s->load & 0x10u)),
++	    NA_U(s, R_AICL_OPTIONS, !!(s->aicl_opt & 4u)), NA_U(s, R_OPTIONS1, !!(s->opt1 & 4u)));
++	n = sc_cat(buf, size, n, " temp=%s", s->core_ok || sc_have(s, R_STATUS2) ? sc_temp_name(s) : "n/a");
++	n = sc_cat_hex(buf, size, n, "st1", sc_have(s, R_STATUS1), s->st1);
++	n = sc_cat_hex(buf, size, n, "st2", sc_have(s, R_STATUS2), s->st2);
++	n = sc_cat_hex(buf, size, n, "st7", sc_have(s, R_STATUS7), s->st7);
++	n = sc_cat_hex(buf, size, n, "ppath", sc_have(s, R_PPATH), s->ppath);
++	n = sc_cat_hex(buf, size, n, "typec1", sc_have(s, R_TYPEC1), s->typec1);
++	n = sc_cat_hex(buf, size, n, "typec4", sc_have(s, R_TYPEC4), s->typec4);
++	n = sc_cat_hex(buf, size, n, "jeita_en", sc_have(s, R_JEITA_EN), s->jeita);
++	n = sc_cat_hex(buf, size, n, "aicl_st", sc_have(s, R_AICL_STATUS), s->aicl_stat);
++	if (sc_mode == 2) {
++		n = sc_cat(buf, size, n, " applied=%s", cs.applied ? sc_apsd_name(cs.applied_res) : "none");
++		n = sc_cat(buf, size, n, " cap_icl_ma=%u cap_fcc_ma=%u writes=%u write_fails=%u applies=%u restores=%u why=%s",
++		    sc_icl_cap_ma, sc_fcc_ma, cs.writes, cs.write_fails, cs.applies, cs.restores,
++		    cs.why ? cs.why : "-");
++	}
++	return n;
++}
++
++static void
++sc_publish(const struct sc_snap *s)
++{
++	unsigned next = sc_cur ^ 1u;
++	char *buf = sc_text[next];
++	size_t n = sc_cat(buf, sizeof(sc_text[next]), 0, "sweet_charger v1 ");
++	(void)sc_format(buf + n, sizeof(sc_text[next]) - n, s);
++	size_t len = strlen(buf);
++	if (len + 2 < sizeof(sc_text[next])) {
++		buf[len] = '\n';
++		buf[len + 1] = 0;
++	}
++	__atomic_store_n(&sc_cur, next, __ATOMIC_RELEASE);
++}
++
++static void
++sc_log(const struct sc_snap *s, const char *tag)
++{
++	char line[1024];
++	(void)sc_format(line, sizeof(line), s);
++	printf("SWEET CHARGER: %s%s%s\n", tag ? tag : "", tag ? " " : "", line);
++}
++
++static int sc_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[sizeof(sc_text[0])];
++	unsigned cur = __atomic_load_n(&sc_cur, __ATOMIC_ACQUIRE);
++	if (sc_mode == 0 || !sc_started || sc_text[cur][0] == 0) {
++		snprintf(buf, sizeof(buf), "sweet_charger v1 mode=%s\n", sc_mode == 0 ? "off" : "starting");
++	} else {
++		memcpy(buf, sc_text[cur], sizeof(buf));
++		buf[sizeof(buf) - 1] = 0;
++	}
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_charger,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sc_sysctl, "A",
++    "Poco F1 PMI8998 charger state, key=value string (see bsd/dev/sweet_charger.c)");
++
++/* ------------------------------------------------------------------ control */
++
++static int
++sc_set(unsigned addr, uint8_t *cache, uint8_t want)
++{
++	if (*cache == want) {
++		return 0;
++	}
++	cs.writes++;
++	if (sweet_spmi_write(SC_SID, addr, &want, 1) != 0) {
++		cs.write_fails++;
++		return -1;
++	}
++	*cache = want;
++	return 1;
++}
++
++/* Put back what we changed: never above the original, never above what we set. */
++static void
++sc_restore(struct sc_snap *s, const char *why)
++{
++	if (!cs.applied || !cs.saved) {
++		cs.applied = false;
++		return;
++	}
++	uint8_t icl = cs.o_icl < cs.applied_icl_raw ? cs.o_icl : cs.applied_icl_raw;
++	uint8_t fcc = cs.o_fcc < cs.applied_fcc_raw ? cs.o_fcc : cs.applied_fcc_raw;
++	/* lower the current first, then give the override bits back */
++	(void)sc_set(R_ICL_CFG, &s->icl_cfg, icl);
++	(void)sc_set(R_FCC, &s->fcc, fcc);
++	(void)sc_set(R_ICL_OPTIONS, &s->icl_opt, (uint8_t)((s->icl_opt & ~1u) | (cs.o_opt & 1u)));
++	(void)sc_set(R_LOAD_CFG, &s->load, (uint8_t)((s->load & ~0x10u) | (cs.o_load & 0x10u)));
++	cs.applied = false;
++	cs.restores++;
++	cs.event = true;
++	cs.why = why;
++	printf("SWEET CHARGER: restored ICL cfg %u mA, FCC %u mA, ICL options 0x%02x, load cfg 0x%02x (%s)\n",
++	    icl * SC_STEP_MA, fcc * SC_STEP_MA, s->icl_opt, s->load, why);
++}
++
++/* returns the number of registers written (or -1 when a write failed) */
++static int
++sc_control(struct sc_snap *s)
++{
++	if (!s->core_ok) {
++		cs.why = "spmi-read-failed";
++		return 0;
++	}
++	bool plug = (s->rt_sts & 0x10u) != 0;
++	uint8_t res = s->apsd_res & 0x7fu;
++	bool done = (s->apsd_st & 1u) != 0;
++
++	if (plug != cs.last_plug || res != cs.last_res || !done) {
++		cs.stable = 0;
++		if (plug != cs.last_plug || res != cs.last_res) {
++			cs.event = true;
++		}
++	} else if (cs.stable < 255u) {
++		cs.stable++;
++	}
++	cs.last_plug = plug;
++	cs.last_res = res;
++
++	if (!plug) {
++		cs.safe = 0;
++		sc_restore(s, "unplug");
++		cs.why = "unplugged";
++		cs.bad = 0;
++		return 0;
++	}
++	if (sc_unsafe(s)) {
++		cs.safe = 0;
++		sc_restore(s, "temperature-or-fault");
++		cs.why = "hold-temp-or-fault";
++		return 0;
++	}
++	if (cs.safe < 255u) {
++		cs.safe++;
++	}
++	if (cs.applied && cs.applied_res != res) {
++		sc_restore(s, "apsd-changed");
++	}
++	if (cs.stable < 1 || cs.safe < 3) {
++		cs.why = "settling";
++		return 0;
++	}
++
++	unsigned icl = sc_icl_for(res);
++	if (icl > sc_icl_cap_ma) {
++		icl = sc_icl_cap_ma;
++	}
++	if (icl && !(s->aicl_opt & 4u) && icl > SC_ICL_NO_AICL_MA) {
++		icl = SC_ICL_NO_AICL_MA;
++	}
++	unsigned fcc = sc_fcc_ma;
++	int wrote = 0, r;
++	uint8_t o_icl = s->icl_cfg, o_opt = s->icl_opt, o_load = s->load, o_fcc = s->fcc;
++	bool fail = false;
++
++#define STEP(x) do { r = (x); if (r < 0) { fail = true; } else { wrote += r; } } while (0)
++	if (!cs.saved && (icl || fcc)) {
++		cs.o_icl = o_icl;
++		cs.o_opt = o_opt;
++		cs.o_load = o_load;
++		cs.o_fcc = o_fcc;
++		cs.saved = true;
++	}
++	if (icl) {
++		uint8_t raw = (uint8_t)(icl / SC_STEP_MA);
++		STEP(sc_set(R_ICL_CFG, &s->icl_cfg, raw));
++		STEP(sc_set(R_ICL_OPTIONS, &s->icl_opt, (uint8_t)(s->icl_opt | 1u)));
++		STEP(sc_set(R_LOAD_CFG, &s->load, (uint8_t)(s->load | 0x10u)));
++		cs.applied_icl_raw = raw;
++		cs.why = "icl";
++	} else {
++		/* SDP / float / OCP / none: the hardware limit stays; give back anything left from before */
++		sc_restore(s, "apsd-no-limit");
++		cs.why = "leave-hw-icl";
++	}
++	if (!fail) {
++		uint8_t raw = (uint8_t)(fcc / SC_STEP_MA);
++		STEP(sc_set(R_FCC, &s->fcc, raw));
++		cs.applied_fcc_raw = raw;
++	}
++	if (!fail && (s->fv == 0 || s->fv > SC_FV_RAW_MAX)) {
++		STEP(sc_set(R_FV, &s->fv, (uint8_t)SC_FV_RAW_MAX));
++	}
++	if (!fail && !(s->chg_en & 1u)) {
++		STEP(sc_set(R_CHG_EN, &s->chg_en, (uint8_t)(s->chg_en | 1u)));
++	}
++	if (!fail && (s->cmd_il & 1u)) {
++		STEP(sc_set(R_CMD_IL, &s->cmd_il, (uint8_t)(s->cmd_il & ~1u)));
++	}
++#undef STEP
++	if (fail) {
++		return -1;
++	}
++	if (wrote) {
++		cs.event = true;
++		if (icl && !cs.applied) {
++			cs.applies++;
++		}
++	}
++	if (icl) {
++		cs.applied = true;
++		cs.applied_res = res;
++	}
++	return wrote;
++}
++
++static void
++sc_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	struct sc_snap s;
++	unsigned period = sc_mode == 2 ? SC_CTL_PERIOD_MS : SC_RO_PERIOD_MS;
++	unsigned since_log = SC_LOG_PERIOD_MS;
++
++	sc_sleep_ms(SC_START_DELAY_S * 1000u);
++	if (sweet_spmi_init() != 0) {
++		printf("SWEET CHARGER: SPMI unavailable, charger not read\n");
++		sc_started = false;
++		thread_terminate(current_thread());
++		return;
++	}
++	if (sc_mode == 2) {
++		sweet_spmi_charger_writes();
++	}
++	for (;;) {
++		sc_read_all(&s);
++		int wrote = 0;
++		if (sc_mode == 2 && !cs.failed) {
++			wrote = sc_control(&s);
++			/* writes needed on 5 ticks in a row: the hardware does not keep them */
++			cs.bad = wrote != 0 ? cs.bad + 1 : 0;
++			if (wrote > 0) {
++				sc_read_all(&s);        /* what the registers say now */
++			}
++			if (cs.bad >= 5u || cs.write_fails >= 6u) {
++				cs.failed = true;
++				cs.event = true;
++				cs.why = cs.write_fails >= 6u ? "write-refused" : "not-taking-effect";
++				printf("SWEET CHARGER: control stopped (%s); registers left as they are\n", cs.why);
++				sc_restore(&s, cs.why);
++			}
++		}
++		sc_started = true;
++		sc_publish(&s);
++		since_log += period;
++		if (cs.event || since_log >= SC_LOG_PERIOD_MS) {
++			sc_log(&s, cs.event ? "event" : NULL);
++			cs.event = false;
++			since_log = 0;
++		}
++		sc_sleep_ms(period);
++	}
++}
++
++void
++sweet_charger_start(void)
++{
++	thread_t thread;
++	int mode = 1;
++
++	if (!sweet_board_beryllium()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweetcharger", &mode, sizeof(mode));
++	if (mode < 0 || mode > 2) {
++		printf("SWEET CHARGER: unknown sweetcharger=%d, using 1 (read only)\n", mode);
++		mode = 1;
++	}
++	if (mode == 0) {
++		printf("SWEET CHARGER: off (sweetcharger=0)\n");
++		return;
++	}
++	int v = 0;
++	if (PE_parse_boot_argn("sweetcharger_icl", &v, sizeof(v)) && v >= 100 && v < (int)SC_ICL_DCP_MA) {
++		sc_icl_cap_ma = (unsigned)v;
++	}
++	if (PE_parse_boot_argn("sweetcharger_fcc", &v, sizeof(v)) && v >= 500 && v < (int)SC_FCC_MA) {
++		sc_fcc_ma = (unsigned)v;
++	}
++	sc_mode = mode;
++	if (kernel_thread_start((thread_continue_t)sc_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("SWEET CHARGER: %s, first sample in %u s (ICL cap %u mA, FCC %u mA, float <= %u uV)\n",
++		    mode == 2 ? "control (sweetcharger=2)" : "read only (sweetcharger=1)", SC_START_DELAY_S,
++		    sc_icl_cap_ma, sc_fcc_ma, 3487500u + 7500u * SC_FV_RAW_MAX);
++	} else {
++		sc_mode = 0;
++		printf("SWEET CHARGER: kernel_thread_start failed\n");
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 554451e..c79b7d4 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -59,6 +59,7 @@ extern void sweet_touch_init(void);
+ extern void beryllium_wlan_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
++extern void sweet_charger_start(void);
+ extern void sweet_a630_probe(void);
+ 
+ #define REG_CAP         0x00
+@@ -852,6 +853,7 @@ sweet_ufs_init(void)
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_cpufreq_max();
++	sweet_charger_start();
+ 	sweet_keys_init();
+ 	sweet_reboot_init();	/* beryllium: PS_HOLD reset + reboot reason, SWEET REBOOT: */
+ 	sweet_touch_init();

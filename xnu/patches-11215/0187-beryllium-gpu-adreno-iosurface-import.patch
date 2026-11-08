@@ -1,0 +1,168 @@
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -756,13 +756,47 @@
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
+-	if (s->memory == NULL || s->wrapped) {
++	if (s->memory == NULL) {
+ 		s->release();
+-		return kIOReturnUnsupported;       /* wrapped client memory is pageable: never entered into the GPU */
++		return kIOReturnUnsupported;
+ 	}
++	/*
++	 * Client-memory (wrapped) surfaces: the memory is another task's, wired by IOMemoryDescriptor::prepare() for as long
++	 * as the SweetSurface lives (sweet_surface_use_task_memory); this BO holds a reference to the surface, so the pages
++	 * stay wired until GEM_CLOSE / connection close, whichever the owner does. The pixels start `wrapDelta` bytes into the
++	 * first page. Such pages are entered READ-ONLY into the GPU: if the owner dies its address space is torn down and
++	 * wired pages are freed, and a GPU that could still write them would corrupt whatever the page becomes. The CPU maps
++	 * them cacheable: BO_SYNC (or SBO_IN_SYNC) after CPU writes.
++	 */
++	const bool wrapped = s->wrapped;
+ 	uint64_t size = round_page_64(s->memory->getLength());
+ 	r->size = size;
+-	r->offset = s->offset;
++	r->offset = s->offset + (wrapped ? s->wrapDelta : 0);
++	r->tiling = 0;
++	r->ubwc = 0;
++	{
++		uint32_t f = 0;
++		if (wrapped) {
++			f |= SWEET_GPU_SBO_READONLY | SWEET_GPU_SBO_CPU_CACHEABLE | SWEET_GPU_SBO_WRAPPED;
++		} else if (s->pooled && sweet_lowpool_cacheable()) {
++			f |= SWEET_GPU_SBO_CPU_CACHEABLE;
++		}
++		r->flags = (r->flags & SWEET_GPU_SBO_IN_SYNC) | f;      /* keep the input bit for below */
++	}
++	bzero(r->plane, sizeof(r->plane));
++	if (s->planeCount == 0) {
++		r->plane[0].offset = r->offset;
++		r->plane[0].stride = s->bytesPerRow;
++		r->plane[0].width = s->width;
++		r->plane[0].height = s->height;
++	} else {
++		for (uint32_t i = 0; i < s->planeCount && i < 3; i++) {
++			r->plane[i].offset = s->planes[i].offset + (wrapped ? s->wrapDelta : 0);
++			r->plane[i].stride = s->planes[i].bytesPerRow;
++			r->plane[i].width = s->planes[i].width;
++			r->plane[i].height = s->planes[i].height;
++		}
++	}
+ 	r->bytes_per_row = s->bytesPerRow;
+ 	r->width = s->width;
+ 	r->height = s->height;
+@@ -783,6 +817,21 @@
+ 	if (!sweet_gpu_ready()) {
+ 		ret = kIOReturnNotReady;
+ 	} else {
++		/* Idempotent: the same surface in the same connection is the same BO (one mapping per surface, not per frame). */
++		for (uint32_t i = 0; i < GEM_MAX; i++) {
++			if (fGems[i].md != NULL && fGems[i].surface == s) {
++				r->handle = i + 1;
++				r->iova = fGems[i].iova;
++				r->flags |= SWEET_GPU_SBO_EXISTING;
++				if ((r->flags & SWEET_GPU_SBO_IN_SYNC) && fGems[i].kva != NULL) {
++					sweet_gpu_cache_sync(fGems[i].kva, (size_t)fGems[i].size);
++				}
++				r->flags &= ~(uint32_t)SWEET_GPU_SBO_IN_SYNC;
++				sweet_gpu_unlock();
++				s->release();
++				return kIOReturnSuccess;
++			}
++		}
+ 		for (uint32_t n = 0; n < GEM_MAX; n++) {
+ 			uint32_t i = (fNextGem + n) % GEM_MAX;
+ 			if (fGems[i].md == NULL) {
+@@ -791,15 +840,20 @@
+ 				s->memory->retain();
+ 				g->md = s->memory;
+ 				g->surface = s;         /* our reference moves into the slot on success */
+-				g->kva = (uint8_t *)s->kernelAddress();
++				uintptr_t ka = s->kernelAddress();      /* of the first pixel (+wrapDelta): the BO starts at the page */
++				g->kva = ka != 0 ? (uint8_t *)(ka - (wrapped ? s->wrapDelta : 0)) : NULL;
+ 				g->size = size;
+-				ret = mapGem(g, 0, &r->handle, 0);
++				ret = mapGem(g, wrapped ? SWEET_MSM_BO_GPU_READONLY : 0, &r->handle, 0);
+ 				if (ret != kIOReturnSuccess) {
+ 					g->md->release();
+ 					bzero(g, sizeof(*g));
+ 				} else {
+ 					fNextGem = i + 1;
+ 					r->iova = g->iova;
++					if ((r->flags & SWEET_GPU_SBO_IN_SYNC) && g->kva != NULL) {
++						sweet_gpu_cache_sync(g->kva, (size_t)g->size);
++					}
++					r->flags &= ~(uint32_t)SWEET_GPU_SBO_IN_SYNC;
+ 					s = NULL;
+ 				}
+ 				break;
+@@ -1002,14 +1056,17 @@
+ 		r.info.va_start = sweet_gpu_param(SWEET_MSM_PARAM_VA_START, &v) ? v : 0;
+ 		r.info.va_size = sweet_gpu_param(SWEET_MSM_PARAM_VA_SIZE, &v) ? v : 0;
+ 		r.info.last_fence = sweet_gpu_ready() ? sweet_gpu_fence_last() : 0;
++		r.info.abi_minor = 1;
+ 		sweet_gpu_unlock();
+ 		outLen = sizeof(r.info);
+ 		break;
+ 	}
+ 	case SWEET_GPU_SEL_SURFACE_BO:
+-		NEED(struct sweet_gpu_surface_bo);
++		if (in < SWEET_GPU_SURFACE_BO_V1_SIZE) {
++			return kIOReturnBadArgument;
++		}
+ 		ret = surfaceBo(&r.surface);
+-		outLen = sizeof(r.surface);
++		outLen = args->structureOutputSize >= sizeof(r.surface) ? (uint32_t)sizeof(r.surface) : SWEET_GPU_SURFACE_BO_V1_SIZE;
+ 		break;
+ 	case SWEET_GPU_SEL_DEBUG:
+ 		sweet_gpu_lock();
+diff --git a/iokit/Kernel/arm/SweetAdrenoABI.h b/iokit/Kernel/arm/SweetAdrenoABI.h
+--- a/iokit/Kernel/arm/SweetAdrenoABI.h
++++ b/iokit/Kernel/arm/SweetAdrenoABI.h
+@@ -166,16 +166,30 @@
+ 	uint64_t va_start;      /* GPU address range the kernel places BOs in */
+ 	uint64_t va_size;
+ 	uint32_t last_fence;    /* last submitted sequence number */
+-	uint32_t reserved;
++	uint32_t abi_minor;     /* 1: SURFACE_BO accepts client-memory surfaces (read-only mappings), is idempotent, returns planes */
+ };
+ 
+ /* IOSurface memory as a BO: the pages of the surface (pixels from byte 0 of its memory) are entered into the
+  * GPU address space. On input handle = SWEET_GPU_DESCRIBE_ONLY asks only for the geometry (no BO is made). */
+ #define SWEET_GPU_DESCRIBE_ONLY         0xffffffffu
++/* Minor 1 (INFO.abi_minor >= 1) added everything after `planes`; a caller may pass/accept only the first
++ * SWEET_GPU_SURFACE_BO_V1_SIZE bytes (minor 0 layout). */
++#define SWEET_GPU_SURFACE_BO_V1_SIZE    48
++#define SWEET_GPU_SBO_IN_SYNC           0x1     /* in flags: clean+invalidate the CPU alias of the whole BO before returning */
++#define SWEET_GPU_SBO_READONLY          0x1     /* out flags: GPU mapping is read-only (client-memory surface) */
++#define SWEET_GPU_SBO_CPU_CACHEABLE     0x2     /* out: the CPU maps it cacheable: BO_SYNC after CPU writes / before CPU reads */
++#define SWEET_GPU_SBO_WRAPPED           0x4     /* out: the surface is client (another process') memory, pinned */
++#define SWEET_GPU_SBO_EXISTING          0x8     /* out: this surface already had a BO for this connection: same handle returned */
++struct sweet_gpu_surface_plane {
++	uint32_t offset;        /* byte offset of the plane in the BO (includes the client-memory start delta) */
++	uint32_t stride;        /* bytes per row of the plane */
++	uint32_t width;
++	uint32_t height;
++};
+ struct sweet_gpu_surface_bo {
+ 	uint32_t surface_id;    /* in: IOSurfaceGetID() */
+ 	uint32_t handle;        /* in: DESCRIBE_ONLY or 0; out: BO handle (0 when describing) */
+-	uint64_t size;          /* out: bytes mapped (whole pages) */
++	uint64_t size;          /* out: bytes mapped (whole 4 KiB pages) */
+ 	uint64_t iova;          /* out: GPU address of byte 0 of the surface memory (0 when describing) */
+ 	uint32_t offset;        /* out: byte offset of pixel (0,0) in the BO */
+ 	uint32_t bytes_per_row;
+@@ -183,6 +197,12 @@
+ 	uint32_t height;
+ 	uint32_t pixel_format;
+ 	uint32_t planes;
++	/* ---- minor 1 ---- */
++	uint32_t flags;         /* in: SWEET_GPU_SBO_IN_*; out: SWEET_GPU_SBO_* */
++	uint32_t tiling;        /* out: 0 = linear (IOSurfaces here are never tiled) */
++	uint32_t ubwc;          /* out: 0 = no UBWC (IOSurfaces here are never compressed) */
++	uint32_t reserved;
++	struct sweet_gpu_surface_plane plane[3];        /* out: first three planes (planes == 0: plane 0 describes the surface) */
+ };
+ 
+ struct sweet_gpu_bo_sync {

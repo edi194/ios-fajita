@@ -1,0 +1,24 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -559,6 +559,12 @@
+ 		return;
+ 	}
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerCollection, TRUE);
++	/*
++	 * Display-integrated on the event itself, as Apple's multitouch stack marks its touches (the service property alone
++	 * was enough for iOS 18). iOS 26: backboardd's event system takes our events (hidutil: EventCount grows, no drops)
++	 * but no touch reaches the screen.
++	 */
++	collection->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+ 
+ 	UInt32 cmask = 0;
+ 	for (int i = 0; i < SWEET_TOUCH_FINGERS; i++) {
+@@ -589,6 +595,7 @@
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerIdentity, i + 2);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerTouch, d);
+ 		child->setIntegerValue(kIOHIDEventFieldDigitizerEventMask, mask);
++		child->setIntegerValue(kIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+ 		collection->appendChild(child);
+ 		child->release();
+ 		cmask |= mask;

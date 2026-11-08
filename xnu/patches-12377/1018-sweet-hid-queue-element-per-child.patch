@@ -1,0 +1,69 @@
+From: Bergamota
+Subject: [PATCH] sweet: queued events carry one queue element per child (iOS 26 / IOHIDFamily 2238 format)
+
+---
+--- a/iokit/Kernel/arm/hid/IOHIDEvent.cpp
++++ b/iokit/Kernel/arm/hid/IOHIDEvent.cpp
+@@ -1653,7 +1653,12 @@
+ 
+         for(i=0 ;i<childCount; i++) {
+             if ( (child = (IOHIDEvent *)_children->getObject(i)) ) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++                /* iOS 26 queue format: every event, child included, carries its own queue element (readBytes) */
++                length += child->getLength(count);
++#else
+                 length += child->getLength(count) - sizeof(IOHIDSystemQueueElement);
++#endif
+             }
+         }
+     }
+@@ -1829,7 +1834,49 @@
+     //bytes += sizeof(IOHIDSystemQueueElement);
+     withLength -= sizeof(IOHIDSystemQueueElement);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++    /*
++     * iOS 26 (IOHIDFamily 2238) reads a queued event as a run of IOHIDSystemQueueElement + event data pairs: the
++     * parent first, then one element per child (depth = parent + 1), with the parent's eventCount the total. Our
++     * single element followed by packed children reached backboardd as a hand with no fingers (boot 26 bbhook trace:
++     * no ChildEvents), so the touch code dropped every event. One level of children, which is all a digitizer
++     * collection has.
++     */
++    {
++        IOByteCount size = SWEET_WIRE_SIZE(_data);
++        UInt32 count = 1;
++
++        if ( size > withLength )
++            return 0;
++        SWEET_WIRE_WRITE(_data, queueElement->payload);
++        queueElement->payload[12] = 0;      /* depth */
++
++        if ( _children ) {
++            UInt32 childCount = _children->getCount();
++            for ( UInt32 i = 0; i < childCount; i++ ) {
++                IOHIDEvent * child = (IOHIDEvent *)_children->getObject(i);
++                if ( !child )
++                    continue;
++                IOByteCount csize = SWEET_WIRE_SIZE(child->_data);
++                if ( size + sizeof(IOHIDSystemQueueElement) + csize > withLength )
++                    break;
++                IOHIDSystemQueueElement * ce = (IOHIDSystemQueueElement *)(queueElement->payload + size);
++                ce->timeStamp       = child->_timeStamp;
++                ce->options         = child->_options;
++                ce->senderID        = child->_senderID ? child->_senderID : _senderID;
++                ce->attributeLength = 0;
++                ce->eventCount      = ++count;
++                SWEET_WIRE_WRITE(child->_data, ce->payload);
++                ce->payload[12] = 1;            /* depth */
++                size += sizeof(IOHIDSystemQueueElement) + csize;
++            }
++        }
++        queueElement->eventCount = count;
++        return size;
++    }
++#else
+     return appendBytes((UInt8 *)queueElement->payload, withLength);
++#endif
+ }
+ 
+ OSData *IOHIDEvent::createBytes()

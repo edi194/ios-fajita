@@ -1,0 +1,63 @@
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+index 315c0ec37243967622bd15a804c597b599b92e4d..4a2c43a9b2b7fafc47bba02160a984aaf47f76c9 100644
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -242,12 +242,10 @@ s8_get(struct sweet80211_req *req)
+ 	case IOC_LOCALE:
+ 		return s8_reply_u32(req, LOCALE_ETSI);
+ 	case IOC_COUNTRY_CODE: {
+-		struct {
+-			uint32_t version;
+-			char     cc[3];
+-		} __attribute__((packed)) d = { 1, { 0 } };
+-		memcpy(d.cc, s8.country_set ? s8.country : "BR", 2);
+-		return s8_reply(req, &d, sizeof(d));
++		/* boot 23: wifid asks with len 3, i.e. the bare char[3], no version word */
++		char cc[3] = { 0 };
++		memcpy(cc, s8.country_set ? s8.country : "BR", 2);
++		return s8_reply(req, cc, sizeof(cc));
+ 	}
+ 	case IOC_SUPPORTED_CHANNELS: {
+ 		static const uint8_t ch5[] = {
+@@ -324,10 +322,11 @@ s8_set(struct sweet80211_req *req)
+ 		return 0;
+ 	}
+ 	case IOC_COUNTRY_CODE: {
++		/* bare char[3] like the get (len 3); a versioned 7-byte form has the code at offset 4 */
+ 		uint8_t d[7] = { 0 };
+-		if (req->data != 0 && req->len >= 6 &&
++		if (req->data != 0 && req->len >= 2 &&
+ 		    copyin((user_addr_t)req->data, d, MIN(req->len, (uint32_t)sizeof(d))) == 0) {
+-			memcpy(s8.country, d + 4, 2);
++			memcpy(s8.country, req->len >= 6 ? d + 4 : d, 2);
+ 			s8.country_set = 1;
+ 		}
+ 		return 0;
+@@ -337,7 +336,12 @@ s8_set(struct sweet80211_req *req)
+ 	case IOC_ASSOCIATE:
+ 		return ENXIO;                                   /* nothing to join with a null backend */
+ 	default:
+-		return EOPNOTSUPP;
++		/*
++		 * boot 23: after power-on wifid pushes ~15 optional settings (battery powersave,
++		 * system state, BT coexistence, Wi-Fi calling, NAN, ...). Accept and ignore them;
++		 * the log line still records each type once.
++		 */
++		return 0;
+ 	}
+ }
+ 
+@@ -371,6 +375,13 @@ sweet80211_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
+ 		ifmr->ifm_count = 1;
+ 		return 0;
+ 	}
++	case SIOCGIFDEVMTU: {
++		struct ifreq *ifr = (struct ifreq *)data;
++		ifr->ifr_devmtu.ifdm_current = ETHERMTU;
++		ifr->ifr_devmtu.ifdm_min = ETHERMIN;
++		ifr->ifr_devmtu.ifdm_max = ETHERMTU;
++		return 0;
++	}
+ 	case SIOCSIFADDR:
+ 	case SIOCAIFADDR:
+ 		ifnet_set_flags(ifp, IFF_UP, IFF_UP);

@@ -1,0 +1,77 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index 51a75a012091c230a8938a3e069d2abff33348ea..2b5ffc6b052317ebc2cf7ca379cd8561abe66e3d 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -987,6 +987,8 @@ static const char *const ms_arc_res[3] = { "cx.lvl", "mx.lvl", "mss.lvl" };
+  * Boot 32: the console stopped right after the stage-4 banner (USB console and persistent log are
+  * buffered, so the stop may be a few steps later). Every step now logs, flushes the persistent log
+  * and waits 1.5 s for the USB console; sweetmssstep=N stops after step N (then tears down).
++ * Steps: 1 map, 2 read mba.mbn, 3 copy MBA, 4 QMP, 5 ARC votes, 6 clocks + alt reset, 7 SCM assign,
++ * 8 QDSP6 boot.
+  */
+ static int ms_step_max = 99;
+ 
+@@ -1403,14 +1405,33 @@ wl_mss(void)
+ 	}
+ 	printf("SWEET MSS: mba.mbn %u bytes read from the modem partition\n", mba_len);
+ 
++	/*
++	 * Boot 34 froze in this copy when it ran after the MSS clocks and the alt reset deassert. Linux
++	 * copies the MBA in q6v5_load(), i.e. before q6v5_start() powers anything; do the same.
++	 */
++	if (!ms_step(3, "copy MBA into its carve-out (before any MSS power: Linux q6v5_load order)")) {
++		goto out;
++	}
++	vm_offset_t mba_va = ml_io_map_wcomb(MSS_MBA_PA, MSS_MBA_SIZE);
++	if (!mba_va) {
++		printf("SWEET MSS: MBA carve-out mapping failed\n");
++		goto out;
++	}
++	memcpy((void *)mba_va, mba, mba_len);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	ml_io_unmap(mba_va, MSS_MBA_SIZE);      /* no kernel mapping may exist once the Q6 owns it */
++	mba_va = 0;
++	printf("SWEET MSS: MBA copied to %#llx (%u bytes)\n", MSS_MBA_PA, mba_len);
++	sweet_log_sync();
++
+ 	/* qcom_q6v5_prepare(): AOSS load_state, then the proxy power domains */
+-	if (!ms_step(3, "AOSS QMP open + load_state on")) {
++	if (!ms_step(4, "AOSS QMP open + load_state on")) {
+ 		goto out;
+ 	}
+ 	if (!ms_qmp_open() || !ms_qmp_send("{class: image, res: load_state, name: modem, val: on}")) {
+ 		goto out;
+ 	}
+-	if (!ms_step(4, "RPMh ARC votes cx/mx/mss")) {
++	if (!ms_step(5, "RPMh ARC votes cx/mx/mss")) {
+ 		goto out;
+ 	}
+ 	for (int i = 0; i < 3; i++) {
+@@ -1425,7 +1446,7 @@ wl_mss(void)
+ 		    wl_rd(wl.gcc, 0x8a000), wl_rd(wl.gcc, 0x34004), wl_rd(wl.gcc, 0x38004), wl_rd(wl.gcc, 0x8a004));
+ 		goto out;
+ 	}
+-	if (!ms_step(5, "snoc_axi clock, alt reset deassert, active clocks")) {
++	if (!ms_step(6, "snoc_axi clock, alt reset deassert, active clocks")) {
+ 		goto out;
+ 	}
+ 	ms.snoc = true;                         /* set even if it fails: teardown clears the enable */
+@@ -1451,18 +1472,6 @@ wl_mss(void)
+ 	    wl_rd(wl.gcc, 0x8a004));
+ 
+ 	/* the MBA image goes in while the kernel still owns the carve-out, then both regions go to the Q6 */
+-	if (!ms_step(6, "copy MBA into its carve-out")) {
+-		goto out;
+-	}
+-	vm_offset_t mba_va = ml_io_map_wcomb(MSS_MBA_PA, MSS_MBA_SIZE);
+-	if (!mba_va) {
+-		printf("SWEET MSS: MBA carve-out mapping failed\n");
+-		goto out;
+-	}
+-	memcpy((void *)mba_va, mba, mba_len);
+-	__asm__ volatile ("dsb sy" ::: "memory");
+-	ml_io_unmap(mba_va, MSS_MBA_SIZE);      /* no kernel mapping may exist once the Q6 owns it */
+-	mba_va = 0;
+ 	if (!ms_step(7, "hyp-assign MPSS and MBA to the modem (SCM)")) {
+ 		goto out;
+ 	}

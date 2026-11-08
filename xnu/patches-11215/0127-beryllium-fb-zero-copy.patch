@@ -1,0 +1,755 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 52138c59d48fb1cd03bee08949fd362cfa85fde7..650d50d7193ac8f0f200f8f2d42fa03f0c3a0e4a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -205,14 +205,20 @@ public:
+ 	void          presentCanvas(SweetSurface *s, uintptr_t src, int32_t sx, int32_t sy,
+ 	    int32_t dx, int32_t dy, int32_t w, int32_t h);
+ 	/*
+-	 * Zero-copy scanout (sweetfb_zc=1, needs sweetfb_hw=1): a lone full-canvas
+-	 * surface is scanned in place. fZcOK: the MDP's SMMU streams were read and
+-	 * are in bypass. fZcHeld: surfaces that are (or may still be) on the panel.
++	 * Zero-copy scanout (sweetfb_zc=1, needs sweetfb_hw=1, patch 0127): a lone
++	 * full-canvas surface that lives in the SWEET low pool (SweetSurface.cpp)
++	 * is scanned in place. fZcOK: the MDP's SMMU streams were read and are in
++	 * bypass (or sweetfb_zcforce=1). fZcHeld: surfaces that are (or may still
++	 * be) on the panel; fZcFront: the newest of them is what the MDP scans now.
++	 * fZcWhySeen: one bit per fallback reason already logged.
+ 	 */
+-	bool          fZc, fZcOK;
++	bool          fZc, fZcOK, fZcFront;
+ 	SweetSurface *fZcHeld[4];
+-	uint32_t      fZcCount, fZcNo[8], fZcNoNext;
++	uint32_t      fZcCount, fZcNo[8], fZcNoNext, fZcWhySeen;
++	uint64_t      fZcFrames, fCopyFrames;
+ 	bool          zcPresent(const uint8_t *rec, uint32_t mask);
++	bool          zcDecline(uint32_t why, const char *text, uint32_t id);
++	void          zcStats(const char *when);
+ 	void          zcPoll(void);
+ 	void          zcReleaseAll(void);
+ 	/* WLED backlight fade (sweetfb_blfade) */
+@@ -399,11 +405,25 @@ AppleCLCD::start(IOService *provider)
+ 			if (!fHw || !fFlip) {
+ 				IOLog("SWEET FB: sweetfb_zc needs a working sweetfb_hw=1; zero-copy off\n");
+ 			} else {
++				int force = 0;
++				PE_parse_boot_argn("sweetfb_zcforce", &force, sizeof(force));
++				if (force && !fZcOK) {
++					fZcOK = true;
++					IOLog("SWEET FB: sweetfb_zcforce=1: MDP SMMU treated as bypass although the probe did not say so "
++					    "(an unmapped fetch can reset the SoC)\n");
++				}
+ 				fZc = true;
+-				sweet_surface_want_contiguous(fHwStride * fLogicalH);
+-				IOLog("SWEET FB: zero-copy scanout armed (default surfaces >= %u bytes asked for contiguous memory below 4 GiB); %s\n",
+-				    fHwStride * fLogicalH, fZcOK ? "MDP SMMU is in bypass" :
+-				    "MDP SMMU is NOT verified bypass: every frame will take the copy path");
++				if (!fZcOK) {
++					IOLog("SWEET FB: zero-copy scanout armed, but the MDP SMMU is NOT verified bypass: low pool not enabled, "
++					    "every frame takes the copy path\n");
++				} else if (!sweet_lowpool_setup(fPhys, 0x2400000, fLogicalW, fLogicalH)) {
++					fZc = false;
++					IOLog("SWEET FB: zero-copy off: no usable low pool\n");
++				} else {
++					IOLog("SWEET FB: zero-copy scanout armed: canvas %ux%u BGRA surfaces live in the low pool and are scanned in place%s\n",
++					    fLogicalW, fLogicalH, sweet_lowpool_cacheable() ? " (cacheable: cleaned before every scan)" :
++					    " (write-combined)");
++				}
+ 			}
+ 		}
+ 		int blfade = 1;
+@@ -1029,6 +1049,7 @@ AppleCLCD::scanTo(uint32_t idx)
+ 	bool hwFrame = fHw && idx != 0;
+ 	scanAddr((uint32_t)fBufPA[idx], hwFrame ? fHwStride : ((fBootStride & 0xffff0000u) | fRowBytes), hwFrame);
+ 	fFront = idx;
++	fZcFront = false;       /* the scan left the pooled surface (zcPoll lets go once this latched) */
+ }
+ 
+ /*
+@@ -1046,36 +1067,68 @@ AppleCLCD::blackout(void)
+ 			zcReleaseAll();
+ 		}
+ 	}
++	if (fZc) {
++		zcStats("display off");
++	}
+ 	IOLog("SWEET FB: display off: screen black in one step\n");
+ }
+ 
+ /*
+- * Zero-copy scanout. A lone layer that is the whole canvas, in a surface
+- * whose memory is contiguous and below 4 GiB (SRC0_ADDR is 32 bit), is
+- * scanned where CoreAnimation drew it. Needs the MDP's SMMU streams verified in
+- * bypass (fZcOK), else every frame is declined and copied. The surface stays
+- * held (IOSurfaceClientIsInUse, state page +0x18 as 0099) until the MDP has
+- * latched a later frame: fZcHeld[0..fZcCount-1], the last one is the newest.
++ * Clean (not invalidate) a CPU-written range to the point of coherency: the
++ * MDP reads DRAM. This build is __ARM_COHERENT_IO__, where the kernel's own
++ * flush_dcache64/clean_dcache64 are bare "dsb sy", so it is done by hand.
++ * dc cvac keeps the lines valid: CoreAnimation's next partial redraw of the
++ * surface still hits the cache.
++ */
++static void
++sweet_dcache_clean_va(const void *va, size_t len)
++{
++	uint64_t ctr;
++	__asm__ volatile ("mrs %0, ctr_el0" : "=r"(ctr));
++	uintptr_t line = (uintptr_t)4 << ((ctr >> 16) & 0xf);   /* DminLine */
++	uintptr_t p = (uintptr_t)va & ~(line - 1);
++	uintptr_t end = (uintptr_t)va + len;
++
++	__asm__ volatile ("dsb sy" ::: "memory");
++	for (; p < end; p += line) {
++		__asm__ volatile ("dc cvac, %0" :: "r"(p) : "memory");
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++/*
++ * Zero-copy scanout (patch 0127). A lone layer that is the whole canvas, in a
++ * surface that SweetSurface placed in the low pool (contiguous, below 4 GiB:
++ * SRC0_ADDR is 32 bit), is scanned where CoreAnimation drew it; QSEED3 scales
++ * canvas -> panel exactly as for the copied frames. Needs the MDP's SMMU
++ * streams verified in bypass (fZcOK), else every frame is declined and copied.
++ * The surface stays held (IOSurfaceClientIsInUse, state page +0x18 as 0099)
++ * and referenced until the MDP has latched a later frame: fZcHeld[0..fZcCount-1],
++ * the last one is the newest. A held surface cannot be freed, so its pool block
++ * cannot be reused under the scan (the pool also cools freed blocks).
+  */
+ void
+ AppleCLCD::zcPoll(void)
+ {
+-	if (fZcCount < 2) {
++	if (fZcCount == 0) {
+ 		return;
+ 	}
+ 	volatile uint32_t *flush = (volatile uint32_t *)(fMdp + SWEET_MDP_CTL0 + SWEET_MDP_CTL_FLUSH);
+ 	if (*flush & fLastFlush) {
+ 		return;         /* the newest frame is not on the panel yet */
+ 	}
+-	SweetSurface *newest = fZcHeld[fZcCount - 1];
+-	for (uint32_t i = 0; i + 1 < fZcCount; i++) {
++	/* the newest scan is on the panel: everything older is free; if a copied frame
++	 * replaced the pooled one, that one is free as well */
++	uint32_t keep = fZcFront ? fZcCount - 1 : fZcCount;
++	SweetSurface *newest = fZcFront ? fZcHeld[fZcCount - 1] : NULL;
++	for (uint32_t i = 0; i < keep; i++) {
+ 		sweet_hold(fZcHeld[i], false);
+ 		fZcHeld[i]->release();
+ 		fZcHeld[i] = NULL;
+ 	}
+ 	fZcHeld[0] = newest;
+ 	fZcHeld[1] = fZcHeld[2] = fZcHeld[3] = NULL;
+-	fZcCount = 1;
++	fZcCount = newest != NULL ? 1 : 0;
+ }
+ 
+ void
+@@ -1087,23 +1140,44 @@ AppleCLCD::zcReleaseAll(void)
+ 		fZcHeld[i] = NULL;
+ 	}
+ 	fZcCount = 0;
++	fZcFront = false;
++}
++
++void
++AppleCLCD::zcStats(const char *when)
++{
++	uint32_t used, total;
++	uint64_t allocs, fails;
++	sweet_lowpool_stats(&used, &total, &allocs, &fails);
++	IOLog("SWEET FB: zero-copy %s: %llu zc frames, %llu copied frames, low pool %u/%u pages used, %llu surfaces pooled, %llu fell back to normal memory\n",
++	    when, fZcFrames, fCopyFrames, used, total, allocs, fails);
++}
++
++/* One log line per fallback reason (bit per reason), the frame is copied. Always returns false. */
++bool
++AppleCLCD::zcDecline(uint32_t why, const char *text, uint32_t id)
++{
++	if (why < 32 && !(fZcWhySeen & (1u << why))) {
++		fZcWhySeen |= 1u << why;
++		IOLog("SWEET FB: zero-copy declined (first for this reason: surface %u): %s; such frames are copied\n", id, text);
++	}
++	return false;
+ }
+ 
+ bool
+ AppleCLCD::zcPresent(const uint8_t *rec, uint32_t mask)
+ {
+-	static uint32_t told;
+ 	int only = -1;
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
+ 			if (only >= 0) {
+-				return false;   /* several layers: composed by the copy path */
++				return zcDecline(1, "several layers are composed by the copy path", 0);
+ 			}
+ 			only = (int)layer;
+ 		}
+ 	}
+ 	if (only < 0) {
+-		return false;
++		return zcDecline(0, "no layer in the swap", 0);
+ 	}
+ 	uint32_t id = get32(rec, 0x54 + 4 * only);
+ 	for (uint32_t i = 0; i < 8; i++) {
+@@ -1116,19 +1190,19 @@ AppleCLCD::zcPresent(const uint8_t *rec, uint32_t mask)
+ 	int32_t dx = (int32_t)get32(b, 0), dy = (int32_t)get32(b, 4);
+ 	int32_t w = (int32_t)get32(b, 8), h = (int32_t)get32(b, 12);
+ 	SweetSurface *s = sweet_surface_copy(id);
+-	const char *why = NULL;
++	uint32_t why = 0;
++	const char *text = NULL;
+ 	bool sticky = true;     /* the reason belongs to the surface, not to this frame */
+-	uint64_t need = 0, pa = 0;
+-	IOByteCount seg = 0;
++	uint64_t need = 0;
+ 
+ 	if (s == NULL || s == fSurface) {
+-		why = "no such surface";
++		text = "no such surface";
+ 		sticky = false;
+ 	} else if (w <= 0 || h <= 0) {
+ 		w = (int32_t)s->width;
+ 		h = (int32_t)s->height;
+ 	}
+-	if (why == NULL) {
++	if (text == NULL) {
+ 		if (sx < 0 || sy < 0) {
+ 			sx = sy = 0;
+ 		}
+@@ -1136,35 +1210,29 @@ AppleCLCD::zcPresent(const uint8_t *rec, uint32_t mask)
+ 			dx = dy = 0;
+ 		}
+ 		if (!fZcOK) {
+-			why = "MDP SMMU streams not verified as bypass";
+-		} else if (s->elementWidth != 1 || s->elementHeight != 1 || (s->bytesPerElement && s->bytesPerElement != 4) ||
+-		    s->wrapped || s->memory == NULL) {
+-			why = "not a plain 32-bit surface";
+-		} else if (s->width != fLogicalW || s->height != fLogicalH) {
+-			why = "not canvas sized";
++			why = 2;
++			text = "MDP SMMU streams not verified as bypass";
++		} else if (!s->pooled) {
++			why = 5;
++			text = "surface is not in the low pool (not a BGRA canvas-sized surface with a 64-byte stride, or the pool was full)";
++		} else if (s->width < fLogicalW || s->height < fLogicalH) {
++			why = 4;
++			text = "smaller than the canvas";
+ 		} else if (sx != 0 || sy != 0 || dx != 0 || dy != 0 || w != (int32_t)fLogicalW || h != (int32_t)fLogicalH) {
+-			why = "layer is not the whole canvas";
++			why = 6;
++			text = "layer is not the whole canvas";
+ 			sticky = false;
+-		} else if ((s->bytesPerRow & 15) != 0 || s->bytesPerRow > 0xffff || (s->offset & 63) != 0) {
+-			why = "stride/offset not aligned for the MDP";
+ 		} else {
+ 			need = (uint64_t)s->offset + (uint64_t)s->bytesPerRow * (fLogicalH - 1) + (uint64_t)fLogicalW * 4;
+-			if (need > s->memory->getLength()) {
+-				why = "surface memory too short";
+-			} else {
+-				pa = s->memory->getPhysicalSegment(0, &seg, kIOMemoryMapperNone);
+-				if (pa == 0 || seg < need) {
+-					why = "memory is not physically contiguous";
+-				} else if ((pa & 63) != 0 || pa + need > (1ull << 32)) {
+-					why = "memory is above 4 GiB or unaligned";
+-				}
++			if (need > s->allocSize || need > s->memory->getLength() ||
++			    s->poolPA + need > (1ull << 32) || ((s->poolPA + s->offset) & 63) != 0) {
++				why = 8;
++				text = "pool block too short, above 4 GiB or unaligned";
+ 			}
+ 		}
+ 	}
+-	if (why != NULL) {
+-		if (told++ < 6) {
+-			IOLog("SWEET FB: zero-copy declined for surface %u: %s\n", id, why);
+-		}
++	if (text != NULL) {
++		zcDecline(why, text, id);
+ 		if (sticky && s != NULL) {
+ 			fZcNo[fZcNoNext++ & 7] = id;
+ 		}
+@@ -1177,22 +1245,30 @@ AppleCLCD::zcPresent(const uint8_t *rec, uint32_t mask)
+ 		zcPoll();
+ 		if (fZcCount >= 4) {
+ 			s->release();
+-			return false;
++			return zcDecline(9, "four earlier zero-copy frames are still waiting for their latch", id);
+ 		}
+ 	}
+-	/* CoreAnimation drew through the CPU cache: the MDP reads DRAM */
+ 	uintptr_t kva = s->kernelAddress();
+ 	if (kva == 0) {
+ 		s->release();
+-		return false;
++		return zcDecline(10, "no kernel mapping of the surface", id);
++	}
++	if (sweet_lowpool_cacheable()) {
++		/* CoreAnimation drew through the CPU cache (write-back mapping): the MDP reads DRAM */
++		sweet_dcache_clean_va((const void *)(kva + s->offset), (size_t)(need - s->offset));
++	} else {
++		__asm__ volatile ("dsb sy" ::: "memory");
+ 	}
+-	sweet_dma_sync_va((const void *)(kva + s->offset), (size_t)(need - s->offset));
+ 	sweet_hold(s, true);
+ 	fZcHeld[fZcCount++] = s;        /* keeps the reference sweet_surface_copy gave */
+-	scanAddr((uint32_t)(pa + s->offset), s->bytesPerRow, true);
+-	if (told < 12) {
+-		told = 12;
+-		IOLog("SWEET FB: zero-copy scanout of surface %u at 0x%llx stride %u\n", id, pa, s->bytesPerRow);
++	scanAddr((uint32_t)(s->poolPA + s->offset), s->bytesPerRow, true);
++	fZcFront = true;
++	if (fZcFrames++ == 0) {
++		IOLog("SWEET FB: first zero-copy scanout: surface %u at 0x%llx stride %u (%ux%u canvas, no copy)\n",
++		    id, s->poolPA + s->offset, s->bytesPerRow, fLogicalW, fLogicalH);
++	}
++	if (((fZcFrames + fCopyFrames) & 255) == 0) {
++		zcStats("counters");
+ 	}
+ 	return true;
+ }
+@@ -1568,6 +1644,10 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (fFlip) {
+ 		scanTo(back);
+ 	}
++	fCopyFrames++;
++	if (fZc && ((fZcFrames + fCopyFrames) & 255) == 0) {
++		zcStats("counters");
++	}
+ }
+ 
+ bool
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index b37b7ae877a7c003d0a7e56b15781817db3720ef..0c165b8b9a68cfbf3f84c2c3e106e318c9213538 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -45,6 +45,9 @@
+ #include <libkern/c++/OSSerialize.h>
+ #include <libkern/c++/OSString.h>
+ #include <sys/proc.h>
++#include <kern/clock.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -98,14 +101,239 @@ static uint64_t      sweet_surface_wired;       /* bytes of buffer surfaces */
+ 
+ OSDefineMetaClassAndStructors(SweetSurface, OSObject);
+ 
+-/* sweetfb_zc: big surfaces want contiguous memory below 4 GiB (0 = off). */
+-static uint32_t sweet_surface_contig_min;
+-static bool     sweet_surface_contig_failed;
++extern "C" unsigned long gPhysBase, gPhysSize;     /* osfmk/arm64/arm_vm_init.c: the RAM xnu manages */
++static void sweet_surface_init_lock(void);
++
++/*
++ * SWEET low pool (sweetfb_zc=1, patch 0127, docs/DISPLAY_HW.md section 3).
++ *
++ * A window of the low DDR bank that xnu does not manage (every byte xnu owns
++ * is above 4 GiB, the ADT's /chosen dram-base) hands out physically contiguous,
++ * page-aligned blocks for canvas-sized BGRA surfaces, so the MDP (32-bit
++ * SRC0_ADDR) can scan them in place. First fit over a per-page table, guard
++ * pages at both ends, and a cooling period after a free: a block is not reused
++ * until SWEET_LOWPOOL_COOL_MS have passed, so a surface released while the MDP
++ * may still fetch from it (a flush that has not latched) is never rewritten
++ * under the scan. The framebuffer also holds a reference on every surface it
++ * scans until a later frame has latched, so the cooling is the second line.
++ *
++ * Window: default 0xb0400000 + 252 MiB (to 0xc0000000). Override: ADT
++ * /arm-io/disp0 "sweet-lowpool" = <u64 base, u64 size> (tools/mkadt.py
++ * --lowpool), then boot-args sweetfb_lowpoolbase=0x... and sweetfb_lowpool=<MB>.
++ * It must lie in [SWEET_LOWPOOL_MIN, SWEET_LOWPOOL_MAX) and not touch any fixed
++ * reserved-memory region of the live DT (dtb/beryllium/live.dts), the splash
++ * carve-out or xnu's RAM: else the pool stays off and surfaces are copied.
++ *
++ * Mapping: write-back cacheable (kIOMapCopybackCache) for the kernel and every
++ * client, so CoreAnimation's CPU renderer runs on cached memory (as it did on
++ * the normal kernel buffers); the framebuffer cleans a frame (dc cvac) before
++ * the MDP reads it. sweetfb_lowwc=1 maps write-combined instead (no cache
++ * maintenance, uncached reads for the renderer: slow) as a diagnostic.
++ */
++#define SWEET_LOWPOOL_DEF_BASE  0xb0400000ull
++#define SWEET_LOWPOOL_DEF_SIZE  (252ull << 20)
++#define SWEET_LOWPOOL_MIN       0x9f800000ull   /* end of cont_splash_region */
++#define SWEET_LOWPOOL_MAX       0xfd000000ull   /* rmtfs (~0xfde01000) and what the modem is given above */
++#define SWEET_LOWPOOL_COOL_MS   100
++#define SWEET_FORMAT_BGRA       0x42475241
++
++/* Fixed reserved-memory regions of the Poco F1 live DT (reg values, not the node names). */
++static const struct {
++	uint64_t base, size;
++	const char *name;
++} sweet_lowpool_known[] = {
++	{ 0x85700000, 0x600000, "hyp" },
++	{ 0x85d00000, 0x200000, "xbl" },
++	{ 0x85fc0000, 0x20000, "removed" },
++	{ 0x85fe0000, 0x20000, "cmd-db" },
++	{ 0x86000000, 0x200000, "smem" },
++	{ 0x86200000, 0x4700000, "removed (tz)" },
++	{ 0x8ab00000, 0x1400000, "qseecom" },
++	{ 0x8bf00000, 0x500000, "camera" },
++	{ 0x8c400000, 0x10000, "ips_fw" },
++	{ 0x8c410000, 0x5000, "ipa_gsi" },
++	{ 0x8c415000, 0x2000, "gpu zap" },
++	{ 0x8c500000, 0x1e00000, "adsp" },
++	{ 0x8e300000, 0x100000, "wlan_fw" },
++	{ 0x8e400000, 0x7800000, "modem" },
++	{ 0x95c00000, 0x500000, "video" },
++	{ 0x96100000, 0x800000, "cdsp" },
++	{ 0x96900000, 0x200000, "mba" },
++	{ 0x96b00000, 0x1400000, "slpi" },
++	{ 0x97f00000, 0x100000, "pil_spss" },
++	{ 0x9d400000, 0x2400000, "cont_splash" },
++	{ 0xaf000000, 0x1000000, "ramdump_fb" },
++	{ 0xb0000000, 0x400000, "ramoops" },
++};
++
++static struct {
++	bool         ready, cacheable;
++	IOOptionBits cache;             /* kIOMap* cache mode of every mapping */
++	uint64_t     base;
++	uint32_t     pages, used, high;
++	uint64_t    *until;             /* per page: 0 free, ~0 in use, else the time it may be reused */
++	uint64_t     cool;              /* cooling period, absolute time units */
++	uint64_t     allocs, fails;
++	uint32_t     minW, minH;
++} sweet_lowpool;
++
++bool
++sweet_lowpool_cacheable(void)
++{
++	return sweet_lowpool.ready && sweet_lowpool.cacheable;
++}
+ 
+ void
+-sweet_surface_want_contiguous(uint32_t minBytes)
++sweet_lowpool_stats(uint32_t *usedPages, uint32_t *totalPages, uint64_t *allocs, uint64_t *fails)
++{
++	*usedPages = sweet_lowpool.used;
++	*totalPages = sweet_lowpool.pages;
++	*allocs = sweet_lowpool.allocs;
++	*fails = sweet_lowpool.fails;
++}
++
++static bool
++sweet_overlap(uint64_t a, uint64_t alen, uint64_t b, uint64_t blen)
++{
++	return a < b + blen && b < a + alen;
++}
++
++/* Is [base, base+size) usable as the pool? Logs the reason when not. */
++static bool
++sweet_lowpool_validate(uint64_t base, uint64_t size, uint64_t splashBase, uint64_t splashSize)
++{
++	if ((base & (PAGE_SIZE - 1)) || (size & (PAGE_SIZE - 1)) || size < (4ull << 20)) {
++		IOLog("SWEET SURF: low pool 0x%llx + 0x%llx refused: not page aligned or under 4 MiB\n", base, size);
++		return false;
++	}
++	if (base < SWEET_LOWPOOL_MIN || base + size > SWEET_LOWPOOL_MAX || base + size < base) {
++		IOLog("SWEET SURF: low pool 0x%llx + 0x%llx refused: outside 0x%llx..0x%llx\n", base, size,
++		    SWEET_LOWPOOL_MIN, SWEET_LOWPOOL_MAX);
++		return false;
++	}
++	for (uint32_t i = 0; i < sizeof(sweet_lowpool_known) / sizeof(sweet_lowpool_known[0]); i++) {
++		if (sweet_overlap(base, size, sweet_lowpool_known[i].base, sweet_lowpool_known[i].size)) {
++			IOLog("SWEET SURF: low pool 0x%llx + 0x%llx refused: overlaps %s 0x%llx + 0x%llx\n", base, size,
++			    sweet_lowpool_known[i].name, sweet_lowpool_known[i].base, sweet_lowpool_known[i].size);
++			return false;
++		}
++	}
++	if (splashSize != 0 && sweet_overlap(base, size, splashBase, splashSize)) {
++		IOLog("SWEET SURF: low pool 0x%llx + 0x%llx refused: overlaps the splash carve-out 0x%llx + 0x%llx\n",
++		    base, size, splashBase, splashSize);
++		return false;
++	}
++	if (sweet_overlap(base, size, (uint64_t)gPhysBase, (uint64_t)gPhysSize)) {
++		IOLog("SWEET SURF: low pool 0x%llx + 0x%llx refused: overlaps xnu's RAM 0x%lx + 0x%lx\n", base, size,
++		    gPhysBase, gPhysSize);
++		return false;
++	}
++	return true;
++}
++
++bool
++sweet_lowpool_setup(uint64_t splashBase, uint64_t splashSize, uint32_t minW, uint32_t minH)
++{
++	uint64_t base = SWEET_LOWPOOL_DEF_BASE, size = SWEET_LOWPOOL_DEF_SIZE;
++	const char *from = "default";
++
++	sweet_surface_init_lock();
++	if (sweet_lowpool.ready) {
++		return true;
++	}
++	DTEntry e;
++	void const *p;
++	unsigned int sz;
++	if (SecureDTLookupEntry(NULL, "/arm-io/disp0", &e) == kSuccess &&
++	    SecureDTGetProperty(e, "sweet-lowpool", &p, &sz) == kSuccess && sz == 16) {
++		memcpy(&base, p, 8);
++		memcpy(&size, (const uint8_t *)p + 8, 8);
++		from = "ADT";
++	}
++	uint32_t arg = 0;
++	if (PE_parse_boot_argn("sweetfb_lowpoolbase", &arg, sizeof(arg)) && arg != 0) {
++		base = arg;
++		from = "boot-arg";
++	}
++	if (PE_parse_boot_argn("sweetfb_lowpool", &arg, sizeof(arg)) && arg != 0) {
++		size = (uint64_t)arg << 20;
++		from = "boot-arg";
++	}
++	if (!sweet_lowpool_validate(base, size, splashBase, splashSize)) {
++		return false;
++	}
++	uint32_t pages = (uint32_t)(size / PAGE_SIZE);
++	uint64_t *until = (uint64_t *)IOMallocData(pages * sizeof(uint64_t));
++	if (until == NULL) {
++		IOLog("SWEET SURF: low pool: no memory for the page table\n");
++		return false;
++	}
++	bzero(until, pages * sizeof(uint64_t));
++	uint32_t wc = 0;
++	PE_parse_boot_argn("sweetfb_lowwc", &wc, sizeof(wc));
++	clock_interval_to_absolutetime_interval(SWEET_LOWPOOL_COOL_MS, 1000 * 1000, &sweet_lowpool.cool);
++	sweet_lowpool.cache = wc ? kIOMapWriteCombineCache : kIOMapCopybackCache;
++	sweet_lowpool.cacheable = !wc;
++	sweet_lowpool.base = base;
++	sweet_lowpool.pages = pages;
++	sweet_lowpool.until = until;
++	sweet_lowpool.minW = minW;
++	sweet_lowpool.minH = minH;
++	sweet_lowpool.ready = true;
++	IOLog("SWEET SURF: low pool (%s) 0x%llx..0x%llx, %llu MiB, %u pages, mapped %s; BGRA surfaces >= %ux%u go here\n",
++	    from, base, base + size, size >> 20, pages, wc ? "write-combined" : "write-back cacheable", minW, minH);
++	return true;
++}
++
++/* A block of np pages, or 0. Pages 0 and pages-1 are never handed out (guards). */
++static uint64_t
++sweet_lowpool_alloc(uint32_t bytes)
++{
++	uint32_t np = (bytes + PAGE_SIZE - 1) / PAGE_SIZE, run = 0;
++	uint64_t pa = 0, now = mach_absolute_time();
++
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t i = 1; i + 1 < sweet_lowpool.pages; i++) {
++		uint64_t u = sweet_lowpool.until[i];
++		if (u == 0 || (u != ~0ull && u <= now)) {
++			if (++run == np) {
++				uint32_t first = i + 1 - np;
++				for (uint32_t j = first; j <= i; j++) {
++					sweet_lowpool.until[j] = ~0ull;
++				}
++				sweet_lowpool.used += np;
++				if (sweet_lowpool.used > sweet_lowpool.high) {
++					sweet_lowpool.high = sweet_lowpool.used;
++				}
++				pa = sweet_lowpool.base + (uint64_t)first * PAGE_SIZE;
++				break;
++			}
++		} else {
++			run = 0;
++		}
++	}
++	if (pa != 0) {
++		sweet_lowpool.allocs++;
++	} else {
++		sweet_lowpool.fails++;
++	}
++	IOLockUnlock(sweet_surface_lock);
++	return pa;
++}
++
++/* Back to the pool, usable again after the cooling period. */
++static void
++sweet_lowpool_free(uint64_t pa, uint32_t np)
+ {
+-	sweet_surface_contig_min = minBytes;
++	uint64_t until = mach_absolute_time() + sweet_lowpool.cool;
++	uint32_t first = (uint32_t)((pa - sweet_lowpool.base) / PAGE_SIZE);
++
++	IOLockLock(sweet_surface_lock);
++	for (uint32_t j = first; j < first + np && j < sweet_lowpool.pages; j++) {
++		sweet_lowpool.until[j] = until;
++	}
++	sweet_lowpool.used -= np;
++	IOLockUnlock(sweet_surface_lock);
+ }
+ 
+ void
+@@ -121,6 +349,11 @@ SweetSurface::free()
+ 	}
+ 	OSSafeReleaseNULL(memory);
+ 	OSSafeReleaseNULL(state);
++	if (pooled) {
++		/* every client mapping is gone (SweetSurfaceRef drops its mappings before its reference) */
++		pooled = false;
++		sweet_lowpool_free(poolPA, poolPages);
++	}
+ 	OSObject::free();
+ }
+ 
+@@ -133,7 +366,7 @@ SweetSurface::kernelAddress()
+ 	}
+ 	IOLockLock(sweet_surface_lock);
+ 	if (kernelMap == NULL && memory != NULL) {
+-		kernelMap = memory->map(wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache);
++		kernelMap = memory->map(pooled ? mapCache : (wrapped ? kIOMapDefaultCache : kIOMapWriteCombineCache));
+ 	}
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return kernelMap != NULL ? (uintptr_t)kernelMap->getVirtualAddress() + wrapDelta : 0;
+@@ -259,6 +492,65 @@ sweet_surface_publish(SweetSurface *s)
+ 	return ok;
+ }
+ 
++/*
++ * Canvas-sized BGRA surfaces (sweetfb_zc) get a low-pool block instead of
++ * normal kernel memory: contiguous, below 4 GiB, 64-byte aligned (the client
++ * chose a 64-byte row stride, checked here), zeroed, mapped cacheable
++ * (pool cache mode) in the kernel and, through mapCache, in every client.
++ * False: not eligible or the pool is full; the caller allocates normally.
++ */
++static bool
++sweet_surface_try_pool(SweetSurface *s)
++{
++	static uint32_t told, full_told;
++
++	if (!sweet_lowpool.ready || s->pixelFormat != SWEET_FORMAT_BGRA || s->bytesPerElement != 4 ||
++	    s->elementWidth != 1 || s->elementHeight != 1 || s->planeCount != 0 ||
++	    s->width < sweet_lowpool.minW || s->height < sweet_lowpool.minH ||
++	    (s->bytesPerRow & 63) != 0 || s->bytesPerRow > 0xffff || (s->offset & 63) != 0) {
++		return false;
++	}
++	uint64_t pa = sweet_lowpool_alloc(s->allocSize);
++	if (pa == 0) {
++		if (full_told++ < 4) {
++			uint32_t used, total;
++			uint64_t allocs, fails;
++			sweet_lowpool_stats(&used, &total, &allocs, &fails);
++			IOLog("SWEET SURF: low pool full for %u bytes (%u/%u pages used); this surface takes normal memory\n",
++			    s->allocSize, used, total);
++		}
++		return false;
++	}
++	uint32_t np = (s->allocSize + PAGE_SIZE - 1) / PAGE_SIZE;
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, (IOByteCount)s->allocSize, kIODirectionInOut);
++	if (md != NULL) {
++		s->memory = md;
++		s->pooled = true;
++		s->poolPA = pa;
++		s->poolPages = np;
++		s->mapCache = sweet_lowpool.cache;
++		uintptr_t kva = s->kernelAddress();
++		if (kva != 0) {
++			bzero((void *)kva, s->allocSize);
++			if (told++ < 4) {
++				uint32_t used, total;
++				uint64_t allocs, fails;
++				sweet_lowpool_stats(&used, &total, &allocs, &fails);
++				IOLog("SWEET SURF: surface %ux%u bpr %u (%u bytes) in the low pool at 0x%llx (%u/%u pages used)\n",
++				    s->width, s->height, s->bytesPerRow, s->allocSize, pa, used, total);
++			}
++			return true;
++		}
++		/* no kernel mapping: undo */
++		OSSafeReleaseNULL(s->kernelMap);
++		OSSafeReleaseNULL(s->memory);
++		s->pooled = false;
++		s->mapCache = kIOMapDefaultCache;
++	}
++	sweet_lowpool_free(pa, np);
++	return false;
++}
++
+ SweetSurface *
+ sweet_surface_create_physical(uint64_t phys, uint32_t width, uint32_t height,
+     uint32_t bytesPerRow, uint32_t pixelFormat)
+@@ -765,31 +1057,17 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 			    client_address->unsigned64BitValue(), used, s->width, s->height, s->pixelFormat, ret);
+ 		}
+ 	}
++	if (ret == kIOReturnSuccess && s->memory == NULL && sweet_surface_try_pool(s)) {
++		if (!sweet_surface_publish(s)) {
++			ret = kIOReturnNoResources;
++		}
++	}
+ 	if (ret == kIOReturnSuccess && s->memory == NULL) {
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			if (sweet_surface_contig_min != 0 && s->allocSize >= sweet_surface_contig_min &&
+-			    !sweet_surface_contig_failed) {
+-				mem = IOBufferMemoryDescriptor::inTaskWithPhysicalMask(kernel_task,
+-				    kIODirectionInOut | kIOMemoryKernelUserShared | kIOMemoryPhysicallyContiguous,
+-				    s->allocSize, 0xfffff000ULL);
+-				if (mem == NULL) {
+-					/* the usual case here: all of the kernel's RAM is above 4 GiB */
+-					sweet_surface_contig_failed = true;
+-					IOLog("SWEET SURF: no contiguous memory below 4 GiB for %u bytes; "
+-					    "large surfaces stay scattered (zero-copy scanout cannot engage)\n", s->allocSize);
+-				} else {
+-					static uint32_t contig_told;
+-					if (contig_told++ < 4) {
+-						IOLog("SWEET SURF: surface %u bytes allocated contiguous below 4 GiB\n", s->allocSize);
+-					}
+-				}
+-			}
+-			if (mem == NULL) {
+-				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+-			}
++			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 164a98e83a5576927b23f464a54b187fd528dcef..89f2a26d44893cccc7079f90a93da2c52d5d175e 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -44,8 +44,11 @@ public:
+ 	uint32_t                  purgeable;    /* IOSurfaceSetPurgeable state */
+ 	uint32_t                  wrapDelta;    /* wrapped client memory: where it starts in its first page */
+ 	bool                      wrapped;      /* memory is a prepared range of a task (ios-topaz 0132/0134) */
++	bool                      pooled;       /* memory is a low-pool block (sweetfb_zc, patch 0127) */
++	uint32_t                  poolPages;    /* pooled: size of the block in kernel pages */
++	uint64_t                  poolPA;       /* pooled: physical address of the block (below 4 GiB) */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; pooled = false; poolPages = 0; poolPA = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use; wrapped memory: of the first pixel), or 0. */
+@@ -64,11 +67,26 @@ SweetSurface *sweet_surface_create_physical(uint64_t phys, uint32_t width,
+     uint32_t height, uint32_t bytesPerRow, uint32_t pixelFormat);
+ 
+ /*
+- * Zero-copy scanout (SweetFramebuffer.cpp, boot-arg sweetfb_zc=1): surfaces of
+- * at least minBytes are allocated physically contiguous below 4 GiB (the MDP's
+- * source address registers are 32 bit) when the kernel can. Off by default.
++ * Zero-copy scanout (SweetFramebuffer.cpp, boot-arg sweetfb_zc=1; patch 0127,
++ * docs/DISPLAY_HW.md section 3). The MDP's source address registers are 32 bit
++ * and all RAM xnu manages is above 4 GiB, so full-screen surfaces are backed
++ * by a "SWEET low pool": a window of the low DDR bank that xnu does not manage
++ * (default 0xb0400000 + 252 MiB, ADT /arm-io/disp0 "sweet-lowpool" or the
++ * boot-args sweetfb_lowpoolbase / sweetfb_lowpool=<MB> override it). The
++ * pool is validated against every reserved-memory region of the live DT, the
++ * splash carve-out and xnu's own RAM; it is refused if anything overlaps.
++ *
++ * sweet_lowpool_setup: resolve and validate the window and arm the pool for
++ * surfaces of at least minW x minH BGRA pixels (a canvas-sized layer). The
++ * splash range is the continuous-splash carve-out (also excluded).
+  */
+-void sweet_surface_want_contiguous(uint32_t minBytes);
++bool sweet_lowpool_setup(uint64_t splashBase, uint64_t splashSize, uint32_t minW, uint32_t minH);
++
++/* The pool maps cacheable (write-back): the CPU must clean a frame before the MDP reads it. */
++bool sweet_lowpool_cacheable(void);
++
++/* Pool statistics: pages in use / total, allocations, failed allocations (fell back to normal memory). */
++void sweet_lowpool_stats(uint32_t *usedPages, uint32_t *totalPages, uint64_t *allocs, uint64_t *fails);
+ 
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);

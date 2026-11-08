@@ -1,0 +1,154 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 1ca3f56..50b04be 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -48,6 +48,10 @@
+  *   sweetcpufreq_log=<seconds>         time-in-state summary period (default
+  *                                      10, 0 = none)
+  *   sweetcpufreq_force=1               also act when ENABLE bit 0 is clear
++ *   sweetcpufreq_little_boost=1        gov: when the A55 cluster sits at >= 90% load at its
++ *                                      ceiling for 1 s, raise the ceiling by 2 LUT states (up to
++ *                                      sweetcpufreq_little_boost_max, % of max, default 100); back
++ *                                      to the base cap after 1 s below 50% load (default off)
+  *   sweetamp=0|1                       idle-core steering in the scheduler (default 1)
+  *   sweetamp_prio=<n>                  base_pri threshold (default 31)
+  * Core-class steering (independent of the cpufreq mode): once all CPUs are up,
+@@ -66,13 +70,13 @@
+  *   line 2:  cluster0 name=A55 cpus=0-3 state=<applied|off|skipped|pending>
+  *            mode=<gov|fixed|off> idx=<current LUT index> cur_khz=<current>
+  *            min_khz=<lowest LUT> max_khz=<highest LUT> cap_khz=<policy max,
+- *            gov cap or fixed target> lut_n=<entries> load=<last load %> changes=<perf
+- *            state writes> tis_ms=<khz>:<ms>,<khz>:<ms>,...  (every LUT state in
+- *            index order, cumulative milliseconds spent there since start; the
+- *            states are the ones listed in lut_khz=)
++ *            gov ceiling incl. any boost, or fixed target> lut_n=<entries>
++ *            load=<last load %> changes=<perf state writes> base_cap_khz=<ceiling
++ *            without boost> lut_khz=<khz>,<khz>,... (every LUT state, index order)
++ *            tis_ms=<khz>:<ms>,<khz>:<ms>,... (the same states, cumulative
++ *            milliseconds spent in each since start)
+  *   line 3:  cluster1 ... (A75, cpus=4-7), same keys
+  * idx/cur_khz are read live from PERF_STATE; they are 0 unless state=applied.
+- * lut_khz=<khz>,<khz>,... is also present on each cluster line (before tis_ms).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -109,6 +113,9 @@ void sweet_cpufreq_max(void);
+ #define GOV_DOWN_SAMPLES        3u
+ #define GOV_DOWN_STEP           2u
+ #define FIXED_PERIOD_MS         250u
++#define BOOST_SAT_SAMPLES       40u     /* 1 s of saturation at the cap raises it */
++#define BOOST_STEP              2u
++#define BOOST_CALM_PCT          50u
+ 
+ enum { CF_PENDING, CF_OFF, CF_APPLIED, CF_SKIPPED };
+ enum { MODE_OFF, MODE_GOV, MODE_FIXED };
+@@ -124,7 +131,11 @@ static struct cf_domain {
+ 	int state;
+ 	uint32_t n;
+ 	uint32_t top;                   /* highest-frequency LUT index */
+-	uint32_t cap;                   /* policy ceiling (LUT index) */
++	uint32_t cap;                   /* base policy ceiling (LUT index) */
++	uint32_t eff_cap;               /* current ceiling: cap, or higher while boosted */
++	uint32_t boost_top;             /* highest index the boost may reach */
++	uint32_t sat_cnt;
++	uint32_t calm_cnt;
+ 	uint32_t req;                   /* last requested LUT index */
+ 	uint32_t load;                  /* last load, % */
+ 	uint32_t changes;
+@@ -143,6 +154,8 @@ static int cf_mode = MODE_OFF;
+ static unsigned cf_ncpus;
+ static unsigned cf_log_secs = 10;
+ static int cf_force;
++static int cf_boost;
++static int cf_boost_pct = 100;
+ static int cf_amp = 1;
+ static int cf_amp_pri = 31;             /* BASEPRI_DEFAULT */
+ static uint64_t cf_amp_big;
+@@ -288,6 +301,11 @@ cf_setup(unsigned id, struct cf_domain *d)
+ 	printf("SWEET CPUFREQ: domain %u: %s %d%% of max -> perf state %u (%u kHz)\n", id,
+ 	    cf_mode == MODE_GOV ? "cap" : "fixed target", d->percent, d->cap, d->khz[d->cap]);
+ 	/* gov starts at the cap and lets the first idle samples bring it down */
++	d->eff_cap = d->cap;
++	d->boost_top = (id == 0 && cf_boost) ? cf_pick(d, cf_boost_pct) : d->cap;
++	if (d->boost_top < d->cap) {
++		d->boost_top = d->cap;
++	}
+ 	cf_request(d, d->cap);
+ 	d->changes = 0;
+ 	cf_readback(id, d, d->cap);
+@@ -329,18 +347,42 @@ cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
+ 	if (cf_mode != MODE_GOV) {
+ 		return;
+ 	}
++	/* A55 boost (sweetcpufreq_little_boost=1): saturated at its ceiling for 1 s -> raise it. */
++	if (id == 0 && cf_boost && d->boost_top > d->cap) {
++		if (load >= GOV_JUMP_PCT && cur >= d->eff_cap) {
++			d->calm_cnt = 0;
++			if (++d->sat_cnt >= BOOST_SAT_SAMPLES && d->eff_cap < d->boost_top) {
++				d->sat_cnt = 0;
++				d->eff_cap = (d->boost_top - d->eff_cap > BOOST_STEP) ? d->eff_cap + BOOST_STEP : d->boost_top;
++				printf("SWEET CPUFREQ: cluster%u saturated, ceiling raised to state %u (%u kHz)\n",
++				    id, d->eff_cap, d->khz[d->eff_cap]);
++			}
++		} else {
++			d->sat_cnt = 0;
++			if (load < BOOST_CALM_PCT && d->eff_cap > d->cap) {
++				if (++d->calm_cnt >= BOOST_SAT_SAMPLES) {
++					d->calm_cnt = 0;
++					d->eff_cap = d->cap;
++					printf("SWEET CPUFREQ: cluster%u calm, ceiling back to state %u (%u kHz)\n",
++					    id, d->cap, d->khz[d->cap]);
++				}
++			} else {
++				d->calm_cnt = 0;
++			}
++		}
++	}
+ 	uint32_t target;
+ 	if (load >= GOV_JUMP_PCT) {
+-		target = d->cap;
++		target = d->eff_cap;
+ 	} else {
+ 		uint64_t need = (uint64_t)d->khz[cur] * load / GOV_TARGET_PCT;
+ 		target = 0;
+-		while (target < d->cap && d->khz[target] < need) {
++		while (target < d->eff_cap && d->khz[target] < need) {
+ 			target++;
+ 		}
+ 	}
+-	if (target > d->cap) {
+-		target = d->cap;
++	if (target > d->eff_cap) {
++		target = d->eff_cap;
+ 	}
+ 	uint32_t next = cur;
+ 	if (target > cur) {
+@@ -357,7 +399,6 @@ cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
+ 	if (next != cur) {
+ 		cf_request(d, next);
+ 	}
+-	(void)id;
+ }
+ 
+ static void
+@@ -530,6 +571,8 @@ sweet_cpufreq_max(void)
+ 	(void)PE_parse_boot_argn("sweetcpufreq_log", &v, sizeof(v));
+ 	cf_log_secs = v < 0 ? 0 : (unsigned)v;
+ 	(void)PE_parse_boot_argn("sweetcpufreq_force", &cf_force, sizeof(cf_force));
++	(void)PE_parse_boot_argn("sweetcpufreq_little_boost", &cf_boost, sizeof(cf_boost));
++	cf_boost_pct = cf_percent_arg("sweetcpufreq_little_boost_max", 100);
+ start:
+ 	if (kernel_thread_start((thread_continue_t)cf_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+@@ -572,9 +615,9 @@ cf_sysctl SYSCTL_HANDLER_ARGS
+ 		uint32_t cur = ok ? cf_rd(d, CPUFREQ_PERF_STATE) : 0;
+ 		n = cf_cat(buf, sizeof(buf), n,
+ 		    "cluster%u name=%s cpus=%s state=%s mode=%s idx=%u cur_khz=%u min_khz=%u max_khz=%u cap_khz=%u "
+-		    "lut_n=%u load=%u changes=%u lut_khz=", i, d->name, d->cpus, st, modes[cf_mode], cur,
++		    "lut_n=%u load=%u changes=%u base_cap_khz=%u lut_khz=", i, d->name, d->cpus, st, modes[cf_mode], cur,
+ 		    ok ? cf_state_khz(d, cur) : 0, ok ? d->khz[0] : 0, ok ? d->khz[d->top] : 0,
+-		    ok ? d->khz[d->cap] : 0, ok ? d->n : 0, d->load, d->changes);
++		    ok ? d->khz[d->eff_cap] : 0, ok ? d->n : 0, d->load, d->changes, ok ? d->khz[d->cap] : 0);
+ 		for (uint32_t k = 0; ok && k < d->n; k++) {
+ 			n = cf_cat(buf, sizeof(buf), n, "%s%u", k ? "," : "", d->khz[k]);
+ 		}

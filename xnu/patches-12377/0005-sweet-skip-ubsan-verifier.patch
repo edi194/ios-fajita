@@ -1,0 +1,14 @@
+diff --git a/osfmk/conf/Makefile.template b/osfmk/conf/Makefile.template
+index e23dabed5098ec4e74fcdddaf252022aaaa4ceaa..45ece6190348b98d9b328909c82cb14d90d154bb 100644
+--- a/osfmk/conf/Makefile.template
++++ b/osfmk/conf/Makefile.template
+@@ -113,6 +113,9 @@ VM_UBSAN_FLAGS = -fsanitize=$(subst ${} ${},,${VM_UBSAN_CHECKS})
+ #
+ ifeq ($(KASAN),1)
+ # UBSan build-time validations disabled on KASAN builds
++else ifeq ($(CURRENT_MACHINE_CONFIG),SWEET)
++# sweet: this is a DEVELOPMENT kernel on the macOS config (no ubsan_minimal runtime, built by the
++# open-source toolchain); the verifier flags the XNUPOST type-ABI tests of vm_sanitize.c
+ else ifeq ($(BUILD_CODE_COVERAGE),1)
+ # UBSan build-time validations disabled on code coverage builds
+ else

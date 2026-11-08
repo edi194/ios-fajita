@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -1780,17 +1780,17 @@
+ #define RING_OFF                0x04000u
+ #define RING_SIZE               0x8000u
+ #define SQE_OFF                 0x0c000u
+-#define SQE_MAX                 0x8000u
+-#define SCRATCH_OFF             0x14000u
++#define SQE_MAX                 0x10000u        /* linux-firmware a630_sqe.fw is 34188 bytes */
++#define SCRATCH_OFF             0x1c000u
+ #define SCRATCH_SIZE            0x4000u
+ #define RING_VA                 (CP_GPU_VA + 0x00000u)
+ #define SQE_VA                  (CP_GPU_VA + 0x10000u)
+-#define SCRATCH_VA              (CP_GPU_VA + 0x20000u)
++#define SCRATCH_VA              (CP_GPU_VA + 0x30000u)   /* SQE_VA + SQE_MAX (0x40020000) stays an unmapped guard */
+ #define SCRATCH_RPTR            0x000u          /* RPTR shadow (disabled by NO_UPDATE) */
+ #define SCRATCH_MEMWR           0x100u
+ #define SCRATCH_TS              0x110u
+-#define SCRATCH_FENCE           0x200u
+-#define SCRATCH_FILL            0x400u          /* stage 8 fill test: 64 dwords */          /* kernel interface: last completed submission (CACHE_FLUSH_TS target) */
++#define SCRATCH_FENCE           0x200u          /* kernel interface: last completed submission (CACHE_FLUSH_TS target) */
++#define SCRATCH_FILL            0x400u          /* stage 8 fill test: 64 dwords */
+ #define CP_RB_CNTL_VALUE        ((1u << 27) | (2u << 8) | 12u)  /* NO_UPDATE, 32 byte blocks, 32 KiB ring */
+ 
+ #define CP_NOP                  16

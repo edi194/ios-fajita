@@ -1,0 +1,14 @@
+Charger control 2 s after its thread starts instead of 20 s: until then the bootloader left a ~25 mA input limit and the
+boot ran on the battery (a negative current on the boot screen while plugged in).
+
+--- a/bsd/dev/sweet_charger.c
++++ b/bsd/dev/sweet_charger.c
+@@ -84,7 +84,7 @@
+ void sweet_charger_start(void);
+ 
+ #define SC_SID                  2u
+-#define SC_START_DELAY_S        20u
++#define SC_START_DELAY_S        2u      /* 0248: was 20 s; until then the bootloader's ~25 mA input limit left boot on the battery */
+ #define SC_RO_PERIOD_MS         30000u
+ #define SC_CTL_PERIOD_MS        3000u
+ #define SC_LOG_PERIOD_MS        30000u

@@ -1,0 +1,49 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 2fdf609..e83469d 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -385,18 +385,18 @@ fw_from_adt(const char *prop, void **buf, size_t *len)
+ 	return true;
+ }
+ 
++/* Searched in this order; the second one is where scripts/gpu-fw-push.sh puts the files (docs/GPU_KERNEL.md). */
++static const char *const fw_dirs[] = { FW_DIR, "/usr/local/share/firmware/" };
++
+ static bool
+-fw_from_file(const char *file, void **buf, size_t *len)
++fw_from_file_in(const char *dir, const char *file, void **buf, size_t *len)
+ {
+ 	char path[128];
+ 	vnode_t vp = NULLVP;
+ 	off_t size = 0;
+ 	int error;
+ 
+-	if (!file || rootvnode == NULLVP) {
+-		return false;
+-	}
+-	snprintf(path, sizeof(path), "%s%s", FW_DIR, file);
++	snprintf(path, sizeof(path), "%s%s", dir, file);
+ 	vfs_context_t ctx = vfs_context_kernel();
+ 	if (vnode_lookup(path, 0, &vp, ctx) != 0 || vp == NULLVP) {
+ 		return false;
+@@ -424,6 +424,20 @@ fw_from_file(const char *file, void **buf, size_t *len)
+ 	return true;
+ }
+ 
++static bool
++fw_from_file(const char *file, void **buf, size_t *len)
++{
++	if (!file || rootvnode == NULLVP) {
++		return false;
++	}
++	for (unsigned i = 0; i < sizeof(fw_dirs) / sizeof(fw_dirs[0]); i++) {
++		if (fw_from_file_in(fw_dirs[i], file, buf, len)) {
++			return true;
++		}
++	}
++	return false;
++}
++
+ /* ADT property first (no file system needed), then the file. Free with sweet_a630_fw_put. */
+ bool
+ sweet_a630_fw_get(const char *adt_prop, const char *file, void **buf, size_t *len)

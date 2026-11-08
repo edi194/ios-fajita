@@ -1,0 +1,42 @@
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -927,8 +927,19 @@
+ 			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
+ 			    st.kind == TOUCH_NVT ? touch_novatek() : touch_focaltech();
+ 			if (err) {
+-				if ((errors++ % 100u) == 0) {
+-					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
++				/* At most one line a minute: bad frames are frequent and harmless */
++				static uint64_t last_log;
++				static unsigned suppressed;
++				uint64_t now = mach_absolute_time(), minute;
++				nanoseconds_to_absolutetime(60ull * NSEC_PER_SEC, &minute);
++				errors++;
++				if (last_log == 0 || now - last_log >= minute) {
++					printf("SWEET TOUCH: report err=%d irq=%#x (+%u since last line)\n",
++					    err, st.irq_status, suppressed);
++					last_log = now;
++					suppressed = 0;
++				} else {
++					suppressed++;
+ 				}
+ 				if (errors == 10) {
+ 					touch_report(0, st.x, st.y); /* release after persistent bad reads */
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -536,7 +536,14 @@
+ 	collection->setIntegerValue(kIOHIDEventFieldDigitizerButtonMask, any ? 1 : 0);
+ 	IOLockUnlock(fLock);
+ 
+-	if (was != down) {
++	/* Per-touch lines flood the screen console: boot-arg sweethidlog=1 */
++	static int touch_log = -1;
++	if (touch_log < 0) {
++		int on = 0;
++		PE_parse_boot_argn("sweethidlog", &on, sizeof(on));
++		touch_log = on ? 1 : 0;
++	}
++	if (touch_log && was != down) {
+ 		IOLog("SWEET HID: touch %d %s at %d,%d%s\n", finger, down ? "down" : "up", x, y,
+ 		    fEdge[finger] ? " edge" : "");
+ 	}

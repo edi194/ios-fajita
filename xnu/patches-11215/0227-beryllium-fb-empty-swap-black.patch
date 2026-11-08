@@ -1,0 +1,27 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2687,7 +2687,23 @@
+ 	fDraw = fFlip ? fBufVA[back] : fPixels;
+ 	if (fFlip) {
+ 		waitLatch();    /* the buffer we draw into may still be on the panel */
++	}
++	/*
++	 * 0227: a swap with no layer (CoreAnimation's first swap after the display comes back on) means nothing is
++	 * composed: black. The copy path below would draw nothing and scan the back buffer as it is, which still holds the
++	 * last frame this path drew, possibly long ago: on every wake the lock screen showed that stale frame for a vsync
++	 * before its wake animation started (the animation seemed to jump forward, back, forward). Once per wake.
++	 */
++	bool any = false;
++	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
++		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
++			any = true;
++		}
+ 	}
++	if (!any) {
++		bzero((void *)fDraw, (size_t)(fHw && fFlip ? (uint64_t)fHwStride * fLogicalH : (uint64_t)fRowBytes * fHeight));
++		fBarsMask |= (uint8_t)(1u << fDrawIdx);      /* its scaling bars are black too */
++	}
+ 
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);

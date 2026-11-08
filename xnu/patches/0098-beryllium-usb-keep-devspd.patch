@@ -1,0 +1,25 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -960,9 +960,19 @@
+ 	dwc_wr(GEVNTCOUNT, dwc_rd(GEVNTCOUNT) & 0xffff);
+ 	ud.evt_pos = 0;
+ 
+-	/* High speed, address 0 */
+-	uint32_t dcfg = dwc_rd(DCFG) & ~(7u | (0x7fu << 3));
+-	dwc_wr(DCFG, dcfg | 0);
++	/*
++	 * High speed, address 0. Without a soft reset (Poco F1) keep the
++	 * DEVSPD ABL programmed (4 = the USB3-capable core's maximum; the port
++	 * is USB 2.0 and links at high speed anyway): DWC3 applies DEVSPD only
++	 * at a soft reset, and rewriting it on the running core may leave it
++	 * inconsistent. Only the device address is cleared.
++	 */
++	uint32_t dcfg = dwc_rd(DCFG) & ~(0x7fu << 3);
++	if (do_reset) {
++		dcfg &= ~7u;
++	}
++	dwc_wr(DCFG, dcfg);
++	printf("SWEET USB: DCFG 0x%08x (DEVSPD %u)\n", dwc_rd(DCFG), dwc_rd(DCFG) & 7u);
+ 	/* Events: disconnect, USB reset, connect done */
+ 	dwc_wr(DEVTEN, 0x7);
+ 

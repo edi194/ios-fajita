@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -2483,9 +2483,16 @@
+ #define GVM_BASE                0x80000000ull
+ #define GVM_END                 0x100000000ull
+ #define GVM_GUARD               0x1000ull       /* unmapped page after every kernel-placed buffer */
+-#define GVM_MAXFREE             512
++#define GVM_MAXFREE             4096            /* 0237: was 512; a full list drops freed ranges (address space lost) */
+ #define PTP_TABLE               0x1000ull       /* a GPU table is 4 KiB; xnu's PAGE_SIZE is 16 KiB: never use PAGE_SIZE for GPU pages */
+-#define PTP_PAGES               256             /* 1 MiB of tables: 2 L2 + up to 254 L3 (2 MiB each) */
++/*
++ * 0237: tables for the whole window. Table pages are taken on first touch of each 2 MiB and never given back, and
++ * first-fit placement walks upward through the 2 GiB as buffers come and go, so 256 (2 L2 + 254 L3 = 508 MiB ever
++ * touched) ran out a while into every boot: small buffers still fitted in regions that had tables, while every
++ * full-screen render target (10-24 MB) needed fresh ones and GEM_NEW failed (Control Center without its backdrop,
++ * a flat wallpaper). 2 L2 + 1024 L3 cover 0x80000000-0x100000000; 1028 keeps the pool a whole number of 16 KiB pages.
++ */
++#define PTP_PAGES               1028            /* 4 MiB of tables: 2 L2 + 1024 L3 (2 MiB each) + 2 spare */
+ 
+ static struct {
+ 	bool     ready;         /* GPU up and the interface usable */
+@@ -3517,11 +3524,11 @@
+ 	}
+ 	n = snprintf(buf, sizeof(buf),
+ 	    "state=%s level=%u mhz=%u max_level=%u freq=%s busy_pct=%llu clients=%u pids=%s submitted=%u completed=%u "
+-	    "suspends=%u resumes=%u recoveries=%u hangs=%u idle_ms=%u hwcg=%u boost_level=%u boosted=%u submits_100ms=%u dcvs_sets=%u dcvs_errors=%u input_level=%u input_ms=%u input_boosts=%u input_boosted=%u input_votes=%u total_ms=%llu res_ms=",
++	    "suspends=%u resumes=%u recoveries=%u hangs=%u idle_ms=%u hwcg=%u boost_level=%u boosted=%u submits_100ms=%u dcvs_sets=%u dcvs_errors=%u input_level=%u input_ms=%u input_boosts=%u input_boosted=%u input_votes=%u gvm_tables=%u/%u gvm_free_ranges=%u total_ms=%llu res_ms=",
+ 	    state, lvl, lvl ? gpu_levels[lvl].mhz : 0, a630_level_max, a630_gov ? "gov" : "fixed", gov_busy_pct, clients, pids,
+ 	    a630_dev.seqno, a630_dev.ready && cp_memory ? *(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) : 0,
+ 	    a630_suspends, a630_resumes, a630_recoveries, a630_dev.hangs, a630_idle_ms, a630_hwcg, a630_boost_level, (unsigned)(a630_boost_level && mach_absolute_time() < gov_boost_until), gov_rate, a630_level_sets, a630_dcvs_errors,
+-	    a630_input_level, a630_input_ms, a630_input_events, (unsigned)(a630_input_level && mach_absolute_time() < a630_input_until), a630_input_votes, tot / NSEC_PER_MSEC);
++	    a630_input_level, a630_input_ms, a630_input_events, (unsigned)(a630_input_level && mach_absolute_time() < a630_input_until), a630_input_votes, ptp_used, (unsigned)PTP_PAGES, gvm_nfree, tot / NSEC_PER_MSEC);
+ 	(void)now_in;
+ 	for (unsigned i = 0; i < 8 && n > 0 && (size_t)n < sizeof(buf); i++) {
+ 		if (i) {

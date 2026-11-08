@@ -1,0 +1,628 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 85626e21a478b99fea1eee567a591d2363d430de..fe1520b8e218e57ae7d04d91225a5bdbb28cfe6e 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/sweet_fb.c			standard
+ bsd/dev/sweet_a630.c			standard
+ bsd/dev/sweet_a630_pas.c			standard
+ bsd/dev/beryllium_wlan.c		standard
++bsd/dev/sweet_80211.c			standard
+ bsd/dev/beryllium_bt_hci.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..315c0ec37243967622bd15a804c597b599b92e4d
+--- /dev/null
++++ b/bsd/dev/sweet_80211.c
+@@ -0,0 +1,486 @@
++/*
++ * SWEET: Wi-Fi interface stand-in for iOS 26 wifid (boot-arg sweet80211=N, off by default).
++ *
++ * iOS 26 has no IO80211Family kext: Apple's Wi-Fi driver is a DriverKit extension, and the
++ * IO80211 framework in user space reaches it through a DriverKit user client. When the matched
++ * service has no user client (IOServiceOpen fails), the framework falls back to the classic
++ * path (docs/WIFI_IOS26.md 1.3), which needs only:
++ *   - a BSD interface that getifaddrs lists and SIOCGIFMEDIA reports as IFM_IEEE80211
++ *     (or SIOCGIFTYPE as Ethernet / Wi-Fi subfamily),
++ *   - an IOKit entry with IOInterfaceName = that interface and
++ *     IO80211InterfaceRole = "Infrastructure" (iokit/Kernel/arm/SweetNetwork.cpp),
++ *   - SIOCGA80211 / SIOCSA80211 ioctls carrying struct apple80211req,
++ *   - kernel events {KEV_VENDOR_APPLE, KEV_IEEE80211_CLASS, subclass 1}, payload =
++ *     interface name (IFNAMSIZ) + event data.
++ * xnu's ifioctl hands any unknown socket ioctl whose buffer starts with an interface name to
++ * that interface's if_ioctl, so the ioctls arrive in sweet80211_if_ioctl below.
++ *
++ * Stage 1 (sweet80211=1) has a null backend: the radio "powers on", a scan finds nothing,
++ * transmitted packets are dropped. Every ioctl type is logged once per direction
++ * ("SWEET 80211: get type 12 (len 1316) -> 0"), so a boot shows what wifid asks for. The
++ * WCN3990 backend (docs/WIFI_BT_PLAN.md) plugs in behind sweet80211_power/scan later.
++ *
++ * Types and events are the IO80211 framework's own numbering (IO80211.framework 1565.3,
++ * iOS 26.6.2). Struct layouts are the classic Apple80211 ones (versioned, version 1); a
++ * reply never writes more than the caller's req_len and zero-fills the rest of it.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <sys/kpi_mbuf.h>
++#include <sys/sockio.h>
++#include <sys/kern_event.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
++#include <kern/clock.h>
++#include <libkern/OSAtomic.h>
++#include <net/if.h>
++#include <net/if_types.h>
++#include <net/ethernet.h>
++#include <net/if_ether.h>
++#include <net/ether_if_module.h>
++#include <net/kpi_interface.h>
++#include <net/if_media.h>
++#include <net/bpf.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/device_tree.h>
++#include "sweet_board.h"
++
++void sweet80211_init(void);
++
++/* iokit/Kernel/arm/SweetNetwork.cpp */
++extern int sweet_net_publish_wlan(const char *bsd_name, const char *prefix, unsigned unit,
++    const uint8_t *mac);
++
++/* struct apple80211req as user space passes it (64-bit processes only on iOS 26) */
++struct sweet80211_req {
++	char            ifname[IFNAMSIZ];
++	uint32_t        type;
++	int32_t         val;
++	uint32_t        len;
++	uint32_t        pad;
++	user64_addr_t   data;
++};
++static_assert(sizeof(struct sweet80211_req) == 40, "apple80211req is 40 bytes");
++
++#define SIOCSA80211     _IOW('i', 200, struct sweet80211_req)   /* 0x802869c8 */
++#define SIOCGA80211     _IOWR('i', 201, struct sweet80211_req)  /* 0xc02869c9 */
++
++/* APPLE80211_IOC_* (IO80211.framework name table index) */
++#define IOC_SSID                1
++#define IOC_CHANNEL             4
++#define IOC_TXPOWER             7
++#define IOC_RATE                8
++#define IOC_BSSID               9
++#define IOC_SCAN_REQ            10
++#define IOC_SCAN_RESULT         11
++#define IOC_CARD_CAPABILITIES   12
++#define IOC_STATE               13
++#define IOC_PHY_MODE            14
++#define IOC_OP_MODE             15
++#define IOC_RSSI                16
++#define IOC_NOISE               17
++#define IOC_POWER               19
++#define IOC_ASSOCIATE           20
++#define IOC_DISASSOCIATE        22
++#define IOC_SUPPORTED_CHANNELS  27
++#define IOC_LOCALE              28
++#define IOC_DRIVER_VERSION      43
++#define IOC_HARDWARE_VERSION    44
++#define IOC_COUNTRY_CODE        51
++#define IOC_SCAN_REQ_MULTIPLE   86
++#define IOC_MAX                 640
++
++/* APPLE80211_M_* event codes */
++#define M_POWER_CHANGED         1
++#define M_SCAN_DONE             10
++#define KEV_APPLE80211_EVENT_SUBCLASS   1
++
++/* channel flags and modes (apple80211_var.h) */
++#define C_FLAG_20MHZ    0x2
++#define C_FLAG_2GHZ     0x8
++#define C_FLAG_5GHZ     0x10
++#define C_FLAG_ACTIVE   0x80
++#define PHY_11A         0x2
++#define PHY_11B         0x4
++#define PHY_11G         0x8
++#define PHY_11N         0x10
++#define PHY_11AC        0x80
++#define OPMODE_STA      0x1
++#define LOCALE_ETSI     2
++
++#define S80211_MAX_REPLY        (64 * 1024)
++
++static struct {
++	int             stage;
++	ifnet_t         ifp;
++	uint8_t         mac[ETHER_ADDR_LEN];
++	uint32_t        power;          /* 0 off, 1 on */
++	uint32_t        country_set;
++	char            country[3];
++	thread_call_t   scan_done;
++	volatile SInt32 logged;         /* log lines used (budget 512) */
++	uint8_t         seen_get[IOC_MAX / 8];
++	uint8_t         seen_set[IOC_MAX / 8];
++} s8;
++
++static void
++s8_log_once(bool set, uint32_t type, uint32_t len, int err)
++{
++	uint8_t *seen = set ? s8.seen_set : s8.seen_get;
++	if (type < IOC_MAX) {
++		uint8_t bit = (uint8_t)(1u << (type & 7));
++		if (seen[type >> 3] & bit) {
++			return;
++		}
++		seen[type >> 3] |= bit;
++	}
++	if (OSIncrementAtomic(&s8.logged) < 512) {
++		printf("SWEET 80211: %s type %u (len %u) -> %d\n", set ? "set" : "get", type, len, err);
++	}
++}
++
++static void
++s8_post_event(uint32_t code, const void *data, uint32_t len)
++{
++	struct kev_msg ev;
++	char ifname[IFNAMSIZ] = "en0";
++
++	bzero(&ev, sizeof(ev));
++	ev.vendor_code = KEV_VENDOR_APPLE;
++	ev.kev_class = KEV_IEEE80211_CLASS;
++	ev.kev_subclass = KEV_APPLE80211_EVENT_SUBCLASS;
++	ev.event_code = code;
++	ev.dv[0].data_ptr = ifname;
++	ev.dv[0].data_length = IFNAMSIZ;
++	if (len != 0) {
++		ev.dv[1].data_ptr = __DECONST(void *, data);
++		ev.dv[1].data_length = len;
++	}
++	int err = kev_post_msg(&ev);
++	if (OSIncrementAtomic(&s8.logged) < 512) {
++		printf("SWEET 80211: event %u (%u bytes) -> %d\n", code, len, err);
++	}
++}
++
++static void
++s8_scan_done(thread_call_param_t p0 __unused, thread_call_param_t p1 __unused)
++{
++	s8_post_event(M_SCAN_DONE, NULL, 0);
++}
++
++/* Copy out a reply: at most req_len bytes, the rest of req_len zero-filled. */
++static int
++s8_reply(struct sweet80211_req *req, const void *buf, uint32_t n)
++{
++	if (req->data == 0 || req->len == 0) {
++		return 0;
++	}
++	if (req->len > S80211_MAX_REPLY) {
++		return EINVAL;
++	}
++	uint8_t *tmp = kalloc_data(req->len, Z_WAITOK | Z_ZERO);
++	if (tmp == NULL) {
++		return ENOMEM;
++	}
++	memcpy(tmp, buf, MIN(n, req->len));
++	int err = copyout(tmp, (user_addr_t)req->data, req->len);
++	kfree_data(tmp, req->len);
++	return err;
++}
++
++/* {u32 version; u32 value} replies, with the value also in req_val */
++static int
++s8_reply_u32(struct sweet80211_req *req, uint32_t value)
++{
++	uint32_t d[2] = { 1, value };
++	req->val = (int32_t)value;
++	return s8_reply(req, d, sizeof(d));
++}
++
++static int
++s8_reply_string(struct sweet80211_req *req, const char *s)
++{
++	struct {
++		uint32_t version;
++		uint16_t len;
++		char     str[256];
++	} __attribute__((packed)) d;
++	bzero(&d, sizeof(d));
++	d.version = 1;
++	d.len = (uint16_t)strlcpy(d.str, s, sizeof(d.str));
++	return s8_reply(req, &d, sizeof(d));
++}
++
++static int
++s8_get(struct sweet80211_req *req)
++{
++	switch (req->type) {
++	case IOC_CARD_CAPABILITIES: {
++		/* {u32 version; u8 capabilities[]}: no optional capabilities yet */
++		uint32_t v = 1;
++		return s8_reply(req, &v, sizeof(v));
++	}
++	case IOC_DRIVER_VERSION:
++		return s8_reply_string(req, "Bergamota sweet80211 1 (null backend)");
++	case IOC_HARDWARE_VERSION:
++		return s8_reply_string(req, "Qualcomm WCN3990");
++	case IOC_POWER: {
++		uint32_t d[6] = { 1, 1, s8.power, 0, 0, 0 };   /* version, num_radios, power_state[4] */
++		req->val = (int32_t)s8.power;
++		return s8_reply(req, d, sizeof(d));
++	}
++	case IOC_STATE:
++		return s8_reply_u32(req, 0);                    /* APPLE80211_S_INIT */
++	case IOC_OP_MODE:
++		return s8_reply_u32(req, OPMODE_STA);
++	case IOC_PHY_MODE: {
++		uint32_t d[3] = { 1, PHY_11A | PHY_11B | PHY_11G | PHY_11N | PHY_11AC, 0 };
++		return s8_reply(req, d, sizeof(d));
++	}
++	case IOC_LOCALE:
++		return s8_reply_u32(req, LOCALE_ETSI);
++	case IOC_COUNTRY_CODE: {
++		struct {
++			uint32_t version;
++			char     cc[3];
++		} __attribute__((packed)) d = { 1, { 0 } };
++		memcpy(d.cc, s8.country_set ? s8.country : "BR", 2);
++		return s8_reply(req, &d, sizeof(d));
++	}
++	case IOC_SUPPORTED_CHANNELS: {
++		static const uint8_t ch5[] = {
++			36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140,
++			149, 153, 157, 161, 165,
++		};
++		struct {
++			uint32_t version;
++			uint32_t num;
++			struct { uint32_t version, channel, flags; } c[64];
++		} d;
++		bzero(&d, sizeof(d));
++		d.version = 1;
++		for (uint32_t ch = 1; ch <= 13; ch++) {
++			d.c[d.num].version = 1;
++			d.c[d.num].channel = ch;
++			d.c[d.num].flags = C_FLAG_2GHZ | C_FLAG_20MHZ | C_FLAG_ACTIVE;
++			d.num++;
++		}
++		for (unsigned i = 0; i < sizeof(ch5); i++) {
++			d.c[d.num].version = 1;
++			d.c[d.num].channel = ch5[i];
++			d.c[d.num].flags = C_FLAG_5GHZ | C_FLAG_20MHZ | C_FLAG_ACTIVE;
++			d.num++;
++		}
++		return s8_reply(req, &d, sizeof(d));
++	}
++	case IOC_SCAN_RESULT:
++		return EIO;                                     /* no (more) results */
++	case IOC_SSID:
++	case IOC_BSSID:
++	case IOC_CHANNEL:
++	case IOC_RSSI:
++	case IOC_NOISE:
++	case IOC_RATE:
++	case IOC_TXPOWER:
++		return ENXIO;                                   /* not associated */
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static int
++s8_set(struct sweet80211_req *req)
++{
++	switch (req->type) {
++	case IOC_POWER: {
++		uint32_t d[6] = { 0 };
++		uint32_t n = MIN(req->len, (uint32_t)sizeof(d));
++		uint32_t on = req->val != 0;
++		if (req->data != 0 && n >= 12) {
++			int err = copyin((user_addr_t)req->data, d, n);
++			if (err) {
++				return err;
++			}
++			on = d[2] != 0;                         /* power_state[0] */
++		}
++		if (on != s8.power) {
++			s8.power = on;
++			printf("SWEET 80211: radio %s (null backend)\n", on ? "on" : "off");
++			s8_post_event(M_POWER_CHANGED, NULL, 0);
++		}
++		return 0;
++	}
++	case IOC_SCAN_REQ:
++	case IOC_SCAN_REQ_MULTIPLE:
++		if (!s8.power) {
++			return ENXIO;
++		}
++	{
++		uint64_t deadline;
++		clock_interval_to_deadline(300, NSEC_PER_MSEC, &deadline);    /* "scan" takes 300 ms */
++		thread_call_enter_delayed(s8.scan_done, deadline);
++		return 0;
++	}
++	case IOC_COUNTRY_CODE: {
++		uint8_t d[7] = { 0 };
++		if (req->data != 0 && req->len >= 6 &&
++		    copyin((user_addr_t)req->data, d, MIN(req->len, (uint32_t)sizeof(d))) == 0) {
++			memcpy(s8.country, d + 4, 2);
++			s8.country_set = 1;
++		}
++		return 0;
++	}
++	case IOC_DISASSOCIATE:
++		return 0;
++	case IOC_ASSOCIATE:
++		return ENXIO;                                   /* nothing to join with a null backend */
++	default:
++		return EOPNOTSUPP;
++	}
++}
++
++static errno_t
++sweet80211_if_ioctl(ifnet_t ifp, unsigned long cmd, void *data)
++{
++	switch (cmd) {
++	case SIOCGA80211:
++	case SIOCSA80211: {
++		struct sweet80211_req *req = (struct sweet80211_req *)data;
++		bool set = cmd == SIOCSA80211;
++		int err = set ? s8_set(req) : s8_get(req);
++		s8_log_once(set, req->type, req->len, err);
++		return err;
++	}
++	case SIOCGIFMEDIA32:
++	case SIOCGIFMEDIA64: {
++		struct ifmediareq *ifmr = (struct ifmediareq *)data;
++		user_addr_t list = (cmd == SIOCGIFMEDIA64) ?
++		    ((struct ifmediareq64 *)ifmr)->ifmu_ulist :
++		    CAST_USER_ADDR_T(((struct ifmediareq32 *)ifmr)->ifmu_ulist);
++		int media = IFM_IEEE80211 | IFM_AUTO;
++		ifmr->ifm_current = media;
++		ifmr->ifm_active = media;
++		ifmr->ifm_mask = 0;
++		ifmr->ifm_status = IFM_AVALID;          /* never associated with the null backend */
++		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
++			ifmr->ifm_count = 1;
++			return copyout(&media, list, sizeof(media));
++		}
++		ifmr->ifm_count = 1;
++		return 0;
++	}
++	case SIOCSIFADDR:
++	case SIOCAIFADDR:
++		ifnet_set_flags(ifp, IFF_UP, IFF_UP);
++		return 0;
++	case SIOCSIFFLAGS:
++	case SIOCADDMULTI:
++	case SIOCDELMULTI:
++		return 0;
++	default:
++		if (OSIncrementAtomic(&s8.logged) < 512) {
++			printf("SWEET 80211: ioctl 0x%lx not handled\n", cmd);
++		}
++		return EOPNOTSUPP;
++	}
++}
++
++static errno_t
++sweet80211_if_output(ifnet_t ifp, mbuf_t m)
++{
++	mbuf_freem(m);
++	ifnet_stat_increment_out(ifp, 0, 0, 1);
++	return 0;
++}
++
++static void
++sweet80211_if_detach(ifnet_t ifp __unused)
++{
++}
++
++/* MAC: ADT /arm-io/wlan local-mac-address, else /chosen mac-address-wifi0, else synthetic */
++static void
++s8_mac(uint8_t out[ETHER_ADDR_LEN])
++{
++	static const uint8_t def[ETHER_ADDR_LEN] = { 0x02, 0x00, 0x5e, 0x77, 0xe0, 0x01 };
++	static const char *const where[][2] = {
++		{ "/arm-io/wlan", "local-mac-address" },
++		{ "/chosen", "mac-address-wifi0" },
++	};
++	memcpy(out, def, ETHER_ADDR_LEN);
++	for (unsigned i = 0; i < 2; i++) {
++		DTEntry node;
++		const void *data = NULL;
++		unsigned int size = 0;
++		if (SecureDTLookupEntry(NULL, where[i][0], &node) == kSuccess &&
++		    SecureDTGetProperty(node, where[i][1], &data, &size) == kSuccess && size == ETHER_ADDR_LEN) {
++			memcpy(out, data, ETHER_ADDR_LEN);
++			printf("SWEET 80211: MAC from %s %s\n", where[i][0], where[i][1]);
++			return;
++		}
++	}
++	printf("SWEET 80211: no MAC in the ADT, using the synthetic one\n");
++}
++
++void
++sweet80211_init(void)
++{
++	struct ifnet_init_eparams init;
++	int stage = 0;
++
++	if (s8.stage != 0 || !sweet_board_beryllium()) {
++		return;
++	}
++	(void)PE_parse_boot_argn("sweet80211", &stage, sizeof(stage));
++	if (stage == 0) {
++		return;                 /* off by default: no interface, no log line */
++	}
++	s8.stage = stage;
++	s8.scan_done = thread_call_allocate(s8_scan_done, NULL);
++	s8_mac(s8.mac);
++
++	bzero(&init, sizeof(init));
++	init.ver = IFNET_INIT_CURRENT_VERSION;
++	init.len = sizeof(init);
++	init.flags = IFNET_INIT_LEGACY;
++	init.uniqueid = "sweet-80211";
++	init.uniqueid_len = sizeof("sweet-80211") - 1;
++	init.name = "en";
++	init.unit = 0;
++	init.family = IFNET_FAMILY_ETHERNET;
++	init.subfamily = IFNET_SUBFAMILY_WIFI;
++	init.type = IFT_ETHER;
++	init.output = sweet80211_if_output;
++	init.demux = ether_demux;
++	init.add_proto = ether_add_proto;
++	init.del_proto = ether_del_proto;
++	init.check_multi = ether_check_multi;
++	init.framer_extended = ether_frameout_extended;
++	init.ioctl = sweet80211_if_ioctl;
++	init.detach = sweet80211_if_detach;
++	init.broadcast_addr = etherbroadcastaddr;
++	init.broadcast_len = ETHER_ADDR_LEN;
++	if (ifnet_allocate_extended(&init, &s8.ifp) != 0) {
++		printf("SWEET 80211: ifnet_allocate failed\n");
++		s8.ifp = NULL;
++		return;
++	}
++	ifnet_set_addrlen(s8.ifp, ETHER_ADDR_LEN);
++	ifnet_set_hdrlen(s8.ifp, sizeof(struct ether_header));
++	ifnet_set_mtu(s8.ifp, ETHERMTU);
++	ifnet_set_flags(s8.ifp, IFF_BROADCAST | IFF_SIMPLEX | IFF_MULTICAST, 0xffff);
++	if (ifnet_attach(s8.ifp, NULL) != 0) {
++		printf("SWEET 80211: ifnet_attach failed\n");
++		s8.ifp = NULL;
++		return;
++	}
++	ifnet_set_lladdr(s8.ifp, s8.mac, ETHER_ADDR_LEN);
++	(void)bpf_attach(s8.ifp, DLT_EN10MB, sizeof(struct ether_header), NULL, NULL);
++	int ok = sweet_net_publish_wlan("en0", "en", 0, s8.mac);
++	printf("SWEET 80211: en0 %02x:%02x:%02x:%02x:%02x:%02x up (stage %d, null backend), IOKit %s\n",
++	    s8.mac[0], s8.mac[1], s8.mac[2], s8.mac[3], s8.mac[4], s8.mac[5], stage,
++	    ok ? "published" : "NOT published");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 27caa0713c7c9c05637520be4858b615e7c525a5..a627530c59fd6cd4117b0dcb85c14acd5c661324 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -71,6 +71,7 @@ extern void sweet_keys_init(void);
+ extern void sweet_reboot_init(void);
+ extern void sweet_touch_init(void);
+ extern void beryllium_wlan_init(void);
++extern void sweet80211_init(void);
+ extern void sweet_usb_probe(void);
+ extern void sweet_cpufreq_max(void);
+ extern void sweet_charger_start(void);
+@@ -1156,6 +1157,7 @@ sweet_ufs_init(void)
+ 	sweet_usb_probe();
+ 	sweet_a630_probe();	/* sweetgpu=N, beryllium only, off by default */
+ 	beryllium_wlan_init();      /* boot-arg sweetwlan=N, off by default */
++	sweet80211_init();          /* boot-arg sweet80211=N (iOS 26 Wi-Fi stand-in), off by default */
+ 	return 0;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetNetwork.cpp b/iokit/Kernel/arm/SweetNetwork.cpp
+index 3c97872a5ae4caa0e27e671bce60d9897bba8c80..5ea056b229a88b3895f29e9b9ea218f99bec8fb5 100644
+--- a/iokit/Kernel/arm/SweetNetwork.cpp
++++ b/iokit/Kernel/arm/SweetNetwork.cpp
+@@ -99,6 +99,22 @@ class IONetworkStack : public SweetNetService {
+ };
+ OSDefineMetaClassAndStructors(IONetworkStack, SweetNetService);
+ 
++/*
++ * Wi-Fi (bsd/dev/sweet_80211.c, boot-arg sweet80211): iOS 26 wifid matches
++ * no class names, only properties (docs/WIFI_IOS26.md 1.2); the names below
++ * are for configd and CoreWiFi, which look for IO80211Controller. Neither
++ * has a user client, so the IO80211 framework takes its ioctl path.
++ */
++class IO80211Controller : public SweetNetService {
++	OSDeclareDefaultStructors(IO80211Controller);
++};
++OSDefineMetaClassAndStructors(IO80211Controller, SweetNetService);
++
++class IO80211Interface : public IOEthernetInterface {
++	OSDeclareDefaultStructors(IO80211Interface);
++};
++OSDefineMetaClassAndStructors(IO80211Interface, IOEthernetInterface);
++
+ class SweetNetworkStackUserClient : public IOUserClient {
+ 	OSDeclareDefaultStructors(SweetNetworkStackUserClient);
+ public:
+@@ -257,4 +273,76 @@ sweet_net_publish(const char *bsd_name, const char *prefix, unsigned unit,
+ 	    stack_published ? "up" : "missing");
+ 	return intf_ok ? 1 : 0;
+ }
++/*
++ * Publish bus -> IO80211Controller ("AppleWLANDriver") -> IO80211Interface
++ * for the Wi-Fi stand-in's ifnet. Properties are set before registerService
++ * so wifid's matching notifications see them:
++ *   {IOPropertyExistsMatch: WiFiHardwareHealthy}           (controller)
++ *   {IOPropertyMatch: {IO80211InterfaceRole: Infrastructure}} (interface)
++ *   IOServiceNameMatching("AppleWLANDriver")                (controller)
++ * The interface has no NetworkConfigurationOverrides: configd runs DHCP.
++ * Returns 1 when the interface object was published, else 0.
++ */
++extern "C" int
++sweet_net_publish_wlan(const char *bsd_name, const char *prefix, unsigned unit, const uint8_t *mac)
++{
++	IOService *platform = IOService::getPlatform();
++
++	if (platform == NULL) {
++		IOLog("SWEET 80211: no platform expert; IOKit interface not published\n");
++		return 0;
++	}
++	SweetNetworkBus *bus = OSTypeAlloc(SweetNetworkBus);
++	if (bus == NULL || !bus->init()) {
++		OSSafeReleaseNULL(bus);
++		return 0;
++	}
++	bus->setName("sweet-wlan");
++	bus->retain();
++	if (!sweet_net_attach(bus, platform)) {
++		bus->release();
++		return 0;
++	}
++
++	IO80211Controller *ctrl = OSTypeAlloc(IO80211Controller);
++	if (ctrl == NULL || !ctrl->init()) {
++		OSSafeReleaseNULL(ctrl);
++		bus->release();
++		return 0;
++	}
++	ctrl->setName("AppleWLANDriver");
++	ctrl->setProperty("IOMACAddress", (void *)mac, 6);
++	ctrl->setProperty("SelfNamed", kOSBooleanTrue);
++	ctrl->setProperty("WiFiHardwareHealthy", kOSBooleanTrue);
++	ctrl->setProperty("IOModel", "WCN3990");
++	ctrl->setProperty("IOVendor", "Qualcomm");
++	ctrl->retain();
++	bool ctrl_ok = sweet_net_attach(ctrl, bus);
++	bus->release();
++	if (!ctrl_ok) {
++		ctrl->release();
++		return 0;
++	}
++
++	IO80211Interface *intf = OSTypeAlloc(IO80211Interface);
++	if (intf == NULL || !intf->init()) {
++		OSSafeReleaseNULL(intf);
++		ctrl->release();
++		return 0;
++	}
++	intf->setProperty("IOInterfaceType", 6ULL, 32);         /* IFT_ETHER */
++	intf->setProperty("IOBuiltin", kOSBooleanTrue);
++	intf->setProperty("IOPrimaryInterface", kOSBooleanTrue);
++	intf->setProperty("BSD Name", bsd_name);
++	intf->setProperty("IOInterfaceName", bsd_name);
++	intf->setProperty("IOInterfaceNamePrefix", prefix);
++	intf->setProperty("IOInterfaceUnit", (unsigned long long)unit, 32);
++	intf->setProperty("IO80211InterfaceRole", "Infrastructure");
++	bool intf_ok = sweet_net_attach(intf, ctrl);
++	ctrl->release();
++
++	IOLog("SWEET 80211: IOKit interface %s %s (AppleWLANDriver, Infrastructure role)\n",
++	    bsd_name, intf_ok ? "published" : "NOT published");
++	return intf_ok ? 1 : 0;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

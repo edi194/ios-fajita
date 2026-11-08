@@ -1,0 +1,103 @@
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -29,6 +29,7 @@
+ #include <sys/sysproto.h>
+ #include <sys/kauth.h>
+ #include <sys/bitstring.h>
++#include <sys/event.h>
+ 
+ #include <security/audit/audit.h>
+ 
+@@ -89,6 +90,84 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ /* bsd/kern/sweet_amfi.c: boot-arg sweetsyserr */
+ void sweet_syserr_trace(struct proc *p, unsigned short code, int error, const uint64_t *arg);
++
++/*
++ * launchd kevent / posix_spawn tracer (0152): how does launchd arm demand watches (EVFILT_MACHPORT = -8) on its
++ * service ports, and which posix_spawn fails? Prints, for pid 1 only, every kevent change item whose filter is
++ * EVFILT_MACHPORT (up to 400 lines) and every failing posix_spawn with path and psa_flags.
++ */
++static int _Atomic sweet_lkq_count;
++
++static void
++sweet_launchd_trace(struct proc *p, unsigned short code, int error, const uint64_t *arg)
++{
++	if (proc_pid(p) != 1) {
++		return;
++	}
++	if (code == 244 && error != 0) {
++		char path[128];
++		size_t done = 0;
++		uint32_t sz[2] = { 0, 0 };
++		uint64_t ap = 0;
++		int16_t psa = -1;
++		path[0] = '\0';
++		if (arg[1] != 0) {
++			(void)copyinstr((user_addr_t)arg[1], path, sizeof(path), &done);
++			path[sizeof(path) - 1] = '\0';
++		}
++		if (arg[2] != 0 && copyin((user_addr_t)arg[2], sz, sizeof(sz)) == 0 &&
++		    copyin((user_addr_t)arg[2] + 8, &ap, sizeof(ap)) == 0 && ap != 0) {
++			(void)copyin((user_addr_t)ap, &psa, sizeof(psa));
++		}
++		printf("SWEET SPAWN launchd posix_spawn e=%d \"%s\" attr_size=%u psa_flags=0x%x\n", error, path, sz[0],
++		    (unsigned)(uint16_t)psa);
++		return;
++	}
++	if (code != 363 && code != 369 && code != 374 && code != 375) {
++		return;
++	}
++	user_addr_t cl;
++	int n;
++	size_t isz;
++	if (code == 363) {
++		cl = (user_addr_t)arg[1]; n = (int)arg[2]; isz = 32;
++	} else if (code == 369) {
++		cl = (user_addr_t)arg[1]; n = (int)arg[2]; isz = 48;
++	} else if (code == 374) {
++		cl = (user_addr_t)arg[1]; n = (int)arg[2]; isz = sizeof(struct kevent_qos_s);
++	} else {
++		/* kevent_id(id, changelist, nchanges, ...) */
++		cl = (user_addr_t)arg[1]; n = (int)arg[2]; isz = sizeof(struct kevent_qos_s);
++	}
++	if (cl == 0 || n <= 0) {
++		return;
++	}
++	for (int i = 0; i < n && i < 16; i++) {
++		struct kevent_qos_s kq;
++		memset(&kq, 0, sizeof(kq));
++		if (copyin(cl + i * isz, &kq, isz < sizeof(kq) ? isz : sizeof(kq)) != 0) {
++			break;
++		}
++		int16_t filt;
++		uint16_t fl;
++		uint32_t ff;
++		if (code == 363 || code == 369) {
++			/* legacy layouts: struct kevent {ident u64? ...} only kevent64 matches the first fields */
++			filt = kq.filter; fl = kq.flags; ff = (code == 369) ? kq.qos : 0;
++		} else {
++			filt = kq.filter; fl = kq.flags; ff = kq.fflags;
++		}
++		if (filt != -8 /* EVFILT_MACHPORT */) {
++			continue;
++		}
++		if (atomic_fetch_add(&sweet_lkq_count, 1) < 400) {
++			printf("SWEET KQ launchd code %u err %d id 0x%llx item %d/%d ident 0x%llx filt %d flags 0x%x fflags 0x%x "
++			    "qos 0x%x data 0x%llx ext0 0x%llx ext1 0x%llx\n",
++			    code, error, code == 375 ? arg[0] : 0ULL, i, n, kq.ident, filt, fl, ff, kq.qos,
++			    (unsigned long long)kq.data, kq.ext[0], kq.ext[1]);
++		}
++	}
++}
+ #endif
+ 
+ void
+@@ -187,6 +266,7 @@
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
++	sweet_launchd_trace(proc, code, error, &uthread->uu_arg[0]);
+ 	if (__improbable(error != 0)) {
+ 		sweet_syserr_trace(proc, code, error, &uthread->uu_arg[0]);
+ 	}

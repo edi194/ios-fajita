@@ -1,0 +1,40 @@
+berga-tools: prebuilt on-device binaries of the Bergamota Project
+=================================================================
+
+This archive holds compiled code only. Which files, their SHA-256, size and CPU architecture: berga-tools.json.
+Everything was built from the sources in https://github.com/ry-diffusion/Bergamota at the commit named in berga-tools.json
+("commit"; "bergamota_gl_source_commit" is HEAD of the gpu-eagl checkout the GL payload was taken from).
+
+What is in it
+-------------
+sweetnet/        Bergamota's own on-device tools (sources: tools/sweetnet/*.c, *.m, sweetrun-app/), built with the Xcode
+                 iphoneos SDK, ad-hoc signed; the iOS 18 ones are arm64e rewritten by `renegade strip --sign` (pacstrip).
+bergamota-gl/    The bglrender payload (sources: gpu/eagl/ on the gpu-eagl branch):
+                   bgl-launch, OpenGLES.framework/OpenGLES   Bergamota's own code
+                   libdrm.2.dylib                            Bergamota's libdrm stand-in over its own GPU kernel client
+                   libOSMesa.8.dylib                         Mesa 25.0.7 (official release tag) with Bergamota's patch
+                                                             (gpu/eagl/mesa/bergamota-mesa-25.0.7.patch); softpipe and
+                                                             freedreno gallium drivers, no LLVM
+ssh/             Third-party tools for SSH over the USB link, built by tools/ssh/build.sh from the official release tarballs
+                 (hashes and signatures: docs/SSH_OVER_USB.md) with the small iOS patches in tools/ssh/*.patch, ad-hoc signed:
+                   dropbear   dropbear 2026.94 (multi-call: dropbear, dropbearkey, scp)
+                   dash       dash 0.5.13.5, installed as /bin/sh
+                   toybox     toybox 0.8.15
+LICENSES/        this file and the license texts of the third-party code that is linked in or shipped.
+
+Licenses
+--------
+Bergamota's own code: the repository does not carry a LICENSE file at the commit this archive was built from. The files under
+gpu/eagl/ say `SPDX-License-Identifier: MIT` in their headers. For everything else, see the repository. This archive grants
+nothing beyond what the repository grants.
+Mesa (libOSMesa.8.dylib): MIT, see LICENSES/Mesa-MIT.txt.
+libdrm headers (used to build the stand-in; official libdrm-2.4.124 tag): MIT, see LICENSES/libdrm-MIT.txt.
+dropbear: MIT-style, with the licenses of the code it includes (libtomcrypt, libtommath, ...), see LICENSES/dropbear-LICENSE.txt.
+dash: BSD, see LICENSES/dash-COPYING.txt.
+toybox: 0BSD, see LICENSES/toybox-LICENSE.txt.
+
+What is NOT in it, on purpose
+-----------------------------
+No file of Apple's (no firmware, no dyld shared cache, no framework or library copied from iOS, nothing out of an IPSW). The
+binaries only name system libraries by path (/usr/lib/..., /System/Library/...), which the phone's own iOS root provides.
+No Qualcomm firmware (no GPU zap/gmu/sqe, nothing from vendor partitions), no device dumps, no serial numbers or calibration data.

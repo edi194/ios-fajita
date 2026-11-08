@@ -1,0 +1,127 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -183,7 +183,10 @@
+ #define DEPCMD_SETEPCONFIG      1
+ #define DEPCMD_SETTRANSFRESOURCE 2
+ #define DEPCMD_SETSTALL         4
++#define DEPCMD_CLEARSTALL       5
+ #define DEPCMD_STARTTRANSFER    6
++#define DEPCMD_ENDTRANSFER      8
++#define DEPCMD_FORCERM          (1u << 11)
+ #define DEPCMD_DEPSTARTCFG      9
+ #define DEPCMD_CMDACT           (1u << 10)
+ 
+@@ -238,6 +241,9 @@
+ 	unsigned    txq_head, txq_count;
+ 	bool        tx_busy;
+ 	uint64_t    rx_frames, tx_frames;
++	bool        xfer_active[6]; /* a STARTTRANSFER is outstanding (physical ep) */
++	uint8_t     xfer_res[6];    /* its transfer resource index */
++	uint32_t    resets;
+ } ud;
+ 
+ static inline void
+@@ -309,7 +315,10 @@
+ 		ud_sync(buf, len);
+ 	}
+ 	uint64_t tpa = ud.dma_pa + trb;
+-	ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0);
++	if (ud_epcmd(ep, DEPCMD_STARTTRANSFER, (uint32_t)(tpa >> 32), (uint32_t)tpa, 0) == 0 && ep < 6) {
++		ud.xfer_res[ep] = (uint8_t)((dwc_rd(DEPCMD(ep)) >> 16) & 0x7f);
++		ud.xfer_active[ep] = true;
++	}
+ }
+ 
+ static void
+@@ -533,7 +542,9 @@
+ 			mbuf_freem(m);
+ 		}
+ 	}
+-	ud_rx_arm();
++	if (ud.configured) {
++		ud_rx_arm();
++	}
+ }
+ 
+ /* Start the next queued frame if the IN endpoint is idle. ud.lock held. */
+@@ -706,6 +717,53 @@
+ 	}
+ 	ifnet_set_flags(ud.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 	printf("SWEET USB: ue0 192.168.7.2/24 %s (err %d)\n", err ? "NOT configured" : "up", err);
++}
++
++/*
++ * USB reset or disconnect (Linux dwc3_gadget_reset_interrupt /
++ * _disconnect_interrupt): end the outstanding transfers, clear stalls,
++ * drop the data endpoints and the configuration, and put ep0 back in the
++ * SETUP stage. Without this a host-side reset (or unplug + replug) left
++ * ep0 waiting in a data/status stage and the bulk endpoints configured,
++ * and the phone never enumerated again until reboot.
++ */
++static void
++ud_bus_reset(const char *why)
++{
++	static const unsigned data_eps[] = { EP_RX, EP_TX, EP_INT };
++	bool was = ud.configured;
++
++	lck_mtx_lock(ud.lock);
++	ud.configured = false;          /* stops ud_tx_kick_locked */
++	for (unsigned i = 0; i < 3; i++) {
++		unsigned ep = data_eps[i];
++		if (ud.xfer_active[ep]) {
++			ud_epcmd(ep, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.xfer_res[ep] << 16), 0, 0, 0);
++			ud.xfer_active[ep] = false;
++		}
++		ud_epcmd(ep, DEPCMD_CLEARSTALL, 0, 0, 0);
++	}
++	ud.tx_busy = false;
++	lck_mtx_unlock(ud.lock);
++	dwc_wr(DALEPENA, dwc_rd(DALEPENA) & 3u);
++	if (ud.xfer_active[1]) {        /* an IN data/status stage on ep0 */
++		ud_epcmd(1, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.xfer_res[1] << 16), 0, 0, 0);
++		ud.xfer_active[1] = false;
++	}
++	ud.data_alt = 0;
++	if (ud.state != EP0_SETUP || !ud.xfer_active[0]) {
++		if (ud.xfer_active[0]) {
++			ud_epcmd(0, DEPCMD_ENDTRANSFER | DEPCMD_FORCERM | ((uint32_t)ud.xfer_res[0] << 16), 0, 0, 0);
++			ud.xfer_active[0] = false;
++		}
++		ud_start_setup();
++	}
++	if (was) {
++		ud_link_event(false);
++	}
++	ud.resets++;
++	printf("SWEET USB: %s #%u: endpoints reset, ep0 back to SETUP (was %s)\n",
++	    why, ud.resets, was ? "configured" : "unconfigured");
+ }
+ 
+ static void
+@@ -716,6 +774,7 @@
+ 		if (type == 1) {        /* USB reset */
+ 			dwc_wr(DCFG, dwc_rd(DCFG) & ~(0x7fu << 3));
+ 			printf("SWEET USB: bus reset\n");
++			ud_bus_reset("bus reset");
+ 		} else if (type == 2) { /* connect done */
+ 			uint32_t speed = dwc_rd(DSTS) & 7;
+ 			/* ep0 max packet: 64 at high/full speed (modify action) */
+@@ -726,6 +785,7 @@
+ 			printf("SWEET USB: connected, speed %u\n", speed);
+ 		} else if (type == 0) {
+ 			printf("SWEET USB: disconnect\n");
++			ud_bus_reset("disconnect");
+ 		}
+ 		return;
+ 	}
+@@ -733,6 +793,10 @@
+ 	unsigned type = (ev >> 6) & 0xf;
+ 	unsigned status = (ev >> 12) & 0xf;
+ 
++	if (type == 1 && ep < 6) {
++		ud.xfer_active[ep] = false;     /* XferComplete: the single TRB is done */
++	}
++
+ 	if (ep == EP_RX && type == 1) {
+ 		ud_rx_done();
+ 		return;

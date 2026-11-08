@@ -1,0 +1,85 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index f495b7e..e956ac6 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -337,7 +337,7 @@ public:
+ 	 * its vsync (it waits up to 20 ms, sleeping, for the latch) so a queued frame is never overwritten (scan_replaced) and
+ 	 * the address/flush registers are never rewritten around the latch itself. fLastStamp keeps vsync timestamps monotonic.
+ 	 */
+-	bool          fLatchConfirm, fNoReplace;
++	bool          fLatchConfirm, fNoReplace, fVsyncSmooth;
+ 	uint64_t      fGuardAbs, fLatchSeenAbs, fLastStamp;
+ 	bool          latchedNow(void);
+ 	bool          waitReplace(void);
+@@ -599,7 +599,9 @@ AppleCLCD::start(IOService *provider)
+ 				fSwapDepth = depth <= 1 ? 1 : 2;
+ 				PE_parse_boot_argn("sweetfb_swapsync", &ss, sizeof(ss));
+ 				PE_parse_boot_argn("sweetfb_vsyncalign", &va, sizeof(va));
+-				int lc = 1, nr = 1, lg = 1000;
++				int lc = 1, nr = 0, lg = 0, vs = 0;
++				PE_parse_boot_argn("sweetfb_vsyncsmooth", &vs, sizeof(vs));
++				fVsyncSmooth = vs != 0;
+ 				PE_parse_boot_argn("sweetfb_latchconfirm", &lc, sizeof(lc));
+ 				PE_parse_boot_argn("sweetfb_noreplace", &nr, sizeof(nr));
+ 				PE_parse_boot_argn("sweetfb_latchguard", &lg, sizeof(lg));
+@@ -610,8 +612,8 @@ AppleCLCD::start(IOService *provider)
+ 					fGuardAbs = 0;
+ 				}
+ 				if (fEarly) {
+-					IOLog("SWEET FB: direct safety: latch confirm %d, release guard %d us, no frame replacement %d (sweetfb_latchconfirm / sweetfb_latchguard / sweetfb_noreplace)\n",
+-					    fLatchConfirm ? 1 : 0, lg < 0 ? 0 : lg, fNoReplace ? 1 : 0);
++					IOLog("SWEET FB: direct safety: latch confirm %d, release guard %d us, no frame replacement %d, vsync smoothing %d (sweetfb_latchconfirm / sweetfb_latchguard=US / sweetfb_noreplace / sweetfb_vsyncsmooth; all but the first default off since 0221)\n",
++					    fLatchConfirm ? 1 : 0, lg < 0 ? 0 : lg, fNoReplace ? 1 : 0, fVsyncSmooth ? 1 : 0);
+ 				}
+ 				fSwapSync = fEarly && ss != 0;
+ 				fVsyncAlign = fSwapSync && va != 0;
+@@ -702,11 +704,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			if (left < per / 4) {
+ 				left += per;    /* too close to the boundary we just served: aim for the next one */
+ 			}
+-			nextUS = (uint32_t)sweet_abs_us(left) + 500;    /* 0220: fire just AFTER the boundary, never before it */
++			nextUS = (uint32_t)sweet_abs_us(left) + (fb->fVsyncSmooth ? 500 : 0);    /* 0220/0221 sweetfb_vsyncsmooth: fire just AFTER the boundary */
+ 			if (nextUS < 1000) {
+ 				nextUS = 1000;
+ 			}
+-			if (stamp <= fb->fLastStamp) {
++			if (fb->fVsyncSmooth && stamp <= fb->fLastStamp) {
+ 				stamp = now > fb->fLastStamp ? now : fb->fLastStamp + 1;        /* never a repeated or older vsync */
+ 			}
+ 		}
+@@ -1604,7 +1606,7 @@ AppleCLCD::notePhase(uint64_t obs)
+ 		nanoseconds_to_absolutetime((uint64_t)fVsyncUS * 1000, &fPeriodAbs);
+ 	}
+ 	uint64_t per = fPeriodAbs;
+-	if (old == 0 || per == 0 || obs <= old || obs - old > second) {
++	if (old == 0 || per == 0 || obs <= old || obs - old > second || !fVsyncSmooth) {
+ 		__atomic_store_n(&fPhaseAbs, obs, __ATOMIC_RELEASE);
+ 		return;
+ 	}
+@@ -1614,7 +1616,7 @@ AppleCLCD::notePhase(uint64_t obs)
+ 		r -= (int64_t)per;
+ 		n++;
+ 	}
+-	__atomic_store_n(&fPhaseAbs, (uint64_t)((int64_t)(old + n * per) + r / 4), __ATOMIC_RELEASE);
++	__atomic_store_n(&fPhaseAbs, (uint64_t)((int64_t)(old + n * per) + (fVsyncSmooth ? r / 4 : r)), __ATOMIC_RELEASE);
+ }
+ 
+ void
+@@ -1660,7 +1662,7 @@ AppleCLCD::zcPoll(bool force)
+ 
+ /*
+  * selector 6, IOMobileFramebufferSwapWait(swap id) (0216). 0 = the swap is complete: its frame was latched by the MDP and
+- * the surfaces it replaced are free again. Anything else (kIOReturnTimeout) = still pending; CoreAnimation then asks
++ * the surfaces it replaced are free again. Anything else (kIOReturnBusy since 0221) = still pending; CoreAnimation then asks
+  * again every 100 us until its own timeout (swap_wait_timeout), so waiting here for up to a frame only saves it
+  * the polling. The wait polls the CTL flush bits (a register read) every 250 us; when it sees them clear it kicks the
+  * work loop (swapFired -> zcPoll) to release the holds and records the time as a real panel vsync (fPhaseAbs) when it
+@@ -1752,7 +1754,7 @@ AppleCLCD::swapWait(uint32_t id)
+ 			fSt.swapWaits++;
+ 			fSt.swapWaitAbs += now - t0;
+ 			fSt.swapWaitTimeouts++;
+-			return kIOReturnTimeout;
++			return kIOReturnBusy;   /* 0221: CoreAnimation's ring poll treats kIOReturnBusy (0xe00002d5) as "pending" and ANY other non-zero as "complete" */
+ 		}
+ 		delay_for_interval(250, NSEC_PER_USEC);
+ 	}

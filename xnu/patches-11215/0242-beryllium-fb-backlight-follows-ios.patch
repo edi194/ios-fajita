@@ -1,0 +1,103 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -450,6 +450,8 @@
+ 	uint16_t      fBlRaw[2];        /* brightness bytes of strings 0, 1 as found */
+ 	void          blInit(void);
+ 	bool          blStep(int dir);
++	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
++	bool          fBlOffFailed;     /* 0242: this power-off could not darken the WLED: black frame instead, for this off only */
+ 	void          blackout(void);
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+@@ -919,12 +921,16 @@
+ 		 * single memset (the old 6-step pixel fade rewrote the 10 MB
+ 		 * write-combined framebuffer every step and painted in bands).
+ 		 */
+-		bool done = false;
++		/*
++		 * 0242: iOS owns the power state and this follows it on the next vsync, with no fade of its own (iOS dims
++		 * before it asks). The old 12-step ramp raced iOS's own off/on (an "on" arriving mid-ramp), and one bad SPMI
++		 * read-back during it switched the backlight path off for the rest of the boot (screen "off" but lit).
++		 */
+ 		IOLockUnlock(fb->fLock);
+-		if (fb->fBlOK) {
+-			done = fb->blStep(-1);
+-		}
+-		if (!done && !fb->fBlOK && !fb->fBlackDone) {
++		if (fb->fBlOK && fb->fBlPos != 0 && !fb->fBlOffFailed && !fb->blSet(false)) {
++			fb->fBlOffFailed = true;
++		}
++		if ((!fb->fBlOK || fb->fBlOffFailed) && !fb->fBlackDone) {
+ 			fb->fBlackDone = true;
+ 			fb->blackout();
+ 		}
+@@ -952,8 +958,8 @@
+ 	if (fb->fZc) {
+ 		fb->zcPoll();
+ 	}
+-	if (fb->fBlOK && fb->fBlPos < SWEET_FB_BL_STEPS && !dirty) {
+-		fb->blStep(+1);     /* back on: the latest frame is up, light the panel again */
++	if (fb->fBlOK && fb->fBlPos != SWEET_FB_BL_STEPS && !dirty) {
++		(void)fb->blSet(true);     /* 0242: back on: the latest frame is up, light the panel in one step */
+ 	}
+ 	sweet_hold_release(taken);      /* copied: CA may render into them again */
+ 	fb->statsTick(now);
+@@ -2461,6 +2467,49 @@
+  * (fBlOK cleared, the original value written back as well as possible) when
+  * a write fails or does not read back: the caller blacks the screen out instead.
+  */
++/*
++ * 0242: the WLED straight to off (0) or to the brightness it had (fBlRaw), on the vsync timer (the only caller, so no
++ * lock). Each write is read back; a mismatch or a failed SPMI access is retried up to 3 times (single reads have come
++ * back 0xffff or 0x0100 while the write had landed). Nothing here turns the backlight path off for good.
++ */
++bool
++AppleCLCD::blSet(bool on)
++{
++	if (!on) {
++		uint16_t now[SWEET_WLED_STRINGS];
++		if (sweet_wled_read16(0, &now[0]) == 0 && sweet_wled_read16(1, &now[1]) == 0 &&
++		    now[0] != 0xffff && now[1] != 0xffff && ((now[0] | now[1]) & 0xfff) != 0) {
++			fBlRaw[0] = now[0];     /* what the panel shows now is what "on" restores */
++			fBlRaw[1] = now[1];
++		}
++	}
++	for (int attempt = 0; attempt < 3; attempt++) {
++		bool ok = true;
++		uint16_t want[SWEET_WLED_STRINGS];
++		for (unsigned n = 0; n < SWEET_WLED_STRINGS && ok; n++) {
++			want[n] = on ? fBlRaw[n] : 0;
++			uint8_t d[2] = { (uint8_t)want[n], (uint8_t)(want[n] >> 8) };
++			ok = sweet_spmi_write(SWEET_WLED_SID, SWEET_WLED_BRIGHT(n), d, 2) == 0;
++		}
++		uint8_t clr = 0, set = SWEET_WLED_SYNC_MASK;
++		ok = ok && sweet_spmi_write(SWEET_WLED_SID, SWEET_WLED_SYNC, &clr, 1) == 0 &&
++		    sweet_spmi_write(SWEET_WLED_SID, SWEET_WLED_SYNC, &set, 1) == 0;
++		for (unsigned n = 0; n < SWEET_WLED_STRINGS && ok; n++) {
++			uint16_t got = 0xffff;
++			ok = sweet_wled_read16(n, &got) == 0 && got == want[n];
++		}
++		if (ok) {
++			fBlPos = on ? SWEET_FB_BL_STEPS : 0;
++			IOLog("SWEET FB: backlight %s (0x%04x/0x%04x)%s\n", on ? "on" : "off", want[0], want[1],
++			    attempt ? " after a retry" : "");
++			return true;
++		}
++		IODelay(200);
++	}
++	IOLog("SWEET FB: backlight %s did not take after 3 tries\n", on ? "on" : "off");
++	return false;
++}
++
+ bool
+ AppleCLCD::blStep(int dir)
+ {
+@@ -3414,6 +3463,7 @@
+ 				fFB->fEmptyBlackArmed = !off;   /* 0233: the first swap after the display comes on may be layerless: black */
+ 				fFB->fFadeStep = 0;
+ 				fFB->fBlackDone = false;
++				fFB->fBlOffFailed = false;      /* 0242: every request tries the backlight again */
+ 				fFB->fDirty = true;     /* on: redraw the latest frame */
+ 			}
+ 			IOLockUnlock(fFB->fLock);

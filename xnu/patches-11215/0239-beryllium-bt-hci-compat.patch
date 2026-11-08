@@ -1,0 +1,342 @@
+diff --git a/bsd/dev/beryllium_bt_hci.c b/bsd/dev/beryllium_bt_hci.c
+index ac42481..f0d21f0 100644
+--- a/bsd/dev/beryllium_bt_hci.c
++++ b/bsd/dev/beryllium_bt_hci.c
+@@ -23,6 +23,7 @@
+ #include <sys/kern_control.h>
+ #include <sys/kpi_mbuf.h>
+ #include <kern/locks.h>
++#include <kern/clock.h>
+ #include <libkern/libkern.h>
+ #include <machine/atomic.h>
+ #include <pexpert/pexpert.h>
+@@ -86,6 +87,7 @@ static struct {
+ 	unsigned tx_pkts, tx_fail, tx_garbage, tios_get, tios_set, baud_req_ignored;
+ 	unsigned connects;
+ 	unsigned last_rx_pkts, last_tx_pkts;
++	unsigned compat, compat_fixed, compat_local, err_budget;       /* sweetbtcompat; rewritten / kernel-answered commands */
+ } bt;
+ 
+ static uint8_t bt_ring[BT_RING_SIZE];
+@@ -136,16 +138,289 @@ bt_hci_connected(void)
+ 	return os_atomic_load(&bt.connected, relaxed);
+ }
+ 
++/*
++ * bluetoothd's HCI init (OI stack) treats any failed command as fatal ("HCI initialization
++ * failed"; with 0238+0239 v2 a SIGABRT in Stack_Init). The WCN3990 answers Command Complete with
++ * status 0x01 (Unknown HCI Command) to commands Apple's Broadcom controllers know: the Broadcom
++ * vendor commands of bluetoothd's bcm_vsc.c (0xfce2, 0xfce9, 0xfd47, 0xfd48 on boot
++ * combo2-0240b-bt0239v2). sweetbtcompat=1 turns such an answer into success for standard
++ * commands (OGF != 0x3f), =2 (default) also for vendor commands: the reply then has no return
++ * parameters, which bcm_vsc.c's sub-opcode checker accepts (it returns true on an empty reply);
++ * a read that needs its parameters still fails in bluetoothd and shows up in the log. Every rewrite and every other non-zero status is logged (own budget), so the
++ * next missing command shows up even after the packet trace budget is spent.
++ */
++#define BT_COMPAT_PAD   16u             /* parameter bytes in a rewritten Command Complete */
++
++/* First parameter byte of the last few commands sent, by opcode (for rewritten replies). */
++static struct { uint16_t op; uint8_t p0; } bt_last_cmd[8];
++static unsigned bt_last_cmd_next;
++
++static void
++bt_cmd_note(const uint8_t *cmd, unsigned len)
++{
++	const unsigned n = sizeof(bt_last_cmd) / sizeof(bt_last_cmd[0]);
++	unsigned op, i;
++
++	if (len < 4 || cmd[0] != 1) {
++		return;
++	}
++	op = cmd[1] | (cmd[2] << 8);
++	for (i = 0; i < n && bt_last_cmd[i].op != op; i++) {
++	}
++	if (i == n) {                   /* one slot per opcode: the newest command wins */
++		i = bt_last_cmd_next++ % n;
++	}
++	bt_last_cmd[i].op = (uint16_t)op;
++	bt_last_cmd[i].p0 = cmd[3] != 0 && len >= 5 ? cmd[4] : 0;
++}
++
++static unsigned
++bt_cmd_param0(unsigned op)
++{
++	for (unsigned i = 0; i < sizeof(bt_last_cmd) / sizeof(bt_last_cmd[0]); i++) {
++		if (bt_last_cmd[i].op == op) {
++			return bt_last_cmd[i].p0;
++		}
++	}
++	return 0;
++}
++
++/*
++ * Command watchdog. Boot combo6-0244-bt0239v4: the WCN3990 never answered 0xfce9 sub-opcode 1
++ * (Broadcom LE Meta Enable Features, while it answers the other 0xfce9 sub-opcodes with 0x01), and
++ * bluetoothd gave up: "BD_VSC_LE_META_ENA_FEATURES timedout waiting for controller", "Notifying BT
++ * Firmware Crashed", restart reason 3602. A command sent to the controller that gets neither Command
++ * Complete nor Command Status within BT_CMD_WATCHDOG_MS is answered here like a rewritten one
++ * (success, first parameter byte + zeros). Only one command is tracked (bluetoothd keeps one in
++ * flight: Num_HCI_Command_Packets 1); a late real answer just arrives as an extra event.
++ */
++#define BT_CMD_WATCHDOG_MS      800u
++
++static struct {
++	uint16_t op;
++	uint8_t p0;
++	bool on;
++	uint64_t t;             /* mach_absolute_time of the transmit */
++} bt_pend;
++static unsigned bt_watchdog_fired;
++
++static void
++bt_pend_set(const uint8_t *cmd, unsigned len)
++{
++	if (len >= 4 && cmd[0] == 1) {
++		bt_pend.op = (uint16_t)(cmd[1] | (cmd[2] << 8));
++		bt_pend.p0 = cmd[3] != 0 && len >= 5 ? cmd[4] : 0;
++		bt_pend.t = mach_absolute_time();
++		os_atomic_store(&bt_pend.on, true, release);
++	}
++}
++
++static void
++bt_pend_answered(const uint8_t *p, unsigned len)
++{
++	unsigned op;
++
++	if (len < 7 || p[0] != 4 || !os_atomic_load(&bt_pend.on, acquire)) {
++		return;
++	}
++	if (p[1] == 0x0e) {
++		op = p[4] | (p[5] << 8);
++	} else if (p[1] == 0x0f) {
++		op = p[5] | (p[6] << 8);
++	} else {
++		return;
++	}
++	if (op == bt_pend.op) {
++		os_atomic_store(&bt_pend.on, false, relaxed);
++	}
++}
++
++static void
++bt_pend_check(void)
++{
++	uint64_t ns;
++	uint8_t ev[7 + 16];
++	unsigned i;
++
++	if (!bt.compat || !os_atomic_load(&bt_pend.on, acquire)) {
++		return;
++	}
++	absolutetime_to_nanoseconds(mach_absolute_time() - bt_pend.t, &ns);
++	if (ns < (uint64_t)BT_CMD_WATCHDOG_MS * 1000000ull) {
++		return;
++	}
++	os_atomic_store(&bt_pend.on, false, relaxed);
++	ev[0] = 4;
++	ev[1] = 0x0e;
++	ev[2] = 4 + 16;
++	ev[3] = 1;
++	ev[4] = (uint8_t)bt_pend.op;
++	ev[5] = (uint8_t)(bt_pend.op >> 8);
++	ev[6] = 0;
++	ev[7] = bt_pend.p0;
++	for (i = 8; i < sizeof(ev); i++) {
++		ev[i] = 0;
++	}
++	bt_watchdog_fired++;
++	printf("SWEET BT: compat: opcode %#06x (OGF %#x OCF %#05x, first parameter %#04x) not answered by the controller "
++	    "within %u ms, answered as success by the kernel (%u so far)\n", bt_pend.op, bt_pend.op >> 10,
++	    bt_pend.op & 0x3ff, bt_pend.p0, BT_CMD_WATCHDOG_MS, bt_watchdog_fired);
++	bt_hci_rx_packet(ev, sizeof(ev));
++}
++
++/*
++ * Commands bluetoothd's init sends unconditionally and fails on when the controller does not list
++ * them (Read Local Supported Commands): { opcode, octet, bit } of the supported-commands mask. They
++ * are answered here with success and never reach the WCN3990. Boot 2026-10-24 combo-0240b-bt0239:
++ * mask octet 18 = 0x83, so bit 3 (Write Default Erroneous Data Reporting) was clear and the OI stack
++ * failed locally: "OI_HCICMD_WriteDefaultErroneousDataReporting (status=628)", "HCI initialization
++ * failed", restart reason 108, without sending the command.
++ */
++static const struct { uint16_t op; uint8_t octet, bit; } bt_local_cmds[] = {
++	{ 0x0c5b, 18, 3 },      /* Write Default Erroneous Data Reporting */
++};
++
++static bool
++bt_hci_local_answer(const uint8_t *cmd, unsigned len)
++{
++	unsigned op, i;
++	uint8_t ev[7];
++
++	if (!bt.compat || len < 4 || cmd[0] != 1) {
++		return false;
++	}
++	op = cmd[1] | (cmd[2] << 8);
++	for (i = 0; i < sizeof(bt_local_cmds) / sizeof(bt_local_cmds[0]); i++) {
++		if (bt_local_cmds[i].op == op) {
++			break;
++		}
++	}
++	if (i == sizeof(bt_local_cmds) / sizeof(bt_local_cmds[0])) {
++		return false;
++	}
++	ev[0] = 4;
++	ev[1] = 0x0e;                   /* Command Complete */
++	ev[2] = 4;
++	ev[3] = 1;                      /* Num_HCI_Command_Packets */
++	ev[4] = cmd[1];
++	ev[5] = cmd[2];
++	ev[6] = 0;                      /* success */
++	bt.compat_local++;
++	printf("SWEET BT: compat: opcode %#06x answered by the kernel (not sent to the controller, %u so far)\n",
++	    op, bt.compat_local);
++	bt_hci_rx_packet(ev, sizeof(ev));
++	return true;
++}
++
++static unsigned
++bt_hci_compat(uint8_t *p, unsigned len)
++{
++	unsigned op, st;
++
++	if (len < 7 || p[0] != 4) {
++		return len;
++	}
++	if (p[1] == 0x0e) {                     /* Command Complete: 04 0e plen ncmd op op status */
++		op = p[4] | (p[5] << 8);
++		st = p[6];
++	} else if (p[1] == 0x0f) {              /* Command Status: 04 0f plen status ncmd op op */
++		op = p[5] | (p[6] << 8);
++		st = p[3];
++	} else {
++		return len;
++	}
++	if (st == 0) {
++		if (bt.compat && p[1] == 0x0e && op == 0x1002 && len >= 7 + 64) {
++			/* Read Local Supported Commands: list the commands answered by bt_hci_local_answer */
++			for (unsigned i = 0; i < sizeof(bt_local_cmds) / sizeof(bt_local_cmds[0]); i++) {
++				uint8_t *b = &p[7 + bt_local_cmds[i].octet];
++				uint8_t was = *b;
++
++				*b |= (uint8_t)(1u << bt_local_cmds[i].bit);
++				printf("SWEET BT: compat: supported commands octet %u %#04x -> %#04x (opcode %#06x)\n",
++				    bt_local_cmds[i].octet, was, *b, bt_local_cmds[i].op);
++			}
++		}
++		return len;
++	}
++	if (bt.compat && p[1] == 0x0e && st == 0x0c &&
++	    (op == 0x2006 || op == 0x2007 || op == 0x200a || op == 0x200b || op == 0x200c)) {
++		/*
++		 * Command Disallowed for an LE command that changes or reads state the controller is busy
++		 * with: Set Advertising Parameters / Read Advertising Channel Tx Power / Set Advertising
++		 * Enable / Set Scan Parameters / Set Scan Enable while advertising or scanning. Apple's
++		 * Broadcom firmware accepts these; the WCN3990 follows the spec. Boot combo8: bluetoothd
++		 * sets new scan parameters while its first passive scan runs, gets 0x0c, logs "Could not
++		 * start LE scan (leScanParamsLPCoreCb): STATUS 712" and restarts (reason 712). Answered as
++		 * success, return parameters (if any) kept as they are: the running scan or advertising
++		 * simply keeps its previous parameters.
++		 */
++		p[6] = 0;
++		bt.compat_fixed++;
++		printf("SWEET BT: compat: LE opcode %#06x Command Disallowed by the controller, answered as success (%u so far)\n",
++		    op, bt.compat_fixed);
++		return len;
++	}
++	if (bt.compat && p[1] == 0x0e && len == 7 && op != 0 &&
++	    st == 0x01 && ((op >> 10) != 0x3f || bt.compat >= 2)) {
++		/*
++		 * Success instead of Unknown HCI Command (0x01), or Command Disallowed (0x0c) for LE Read
++		 * Advertising Physical Channel Tx Power. bluetoothd's reply parsers read return
++		 * parameters on success: bcm_vsc.c's sub-opcode checker compares the first byte with the
++		 * command's sub-opcode (its first parameter), _BCM_CreateMultiAdvInstParser (0xfd48) reads a
++		 * 1-byte instance, LE 0x2007 a 1-byte Tx power; the generic status-only parser ignores the
++		 * rest. So the reply carries the command's first parameter byte followed by zeros
++		 * (BT_COMPAT_PAD bytes in all). Boot combo5-0243-bt0239v3: an empty success for 0xfd48
++		 * tripped "ByteStream_NumReadBytesAvail(*pBs) >= 1" (abort in bcm_vsc.c:827).
++		 */
++		/*
++		 * The sub-opcode byte must be the one of the command this answers: bcm_vsc.c matches
++		 * 0xfce9/0xfd23 replies to their pending command by it. Combo7: an older 0xfce9 entry gave
++		 * 0x32 instead of 0x01 for LE Meta Enable Features, its completion never ran and
++		 * bluetoothd restarted after 15 s ("timedout waiting for controller", reason 3602).
++		 */
++		unsigned i, p0 = op == bt_pend.op ? bt_pend.p0 : bt_cmd_param0(op);
++
++		p[2] = 4 + BT_COMPAT_PAD;
++		p[6] = 0;
++		p[7] = (uint8_t)p0;
++		for (i = 1; i < BT_COMPAT_PAD; i++) {
++			p[7 + i] = 0;
++		}
++		bt.compat_fixed++;
++		printf("SWEET BT: compat: opcode %#06x (OGF %#x OCF %#05x) status %#04x from the controller, answered as success "
++		    "with %u parameter bytes (first %#04x) (%u so far)\n", op, op >> 10, op & 0x3ff, st, BT_COMPAT_PAD, p0,
++		    bt.compat_fixed);
++		return 7 + BT_COMPAT_PAD;
++	}
++	if (bt.err_budget) {
++		bt.err_budget--;
++		printf("SWEET BT: %s for opcode %#06x (OGF %#x OCF %#05x): status %#04x\n",
++		    p[1] == 0x0e ? "Command Complete" : "Command Status", op, op >> 10, op & 0x3ff, st);
++	}
++	return len;
++}
++
+ /* Called by the UART RX path (under the UART lock) with one complete, IBS-free H4 packet. */
+ void
+ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
+ {
++	uint8_t ev[3 + 255];
+ 	unsigned used, i;
+ 
+ 	if (!os_atomic_load(&bt.connected, relaxed)) {
+ 		bt.rx_drop_nc++;
+ 		return;
+ 	}
++	if (pkt[0] == 4 && len >= 7 && len <= 3 + 255 && (pkt[1] == 0x0e || pkt[1] == 0x0f)) {
++		bt_pend_answered(pkt, len);
++		/* Command Complete / Status: bt_hci_compat may rewrite it (and make it longer) */
++		for (i = 0; i < len; i++) {
++			ev[i] = pkt[i];
++		}
++		len = bt_hci_compat(ev, len);
++		pkt = ev;
++	}
+ 	lck_mtx_lock(&bt_lock);
+ 	used = bt.wr - bt.rd;
+ 	if (BT_RING_SIZE - used < len) {
+@@ -174,6 +449,7 @@ bt_hci_rx_packet(const uint8_t *pkt, unsigned len)
+ void
+ bt_hci_rx_service(void)
+ {
++	bt_pend_check();
+ 	for (unsigned loops = 0; loops < 16; loops++) {
+ 		kern_ctl_ref ref;
+ 		uint32_t unit, rd;
+@@ -266,7 +542,10 @@ bt_tx_feed(const uint8_t *p, size_t n)
+ 		}
+ 		if (bt.txtotal != 0 && bt.txn == bt.txtotal) {
+ 			bt_log_pkt("TX", bt.txb, bt.txn);
+-			if (bt.ops->tx(bt.txb, bt.txn)) {
++			bt_cmd_note(bt.txb, bt.txn);
++			if (bt_hci_local_answer(bt.txb, bt.txn)) {
++				bt.tx_pkts++;
++			} else if ((bt_pend_set(bt.txb, bt.txn), bt.ops->tx(bt.txb, bt.txn))) {
+ 				bt.tx_pkts++;
+ 				bt.tx_bytes += bt.txn;
+ 			} else {
+@@ -451,6 +730,11 @@ bt_hci_register(const struct bt_hci_ops *ops, unsigned sk_alias, unsigned log_bu
+ 	}
+ 	bt.ops = ops;
+ 	bt.log_budget = log_budget;
++	bt.compat = 2;
++	bt.err_budget = 64;
++	(void)PE_parse_boot_argn("sweetbtcompat", &bt.compat, sizeof(bt.compat));
++	printf("SWEET BT: compat %u (unknown commands answered as success: %s)\n", bt.compat,
++	    bt.compat >= 2 ? "standard and Broadcom vendor" : bt.compat ? "standard only" : "off");
+ 	/* raw mode as bluetoothd would set it (cfmakeraw, 8N1, hw flow control); the speed is filled in on get */
+ 	bt.tio.c_cflag = 0x38B00ul;
+ 	bt.tio.c_ispeed = bt.tio.c_ospeed = ops->baud(0);

@@ -1,0 +1,570 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -2207,7 +2207,7 @@
+ 	bool intent_asked;
+ 	uint32_t next_liid;
+ 	uint32_t node;                  /* the modem's QRTR node, learned from its packets */
+-	bool hello_seen, announced, tftp, pdm, wlfw_seen, wlfw, ce;
++	bool hello_seen, announced, tftp, pdm, wlfw_seen, wlfw, ce, wmi;
+ 	unsigned pdm_reqs;
+ 	char notes[3072];               /* the stage's key events, printed again at the end (ipc_note) */
+ 	uint32_t notes_len;
+@@ -3609,10 +3609,12 @@
+ enum { WF_IND_REGISTER = 0x20, WF_FW_READY_IND = 0x21, WF_CAP = 0x24, WF_BDF_DOWNLOAD = 0x25, WF_CAL_REPORT = 0x26,
+        WF_MSA_READY_IND = 0x2b, WF_MSA_INFO = 0x2d, WF_MSA_READY = 0x2e };
+ enum { WS_OFF, WS_IND, WS_MSA_INFO, WS_MSA_READY, WS_CAP, WS_WAIT_MSA_IND, WS_BDF, WS_CAL, WS_WAIT_FW_READY, WS_READY,
+-       WS_CFG, WS_MODE, WS_CE, WS_HTC_READY, WS_MODE_OFF, WS_FAILED };
++       WS_CFG, WS_MODE, WS_CE, WS_HTC_READY, WS_HTC_CONNECT, WS_WMI_WAIT_SVC, WS_WMI_SVC_READY, WS_WMI_INIT,
++       WS_WMI_READY, WS_MODE_OFF, WS_FAILED };
+ static const char *const wf_state_name[] = { "off", "ind-register", "msa-info", "msa-ready", "cap", "wait msa-ready-ind",
+ 	                                     "bdf", "cal-report", "wait fw-ready-ind", "FW READY", "wlan-cfg", "mode-on",
+-	                                     "wait HTC ready", "HTC READY", "mode-off", "failed" };
++	                                     "wait HTC ready", "HTC READY", "HTC connect", "wait WMI service-ready",
++	                                     "WMI service-ready", "WMI init", "WMI READY", "mode-off", "failed" };
+ 
+ static struct {
+ 	int state;
+@@ -3803,7 +3805,7 @@
+ #define WCE_MEMBASE_PA          0x18800000ull   /* &wifi reg "membase" */
+ #define WCE_MEMBASE_LEN         0x250000u       /* through the CE wrap registers at 0x24c000 */
+ #define WCE_POOL_PA             0xe0100000ull
+-#define WCE_POOL_LEN            0x100000u
++#define WCE_POOL_LEN            0x400000u       /* rings, buffers, then host memory from +1 MiB */
+ #define WCE_BASE(ce)            (0x240000u + (ce) * 0x1000u)    /* wcn3990_regs ce0..ce11_base_address */
+ #define WCE_RRI_LOW             0x24c004u       /* wcn3990_ce_regs ce_rri_low / high */
+ #define WCE_RRI_HIGH            0x24c008u
+@@ -3853,7 +3855,7 @@
+ 	bool src;
+ 	uint32_t ring, bufs, dmax;
+ } wce_ring[4] = {
+-	{ 0, 16, true, 0x1000, 0, 2048 }, { 3, 32, true, 0x2000, 0, 2048 },
++	{ 0, 16, true, 0x1000, 0x40000, 2048 }, { 3, 32, true, 0x2000, 0x48000, 2048 },
+ 	{ 1, 32, false, 0x3000, 0x10000, 0 }, { 2, 64, false, 0x4000, 0x20000, 0 },
+ };
+ 
+@@ -3869,9 +3871,16 @@
+ 	bool pool_ok, mode_on, mode_sent, rings;
+ 	int prev_state;                 /* the state to report again after mode off */
+ 	uint32_t sw[4], wr[4];
+-	unsigned msgs, logged;
+-	uint16_t credits, credit_size;
+-	uint8_t max_ep, htc_version;
++	unsigned msgs, logged, wmi_events, htt_msgs, wmi_credits, nchunks;
++	uint16_t credits, credit_size, conn_svc;
++	uint8_t max_ep, htc_version, htt_eid, wmi_eid, seq[8], mac[6];
++	bool svc_avail, ack_rssi, ext_addr;
++	uint32_t svc[32];               /* the SERVICE_READY ARRAY_UINT32 as sent */
++	uint32_t svc_bytes;             /* its TLV length: the "len" of WMI_SERVICE_IS_ENABLED */
++	struct {
++		uint32_t req_id, len;
++		uint64_t pa;
++	} chunk[16];
+ } wce;
+ 
+ /* the SMMU bank and the DMA pool, before WLAN_CFG */
+@@ -4000,12 +4009,306 @@
+ 	return true;
+ }
+ 
+-/* one received HTC message (ath10k_htc_rx_completion_handler: 8-byte header, endpoint 0 = control) */
++/*
++ * ---- HTC + WMI (sweetwmi=1, after HTC READY): ath10k core.c ath10k_core_start() order: HTC connect HTT_DATA_MSG
++ * (no credit flow), HTC connect WMI_CONTROL (credit flow, the one transmit credit: WCN3990 does not use the
++ * firmware's credit count), HTC SETUP_COMPLETE_EX; then the target's WMI SERVICE_READY event (capabilities, host
++ * memory requests), host memory from the pool, WMI INIT (wmi-tlv.c gen_init: ABI version, resource config, memory
++ * chunks), and the WMI READY event (MAC address). Messages go out on CE0 (HTC control) / CE3 (WMI) with the write
++ * index through the shadow registers (shadow_reg_support), come back on CE2; HTT messages on CE1 are only logged.
++ */
++#define WCE_HOSTMEM_OFF         0x100000u       /* host memory chunks: pool + 1 MiB .. pool end */
++#define HTC_SVC_RSVD_CTRL       0x0001u
++#define HTC_SVC_WMI_CONTROL     0x0100u
++#define HTC_SVC_HTT_DATA        0x0300u
++#define WMI_TLV_ARRAY_UINT32    16u
++#define WMI_TLV_ARRAY_STRUCT    18u
++#define WMI_TLV_SVC_READY_EV    32u
++#define WMI_TLV_HAL_REG_CAPS    33u
++#define WMI_TLV_HOST_MEM_REQ    34u
++#define WMI_TLV_READY_EV        35u
++#define WMI_TLV_INIT_CMD        74u
++#define WMI_TLV_RESOURCE_CONFIG 75u
++#define WMI_TLV_HOST_MEM_CHUNK  76u
++#define WMI_TLV_SVC_AVAIL_EV    559u
++#define WMI_TLV_ABI_NS0         0x5f414351u     /* "QCA_" */
++#define WMI_TLV_ABI_NS1         0x00004c4du     /* "ML" */
++
++struct wmi_rsrc_cfg {                   /* struct wmi_tlv_resource_config */
++	uint32_t num_vdevs, num_peers, num_offload_peers, num_offload_reorder_bufs, num_peer_keys, num_tids,
++	    ast_skid_limit, tx_chain_mask, rx_chain_mask, rx_timeout_pri[4], rx_decap_mode, scan_max_pending_reqs,
++	    bmiss_offload_max_vdev, roam_offload_max_vdev, roam_offload_max_ap_profiles, num_mcast_groups,
++	    num_mcast_table_elems, mcast2ucast_mode, tx_dbg_log_size, num_wds_entries, dma_burst_size, mac_aggr_delim,
++	    rx_skip_defrag_timeout_dup_detection_check, vow_config, gtk_offload_max_vdev, num_msdu_desc,
++	    max_frag_entries, num_tdls_vdevs, num_tdls_conn_table_entries, beacon_tx_offload_max_vdev,
++	    num_multicast_filter_entries, num_wow_filters, num_keep_alive_pattern, keep_alive_pattern_size,
++	    max_tdls_concurrent_sleep_sta, max_tdls_concurrent_buffer_sta, wmi_send_separate, num_ocb_vdevs,
++	    num_ocb_channels, num_ocb_schedules, host_capab;
++};
++
++/* HTC send (ath10k_htc_send + ath10k_ce_send_nolock_64 + the shadow write index): r = 0 for CE0, 1 for CE3 */
++static bool
++wce_send(unsigned r, uint8_t eid, const void *payload, uint32_t plen)
++{
++	if (!wce.rings || r > 1 || 8 + plen > CE_RX_BUF) {
++		return false;
++	}
++	uint32_t b = WCE_BASE(wce_ring[r].ce), mask = wce_ring[r].n - 1, wr = wce.wr[r];
++	uint32_t srri = wl_rd(wce.regs, b + CE_CURRENT_SRRI) & mask;
++	if (((srri - 1 - wr) & mask) == 0) {
++		printf("SWEET IPC: wmi: CE%u source ring full\n", wce_ring[r].ce);
++		return false;
++	}
++	uint8_t *buf = (uint8_t *)(wce.pool + wce_ring[r].bufs + (uint64_t)wr * CE_RX_BUF);
++	uint16_t l = (uint16_t)plen;
++	buf[0] = eid;
++	buf[1] = eid != 0 && eid == wce.wmi_eid ? 1 : 0;   /* NEED_CREDIT_UPDATE on the credit-flow endpoint */
++	memcpy(buf + 2, &l, 2);
++	buf[4] = 0;
++	buf[5] = wce.seq[eid & 7]++;
++	buf[6] = 0;
++	buf[7] = 0;
++	memcpy(buf + 8, payload, plen);
++	struct wce_desc *d = wce_desc(r, wr);
++	d->addr = (WCE_POOL_PA + wce_ring[r].bufs + (uint64_t)wr * CE_RX_BUF) & 0x7ffffffffull;
++	d->nbytes = (uint16_t)(8 + plen);
++	d->flags = (uint16_t)(((uint32_t)eid << 4) & 0xfff0);  /* transfer id = endpoint (CE_DESC_FLAGS_META_DATA) */
++	d->hash = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr = (wr + 1) & mask;
++	wce.wr[r] = wr;
++	wl_wr(wce.regs, wce_ring[r].ce == 0 ? 0x32000u : 0x3200cu, wr);
++	return true;
++}
++
++static void
++wmi_connect(uint16_t svc)
++{
++	uint8_t m[8] = { 2, 0 };                        /* CONNECT_SERVICE: id, service, flags, pad */
++	uint16_t flags = svc == HTC_SVC_WMI_CONTROL ? (uint16_t)(1u << 8) : (uint16_t)(1u << 3);
++	memcpy(m + 2, &svc, 2);
++	memcpy(m + 4, &flags, 2);
++	wce.conn_svc = svc;
++	if (!wce_send(0, 0, m, sizeof(m))) {
++		wf_fail("HTC connect not sent", 0);
++		return;
++	}
++	wf.state = WS_HTC_CONNECT;
++	wf.sent_ms = ms_now_ms();
++}
++
++/*
++ * wmi_tlv_svc_map(): WMI_SERVICE_IS_ENABLED (service < len: word service / 4, bit service % 4, the legacy packing)
++ * or WMI_TLV_EXT_SERVICE_IS_ENABLED (len <= service < 256: word (service - len) / 32, bit (service - len) % 32), with
++ * len = the bitmap's TLV length in bytes, exactly as ath10k evaluates them.
++ */
++static bool
++wmi_svc_on(uint32_t id)
++{
++	uint32_t len = wce.svc_bytes, words = MIN(len / 4, 32u), w;
++	if (id < len) {
++		w = id / 4;
++		return w < words && ((wce.svc[w] >> (id % 4)) & 1);
++	}
++	if (id >= 256) {
++		return false;
++	}
++	w = (id - len) / 32;
++	return w < words && ((wce.svc[w] >> ((id - len) % 32)) & 1);
++}
++
++/* WMI INIT (ath10k_wmi_tlv_op_gen_init) with the host memory chunks of the service-ready event */
++static void
++wmi_send_init(void)
++{
++	uint8_t c[4 + 4 + 28 + 4 + sizeof(struct wmi_rsrc_cfg) + 4 + 16 * 20];
++	uint32_t n = 0, cmd = 0x1, v;           /* WMI_TLV_INIT_CMDID, no platform bits */
++	uint16_t tl, tg;
++	memcpy(c, &cmd, 4);
++	n = 4;
++	tl = 28;
++	tg = WMI_TLV_INIT_CMD;
++	memcpy(c + n, &tl, 2);
++	memcpy(c + n + 2, &tg, 2);
++	uint32_t abi[7] = { 0x01000000u, 53, WMI_TLV_ABI_NS0, WMI_TLV_ABI_NS1, 0, 0, wce.nchunks };
++	memcpy(c + n + 4, abi, 28);
++	n += 4 + 28;
++	struct wmi_rsrc_cfg cfg;
++	memset(&cfg, 0, sizeof(cfg));
++	bool reorder = wmi_svc_on(65);          /* WMI_TLV_SERVICE_RX_FULL_REORDER */
++	cfg.num_vdevs = 4;                      /* TARGET_TLV_NUM_VDEVS */
++	cfg.num_peers = 33;                     /* hw_params num_peers TARGET_HL_TLV_NUM_PEERS */
++	cfg.ast_skid_limit = 16;
++	cfg.num_wds_entries = 2;
++	cfg.num_offload_peers = reorder ? 4 : 0;
++	cfg.num_offload_reorder_bufs = reorder ? 4 : 0;
++	cfg.num_peer_keys = 2;
++	cfg.num_tids = 33 * 2;
++	cfg.tx_chain_mask = 7;
++	cfg.rx_chain_mask = 7;
++	cfg.rx_timeout_pri[0] = 0x64;
++	cfg.rx_timeout_pri[1] = 0x64;
++	cfg.rx_timeout_pri[2] = 0x64;
++	cfg.rx_timeout_pri[3] = 0x28;
++	cfg.rx_decap_mode = 1;                  /* ATH10K_HW_TXRX_NATIVE_WIFI */
++	cfg.scan_max_pending_reqs = 4;
++	cfg.bmiss_offload_max_vdev = 4;
++	cfg.roam_offload_max_vdev = 4;
++	cfg.roam_offload_max_ap_profiles = 8;
++	cfg.tx_dbg_log_size = 0x400;
++	cfg.gtk_offload_max_vdev = 2;
++	cfg.num_msdu_desc = 1024 + 32;          /* TARGET_TLV_NUM_MSDU_DESC */
++	cfg.max_frag_entries = 2;
++	cfg.num_tdls_vdevs = 1;
++	cfg.num_tdls_conn_table_entries = 0x20;
++	cfg.beacon_tx_offload_max_vdev = 2;
++	cfg.num_multicast_filter_entries = 5;
++	cfg.num_wow_filters = 22;               /* TARGET_TLV_NUM_WOW_PATTERNS */
++	cfg.num_keep_alive_pattern = 6;
++	cfg.max_tdls_concurrent_sleep_sta = 1;
++	cfg.max_tdls_concurrent_buffer_sta = 1;
++	cfg.host_capab = 1u << 9;               /* WMI_TLV_FLAG_MGMT_BUNDLE_TX_COMPL */
++	if (wce.ack_rssi) {
++		cfg.host_capab |= 1u << 18;     /* WMI_RSRC_CFG_FLAG_TX_ACK_RSSI */
++	}
++	tl = sizeof(cfg);
++	tg = WMI_TLV_RESOURCE_CONFIG;
++	memcpy(c + n, &tl, 2);
++	memcpy(c + n + 2, &tg, 2);
++	memcpy(c + n + 4, &cfg, sizeof(cfg));
++	n += 4 + (uint32_t)sizeof(cfg);
++	tl = (uint16_t)(wce.nchunks * 20);
++	tg = WMI_TLV_ARRAY_STRUCT;
++	memcpy(c + n, &tl, 2);
++	memcpy(c + n + 2, &tg, 2);
++	n += 4;
++	for (unsigned k = 0; k < wce.nchunks; k++) {
++		uint32_t ch[4] = { wce.chunk[k].req_id, (uint32_t)wce.chunk[k].pa, wce.chunk[k].len,
++			           wce.ext_addr ? (uint32_t)(wce.chunk[k].pa >> 32) : 0 };
++		tl = 16;
++		tg = WMI_TLV_HOST_MEM_CHUNK;
++		memcpy(c + n, &tl, 2);
++		memcpy(c + n + 2, &tg, 2);
++		memcpy(c + n + 4, ch, 16);
++		n += 20;
++	}
++	v = n;
++	printf("SWEET IPC: wmi: INIT (%u bytes, %u memory chunks, rx reorder offload %s, tx ack rssi %s)\n", v,
++	    wce.nchunks, reorder ? "on" : "off", wce.ack_rssi ? "on" : "off");
++	if (!wce_send(1, wce.wmi_eid, c, n)) {
++		wf_fail("WMI INIT not sent", 0);
++		return;
++	}
++	wf.state = WS_WMI_INIT;
++	wf.sent_ms = ms_now_ms();
++}
++
++/* SERVICE_READY (ath10k_wmi_tlv_op_pull_svc_rdy_ev): ABI check, capabilities, service map, memory requests */
++static void
++wmi_service_ready(const uint8_t *t, uint32_t len)
++{
++	const uint8_t *ev = NULL, *reg = NULL, *bmap = NULL, *reqs = NULL;
++	uint16_t evl = 0, regl = 0, bmapl = 0, reqsl = 0;
++	for (uint32_t o = 0; o + 4 <= len;) {
++		uint16_t l, tag;
++		memcpy(&l, t + o, 2);
++		memcpy(&tag, t + o + 2, 2);
++		if (o + 4 + l > len) {
++			break;
++		}
++		const uint8_t *v = t + o + 4;
++		if (tag == WMI_TLV_SVC_READY_EV) {
++			ev = v;
++			evl = l;
++		} else if (tag == WMI_TLV_HAL_REG_CAPS) {
++			reg = v;
++			regl = l;
++		} else if (tag == WMI_TLV_ARRAY_UINT32 && !bmap) {
++			bmap = v;
++			bmapl = l;
++		} else if (tag == WMI_TLV_ARRAY_STRUCT) {
++			reqs = v;
++			reqsl = l;
++		}
++		o += 4 + l;
++	}
++	uint32_t e[22];
++	memset(e, 0, sizeof(e));
++	if (!ev || evl < 88 || !reg || regl < 36 || !bmap || !reqs) {
++		wf_fail("malformed WMI SERVICE_READY", 0);
++		return;
++	}
++	memcpy(e, ev, 88);                      /* fw_build_vers, abi[6], phy_cap, max_frag, rf_chains, ht, vht, vht_mcs,
++	                                         * min_tx, max_tx, sys_cap, min_pkt, max_bcn_ie, num_mem_reqs, max_scan_chans */
++	uint32_t rg[9];
++	memcpy(rg, reg, 36);
++	memset(wce.svc, 0, sizeof(wce.svc));
++	memcpy(wce.svc, bmap, MIN((uint32_t)bmapl, (uint32_t)sizeof(wce.svc)));
++	wce.svc_bytes = bmapl;
++	printf("SWEET IPC: wmi: service bitmap %u bytes: %08x %08x %08x %08x %08x %08x %08x %08x ...\n", bmapl, wce.svc[0],
++	    wce.svc[1], wce.svc[2], wce.svc[3], wce.svc[4], wce.svc[5], wce.svc[6], wce.svc[7]);
++	printf("SWEET IPC: wmi: SERVICE_READY fw_build %#x abi %#x/%u ns %#x %#x, phy_cap %#x, %u rf chains, ht_cap %#x "
++	    "vht_cap %#x, tx power %u..%u, %u memory requests; regdomain %#x, 2 GHz %u-%u, 5 GHz %u-%u\n", e[0], e[1], e[2],
++	    e[3], e[4], e[7], e[9], e[10], e[11], e[13], e[14], e[18], rg[0], rg[5], rg[6], rg[7], rg[8]);
++	ipc_note(" wmi svc-ready fw %#x phy %#x chains %u mem %u rd %#x;", e[0], e[7], e[9], e[18], rg[0]);
++	if (e[1] != 0x01000000u || e[3] != WMI_TLV_ABI_NS0 || e[4] != WMI_TLV_ABI_NS1 || e[5] || e[6]) {
++		wf_fail("WMI TLV ABI mismatch", 0);
++		return;
++	}
++	/* the memory requests: nested TLVs of struct wlan_host_mem_req {req_id, unit_size, num_unit_info, num_units} */
++	uint32_t off = WCE_HOSTMEM_OFF;
++	wce.nchunks = 0;
++	if (e[18] > 16) {                       /* WMI_MAX_MEM_REQS */
++		wf_fail("more than 16 memory requests", 0);
++		return;
++	}
++	for (uint32_t o = 0; o + 4 <= reqsl && wce.nchunks < 16;) {
++		uint16_t l, tag;
++		memcpy(&l, reqs + o, 2);
++		memcpy(&tag, reqs + o + 2, 2);
++		if (o + 4 + l > reqsl || tag != WMI_TLV_HOST_MEM_REQ || l < 16) {
++			wf_fail("malformed memory request", 0);
++			return;
++		}
++		uint32_t q[4];
++		memcpy(q, reqs + o + 4, 16);
++		uint32_t units = q[3], usize = (q[1] + 3) & ~3u;
++		if (q[2] & 4) {
++			units = 33 + 1;                 /* NUM_UNITS_IS_NUM_ACTIVE_PEERS, no active peers: max_num_peers + 1 */
++		} else if (q[2] & 2) {
++			units = 33 + 1;                 /* NUM_UNITS_IS_NUM_PEERS */
++		} else if (q[2] & 1) {
++			units = 4 + 1;                  /* NUM_UNITS_IS_NUM_VDEVS */
++		}
++		uint64_t sz = (uint64_t)units * usize;
++		printf("SWEET IPC: wmi: memory request %u: id %u, %u units of %u bytes (info %#x) = %llu bytes\n",
++		    wce.nchunks, q[0], units, q[1], q[2], sz);
++		if (sz == 0 || sz > WCE_POOL_LEN - off) {
++			wf_fail("memory request does not fit the pool", 0);
++			return;
++		}
++		wce.chunk[wce.nchunks].req_id = q[0];
++		wce.chunk[wce.nchunks].pa = WCE_POOL_PA + off;
++		wce.chunk[wce.nchunks].len = (uint32_t)sz;
++		wce.nchunks++;
++		off = (uint32_t)((off + sz + 0xfff) & ~0xfffull);
++		o += 4 + l;
++	}
++	if (wce.nchunks != e[18]) {
++		printf("SWEET IPC: wmi: %u memory requests parsed, the event says %u\n", wce.nchunks, e[18]);
++		wf_fail("memory request count mismatch", 0);
++		return;
++	}
++	wf.state = WS_WMI_SVC_READY;
++	wf.sent_ms = ms_now_ms();       /* SERVICE_AVAILABLE usually follows at once; INIT goes after it or 300 ms */
++}
++
++/* one received HTC message: control (endpoint 0), WMI events, HTT (logged) */
+ static void
+ wce_htc(unsigned ce, const uint8_t *p, uint32_t len)
+ {
+ 	wce.msgs++;
+-	if (wce.logged < 8) {
++	if (wce.logged < 12) {
+ 		char hex[3 * 32 + 1];
+ 		uint32_t hl = 0;
+ 		for (uint32_t i = 0; i < MIN(len, 32u); i++) {
+@@ -4014,22 +4317,133 @@
+ 		wce.logged++;
+ 		printf("SWEET IPC: wce: CE%u message %u bytes: %s\n", ce, len, hex);
+ 	}
+-	if (len < 8 + 8) {
++	if (len < 8 + 2) {
+ 		return;
+ 	}
+ 	uint16_t hlen, id;
+ 	memcpy(&hlen, p + 2, 2);
+-	memcpy(&id, p + 8, 2);
+-	if (p[0] == 0 && id == 1 && wf.state == WS_CE) {   /* ATH10K_HTC_MSG_READY_ID */
+-		memcpy(&wce.credits, p + 10, 2);
+-		memcpy(&wce.credit_size, p + 12, 2);
+-		wce.max_ep = p[14];
+-		wce.htc_version = hlen >= 12 && len >= 20 ? p[16] : 0xff;  /* ath10k_htc_ready_extended */
+-		printf("SWEET IPC: wce: HTC READY: %u credits of %u bytes, %u endpoints, HTC version %u: the WCN3990 "
+-		    "talks to the host\n", wce.credits, wce.credit_size, wce.max_ep, wce.htc_version);
+-		ipc_note(" wce HTC-READY %u x %u ep %u v %u;", wce.credits, wce.credit_size, wce.max_ep, wce.htc_version);
+-		wf.state = WS_HTC_READY;
++	uint32_t trailer = (p[1] & 2) ? p[4] : 0;   /* ATH10K_HTC_FLAG_TRAILER_PRESENT */
++	if (8u + hlen > len || trailer > hlen || ((p[1] & 2) && trailer < 4)) {
++		printf("SWEET IPC: wce: malformed HTC message (len %u, header len %u, trailer %u)\n", len, hlen, trailer);
++		return;
+ 	}
++	const uint8_t *pl = p + 8;
++	uint32_t plen = hlen - trailer;
++	/* trailer records {u8 id, u8 len, u8 pad[2], data}: id 1 = credit reports {eid, credits, pad, pad} */
++	for (uint32_t o = plen; o + 4 <= hlen;) {
++		uint8_t rid = pl[o], rl = pl[o + 1];
++		if (o + 4 + rl > hlen) {
++			break;
++		}
++		for (uint32_t k = 0; rid == 1 && k + 4 <= rl; k += 4) {
++			if (pl[o + 4 + k] == wce.wmi_eid && wce.wmi_eid) {
++				wce.wmi_credits += pl[o + 4 + k + 1];
++			}
++		}
++		o += 4u + rl;
++	}
++	memcpy(&id, pl, 2);
++	if (p[0] == 0) {                        /* HTC control */
++		if (id == 1 && wf.state == WS_CE && plen >= 8) {   /* READY */
++			memcpy(&wce.credits, pl + 2, 2);
++			memcpy(&wce.credit_size, pl + 4, 2);
++			wce.max_ep = pl[6];
++			wce.htc_version = plen >= 12 ? pl[8] : 0xff;   /* ath10k_htc_ready_extended */
++			printf("SWEET IPC: wce: HTC READY: %u credits of %u bytes, %u endpoints, HTC version %u: the WCN3990 "
++			    "talks to the host\n", wce.credits, wce.credit_size, wce.max_ep, wce.htc_version);
++			ipc_note(" wce HTC-READY %u x %u ep %u v %u;", wce.credits, wce.credit_size, wce.max_ep,
++			    wce.htc_version);
++			wf.state = WS_HTC_READY;
++			if (ipc.wmi) {
++				wmi_connect(HTC_SVC_HTT_DATA);  /* ath10k_htt_connect() first, then ath10k_wmi_connect() */
++			}
++		} else if (id == 3 && wf.state == WS_HTC_CONNECT && plen >= 8) {   /* CONNECT_SERVICE_RESP */
++			uint16_t svc, maxm;
++			memcpy(&svc, pl + 2, 2);
++			memcpy(&maxm, pl + 6, 2);
++			uint8_t st = pl[4], eid = pl[5];
++			printf("SWEET IPC: wmi: HTC connect %#x -> status %u endpoint %u max message %u\n", svc, st, eid, maxm);
++			ipc_note(" htc conn %#x st %u ep %u max %u;", svc, st, eid, maxm);
++			if (svc != wce.conn_svc || st != 0 || eid == 0 || eid >= 8 || maxm == 0) {
++				wf_fail("HTC connect refused", st);
++			} else if (svc == HTC_SVC_HTT_DATA) {
++				wce.htt_eid = eid;
++				wmi_connect(HTC_SVC_WMI_CONTROL);
++			} else {
++				wce.wmi_eid = eid;
++				wce.wmi_credits = 1;    /* tx_alloc: total_transmit_credits = 1 (use_fw_tx_credits false) */
++				uint8_t sc[12];         /* SETUP_COMPLETE_EX: id 5, pad, flags 0, max bundle 0, pad (snoc) */
++				memset(sc, 0, sizeof(sc));
++				sc[0] = 5;
++				if (!wce_send(0, 0, sc, sizeof(sc))) {
++					wf_fail("HTC setup complete not sent", 0);
++				} else {
++					printf("SWEET IPC: wmi: HTC setup complete sent; waiting for WMI SERVICE_READY\n");
++					wf.state = WS_WMI_WAIT_SVC;
++					wf.sent_ms = ms_now_ms();
++				}
++			}
++		} else {
++			printf("SWEET IPC: wce: HTC control message %u (%u bytes) in state %s\n", id, plen, wf_state_name[wf.state]);
++		}
++		return;
++	}
++	if (p[0] == wce.wmi_eid && wce.wmi_eid && plen >= 4) {
++		uint32_t ev;
++		memcpy(&ev, pl, 4);
++		ev &= 0xffffff;
++		wce.wmi_events++;
++		if (ev == 0x1 && wf.state == WS_WMI_WAIT_SVC) {
++			wmi_service_ready(pl + 4, plen - 4);
++		} else if (ev == 0x3) {         /* SERVICE_AVAILABLE: u32 length, then the services from 128 on */
++			if (plen >= 4 + 4 + 8) {
++				uint16_t l, tag;
++				memcpy(&l, pl + 4, 2);
++				memcpy(&tag, pl + 6, 2);
++				if (tag == WMI_TLV_SVC_AVAIL_EV && l >= 4 + 8 && 8u + l <= plen) {
++					uint32_t ext[2];
++					memcpy(ext, pl + 12, 8);
++					wce.ack_rssi = (ext[(174 - 128) / 32] >> ((174 - 128) % 32)) & 1;
++					wce.ext_addr = (ext[(179 - 128) / 32] >> ((179 - 128) % 32)) & 1;
++				}
++			}
++			wce.svc_avail = true;
++			printf("SWEET IPC: wmi: SERVICE_AVAILABLE: tx ack rssi %u, extended address %u\n", wce.ack_rssi,
++			    wce.ext_addr);
++		} else if (ev == 0x2 && wf.state == WS_WMI_INIT) {      /* READY */
++			const uint8_t *rv = NULL;
++			for (uint32_t o = 4; o + 4 <= plen;) {
++				uint16_t l, tag;
++				memcpy(&l, pl + o, 2);
++				memcpy(&tag, pl + o + 2, 2);
++				if (o + 4 + l > plen) {
++					break;
++				}
++				if (tag == WMI_TLV_READY_EV && l >= 36) {
++					rv = pl + o + 4;
++				}
++				o += 4u + l;
++			}
++			if (!rv) {
++				wf_fail("malformed WMI READY", 0);
++				return;
++			}
++			uint32_t st;
++			memcpy(wce.mac, rv + 24, 6);
++			memcpy(&st, rv + 32, 4);
++			printf("SWEET IPC: wmi: READY status %u, MAC %02x:%02x:%02x:%02x:%02x:%02x: WMI is up\n", st, wce.mac[0],
++			    wce.mac[1], wce.mac[2], wce.mac[3], wce.mac[4], wce.mac[5]);
++			ipc_note(" wmi READY st %u mac %02x:%02x:%02x:%02x:%02x:%02x;", st, wce.mac[0], wce.mac[1], wce.mac[2],
++			    wce.mac[3], wce.mac[4], wce.mac[5]);
++			wf.state = WS_WMI_READY;
++		} else if (wce.wmi_events <= 16) {
++			printf("SWEET IPC: wmi: event %#x (%u bytes) in state %s\n", ev, plen, wf_state_name[wf.state]);
++		}
++		return;
++	}
++	if (p[0] == wce.htt_eid && wce.htt_eid && wce.htt_msgs++ < 8) {
++		printf("SWEET IPC: wmi: HTT message type %u (%u bytes)\n", pl[0], plen);
++	}
+ }
+ 
+ /* destination rings: ath10k_ce_completed_recv_next_nolock() (nbytes != 0 = done), slot reposted at once */
+@@ -4347,6 +4761,12 @@
+ 	wf.buf = buf;
+ 	wce.rings = false;
+ 	wce.mode_on = false;
++	wce.mode_sent = false;
++	wce.htt_eid = 0;
++	wce.wmi_eid = 0;
++	wce.svc_avail = false;
++	wce.nchunks = 0;
++	memset(wce.seq, 0, sizeof(wce.seq));
+ }
+ 
+ /* NEW_SERVER 0x45: connect and start (ath10k_qmi_new_server + server_arrive) */
+@@ -4383,9 +4803,13 @@
+ 		wf_data_path();
+ 	}
+ 	wce_poll();
+-	bool waiting = wf.pending || wf.state == WS_WAIT_MSA_IND || wf.state == WS_WAIT_FW_READY || wf.state == WS_CE;
++	if (wf.state == WS_WMI_SVC_READY && (wce.svc_avail || ms_now_ms() > wf.sent_ms + 300)) {
++		wmi_send_init();
++	}
++	bool waiting = wf.pending || wf.state == WS_WAIT_MSA_IND || wf.state == WS_WAIT_FW_READY || wf.state == WS_CE ||
++	    wf.state == WS_HTC_CONNECT || wf.state == WS_WMI_WAIT_SVC || wf.state == WS_WMI_INIT;
+ 	if (ipc.wlfw && waiting && wf.state != WS_FAILED && ms_now_ms() > wf.sent_ms + WLFW_TIMEOUT_MS) {
+-		wf_fail(wf.pending ? "no response" : (wf.state == WS_CE ? "no HTC message" : "no indication"), wf.pending);
++		wf_fail(wf.pending ? "no response" : (wf.state >= WS_CE && wf.state <= WS_WMI_INIT ? "no target message" : "no indication"), wf.pending);
+ 	}
+ }
+ 
+@@ -4524,6 +4948,9 @@
+ 	int ce = 0;
+ 	(void)PE_parse_boot_argn("sweetce", &ce, sizeof(ce));
+ 	ipc.ce = ipc.wlfw && ce == 1;
++	int wmi = 0;
++	(void)PE_parse_boot_argn("sweetwmi", &wmi, sizeof(wmi));
++	ipc.wmi = ipc.ce && wmi == 1;
+ 	memset(&wf, 0, sizeof(wf));
+ 	if (ipc.wlfw && !wf_rails()) {
+ 		ipc.wlfw = false;
+@@ -4596,6 +5023,11 @@
+ 	if (ipc.ce) {
+ 		printf("SWEET IPC: wce: %u target messages, HTC %s (%u credits of %u bytes, %u endpoints)\n", wce.msgs,
+ 		    wce.credits ? "READY" : "not seen", wce.credits, wce.credit_size, wce.max_ep);
++	}
++	if (ipc.wmi) {
++		printf("SWEET IPC: wmi: endpoints HTT %u WMI %u, %u WMI events, %u memory chunks, MAC %02x:%02x:%02x:%02x:%02x:%02x\n",
++		    wce.htt_eid, wce.wmi_eid, wce.wmi_events, wce.nchunks, wce.mac[0], wce.mac[1], wce.mac[2], wce.mac[3],
++		    wce.mac[4], wce.mac[5]);
+ 	}
+ 	if (alive) {
+ 		wf_shutdown();

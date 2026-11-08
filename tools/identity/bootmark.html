@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- The boot mark: the logo partition's "Google" slots (3, 6, 8; 458x154 on black, drawn by ABL while it boots),
+     tools/identity/mkbootmark.sh renders it. The app icon in small (Newton's head on the lime halftone, rounded square)
+     beside the wordmark in white and the iOS generation in lime mono. Query: ?n=26 -->
+<html><head><meta charset="utf-8">
+<style>
+@font-face { font-family: Archivo; src: url(fonts/archivo.woff2) format('woff2'); font-weight: 100 900; font-stretch: 62% 125%; }
+@font-face { font-family: JBMono; src: url(fonts/jetbrains-mono.woff2) format('woff2'); font-weight: 100 800; }
+html, body { margin: 0; width: 458px; height: 154px; overflow: hidden; background: #000; }
+.icon { position: absolute; left: 8px; top: 8px; width: 138px; height: 138px; border-radius: 31px; overflow: hidden;
+  background-color: #d7e98a; background-image: radial-gradient(circle, #c6dc72 1.1px, transparent 1.5px); background-size: 7px 7px; }
+.fig { position: absolute; left: -16px; top: 12px; width: 170px; }
+.word { position: absolute; left: 162px; top: 46px; font-family: Archivo; font-weight: 900; font-stretch: 108%;
+  font-size: 34px; line-height: 1; letter-spacing: 0; color: #fff; }
+.sub { position: absolute; left: 164px; top: 90px; font-family: JBMono; font-weight: 600; font-size: 17px;
+  letter-spacing: 0.18em; color: #d7e98a; }
+</style></head>
+<body>
+<div class="icon"><img class="fig" src="newton-halftone.png" alt=""></div>
+<div class="word">BERGAMOTA</div>
+<div class="sub" id="sub"></div>
+<script>
+document.getElementById('sub').textContent = 'iOS ' + (new URLSearchParams(location.search).get('n') || '26');
+</script>
+</body></html>

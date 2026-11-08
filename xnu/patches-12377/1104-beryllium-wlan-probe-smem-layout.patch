@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index fb25b5716956206834be43520cb091f7b0bd1211..2ee8e565c4bfc011d374156cc0bd4ce436cdfc19 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -752,7 +752,9 @@ wl_dump_smem(void)
+ 		return;
+ 	}
+ 	for (uint32_t i = 0; i < n; i++) {
+-		uint32_t e = top + 32 + i * 32;
++		/* struct smem_ptable_entry (Linux qcom/smem.c): offset, size, flags, host0/host1, cacheline,
++		 * reserved[7] = 48 bytes (a 32-byte stride showed only every other entry: boot 30) */
++		uint32_t e = top + 32 + i * 48;
+ 		uint32_t offset = smem_u32(e), size = smem_u32(e + 4), hosts = smem_u32(e + 12);
+ 		if (!offset || !size) {
+ 			continue;
+@@ -762,7 +764,8 @@ wl_dump_smem(void)
+ 		if ((hosts & 0xffff) == 0 && (hosts >> 16) == 1 && offset + 32 < WL_SMEM_SIZE &&
+ 		    smem_u32(offset) == 0x54525024u) {
+ 			/* apps<->modem: list the items (the modem is cold if 435 is absent) */
+-			uint32_t free_u = smem_u32(offset + 16), pos = offset + 32;
++			/* struct smem_partition_header: magic, host0/host1, size, offset_free_uncached @12 */
++			uint32_t free_u = smem_u32(offset + 12), pos = offset + 32;
+ 			unsigned items = 0;
+ 			printf("SWEET WLAN: apps<->modem partition: free-uncached %#x\n", free_u);
+ 			while (pos + 16 <= offset + free_u && pos + 16 < WL_SMEM_SIZE && items < 16) {

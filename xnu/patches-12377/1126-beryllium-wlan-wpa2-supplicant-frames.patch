@@ -1,0 +1,1094 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -119,6 +119,8 @@
+ bsd/dev/sweet_a630_pas.c			standard
+ bsd/dev/beryllium_wlan.c		standard
+ bsd/dev/sweet_80211.c			standard
++bsd/dev/sweet_wpa.c			standard
++bsd/dev/sweet_wlan_frames.c		standard
+ bsd/dev/beryllium_bt_hci.c		standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+diff --git a/bsd/dev/sweet_wlan_frames.c b/bsd/dev/sweet_wlan_frames.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wlan_frames.c
+@@ -0,0 +1,315 @@
++/*
++ * SWEET: 802.11 frames of the WCN3990 station, built and parsed on the host. docs/WIFI_IOS26_PHASE2.md WL3.
++ * Contents follow what mac80211 sends for a client (mlme.c ieee80211_send_assoc): capability ESS (+ privacy,
++ * short preamble / short slot time on 2.4 GHz when the AP has them), listen interval, SSID, the rates both sides
++ * support (no basic bits), RSN, HT Capabilities, WMM information element.
++ */
++#if !defined(KERNEL) || defined(ARM64_BOARD_CONFIG_SWEET)
++#ifdef KERNEL
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#else
++#include <string.h>
++#include <strings.h>
++#include <errno.h>
++#endif
++#include "sweet_wlan_frames.h"
++
++const uint8_t *
++swf_ie_find(const uint8_t *ies, size_t len, uint8_t id)
++{
++	for (size_t o = 0; o + 2 <= len && o + 2 + ies[o + 1] <= len; o += 2u + ies[o + 1]) {
++		if (ies[o] == id) {
++			return ies + o;
++		}
++	}
++	return NULL;
++}
++
++const uint8_t *
++swf_ie_vendor(const uint8_t *ies, size_t len, uint32_t oui, uint8_t type)
++{
++	for (size_t o = 0; o + 2 <= len && o + 2 + ies[o + 1] <= len; o += 2u + ies[o + 1]) {
++		if (ies[o] == 221 && ies[o + 1] >= 4 && ies[o + 2] == (uint8_t)(oui >> 16) &&
++		    ies[o + 3] == (uint8_t)(oui >> 8) && ies[o + 4] == (uint8_t)oui && ies[o + 5] == type) {
++			return ies + o;
++		}
++	}
++	return NULL;
++}
++
++static void
++mgmt_hdr(uint8_t *b, uint8_t fc, const uint8_t bssid[6], const uint8_t sa[6])
++{
++	bzero(b, SWF_HDR_LEN);
++	b[0] = fc;
++	bcopy(bssid, b + 4, 6);         /* addr1 = DA = the AP */
++	bcopy(sa, b + 10, 6);           /* addr2 = SA = us */
++	bcopy(bssid, b + 16, 6);        /* addr3 = BSSID */
++}
++
++/* a management frame of this subtype from bssid (addr2 and addr3) to us (addr1) */
++static int
++mgmt_from_ap(const uint8_t *f, size_t len, uint8_t fc, const uint8_t bssid[6], const uint8_t sa[6], size_t min)
++{
++	if (len < SWF_HDR_LEN + min || f[0] != fc || memcmp(f + 4, sa, 6) || memcmp(f + 10, bssid, 6) ||
++	    memcmp(f + 16, bssid, 6)) {
++		return EINVAL;
++	}
++	return 0;
++}
++
++static inline uint16_t
++le16(const uint8_t *p)
++{
++	return (uint16_t)(p[0] | (p[1] << 8));
++}
++
++static inline void
++put_le16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)v;
++	p[1] = (uint8_t)(v >> 8);
++}
++
++size_t
++swf_auth_req(uint8_t *b, size_t max, const uint8_t bssid[6], const uint8_t sa[6])
++{
++	if (max < SWF_HDR_LEN + 6) {
++		return 0;
++	}
++	mgmt_hdr(b, SWF_FC_AUTH, bssid, sa);
++	put_le16(b + 24, 0);            /* open system */
++	put_le16(b + 26, 1);            /* transaction sequence 1 */
++	put_le16(b + 28, 0);            /* status */
++	return SWF_HDR_LEN + 6;
++}
++
++int
++swf_auth_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t sa[6], uint16_t *status)
++{
++	if (mgmt_from_ap(f, len, SWF_FC_AUTH, bssid, sa, 6) || le16(f + 24) != 0 || le16(f + 26) != 2) {
++		return EINVAL;
++	}
++	*status = le16(f + 28);
++	return 0;
++}
++
++static int
++rate_ok(uint8_t r, int g5)
++{
++	switch (r) {
++	case 2: case 4: case 11: case 22:       /* 1, 2, 5.5, 11 Mb/s (CCK): 2.4 GHz only */
++		return !g5;
++	case 12: case 18: case 24: case 36: case 48: case 72: case 96: case 108:
++		return 1;
++	default:
++		return 0;
++	}
++}
++
++size_t
++swf_assoc_req(uint8_t *b, size_t max, const struct swf_assoc_params *p)
++{
++	uint8_t rates[16];
++	size_t nr = 0, n;
++	int g5 = p->mhz > 4900;
++	uint16_t cap = 0x0001;          /* ESS */
++	const uint8_t *ssid = swf_ie_find(p->ap_ies, p->ap_ies_len, 0);
++
++	if (!ssid || max < 256) {
++		return 0;
++	}
++	if (p->ap_cap & 0x0010) {
++		cap |= 0x0010;                  /* privacy */
++	}
++	if (!g5 && (p->ap_cap & 0x0020)) {
++		cap |= 0x0020;                  /* short preamble */
++	}
++	if (!g5 && (p->ap_cap & 0x0400)) {
++		cap |= 0x0400;                  /* short slot time */
++	}
++	for (uint8_t id = 1; id != 0; id = id == 1 ? 50 : 0) {
++		const uint8_t *e = swf_ie_find(p->ap_ies, p->ap_ies_len, id);
++		for (unsigned i = 0; e && i < e[1] && nr < sizeof(rates); i++) {
++			uint8_t r = e[2 + i] & 0x7f;
++			if (rate_ok(r, g5)) {
++				rates[nr++] = r;
++			}
++		}
++	}
++	if (nr == 0) {
++		return 0;
++	}
++	mgmt_hdr(b, SWF_FC_ASSOC_REQ, p->bssid, p->sa);
++	put_le16(b + 24, cap);
++	put_le16(b + 26, p->listen_interval);
++	n = 28;
++	bcopy(ssid, b + n, 2u + ssid[1]);
++	n += 2u + ssid[1];
++	b[n++] = 1;
++	b[n++] = (uint8_t)(nr > 8 ? 8 : nr);
++	bcopy(rates, b + n, nr > 8 ? 8 : nr);
++	n += nr > 8 ? 8 : nr;
++	if (nr > 8) {
++		b[n++] = 50;
++		b[n++] = (uint8_t)(nr - 8);
++		bcopy(rates + 8, b + n, nr - 8);
++		n += nr - 8;
++	}
++	if (p->rsn_ie && p->rsn_ie_len) {
++		if (n + p->rsn_ie_len > max) {
++			return 0;
++		}
++		bcopy(p->rsn_ie, b + n, p->rsn_ie_len);
++		n += p->rsn_ie_len;
++	}
++	if (p->ht && swf_ie_find(p->ap_ies, p->ap_ies_len, 45)) {
++		/* HT Capabilities: SM power save disabled, SGI 20, RX STBC 1; A-MPDU 64 KiB, 8 us; MCS 0-15 */
++		static const uint8_t htc[28] = {
++			45, 26, 0x2c, 0x01, 0x1b,
++			0xff, 0xff, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01, 0, 0, 0,       /* MCS set: rx mask, highest, tx params */
++		};
++		bcopy(htc, b + n, sizeof(htc));
++		n += sizeof(htc);
++	}
++	if (swf_ie_vendor(p->ap_ies, p->ap_ies_len, 0x0050f2, 2)) {
++		/* WMM information element: version 1, QoS info 0 (no U-APSD) */
++		static const uint8_t wmm[9] = { 221, 7, 0x00, 0x50, 0xf2, 0x02, 0x00, 0x01, 0x00 };
++		bcopy(wmm, b + n, sizeof(wmm));
++		n += sizeof(wmm);
++	}
++	return n;
++}
++
++int
++swf_assoc_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t sa[6], struct swf_assoc_resp *r)
++{
++	const uint8_t *ies, *e;
++	size_t il;
++
++	if (mgmt_from_ap(f, len, SWF_FC_ASSOC_RESP, bssid, sa, 6) &&
++	    mgmt_from_ap(f, len, SWF_FC_REASSOC_RESP, bssid, sa, 6)) {
++		return EINVAL;
++	}
++	bzero(r, sizeof(*r));
++	r->cap = le16(f + 24);
++	r->status = le16(f + 26);
++	r->aid = le16(f + 28) & 0x3fff;
++	ies = f + 30;
++	il = len - 30;
++	for (uint8_t id = 1; id != 0; id = id == 1 ? 50 : 0) {
++		e = swf_ie_find(ies, il, id);
++		for (unsigned i = 0; e && i < e[1] && r->nrates < sizeof(r->rates); i++) {
++			if ((e[2 + i] & 0x7f) < 0x7b) {
++				r->rates[r->nrates++] = e[2 + i];
++			}
++		}
++	}
++	if ((e = swf_ie_find(ies, il, 45)) && e[1] >= 26) {
++		r->ht = 1;
++		bcopy(e + 2, r->ht_cap, 26);
++	}
++	if ((e = swf_ie_find(ies, il, 61)) && e[1] >= 22) {
++		r->ht_op_present = 1;
++		bcopy(e + 2, r->ht_op, 22);
++	}
++	r->wmm = swf_ie_vendor(ies, il, 0x0050f2, 2) != NULL;
++	return 0;
++}
++
++size_t
++swf_deauth(uint8_t *b, size_t max, const uint8_t bssid[6], const uint8_t sa[6], uint16_t reason)
++{
++	if (max < SWF_HDR_LEN + 2) {
++		return 0;
++	}
++	mgmt_hdr(b, SWF_FC_DEAUTH, bssid, sa);
++	put_le16(b + 24, reason);
++	return SWF_HDR_LEN + 2;
++}
++
++int
++swf_kicked(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t sa[6], uint16_t *reason)
++{
++	static const uint8_t bc[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
++
++	if (len < SWF_HDR_LEN + 2 || (f[0] != SWF_FC_DEAUTH && f[0] != SWF_FC_DISASSOC) ||
++	    memcmp(f + 10, bssid, 6) || (memcmp(f + 4, sa, 6) && memcmp(f + 4, bc, 6))) {
++		return EINVAL;
++	}
++	*reason = le16(f + 24);
++	return 0;
++}
++
++size_t
++swf_eth_to_nwifi(const uint8_t *eth, size_t len, const uint8_t bssid[6], uint8_t *o, size_t max)
++{
++	size_t pl;
++
++	if (len < SWF_ETH_HLEN || (eth[12] << 8 | eth[13]) < 0x0600) {
++		return 0;                       /* 802.3 length frames are not carried */
++	}
++	pl = len - SWF_ETH_HLEN;
++	if (SWF_HDR_LEN + SWF_SNAP_LEN + pl > max) {
++		return 0;
++	}
++	bzero(o, SWF_HDR_LEN);
++	o[0] = 0x08;                            /* data */
++	o[1] = 0x01;                            /* To DS */
++	bcopy(bssid, o + 4, 6);                 /* addr1 = BSSID */
++	bcopy(eth + 6, o + 10, 6);              /* addr2 = SA */
++	bcopy(eth, o + 16, 6);                  /* addr3 = DA */
++	o[24] = 0xaa;
++	o[25] = 0xaa;
++	o[26] = 0x03;
++	o[27] = 0;
++	o[28] = 0;
++	o[29] = 0;
++	o[30] = eth[12];
++	o[31] = eth[13];
++	bcopy(eth + SWF_ETH_HLEN, o + SWF_HDR_LEN + SWF_SNAP_LEN, pl);
++	return SWF_HDR_LEN + SWF_SNAP_LEN + pl;
++}
++
++size_t
++swf_nwifi_to_eth(const uint8_t *f, size_t len, uint8_t *o, size_t max)
++{
++	size_t hl = SWF_HDR_LEN, pl;
++	const uint8_t *da, *sa;
++
++	if (len < hl || (f[0] & 0x0c) != 0x08) {
++		return 0;                               /* not a data frame */
++	}
++	switch (f[1] & 0x03) {
++	case 0x02:                                      /* From DS: addr1 DA, addr2 BSSID, addr3 SA */
++		da = f + 4;
++		sa = f + 16;
++		break;
++	case 0x00:                                      /* IBSS / direct: addr1 DA, addr2 SA */
++		da = f + 4;
++		sa = f + 10;
++		break;
++	default:                                        /* To DS or WDS: not for a station */
++		return 0;
++	}
++	if (f[0] & 0x80) {
++		hl += 2;                                /* QoS control (native wifi normally strips it) */
++	}
++	if (len < hl + SWF_SNAP_LEN || f[hl] != 0xaa || f[hl + 1] != 0xaa || f[hl + 2] != 0x03 ||
++	    f[hl + 3] != 0 || f[hl + 4] != 0 || (f[hl + 5] != 0 && f[hl + 5] != 0xf8)) {
++		return 0;                               /* no RFC 1042 / bridge-tunnel SNAP header */
++	}
++	pl = len - hl - SWF_SNAP_LEN;
++	if (SWF_ETH_HLEN + pl > max) {
++		return 0;
++	}
++	bcopy(da, o, 6);
++	bcopy(sa, o + 6, 6);
++	o[12] = f[hl + 6];
++	o[13] = f[hl + 7];
++	bcopy(f + hl + SWF_SNAP_LEN, o + SWF_ETH_HLEN, pl);
++	return SWF_ETH_HLEN + pl;
++}
++#endif /* !KERNEL || ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_wlan_frames.h b/bsd/dev/sweet_wlan_frames.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wlan_frames.h
+@@ -0,0 +1,75 @@
++/*
++ * SWEET: 802.11 frames the WCN3990 station builds and parses on the host (docs/WIFI_IOS26_PHASE2.md WL3/WL4):
++ * open-system authentication, (re)association, deauthentication, and the 802.3 <-> native-wifi conversion of
++ * the data path. Pure functions, no hardware; tested on the Mac.
++ */
++#ifndef _SWEET_WLAN_FRAMES_H_
++#define _SWEET_WLAN_FRAMES_H_
++
++#include <stdint.h>
++#include <stddef.h>
++
++#define SWF_HDR_LEN             24u
++#define SWF_SNAP_LEN            8u
++#define SWF_ETH_HLEN            14u
++
++/* frame control byte 0 (type/subtype) */
++#define SWF_FC_ASSOC_REQ        0x00
++#define SWF_FC_ASSOC_RESP       0x10
++#define SWF_FC_REASSOC_RESP     0x30
++#define SWF_FC_BEACON           0x80
++#define SWF_FC_DISASSOC         0xa0
++#define SWF_FC_AUTH             0xb0
++#define SWF_FC_DEAUTH           0xc0
++#define SWF_FC_ACTION           0xd0
++
++/* what the association request offers, built from the AP's beacon and our capabilities */
++struct swf_assoc_params {
++	uint8_t  bssid[6];
++	uint8_t  sa[6];
++	uint16_t ap_cap;                /* the AP's capability field (beacon) */
++	uint16_t listen_interval;
++	uint16_t mhz;
++	const uint8_t *ap_ies;          /* the AP's beacon / probe response elements */
++	size_t   ap_ies_len;
++	const uint8_t *rsn_ie;          /* our RSN element (sweet_wpa_build_ie), NULL for an open network */
++	size_t   rsn_ie_len;
++	int      ht;                    /* offer HT (20 MHz, 2 streams) when the AP has an HT Capabilities element */
++};
++
++/* the association response, as the station needs it for PEER_ASSOC / VDEV_UP */
++struct swf_assoc_resp {
++	uint16_t status;
++	uint16_t aid;                   /* without the two top bits */
++	uint16_t cap;
++	uint8_t  rates[16];             /* 500 kb/s units, basic bit (0x80) kept, from both rate elements */
++	uint8_t  nrates;
++	int      ht;                    /* the AP sent HT Capabilities */
++	uint8_t  ht_cap[26];
++	int      ht_op_present;
++	uint8_t  ht_op[22];
++	int      wmm;                   /* the AP sent a WMM parameter element */
++};
++
++const uint8_t *swf_ie_find(const uint8_t *ies, size_t len, uint8_t id);
++/* vendor element (221) with this OUI and type, e.g. WMM 00-50-f2 type 2 */
++const uint8_t *swf_ie_vendor(const uint8_t *ies, size_t len, uint32_t oui, uint8_t type);
++
++size_t swf_auth_req(uint8_t *buf, size_t max, const uint8_t bssid[6], const uint8_t sa[6]);
++/* 0 = an authentication response from bssid to us (status in *status); EINVAL otherwise */
++int swf_auth_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t sa[6], uint16_t *status);
++size_t swf_assoc_req(uint8_t *buf, size_t max, const struct swf_assoc_params *p);
++int swf_assoc_resp(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t sa[6], struct swf_assoc_resp *r);
++size_t swf_deauth(uint8_t *buf, size_t max, const uint8_t bssid[6], const uint8_t sa[6], uint16_t reason);
++/* a deauthentication / disassociation from bssid to us: 0 and the reason; EINVAL otherwise */
++int swf_kicked(const uint8_t *f, size_t len, const uint8_t bssid[6], const uint8_t sa[6], uint16_t *reason);
++
++/*
++ * Data frames. TX: an Ethernet II frame -> native wifi (3-address 802.11 data header, To DS, then LLC/SNAP and the
++ * payload): out needs len + 24 + 8 - 14 bytes. RX: native wifi from the AP (From DS) -> Ethernet II. Both return
++ * the new length, 0 if the frame cannot be converted.
++ */
++size_t swf_eth_to_nwifi(const uint8_t *eth, size_t len, const uint8_t bssid[6], uint8_t *out, size_t max);
++size_t swf_nwifi_to_eth(const uint8_t *f, size_t len, uint8_t *out, size_t max);
++
++#endif /* _SWEET_WLAN_FRAMES_H_ */
+diff --git a/bsd/dev/sweet_wpa.c b/bsd/dev/sweet_wpa.c
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wpa.c
+@@ -0,0 +1,583 @@
++/*
++ * SWEET: a minimal WPA2-Personal supplicant for the WCN3990 station. docs/WIFI_IOS26_PHASE2.md WL4.
++ *
++ * IEEE 802.11-2020 12.7: EAPOL-Key frames, the 4-way handshake (12.7.6) and the group key handshake (12.7.7)
++ * for AKM 00-0f-ac:2 (PSK) with key descriptor version 2 (HMAC-SHA1-128 MIC, AES key wrap). The PTK is
++ * PRF-384(PMK, "Pairwise key expansion", min(AA,SPA) | max(AA,SPA) | min(ANonce,SNonce) | max(ANonce,SNonce))
++ * split as KCK (16) | KEK (16) | TK (16). Behaviour follows wpa_supplicant's wpa.c where the standard leaves
++ * room (replay counter set only by MIC-verified frames, key length 0 in messages 2 and 4, message 4 sent before
++ * the PTK is installed).
++ */
++#if !defined(KERNEL) || defined(ARM64_BOARD_CONFIG_SWEET)
++#ifdef KERNEL
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/errno.h>
++#include <libkern/crypto/sha1.h>
++#include <libkern/crypto/aes.h>
++#else
++#include "sweet_wpa_host.h"     /* the Mac harness: the same SHA-1 / AES API over CommonCrypto */
++#endif
++#include "sweet_wpa.h"
++
++/* EAPOL header (4) + EAPOL-Key descriptor fixed part (95) */
++#define EK_HDR          4
++#define EK_TYPE         (EK_HDR + 0)
++#define EK_INFO         (EK_HDR + 1)
++#define EK_KEYLEN       (EK_HDR + 3)
++#define EK_REPLAY       (EK_HDR + 5)
++#define EK_NONCE        (EK_HDR + 13)
++#define EK_IV           (EK_HDR + 45)
++#define EK_RSC          (EK_HDR + 61)
++#define EK_MIC          (EK_HDR + 77)
++#define EK_DLEN         (EK_HDR + 93)
++#define EK_DATA         (EK_HDR + 95)
++
++#define KI_VER_MASK     0x0007u
++#define KI_PAIRWISE     0x0008u
++#define KI_INSTALL      0x0040u
++#define KI_ACK          0x0080u
++#define KI_MIC          0x0100u
++#define KI_SECURE       0x0200u
++#define KI_ERROR        0x0400u
++#define KI_REQUEST      0x0800u
++#define KI_ENC_DATA     0x1000u
++#define KI_VER_AES      2u
++
++#define EAPOL_TYPE_KEY  3
++#define DESC_RSN        2
++
++static inline uint16_t
++be16(const uint8_t *p)
++{
++	return (uint16_t)((p[0] << 8) | p[1]);
++}
++
++static inline void
++put_be16(uint8_t *p, uint16_t v)
++{
++	p[0] = (uint8_t)(v >> 8);
++	p[1] = (uint8_t)v;
++}
++
++static inline uint32_t
++be32(const uint8_t *p)
++{
++	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
++}
++
++static int
++ct_differ(const uint8_t *a, const uint8_t *b, size_t n)
++{
++	uint8_t d = 0;
++	for (size_t i = 0; i < n; i++) {
++		d |= (uint8_t)(a[i] ^ b[i]);
++	}
++	return d != 0;
++}
++
++static void
++wipe(void *p, size_t n)
++{
++	volatile uint8_t *v = p;
++	while (n--) {
++		*v++ = 0;
++	}
++}
++
++/* ---- primitives ---- */
++
++void
++sweet_wpa_hmac_sha1(const uint8_t *key, size_t key_len, const uint8_t *d1, size_t l1,
++    const uint8_t *d2, size_t l2, uint8_t out[20])
++{
++	SHA1_CTX c;
++	uint8_t k[64], pad[64], inner[20];
++
++	bzero(k, sizeof(k));
++	if (key_len > 64) {
++		SHA1Init(&c);
++		SHA1Update(&c, key, key_len);
++		SHA1Final(k, &c);
++	} else {
++		bcopy(key, k, key_len);
++	}
++	for (int i = 0; i < 64; i++) {
++		pad[i] = k[i] ^ 0x36;
++	}
++	SHA1Init(&c);
++	SHA1Update(&c, pad, 64);
++	if (l1) {
++		SHA1Update(&c, d1, l1);
++	}
++	if (l2) {
++		SHA1Update(&c, d2, l2);
++	}
++	SHA1Final(inner, &c);
++	for (int i = 0; i < 64; i++) {
++		pad[i] = k[i] ^ 0x5c;
++	}
++	SHA1Init(&c);
++	SHA1Update(&c, pad, 64);
++	SHA1Update(&c, inner, 20);
++	SHA1Final(out, &c);
++	wipe(k, sizeof(k));
++	wipe(pad, sizeof(pad));
++	wipe(inner, sizeof(inner));
++}
++
++/* 802.11-2020 12.7.1.2: PRF-n(K, A, B) = first n bits of HMAC-SHA1(K, A | 0 | B | i), i = 0, 1, ... */
++void
++sweet_wpa_prf(const uint8_t *key, size_t key_len, const char *label, const uint8_t *data, size_t data_len,
++    uint8_t *out, size_t out_len)
++{
++	uint8_t buf[128], h[20];
++	size_t ll = strlen(label);
++	size_t n = ll + 1 + data_len + 1;
++
++	if (n > sizeof(buf)) {
++		bzero(out, out_len);
++		return;
++	}
++	bcopy(label, buf, ll);
++	buf[ll] = 0;
++	bcopy(data, buf + ll + 1, data_len);
++	for (uint8_t i = 0; out_len; i++) {
++		size_t take = out_len < 20 ? out_len : 20;
++		buf[n - 1] = i;
++		sweet_wpa_hmac_sha1(key, key_len, buf, n, NULL, 0, h);
++		bcopy(h, out, take);
++		out += take;
++		out_len -= take;
++	}
++	wipe(buf, sizeof(buf));
++	wipe(h, sizeof(h));
++}
++
++/* RFC 3394 key unwrap with a 128-bit KEK; out gets in_len - 8 bytes. 0, or EBADMSG on a bad length/IV */
++int
++sweet_wpa_aes_unwrap(const uint8_t kek[16], const uint8_t *in, size_t in_len, uint8_t *out)
++{
++	aes_decrypt_ctx ctx;
++	uint8_t a[8], b[16], o[16];
++	size_t n;
++	int bad = 0;
++
++	if (in_len < 24 || (in_len % 8) != 0) {
++		return EBADMSG;
++	}
++	n = in_len / 8 - 1;
++	bcopy(in, a, 8);
++	bcopy(in + 8, out, n * 8);
++	aes_decrypt_key128(kek, &ctx);
++	for (int j = 5; j >= 0; j--) {
++		for (size_t i = n; i >= 1; i--) {
++			uint64_t t = (uint64_t)n * (uint64_t)j + i;
++			for (int k = 0; k < 8; k++) {
++				a[7 - k] ^= (uint8_t)(t >> (8 * k));
++			}
++			bcopy(a, b, 8);
++			bcopy(out + (i - 1) * 8, b + 8, 8);
++			aes_decrypt(b, o, &ctx);
++			bcopy(o, a, 8);
++			bcopy(o + 8, out + (i - 1) * 8, 8);
++		}
++	}
++	for (int k = 0; k < 8; k++) {
++		bad |= a[k] != 0xa6;
++	}
++	wipe(&ctx, sizeof(ctx));
++	wipe(b, sizeof(b));
++	wipe(o, sizeof(o));
++	if (bad) {
++		wipe(out, n * 8);
++		return EBADMSG;
++	}
++	return 0;
++}
++
++int
++sweet_wpa_pmk_from_passphrase(const char *pass, size_t pass_len, const uint8_t *ssid, size_t ssid_len, uint8_t pmk[32])
++{
++	uint8_t salt[36], u[20], t[20];
++
++	if (pass_len < 8 || pass_len > 63 || ssid_len > 32) {
++		return EINVAL;
++	}
++	bcopy(ssid, salt, ssid_len);
++	for (uint8_t blk = 1; blk <= 2; blk++) {
++		salt[ssid_len + 0] = 0;
++		salt[ssid_len + 1] = 0;
++		salt[ssid_len + 2] = 0;
++		salt[ssid_len + 3] = blk;
++		sweet_wpa_hmac_sha1((const uint8_t *)pass, pass_len, salt, ssid_len + 4, NULL, 0, u);
++		bcopy(u, t, 20);
++		for (int it = 1; it < 4096; it++) {
++			sweet_wpa_hmac_sha1((const uint8_t *)pass, pass_len, u, 20, NULL, 0, u);
++			for (int k = 0; k < 20; k++) {
++				t[k] ^= u[k];
++			}
++		}
++		bcopy(t, pmk + (blk - 1) * 20, blk == 1 ? 20 : 12);
++	}
++	wipe(u, sizeof(u));
++	wipe(t, sizeof(t));
++	return 0;
++}
++
++/* ---- RSN element ---- */
++
++size_t
++sweet_wpa_build_ie(const uint8_t *ie, size_t len, uint8_t *out, size_t out_max, uint32_t *group_cipher)
++{
++	size_t p = 2, cnt;
++	uint32_t group;
++	int ccmp = 0, psk = 0;
++	uint16_t caps = 0;
++
++	if (len < 8 || ie[0] != 0x30 || (size_t)ie[1] + 2 > len || ie[1] < 6 || be16(ie + 2) != 0x0100) {
++		return 0;
++	}
++	len = (size_t)ie[1] + 2;
++	p = 4;
++	group = be32(ie + p);
++	p += 4;
++	if (group != SWEET_WPA_CIPHER_CCMP && group != SWEET_WPA_CIPHER_TKIP) {
++		return 0;
++	}
++	if (p + 2 > len) {
++		return 0;
++	}
++	cnt = ie[p] | (ie[p + 1] << 8);
++	p += 2;
++	if (p + cnt * 4 > len) {
++		return 0;
++	}
++	for (size_t i = 0; i < cnt; i++, p += 4) {
++		ccmp |= be32(ie + p) == SWEET_WPA_CIPHER_CCMP;
++	}
++	if (p + 2 > len) {
++		return 0;
++	}
++	cnt = ie[p] | (ie[p + 1] << 8);
++	p += 2;
++	if (p + cnt * 4 > len) {
++		return 0;
++	}
++	for (size_t i = 0; i < cnt; i++, p += 4) {
++		psk |= be32(ie + p) == SWEET_WPA_AKM_PSK;
++	}
++	if (p + 2 <= len) {
++		caps = (uint16_t)(ie[p] | (ie[p + 1] << 8));
++	}
++	/* MFPR (bit 7): the AP refuses stations without management frame protection, which we do not do */
++	if (!ccmp || !psk || (caps & 0x0080) || out_max < 22) {
++		return 0;
++	}
++	static const uint8_t tmpl[22] = {
++		0x30, 20, 0x01, 0x00,
++		0x00, 0x0f, 0xac, 0x04,         /* group, patched below */
++		0x01, 0x00, 0x00, 0x0f, 0xac, 0x04,
++		0x01, 0x00, 0x00, 0x0f, 0xac, 0x02,
++		0x00, 0x00,
++	};
++	bcopy(tmpl, out, sizeof(tmpl));
++	out[7] = (uint8_t)group;
++	if (group_cipher) {
++		*group_cipher = group;
++	}
++	return sizeof(tmpl);
++}
++
++/* ---- the handshakes ---- */
++
++static void
++wpa_fail(struct sweet_wpa *w, int err)
++{
++	int was = w->state;
++
++	w->last_err = err;
++	if (was == SWEET_WPA_WAIT_M1 || was == SWEET_WPA_WAIT_M3) {
++		w->state = SWEET_WPA_FAILED;
++		if (w->ops->done) {
++			w->ops->done(w->arg, err);
++		}
++	}
++}
++
++static void
++wpa_derive_ptk(struct sweet_wpa *w)
++{
++	uint8_t d[76], ptk[48];
++	int a_lo = memcmp(w->aa, w->spa, 6) < 0;
++	int n_lo = memcmp(w->anonce, w->snonce, 32) < 0;
++
++	bcopy(a_lo ? w->aa : w->spa, d, 6);
++	bcopy(a_lo ? w->spa : w->aa, d + 6, 6);
++	bcopy(n_lo ? w->anonce : w->snonce, d + 12, 32);
++	bcopy(n_lo ? w->snonce : w->anonce, d + 44, 32);
++	sweet_wpa_prf(w->pmk, 32, "Pairwise key expansion", d, sizeof(d), ptk, sizeof(ptk));
++	bcopy(ptk, w->kck, 16);
++	bcopy(ptk + 16, w->kek, 16);
++	bcopy(ptk + 32, w->tk, 16);
++	w->ptk_valid = 1;
++	wipe(ptk, sizeof(ptk));
++}
++
++static void
++wpa_mic(const uint8_t kck[16], uint8_t *frame, size_t len)
++{
++	uint8_t h[20];
++
++	bzero(frame + EK_MIC, 16);
++	sweet_wpa_hmac_sha1(kck, 16, frame, len, NULL, 0, h);
++	bcopy(h, frame + EK_MIC, 16);
++}
++
++static int
++wpa_mic_ok(const uint8_t kck[16], const uint8_t *frame, size_t len)
++{
++	uint8_t copy[EK_DATA + 528], h[20];
++	int ok;
++
++	if (len > sizeof(copy)) {
++		return 0;
++	}
++	bcopy(frame, copy, len);
++	bzero(copy + EK_MIC, 16);
++	sweet_wpa_hmac_sha1(kck, 16, copy, len, NULL, 0, h);
++	ok = !ct_differ(h, frame + EK_MIC, 16);
++	wipe(h, sizeof(h));
++	return ok;
++}
++
++/* send an EAPOL-Key frame with our nonce (or zeros) and the given key data, MIC'd with the KCK */
++static void
++wpa_send(struct sweet_wpa *w, uint8_t eapol_ver, uint16_t info, const uint8_t replay[8],
++    const uint8_t *nonce, const uint8_t *kd, size_t kd_len)
++{
++	uint8_t f[EK_DATA + SWEET_WPA_IE_MAX];
++	size_t len = EK_DATA + kd_len;
++
++	if (kd_len > SWEET_WPA_IE_MAX) {
++		return;
++	}
++	bzero(f, len);
++	f[0] = eapol_ver;
++	f[1] = EAPOL_TYPE_KEY;
++	put_be16(f + 2, (uint16_t)(len - EK_HDR));
++	f[EK_TYPE] = DESC_RSN;
++	put_be16(f + EK_INFO, info);
++	bcopy(replay, f + EK_REPLAY, 8);
++	if (nonce) {
++		bcopy(nonce, f + EK_NONCE, 32);
++	}
++	put_be16(f + EK_DLEN, (uint16_t)kd_len);
++	if (kd_len) {
++		bcopy(kd, f + EK_DATA, kd_len);
++	}
++	wpa_mic(w->kck, f, len);
++	w->tx++;
++	w->ops->tx_eapol(w->arg, f, len);
++}
++
++/* key data elements: find the GTK KDE (dd len 00-0f-ac 01) and the RSN element */
++static int
++wpa_parse_kd(const uint8_t *kd, size_t len, const uint8_t **gtk, size_t *gtk_len, unsigned *gtk_idx,
++    const uint8_t **rsn, size_t *rsn_len)
++{
++	size_t p = 0;
++
++	*gtk = NULL;
++	*rsn = NULL;
++	while (p + 2 <= len) {
++		uint8_t id = kd[p], l = kd[p + 1];
++		if (id == 0xdd && l == 0) {
++			break;          /* padding */
++		}
++		if (p + 2 + l > len) {
++			return EBADMSG;
++		}
++		if (id == 0x30) {
++			*rsn = kd + p;
++			*rsn_len = (size_t)l + 2;
++		} else if (id == 0xdd && l >= 6 && kd[p + 2] == 0x00 && kd[p + 3] == 0x0f && kd[p + 4] == 0xac &&
++		    kd[p + 5] == 0x01) {
++			if (l < 6 + 16 || l > 6 + 32) {
++				return EBADMSG;
++			}
++			*gtk_idx = kd[p + 6] & 3;
++			*gtk = kd + p + 8;
++			*gtk_len = (size_t)l - 6;
++		}
++		p += 2 + (size_t)l;
++	}
++	return 0;
++}
++
++static int
++wpa_install_gtk(struct sweet_wpa *w, const uint8_t *gtk, size_t gtk_len, unsigned idx, const uint8_t rsc[8])
++{
++	size_t want = w->group_cipher == SWEET_WPA_CIPHER_TKIP ? 32 : 16;
++
++	if (gtk_len != want || idx == 0) {
++		return EBADMSG;
++	}
++	w->gtk_idx = idx;
++	return w->ops->install_key(w->arg, 0, idx, w->group_cipher, gtk, gtk_len, rsc);
++}
++
++void
++sweet_wpa_start(struct sweet_wpa *w, const struct sweet_wpa_ops *ops, void *arg, const uint8_t pmk[32],
++    const uint8_t aa[6], const uint8_t spa[6], const uint8_t *own_ie, size_t own_ie_len,
++    const uint8_t *ap_ie, size_t ap_ie_len, uint32_t group_cipher)
++{
++	wipe(w, sizeof(*w));
++	w->ops = ops;
++	w->arg = arg;
++	bcopy(pmk, w->pmk, 32);
++	bcopy(aa, w->aa, 6);
++	bcopy(spa, w->spa, 6);
++	w->own_ie_len = (uint8_t)(own_ie_len > SWEET_WPA_IE_MAX ? 0 : own_ie_len);
++	bcopy(own_ie, w->own_ie, w->own_ie_len);
++	w->ap_ie_len = (uint8_t)(ap_ie_len > SWEET_WPA_IE_MAX ? 0 : ap_ie_len);
++	if (w->ap_ie_len) {
++		bcopy(ap_ie, w->ap_ie, w->ap_ie_len);
++	}
++	w->group_cipher = group_cipher;
++	w->state = SWEET_WPA_WAIT_M1;
++}
++
++void
++sweet_wpa_stop(struct sweet_wpa *w)
++{
++	const struct sweet_wpa_ops *ops = w->ops;
++	void *arg = w->arg;
++
++	wipe(w, sizeof(*w));
++	w->ops = ops;
++	w->arg = arg;
++}
++
++int
++sweet_wpa_rx(struct sweet_wpa *w, const uint8_t *f, size_t len)
++{
++	uint16_t info, dlen;
++	uint8_t kd[512];
++	const uint8_t *gtk, *rsn;
++	size_t gtk_len = 0, rsn_len = 0, kd_len;
++	unsigned gidx = 0;
++	int err;
++
++	if (w->state == SWEET_WPA_IDLE || w->state == SWEET_WPA_FAILED) {
++		return ENOTCONN;
++	}
++	w->rx++;
++	if (len < EK_DATA || f[1] != EAPOL_TYPE_KEY || f[EK_TYPE] != DESC_RSN) {
++		return EBADMSG;
++	}
++	if ((size_t)be16(f + 2) + EK_HDR > len) {
++		return EBADMSG;
++	}
++	len = (size_t)be16(f + 2) + EK_HDR;         /* drop link-layer padding */
++	info = be16(f + EK_INFO);
++	dlen = be16(f + EK_DLEN);
++	if ((size_t)EK_DATA + dlen > len || (info & KI_VER_MASK) != KI_VER_AES || !(info & KI_ACK) ||
++	    (info & (KI_REQUEST | KI_ERROR))) {
++		return EBADMSG;
++	}
++	if (w->replay_valid && memcmp(f + EK_REPLAY, w->replay, 8) <= 0) {
++		w->replay_bad++;
++		return EALREADY;
++	}
++
++	if ((info & KI_PAIRWISE) && !(info & KI_MIC)) {
++		/* message 1/4: new SNonce, PTK, message 2/4 carrying our RSN element */
++		if (w->state != SWEET_WPA_WAIT_M1 && w->state != SWEET_WPA_WAIT_M3) {
++			return EALREADY;        /* a new 4-way handshake (PTK rekey) is not supported */
++		}
++		bcopy(f + EK_NONCE, w->anonce, 32);
++		w->ops->random(w->snonce, 32);
++		wpa_derive_ptk(w);
++		wpa_send(w, f[0], KI_VER_AES | KI_PAIRWISE | KI_MIC, f + EK_REPLAY, w->snonce, w->own_ie, w->own_ie_len);
++		w->state = SWEET_WPA_WAIT_M3;
++		return 0;
++	}
++	if (!(info & KI_MIC) || !w->ptk_valid) {
++		return EBADMSG;
++	}
++	if (!wpa_mic_ok(w->kck, f, len)) {
++		w->mic_bad++;
++		return EAUTH;
++	}
++	bcopy(f + EK_REPLAY, w->replay, 8);
++	w->replay_valid = 1;
++
++	/* key data: AES key wrap with the KEK */
++	if (!(info & KI_ENC_DATA) || dlen < 24 || dlen > sizeof(kd) + 8 || (dlen % 8)) {
++		wpa_fail(w, EBADMSG);
++		return EBADMSG;
++	}
++	if ((err = sweet_wpa_aes_unwrap(w->kek, f + EK_DATA, dlen, kd)) != 0) {
++		wpa_fail(w, err);
++		return err;
++	}
++	kd_len = dlen - 8u;
++	if ((err = wpa_parse_kd(kd, kd_len, &gtk, &gtk_len, &gidx, &rsn, &rsn_len)) != 0 || !gtk) {
++		wipe(kd, sizeof(kd));
++		wpa_fail(w, err ? err : ENOENT);
++		return err ? err : ENOENT;
++	}
++
++	if (info & KI_PAIRWISE) {
++		/* message 3/4 */
++		if (w->state == SWEET_WPA_DONE && (info & KI_INSTALL) && !ct_differ(f + EK_NONCE, w->anonce, 32)) {
++			/* our message 4/4 was lost and the AP retried 3/4: answer again, keys stay as installed */
++			wipe(kd, sizeof(kd));
++			wpa_send(w, f[0], KI_VER_AES | KI_PAIRWISE | KI_MIC | KI_SECURE, f + EK_REPLAY, NULL, NULL, 0);
++			return 0;
++		}
++		if (w->state != SWEET_WPA_WAIT_M3 || !(info & KI_INSTALL)) {
++			wipe(kd, sizeof(kd));
++			return EALREADY;
++		}
++		if (ct_differ(f + EK_NONCE, w->anonce, 32) ||
++		    (w->ap_ie_len && rsn && (rsn_len != w->ap_ie_len || memcmp(rsn, w->ap_ie, rsn_len)))) {
++			wipe(kd, sizeof(kd));
++			wpa_fail(w, EPROTO);
++			return EPROTO;
++		}
++		wpa_send(w, f[0], KI_VER_AES | KI_PAIRWISE | KI_MIC | KI_SECURE, f + EK_REPLAY, NULL, NULL, 0);
++		static const uint8_t zero_rsc[8];
++		err = w->ops->install_key(w->arg, 1, 0, SWEET_WPA_CIPHER_CCMP, w->tk, 16, zero_rsc);
++		if (!err) {
++			err = wpa_install_gtk(w, gtk, gtk_len, gidx, f + EK_RSC);
++		}
++		wipe(kd, sizeof(kd));
++		if (err) {
++			wpa_fail(w, err);
++			return err;
++		}
++		w->state = SWEET_WPA_DONE;
++		if (w->ops->done) {
++			w->ops->done(w->arg, 0);
++		}
++		return 0;
++	}
++
++	/* group key message 1/2 (rekey) */
++	if (w->state != SWEET_WPA_DONE || !(info & KI_SECURE)) {
++		wipe(kd, sizeof(kd));
++		return EALREADY;
++	}
++	err = wpa_install_gtk(w, gtk, gtk_len, gidx, f + EK_RSC);
++	wipe(kd, sizeof(kd));
++	if (err) {
++		w->last_err = err;
++		return err;
++	}
++	w->rekeys++;
++	wpa_send(w, f[0], KI_VER_AES | KI_MIC | KI_SECURE, f + EK_REPLAY, NULL, NULL, 0);
++	return 0;
++}
++#endif /* !KERNEL || ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_wpa.h b/bsd/dev/sweet_wpa.h
+new file mode 100644
+--- /dev/null
++++ b/bsd/dev/sweet_wpa.h
+@@ -0,0 +1,89 @@
++/*
++ * SWEET: a minimal WPA2-Personal supplicant (4-way and group-key handshakes, CCMP pairwise and group,
++ * AKM 00-0f-ac:2 PSK, key descriptor version 2) for the WCN3990 station (beryllium_wlan.c).
++ * docs/WIFI_IOS26_PHASE2.md WL4. No hardware access: frames in, frames and keys out through the ops.
++ */
++#ifndef _SWEET_WPA_H_
++#define _SWEET_WPA_H_
++
++#include <stdint.h>
++#include <stddef.h>
++
++#define SWEET_WPA_IE_MAX        64u
++
++struct sweet_wpa_ops {
++	/* send one EAPOL frame (802.1X header on, no Ethernet header) to the AP, ethertype 0x888e */
++	void (*tx_eapol)(void *arg, const uint8_t *frame, size_t len);
++	/* install a key: pairwise (idx 0) or group (idx 1..3); key 16 bytes CCMP (32 for a TKIP group key);
++	 * rsc = the receive sequence counter for a group key (little-endian, 6 bytes used), zero for pairwise */
++	int (*install_key)(void *arg, int pairwise, unsigned idx, uint32_t cipher_suite,
++	    const uint8_t *key, size_t key_len, const uint8_t rsc[8]);
++	/* the 4-way handshake finished (status 0) or failed (an errno); group rekeys do not call this */
++	void (*done)(void *arg, int status);
++	void (*random)(uint8_t *buf, size_t len);
++};
++
++/* RSN suite selectors, as big-endian u32 (OUI << 8 | type) */
++#define SWEET_WPA_CIPHER_TKIP   0x000fac02u
++#define SWEET_WPA_CIPHER_CCMP   0x000fac04u
++#define SWEET_WPA_AKM_PSK       0x000fac02u
++
++enum {
++	SWEET_WPA_IDLE = 0,
++	SWEET_WPA_WAIT_M1,      /* associated, waiting for message 1/4 */
++	SWEET_WPA_WAIT_M3,      /* message 2/4 sent */
++	SWEET_WPA_DONE,         /* PTK and GTK installed; group rekeys handled */
++	SWEET_WPA_FAILED,
++};
++
++struct sweet_wpa {
++	const struct sweet_wpa_ops *ops;
++	void     *arg;
++	int       state;
++	uint8_t   pmk[32];
++	uint8_t   aa[6];                /* authenticator (AP) MAC */
++	uint8_t   spa[6];               /* our MAC */
++	uint8_t   own_ie[SWEET_WPA_IE_MAX];     /* the RSN element we sent in the association request */
++	uint8_t   own_ie_len;
++	uint8_t   ap_ie[SWEET_WPA_IE_MAX];      /* the AP's RSN element from its beacon / probe response */
++	uint8_t   ap_ie_len;
++	uint32_t  group_cipher;
++	uint8_t   anonce[32];
++	uint8_t   snonce[32];
++	uint8_t   kck[16], kek[16], tk[16];     /* PTK = KCK | KEK | TK (CCMP, 384 bits) */
++	int       ptk_valid;
++	uint8_t   replay[8];            /* last accepted replay counter (big-endian) */
++	int       replay_valid;
++	unsigned  gtk_idx;
++	/* counters for the status line */
++	uint32_t  rx, tx, mic_bad, replay_bad, rekeys;
++	int       last_err;
++};
++
++/*
++ * Build our RSN element for the association request from the AP's: CCMP pairwise, the AP's group cipher
++ * (CCMP or TKIP), AKM PSK, no PMKIDs, capabilities 0. Returns the length, or 0 if the AP does not offer
++ * PSK with CCMP pairwise (or requires management frame protection).
++ */
++size_t sweet_wpa_build_ie(const uint8_t *ap_ie, size_t ap_ie_len, uint8_t *out, size_t out_max, uint32_t *group_cipher);
++
++/* PMK = PBKDF2-HMAC-SHA1(passphrase, ssid, 4096, 32), for when only the passphrase is available */
++int sweet_wpa_pmk_from_passphrase(const char *pass, size_t pass_len, const uint8_t *ssid, size_t ssid_len, uint8_t pmk[32]);
++
++/* arm for a new association; own_ie must be what went into the association request */
++void sweet_wpa_start(struct sweet_wpa *w, const struct sweet_wpa_ops *ops, void *arg, const uint8_t pmk[32],
++    const uint8_t aa[6], const uint8_t spa[6], const uint8_t *own_ie, size_t own_ie_len,
++    const uint8_t *ap_ie, size_t ap_ie_len, uint32_t group_cipher);
++/* an EAPOL frame from the AP (802.1X header on); returns 0 if consumed, an errno if dropped */
++int sweet_wpa_rx(struct sweet_wpa *w, const uint8_t *frame, size_t len);
++/* forget all keys (disassociation) */
++void sweet_wpa_stop(struct sweet_wpa *w);
++
++/* exposed for the harness */
++void sweet_wpa_hmac_sha1(const uint8_t *key, size_t key_len, const uint8_t *d1, size_t l1,
++    const uint8_t *d2, size_t l2, uint8_t out[20]);
++void sweet_wpa_prf(const uint8_t *key, size_t key_len, const char *label, const uint8_t *data, size_t data_len,
++    uint8_t *out, size_t out_len);
++int sweet_wpa_aes_unwrap(const uint8_t kek[16], const uint8_t *in, size_t in_len, uint8_t *out);
++
++#endif /* _SWEET_WPA_H_ */

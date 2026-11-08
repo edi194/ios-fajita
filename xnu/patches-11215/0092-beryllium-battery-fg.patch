@@ -1,0 +1,107 @@
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index 9969739eed65d43841cbd932d0de382c998e7298..93b76396009fcca972b8d5e9c17e602542f5dd4b 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -12,6 +12,7 @@
+ #include <IOKit/pwr_mgt/IOPMPowerSource.h>
+ #include <libkern/c++/OSCollectionIterator.h>
+ #include <pexpert/pexpert.h>
++#include "../../../bsd/dev/sweet_board.h"
+ /* bsd/dev/sweet_spmi.c */
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+@@ -35,7 +36,8 @@ private:
+ 	void poll(void);
+ 	static void timerFired(OSObject *owner, IOTimerEventSource *sender);
+ 	static IOReturn stopPolling(OSObject *owner, void *, void *, void *, void *);
+-	static bool readWord(unsigned address, uint16_t *value);
++	static bool readWord(unsigned address, uint16_t *value, unsigned sid = 0);
++	void pollBeryllium(void);
+ 	static unsigned estimatePercent(unsigned mv);
+ };
+ OSDefineMetaClassAndStructors(SweetBattery, IOPMPowerSource);
+@@ -154,7 +156,7 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	int mode = measured ? 1 : 0;
+ 	if (mode != fLastMode) {
+ 		IOLog("SWEET BATTERY: %s, %u%% %umV external=%d charging=%d\n",
+-		    measured ? "PM6150 / estimated SOC" : "static fallback",
++		    measured ? (sweet_board_beryllium() ? "PMI8998 FG SOC" : "PM6150 / estimated SOC") : "static fallback",
+ 		    percent, mv, external, charging);
+ 		fLastMode = mode;
+ 	}
+@@ -164,13 +166,13 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+  * words to reject most torn ADC samples without writing the QG HOLD bit.
+  * This is a bounded consistency check, not a hardware snapshot guarantee. */
+ bool
+-SweetBattery::readWord(unsigned address, uint16_t *value)
++SweetBattery::readWord(unsigned address, uint16_t *value, unsigned sid)
+ {
+ 	uint16_t previous = 0;
+ 	for (unsigned attempt = 0; attempt < 4; ++attempt) {
+ 		uint8_t lo, hi;
+-		if (sweet_spmi_read(0, address, &lo) ||
+-		    sweet_spmi_read(0, address + 1, &hi)) {
++		if (sweet_spmi_read(sid, address, &lo) ||
++		    sweet_spmi_read(sid, address + 1, &hi)) {
+ 			return false;
+ 		}
+ 		uint16_t next = (uint16_t)((unsigned)lo | ((unsigned)hi << 8));
+@@ -203,9 +205,58 @@ SweetBattery::estimatePercent(unsigned mv)
+ 	return 100;
+ }
+ 
++/*
++ * Poco F1: PMI8998 (SID 2) FG gen3 + SMB2 charger, read-only, as Linux
++ * qpnp-fg-gen3.c / smb-reg.h. The FG keeps its own calibrated monotonic
++ * SOC (0x4009, 0..255), so no voltage estimate is needed here.
++ */
++void
++SweetBattery::pollBeryllium(void)
++{
++	const unsigned sid = 2;
++	uint8_t msoc = 0, msoc2 = 1, usb = 0, charger = 0;
++	uint16_t rawVoltage = 0, rawCurrent = 0;
++	bool valid = fReal;
++	/* two equal reads of the monotonic SOC, like fg_get_msoc_raw */
++	for (unsigned i = 0; valid && i < 5; ++i) {
++		valid = !sweet_spmi_read(sid, 0x4009, &msoc) && !sweet_spmi_read(sid, 0x4009, &msoc2);
++		if (msoc == msoc2) {
++			break;
++		}
++	}
++	valid = valid && msoc == msoc2 &&
++	    readWord(0x41a0, &rawVoltage, sid) &&
++	    !sweet_spmi_read(sid, 0x1310, &usb) &&
++	    !sweet_spmi_read(sid, 0x1006, &charger);
++	unsigned mv = valid ? (unsigned)(((uint64_t)rawVoltage * 122070u) / 1000000u) : 0;
++	valid = valid && mv >= 2800 && mv <= 4600;
++	if (!valid) {
++		publish(100, 4200, 0, true, true, false, true, false, false);
++		return;
++	}
++	unsigned percent = msoc == 255 ? 100 : msoc == 0 ? 0 :
++	    ((unsigned)(msoc - 1) * 98u + 252u) / 253u + 1u;
++	bool external = (usb & 0x10u) != 0;          /* USBIN_PLUGIN_RT_STS */
++	unsigned state = charger & 7u;
++	bool charging = external && state >= 1 && state <= 4;
++	bool full = external && state == 5;          /* TERMINATE_CHARGE */
++	int ma = 0;
++	bool currentValid = readWord(0x41a2, &rawCurrent, sid);
++	if (currentValid) {
++		int signedRaw = (rawCurrent & 0x8000u) ? (int)rawCurrent - 65536 : (int)rawCurrent;
++		/* FG: positive = discharging, 488.281 uA/bit; IOPMPowerSource: positive = charging, mA */
++		ma = (int)(-((int64_t)signedRaw * 488281) / 1000000);
++	}
++	publish(full ? 100 : percent, mv, ma, external, external, charging, full, true, currentValid);
++}
++
+ void
+ SweetBattery::poll(void)
+ {
++	if (fReal && sweet_board_beryllium()) {
++		pollBeryllium();
++		return;
++	}
+ 	uint8_t type, present, usb, path, charger, error, temperature;
+ 	uint16_t rawVoltage;
+ 	bool valid = fReal &&

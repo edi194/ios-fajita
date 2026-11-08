@@ -1,0 +1,123 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -214,6 +214,22 @@
+ };
+ 
+ OSDefineMetaClassAndStructors(IOAcceleratorES, IOService);
++
++/*
++ * 0243: the backlight service iOS's brightness stack looks for. backboardd (CoreBrightness, BLControl) matches
++ * IOPropertyMatch { backlight-control = true } and found nothing here, so the slider and auto-brightness reached no
++ * hardware. This publishes one under the framebuffer, advertises IODisplayParameters brightness 0..4095 (the WLED's
++ * 12 bits), logs every property iOS sets on it (what it sends is not documented), and hands a brightness it
++ * recognises to the framebuffer, whose vsync timer writes the WLED (blReqApply).
++ */
++class SweetBacklight : public IOService {
++	OSDeclareDefaultStructors(SweetBacklight);
++public:
++	AppleCLCD *fFB;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++};
++
++OSDefineMetaClassAndStructors(SweetBacklight, IOService);
+ 
+ class IOMobileFramebufferUserClient;
+ 
+@@ -452,6 +468,10 @@
+ 	bool          blStep(int dir);
+ 	bool          blSet(bool on);   /* 0242: the backlight straight to iOS's state (no ramp), retried; false: it did not take */
+ 	bool          fBlOffFailed;     /* 0242: this power-off could not darken the WLED: black frame instead, for this off only */
++	/* 0243: brightness iOS asked for through SweetBacklight (0..4095), and the one written; applied on the vsync timer */
++	uint32_t      fBlReq, fBlReqApplied;
++	SweetBacklight *fBacklight;
++	void          blRequest(uint32_t level) { __atomic_store_n(&fBlReq, level | 0x80000000u, __ATOMIC_RELEASE); }
+ 	void          blackout(void);
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+@@ -759,6 +779,27 @@
+ 		PE_parse_boot_argn("sweetfb_blfade", &blfade, sizeof(blfade));
+ 		if (blfade) {
+ 			blInit();
++			if ((fBacklight = OSTypeAlloc(SweetBacklight)) != NULL && fBacklight->init() && fBacklight->attach(this)) {
++				fBacklight->fFB = this;
++				fBacklight->setProperty("backlight-control", true);
++				OSDictionary *dp = OSDictionary::withCapacity(1), *br = OSDictionary::withCapacity(3);
++				if (dp && br) {
++					OSNumber *mn = OSNumber::withNumber(0ULL, 32), *mx = OSNumber::withNumber(4095ULL, 32),
++					    *va = OSNumber::withNumber((unsigned long long)(fBlRaw[0] & 0xfff), 32);
++					br->setObject("min", mn);
++					br->setObject("max", mx);
++					br->setObject("value", va);
++					OSSafeReleaseNULL(mn);
++					OSSafeReleaseNULL(mx);
++					OSSafeReleaseNULL(va);
++					dp->setObject("brightness", br);
++					fBacklight->setProperty("IODisplayParameters", dp);
++				}
++				OSSafeReleaseNULL(dp);
++				OSSafeReleaseNULL(br);
++				fBacklight->registerService();
++				IOLog("SWEET FB: backlight service published (0243): backlight-control, brightness 0..4095\n");
++			}
+ 		} else {
+ 			IOLog("SWEET FB: backlight fade off (sweetfb_blfade=0): black in one step\n");
+ 		}
+@@ -960,6 +1001,20 @@
+ 	}
+ 	if (fb->fBlOK && fb->fBlPos != SWEET_FB_BL_STEPS && !dirty) {
+ 		(void)fb->blSet(true);     /* 0242: back on: the latest frame is up, light the panel in one step */
++	}
++	uint32_t req = __atomic_load_n(&fb->fBlReq, __ATOMIC_ACQUIRE);
++	if (fb->fBlOK && req != fb->fBlReqApplied && fb->fBlPos == SWEET_FB_BL_STEPS) {
++		/* 0243: iOS's brightness, on both WLED strings (the floor keeps the panel readable: 0 is iOS's "off", which is
++		 * RequestPowerChange's job) */
++		uint32_t lvl = req & 0xfffu;
++		if (lvl < 16) {
++			lvl = 16;
++		}
++		fb->fBlRaw[0] = (uint16_t)lvl;
++		fb->fBlRaw[1] = (uint16_t)lvl;
++		if (fb->blSet(true)) {
++			fb->fBlReqApplied = req;
++		}
+ 	}
+ 	sweet_hold_release(taken);      /* copied: CA may render into them again */
+ 	fb->statsTick(now);
+@@ -2467,6 +2522,36 @@
+  * (fBlOK cleared, the original value written back as well as possible) when
+  * a write fails or does not read back: the caller blacks the screen out instead.
+  */
++/* 0243: what iOS sets on the backlight service, logged (first 64 calls), and the brightness taken from it. */
++IOReturn
++SweetBacklight::setProperties(OSObject *properties)
++{
++	static uint32_t logged;
++	OSDictionary *d = OSDynamicCast(OSDictionary, properties);
++	if (d == NULL) {
++		return kIOReturnBadArgument;
++	}
++	if (logged++ < 64) {
++		OSSerialize *ser = OSSerialize::withCapacity(512);
++		if (ser != NULL && d->serialize(ser)) {
++			char name[32];
++			proc_selfname(name, sizeof(name));
++			IOLog("SWEET BL: %s sets %.400s\n", name, ser->text());
++		}
++		OSSafeReleaseNULL(ser);
++	}
++	OSNumber *n = OSDynamicCast(OSNumber, d->getObject("brightness"));
++	if (n == NULL) {
++		OSDictionary *dp = OSDynamicCast(OSDictionary, d->getObject("IODisplayParameters"));
++		OSDictionary *br = dp ? OSDynamicCast(OSDictionary, dp->getObject("brightness")) : NULL;
++		n = br ? OSDynamicCast(OSNumber, br->getObject("value")) : NULL;
++	}
++	if (n != NULL && fFB != NULL && n->unsigned64BitValue() <= 4095) {
++		fFB->blRequest((uint32_t)n->unsigned64BitValue());
++	}
++	return kIOReturnSuccess;
++}
++
+ /*
+  * 0242: the WLED straight to off (0) or to the brightness it had (fBlRaw), on the vsync timer (the only caller, so no
+  * lock). Each write is read back; a mismatch or a failed SPMI access is retried up to 3 times (single reads have come

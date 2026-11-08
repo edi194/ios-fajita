@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- One layer of the Icon Composer app icon (tools/identity/mkicon.sh renders each at 1024 px on a transparent canvas):
+     no background, no shadow, no mask; Icon Composer adds those per appearance.
+     Query: ?layer=newton|numerals&n=26 -->
+<html><head><meta charset="utf-8">
+<style>
+@font-face { font-family: Archivo; src: url(fonts/archivo.woff2) format('woff2'); font-weight: 100 900; font-stretch: 62% 125%; }
+html, body { margin: 0; width: 1024px; height: 1024px; overflow: hidden; background: transparent; }
+/* head and shoulders: the hair inside the canvas, the coat running off the bottom edge */
+#newton { position: absolute; left: -56px; top: 196px; width: 1136px; display: none; }
+/* the iOS generation, giant and white, behind the head (as on the wallpaper) */
+#numerals { position: absolute; left: 0; right: 0; top: 18px; text-align: center; display: none;
+  font-family: Archivo; font-weight: 900; font-stretch: 112%; font-size: 560px; line-height: 0.82; letter-spacing: -0.04em;
+  color: #fff; }
+</style></head>
+<body>
+<img id="newton" src="newton-halftone.png" alt="">
+<div id="numerals"></div>
+<script>
+const q = new URLSearchParams(location.search);
+const el = document.getElementById(q.get('layer') || 'newton');
+if (el.id === 'numerals') el.textContent = q.get('n') || '26';
+el.style.display = 'block';
+</script>
+</body></html>

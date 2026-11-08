@@ -1,0 +1,62 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index dbcaff30e37272844307aa7ce95db9ab1ed42e37..2b04e618ffded7e2417edf78b49ffe1fbaf04554 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1126,6 +1126,57 @@ sweet_sample_task(const char *name, int pid, task_t task)
+ 		printf("%s\n", line);
+ 	}
+ 	task_unlock(task);
++
++	/*
++	 * Receive rights of the task: is the service endpoint checked in (a receive right exists) and are messages
++	 * piling up on it (clients sent, nobody dequeues)? "SMP name PORTS recv N queued M: name:count ..." lists the
++	 * receive rights that hold queued messages (up to 24), N = all receive rights, M = those with messages.
++	 */
++	{
++		ipc_space_t space = task->itk_space;
++		mach_port_name_t qn[24];
++		uint32_t qc[24];
++		int nq = 0;
++		uint32_t nrecv = 0, nqueued = 0, npset = 0;
++
++		if (space != IS_NULL) {
++			is_read_lock(space);
++			if (is_active(space)) {
++				ipc_entry_table_t table = is_active_table(space);
++				ipc_entry_num_t tsize = ipc_entry_table_count(table);
++				for (mach_port_index_t index = 1; index < tsize; index++) {
++					ipc_entry_t entry = ipc_entry_table_get_nocheck(table, index);
++					ipc_entry_bits_t bits = entry->ie_bits;
++					if (!(IE_BITS_TYPE(bits) & MACH_PORT_TYPE_RECEIVE) || entry->ie_object == IO_NULL) {
++						continue;
++					}
++					nrecv++;
++					ipc_object_t obj = entry->ie_object;
++					if (io_otype(obj) != IOT_PORT) {
++						npset++;
++						continue;
++					}
++					ipc_port_t port = ip_object_to_port(obj);
++					uint32_t cnt = port->ip_messages.imq_msgcount;
++					if (cnt != 0) {
++						nqueued++;
++						if (nq < 24) {
++							qn[nq] = MACH_PORT_MAKE(index, IE_BITS_GEN(bits));
++							qc[nq] = cnt;
++							nq++;
++						}
++					}
++				}
++			}
++			is_read_unlock(space);
++		}
++		char pl[300];
++		int pn = snprintf(pl, sizeof(pl), "SMP %s PORTS recv %u psets %u queued %u:", name, nrecv, npset, nqueued);
++		for (int i = 0; i < nq && pn < (int)sizeof(pl) - 24; i++) {
++			pn += snprintf(pl + pn, sizeof(pl) - pn, " 0x%x:%u", qn[i], qc[i]);
++		}
++		printf("%s\n", pl);
++	}
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

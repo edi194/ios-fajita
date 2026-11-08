@@ -1,0 +1,54 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index c028ea8..c091c53 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -39,6 +39,7 @@
+ #include <pexpert/pexpert.h>
+ #include <kern/clock.h>
+ #include <security/mac_policy.h>
++#include <IOKit/IOBSD.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+ void *sweet_entitlements_create(const CS_GenericBlob *blob, size_t blob_len);
+@@ -426,12 +427,41 @@ static struct {
+ } sweet_priv_logged[SWEET_PRIV_LOG_MAX];
+ static int _Atomic sweet_priv_logged_count;   /* slots reserved; may exceed the max */
+ 
++/*
++ * Skywalk privileges, granted like AMFI does on iOS: only to a process holding the matching
++ * entitlement. bluetoothd (com.apple.private.skywalk.register-user-pipe) registers its audio
++ * user-pipe nexus "com.apple.bluetooth.AudioPipe" when an audio device connects; without the
++ * grant nxprov_create failed with EPERM, the audio channel stayed NULL and bluetoothd crashed in
++ * os_channel_get_fd(NULL) on its media queue (boot combo9: every "Connect" dropped, then a
++ * SIGSEGV loop because bluetoothd reconnects the device on every start).
++ */
++static const struct {
++	int priv;
++	const char *entitlement;
++} sweet_skywalk_privs[] = {
++	{ PRIV_SKYWALK_REGISTER_USER_PIPE, "com.apple.private.skywalk.register-user-pipe" },
++	{ PRIV_SKYWALK_REGISTER_KERNEL_PIPE, "com.apple.private.skywalk.register-kernel-pipe" },
++	{ PRIV_SKYWALK_REGISTER_NET_IF, "com.apple.private.skywalk.register-net-if" },
++	{ PRIV_SKYWALK_REGISTER_FLOW_SWITCH, "com.apple.private.skywalk.register-flow-switch" },
++	{ PRIV_SKYWALK_LOW_LATENCY_CHANNEL, "com.apple.private.skywalk.low-latency-channel" },
++	{ PRIV_SKYWALK_OBSERVE_ALL, "com.apple.private.skywalk.observe-all" },
++	{ PRIV_SKYWALK_OBSERVE_STATS, "com.apple.private.skywalk.observe-stats" },
++};
++
+ static int
+ sweet_sandbox_priv_grant(kauth_cred_t cred __unused, int priv)
+ {
+ 	if (priv == PRIV_WORK_INTERVAL) {
+ 		return 0;
+ 	}
++	for (unsigned i = 0; i < sizeof(sweet_skywalk_privs) / sizeof(sweet_skywalk_privs[0]); i++) {
++		if (sweet_skywalk_privs[i].priv == priv) {
++			if (IOCurrentTaskHasEntitlement(sweet_skywalk_privs[i].entitlement)) {
++				return 0;
++			}
++			break;
++		}
++	}
+ 	char name[20];
+ 	proc_selfname(name, sizeof(name));
+ 	/*

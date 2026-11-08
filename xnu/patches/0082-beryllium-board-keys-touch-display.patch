@@ -1,0 +1,568 @@
+--- /dev/null
++++ b/bsd/dev/sweet_board.h
+@@ -0,0 +1,51 @@
++/*
++ * SWEET kernels run on two Xiaomi phones. The ADT root compatible
++ * (tools/mkadt.py --board) names the board; everything else is common.
++ *   xiaomi,sweet      Redmi Note 10 Pro, SM7150 (default)
++ *   xiaomi,beryllium  Poco F1, SDM845
++ */
++#ifndef _SWEET_BOARD_H_
++#define _SWEET_BOARD_H_
++
++#include <stdbool.h>
++#include <pexpert/device_tree.h>
++
++static inline bool
++sweet_board_is(const char *want)
++{
++	DTEntry root;
++	void const *prop;
++	unsigned int size;
++
++	if (SecureDTLookupEntry(NULL, "/", &root) != kSuccess ||
++	    SecureDTGetProperty(root, "compatible", &prop, &size) != kSuccess) {
++		return false;
++	}
++	const char *s = (const char *)prop, *end = s + size;
++	while (s < end) {
++		const char *a = s, *b = want;
++		while (a < end && *a && *a == *b) {
++			a++, b++;
++		}
++		if (a < end && *a == 0 && *b == 0) {
++			return true;
++		}
++		while (s < end && *s) {
++			s++;
++		}
++		s++;
++	}
++	return false;
++}
++
++static inline bool
++sweet_board_beryllium(void)
++{
++	static int cached = -1;
++	if (cached < 0) {
++		cached = sweet_board_is("xiaomi,beryllium") ? 1 : 0;
++	}
++	return cached == 1;
++}
++
++#endif /* _SWEET_BOARD_H_ */
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -1,6 +1,8 @@
+ /*
+  * Minimal polled SWEET keys. Call once after the scheduler is running.
+  * See hw-report.md: volume-up is PM6150L SID 4, NOT PM6150 SID 0.
++ * Poco F1 (beryllium): power/RESIN on PM8998 PON (SID 0, same block),
++ * volume-up on PM8998 GPIO6 (SID 0, 0xc500; mainline gpio-keys).
+  * PMIC access is READ ONLY: the sole MMIO write issues EXT_READL on an
+  * observer channel. No PMIC config, IRQ acknowledge or reset writes exist.
+  */
+@@ -12,6 +14,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_board.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+@@ -21,11 +24,14 @@
+ #define KEYS_OBS_PA      0x0e600000u
+ #define KEYS_CNFG_PA     0x0c40a000u
+ #define KEYS_PON_RT      0x0810u
+-#define KEYS_GPIO_RT     0xc110u
++/* volume-up GPIO peripheral: sweet PM6150L GPIO2 (SID 4), beryllium PM8998 GPIO6 (SID 0) */
++#define KEYS_GPIO_BASE   (keys_gpio_base)
++#define KEYS_GPIO_RT     (KEYS_GPIO_BASE + 0x10u)
+ #define KEYS_NO_APID     0xffffu
+ 
+ static vm_offset_t keys_core, keys_obs, keys_cnfg;
+ static uint16_t keys_pon_apid = KEYS_NO_APID, keys_gpio_apid = KEYS_NO_APID;
++static uint16_t keys_gpio_base = 0xc100u, keys_gpio_ppid = 0x4c1u;
+ static uint32_t keys_version, keys_last_status;
+ static bool keys_started;
+ static int keys_sleep_chan;
+@@ -113,7 +119,7 @@
+ 		for (int k = 0; k < 3; ++k) {
+ 			if ((k == 1 ? gok : pok) && now[k] != state[k]) {
+ 				state[k] = now[k];
+-				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio4:c110=%#x\n",
++				printf("SWEET KEYS: key=%d down=%d pon=%#x gpio=%#x\n",
+ 				    k, state[k], pon, gpio);
+ 				sweet_hid_key(k, state[k]);
+ 			}
+@@ -136,6 +142,10 @@
+ 		printf("SWEET KEYS: disabled (sweetkeys=0)\n");
+ 		return;
+ 	}
++	if (sweet_board_beryllium()) {
++		keys_gpio_base = 0xc500u;
++		keys_gpio_ppid = 0x0c5u;
++	}
+ 	keys_core = ml_io_map(KEYS_CORE_PA, 0x2000);
+ 	keys_cnfg = ml_io_map(KEYS_CNFG_PA, 0x1000);
+ 	keys_obs = ml_io_map(KEYS_OBS_PA, 0x10000);
+@@ -152,21 +162,21 @@
+ 		return;
+ 	}
+ 	keys_pon_apid = keys_find_apid(0x008, count);
+-	keys_gpio_apid = keys_find_apid(0x4c1, count);
++	keys_gpio_apid = keys_find_apid(keys_gpio_ppid, count);
+ 	uint8_t pon = 0, gpio = 0, mode = 0, en = 0, subtype = 0;
+ 	bool pok = keys_read(keys_pon_apid, KEYS_PON_RT, &pon);
+ 	bool gok = keys_read(keys_gpio_apid, KEYS_GPIO_RT, &gpio);
+-	bool mok = keys_read(keys_gpio_apid, 0xc140, &mode);
+-	bool eok = keys_read(keys_gpio_apid, 0xc146, &en);
+-	bool sok = keys_read(keys_gpio_apid, 0xc105, &subtype);
+-	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio4-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
+-	    keys_version, count, keys_pon_apid, keys_gpio_apid,
++	bool mok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x40u, &mode);
++	bool eok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x46u, &en);
++	bool sok = keys_read(keys_gpio_apid, KEYS_GPIO_BASE + 0x05u, &subtype);
++	printf("SWEET KEYS: arb=%#x apids=%u pon-apid=%u gpio-ppid=%#x gpio-apid=%u pon=%#x/%d gpio=%#x/%d mode=%#x/%d en=%#x/%d subtype=%#x/%d\n",
++	    keys_version, count, keys_pon_apid, keys_gpio_ppid, keys_gpio_apid,
+ 	    pon, pok, gpio, gok, mode, mok, en, eok, subtype, sok);
+ 	/* GPIO configuration belongs to firmware. Diagnose, never repair it here. */
+ 	unsigned dir = subtype >= 0x10u && subtype <= 0x13u ?
+ 	    mode & 3u : (mode >> 4) & 7u;
+ 	if (!eok || !mok || !sok || !(en & 0x80u) || (dir != 0 && dir != 2)) {
+-		printf("SWEET KEYS: GPIO2 not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
++		printf("SWEET KEYS: volume-up GPIO not confirmed enabled as input; volume-up withheld, PMIC unchanged\n");
+ 		keys_gpio_apid = KEYS_NO_APID;
+ 	}
+ 	if (!pok && !gok) {
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -4,6 +4,11 @@
+  * Requires ABL-loaded GENI I2C firmware; votes L11C through sweet_rpmh.c.
+  * No firmware/config upload or direct PMIC writes. Only IC data write:
+  * zero to GT9896's event status after reading a report. See touch2/report.md.
++ *
++ * Poco F1 (beryllium, Tianma panel): Novatek NT36672A at 0x01 on I2C14 =
++ * QUP wrap1 SE6 @0xa98000, IRQ TLMM 31, reset TLMM 32, SDA/SCL 33/34
++ * (function qup14). Its rails (L14A, PMI8998 LAB/IBB) belong to the panel
++ * and are on after ABL: no RPMh vote. Protocol as Linux novatek-nvt-ts.c.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -14,6 +19,7 @@
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_board.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ /* Mach MIG declaration is not included by BSD's exported thread.h. */
+@@ -22,16 +28,41 @@
+ extern void sweet_hid_touch(int finger, int down, int x, int y);
+ void sweet_touch_init(void);
+ 
+-#define TOUCH_SE_PA      0x00a84000u
+ #define TOUCH_GCC_PA     0x00100000u
+-#define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000) */
++#define TOUCH_NORTH_PA   0x03900000u /* DT TLMM + NORTH (0x500000), SM7150 and SDM845 */
+ #define TOUCH_GCC_VOTE   0x5200cu
+-#define TOUCH_RCG       0x18148u    /* wrapper1 LOCAL S1 = global SE7 */
++#define TOUCH_SE_PA      (tb->se_pa)
++#define TOUCH_RCG        (tb->rcg)
+ #define TOUCH_GPIO_CFG(n) ((uint32_t)(n) * 0x1000u)
+ #define TOUCH_GPIO_IO(n)  (TOUCH_GPIO_CFG(n) + 4u)
+ #define TOUCH_MAX        10u
+ #define TOUCH_GOODIX     1
+ #define TOUCH_FTS        2
++#define TOUCH_NVT        3
++/* NT36672A (Linux novatek-nvt-ts.c) */
++#define NVT_ADDR         0x01u
++#define NVT_PARAMS_REG   0x78u
++#define NVT_PARAMS_LEN   15u
++#define NVT_CHIP_ID      0x08u
++#define NVT_RECORD       6u
++
++/* Per-board wiring of the touch bus; the GENI SE programming is common. */
++struct touch_board {
++	const char *name;
++	uint32_t se_pa, rcg, vote, se_branch;
++	unsigned sda, scl, mux, irq, rst;
++	unsigned w, h;
++	bool rpmh_l11c;   /* sweet: L11C vote + GPIO90 digital enable */
++};
++static const struct touch_board touch_sweet = {
++	"SE7", 0x00a84000u, 0x18148u, (0x0fu << 18) | (1u << 23), 0x18144u,
++	6, 7, 1, 9, 8, 1080, 2400, true,
++};
++static const struct touch_board touch_beryllium = {
++	"SE14", 0x00a98000u, 0x18738u, (0x0fu << 18) | (1u << 28), 0x18734u,
++	33, 34, 2, 31, 32, 1080, 2246, false,
++};
++static const struct touch_board *tb = &touch_sweet;
+ /* GT9896 is Yellowstone in Xiaomi sweet-r-oss, not the Berlin protocol. */
+ #define GOODIX_PID_REG   0x4022u
+ #define GOODIX_EVENT_REG 0x4180u
+@@ -136,8 +167,8 @@
+ static bool
+ touch_clocks(void)
+ {
+-	/* Vote on only wrapper1 and SE7, preserving other clock users. */
+-	uint32_t mask = (0x0fu << 18) | (1u << 23);
++	/* Vote on only wrapper1 and the touch SE, preserving other clock users. */
++	uint32_t mask = tb->vote;
+ 	touch_wr(st.gcc, TOUCH_GCC_VOTE, touch_rd(st.gcc, TOUCH_GCC_VOTE) | mask);
+ 	uint32_t dfs = touch_rd(st.gcc, TOUCH_RCG + 0x14u);
+ 	uint32_t cfg = touch_rd(st.gcc, TOUCH_RCG + 4u);
+@@ -160,7 +191,7 @@
+ 			return false;
+ 		}
+ 	}
+-	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, 0x18144};
++	const uint32_t branches[] = {0x18004, 0x18008, 0x1800c, 0x18010, tb->se_branch};
+ 	for (unsigned i = 0; i < sizeof(branches) / sizeof(branches[0]); ++i) {
+ 		if (!touch_wait_clear(st.gcc, branches[i], 1u << 31)) {
+ 			printf("SWEET TOUCH: GCC branch %#x halted (%#x)\n", branches[i],
+@@ -425,7 +456,7 @@
+ 		unsigned px = touch_be16(p + 2), py = touch_be16(p + 4);
+ 		/* Low nibble 1/3 denotes pen data in the vendor parser. */
+ 		if ((p[0] & 15u) == 1u || (p[0] & 15u) == 3u || id >= TOUCH_MAX ||
+-		    (mask & (1u << id)) || px > 1079 || py > 2399) {
++		    (mask & (1u << id)) || px >= tb->w || py >= tb->h) {
+ 			(void)touch_goodix_ack();
+ 			return EIO;
+ 		}
+@@ -472,7 +503,7 @@
+ 		}
+ 		unsigned px = ((unsigned)(p[0] & 15u) << 8) | p[1];
+ 		unsigned py = ((unsigned)(p[2] & 15u) << 8) | p[3];
+-		if (px > 1079 || py > 2399) {
++		if (px >= tb->w || py >= tb->h) {
+ 			return EIO;
+ 		}
+ 		mask |= 1u << id;
+@@ -482,18 +513,115 @@
+ 	}
+ 	if (active != n) {
+ 		return EIO;
++	}
++	touch_report(mask, x, y);
++	return 0;
++}
++
++static unsigned nvt_max = TOUCH_MAX;
++
++/* One frame lists every active contact; slots missing from it are released. */
++static int
++touch_novatek(void)
++{
++	uint8_t buf[NVT_RECORD * TOUCH_MAX];
++	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
++	uint32_t mask = 0;
++	int err = touch_read(NVT_ADDR, 0, false, buf, NVT_RECORD * nvt_max);
++	if (err) {
++		return err;
++	}
++	for (unsigned i = 0; i < nvt_max; ++i) {
++		const uint8_t *p = buf + NVT_RECORD * i;
++		if (p[0] == 0xffu) {
++			continue;
++		}
++		unsigned slot = p[0] >> 3, type = p[0] & 7u;
++		if (slot < 1 || slot > nvt_max) {
++			continue;
++		}
++		if (type == 3u) {
++			continue; /* release */
++		}
++		if (type != 1u && type != 2u) {
++			continue;
++		}
++		unsigned px = ((unsigned)p[1] << 4) | (p[3] >> 4);
++		unsigned py = ((unsigned)p[2] << 4) | (p[3] & 15u);
++		if (px >= tb->w || py >= tb->h) {
++			return EIO;
++		}
++		mask |= 1u << (slot - 1);
++		x[slot - 1] = (int)px;
++		y[slot - 1] = (int)py;
+ 	}
+ 	touch_report(mask, x, y);
+ 	return 0;
+ }
+ 
++static int
++touch_nvt_params(void)
++{
++	uint8_t p[NVT_PARAMS_LEN];
++	memset(p, 0xa5, sizeof(p));
++	int err = touch_read(NVT_ADDR, NVT_PARAMS_REG, false, p, sizeof(p));
++	printf("SWEET TOUCH: nvt params err=%d: %02x %02x %02x %02x w=%u h=%u max=%u buttons=%u irq-type=%u chip=%#x\n",
++	    err, p[0], p[1], p[2], p[3], touch_be16(p + 4), touch_be16(p + 6),
++	    p[9], p[10], p[11], p[14]);
++	if (err) {
++		return err;
++	}
++	if (p[9] == 0 || p[9] > TOUCH_MAX) {
++		return EIO;
++	}
++	if (p[14] != NVT_CHIP_ID) {
++		printf("SWEET TOUCH: nvt chip id %#x is not NT36672A (%#x); continuing\n",
++		    p[14], NVT_CHIP_ID);
++	}
++	nvt_max = p[9];
++	return 0;
++}
++
++/* Poco F1: NT36672A, powered with the panel. Reset only if it does not answer. */
+ static bool
++touch_beryllium_start(void)
++{
++	printf("SWEET TOUCH: TLMM rst%u=%#x/%#x irq%u=%#x/%#x sda=%#x scl=%#x\n",
++	    tb->rst, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->rst)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->rst)),
++	    tb->irq, touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->irq)), touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)),
++	    touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->sda)), touch_rd(st.gpio, TOUCH_GPIO_CFG(tb->scl)));
++	touch_gpio(tb->irq, 0, 1, 0, false, false);       /* input, pull-down (rising IRQ) */
++	touch_gpio(tb->sda, tb->mux, 0, 0, false, false); /* qup14, 2 mA, no pull */
++	touch_gpio(tb->scl, tb->mux, 0, 0, false, false);
++	touch_gpio(tb->rst, 0, 0, 0, true, true);         /* reset released (pin high) */
++	touch_wait(100);
++	st.probing = true;
++	int err = touch_nvt_params();
++	if (err) {
++		printf("SWEET TOUCH: nvt silent (%d); pulsing reset\n", err);
++		touch_gpio(tb->rst, 0, 0, 0, true, false);
++		touch_wait(10);
++		touch_gpio(tb->rst, 0, 0, 0, true, true);
++		touch_wait(300);
++		err = touch_nvt_params();
++	}
++	st.probing = false;
++	if (err || st.dead) {
++		printf("SWEET TOUCH: no NT36672A at %#x (err=%d dead=%d); stopping\n",
++		    NVT_ADDR, err, st.dead);
++		return false;
++	}
++	st.kind = TOUCH_NVT;
++	return true;
++}
++
++static bool
+ touch_se_init(void)
+ {
+ 	uint32_t fw = touch_rd(st.se, SE_FW);
+ 	uint32_t tx = touch_rd(st.se, SE_HW_TX), rx = touch_rd(st.se, SE_HW_RX);
+-	printf("SWEET TOUCH: se7 fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
+-	    fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
++	printf("SWEET TOUCH: %s fw=%#x proto=%u status=%#x tx=%#x rx=%#x ios=%#x\n",
++	    tb->name, fw, (fw >> 8) & 0xffu, touch_rd(st.se, SE_STATUS), tx, rx,
+ 	    touch_rd(st.se, 0x908));
+ 	if (((fw >> 8) & 0xffu) != 3u || (touch_rd(st.se, 0x64) & 1u) ||
+ 	    ((tx >> 24) & 0x3fu) != 32u || ((rx >> 24) & 0x3fu) != 32u ||
+@@ -502,7 +630,7 @@
+ 		return false;
+ 	}
+ 	if (touch_rd(st.se, SE_STATUS) & 0x1001u) {
+-		printf("SWEET TOUCH: SE7 already busy; probes skipped\n");
++		printf("SWEET TOUCH: %s already busy; probes skipped\n", tb->name);
+ 		return false;
+ 	}
+ 	touch_wr(st.se, 0xe18, 0); /* no GSI events */
+@@ -558,7 +686,7 @@
+ 	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
+ 	printf("SWEET TOUCH: starting in %u s\n", delay_s);
+ 	touch_wait(delay_s * 1000u);
+-	printf("SWEET TOUCH: mapping GCC/TLMM/SE7\n");
++	printf("SWEET TOUCH: mapping GCC/TLMM/%s\n", tb->name);
+ 	st.gcc = ml_io_map(TOUCH_GCC_PA, 0x60000);
+ 	st.gpio = ml_io_map(TOUCH_NORTH_PA, 0x5b000);
+ 	st.se = ml_io_map(TOUCH_SE_PA, 0x4000);
+@@ -569,6 +697,12 @@
+ 	if (!touch_clocks() || !touch_se_init()) {
+ 		goto out;
+ 	}
++	if (!tb->rpmh_l11c) {
++		if (!touch_beryllium_start()) {
++			goto out;
++		}
++		goto selected;
++	}
+ 	printf("SWEET TOUCH: TLMM reset=%#x irq=%#x vdd90=%#x; voting L11C through RPMh\n",
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(8)), touch_rd(st.gpio, TOUCH_GPIO_IO(9)),
+ 	    touch_rd(st.gpio, TOUCH_GPIO_IO(90)));
+@@ -608,14 +742,19 @@
+ 		goto out;
+ 	}
+ 	st.kind = goodix ? TOUCH_GOODIX : TOUCH_FTS;
+-	printf("SWEET TOUCH: selected %s, 1080x2400, poll=10ms irq-hint=%d\n",
+-	    goodix ? "GT9896 Yellowstone" : "Focaltech 54:52", st.irq_hint);
++selected:
++	printf("SWEET TOUCH: selected %s, %ux%u, poll=10ms irq-hint=%d\n",
++	    st.kind == TOUCH_NVT ? "NT36672A" : st.kind == TOUCH_GOODIX ? "GT9896 Yellowstone" : "Focaltech 54:52",
++	    tb->w, tb->h, st.irq_hint);
+ 	unsigned errors = 0, ticks = 0;
+ 	while (!st.dead) {
+ 		/* Optional IRQ hint still reads every 100ms, and always while down. */
+-		if (!st.irq_hint || st.active || !(touch_rd(st.gpio, TOUCH_GPIO_IO(9)) & 1u) ||
+-		    (++ticks % 10u) == 0) {
+-			int err = st.kind == TOUCH_GOODIX ? touch_goodix() : touch_focaltech();
++		/* sweet's IRQ lines idle high (low = report pending); NT36672A pulses high. */
++		bool irq_level = touch_rd(st.gpio, TOUCH_GPIO_IO(tb->irq)) & 1u;
++		bool pending = st.kind == TOUCH_NVT ? irq_level : !irq_level;
++		if (!st.irq_hint || st.active || pending || (++ticks % 10u) == 0) {
++			int err = st.kind == TOUCH_GOODIX ? touch_goodix() :
++			    st.kind == TOUCH_NVT ? touch_novatek() : touch_focaltech();
+ 			if (err) {
+ 				if ((errors++ % 100u) == 0) {
+ 					printf("SWEET TOUCH: report err=%d irq=%#x\n", err, st.irq_status);
+@@ -644,6 +783,9 @@
+ 		return;
+ 	}
+ 	st.started = true;
++	if (sweet_board_beryllium()) {
++		tb = &touch_beryllium;
++	}
+ 	(void)PE_parse_boot_argn("sweettouch", &enabled, sizeof(enabled));
+ 	(void)PE_parse_boot_argn("sweettouchirq", &st.irq_hint, sizeof(st.irq_hint));
+ 	if (!enabled) {
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -368,6 +368,7 @@
+ private:
+ 	IOLock *fLock;
+ 	int fLogicalW, fLogicalH, fOffX, fOffY;
++	int fPanelW, fPanelH;
+ 	bool fDown[SWEET_TOUCH_FINGERS];
+ 	bool fEdge[SWEET_TOUCH_FINGERS];
+ 	IOFixed fX[SWEET_TOUCH_FINGERS];
+@@ -433,11 +434,16 @@
+ 		return false;
+ 	}
+ 	int native = 0;
++	PE_Video video;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-	fLogicalW = native ? 1080 : 1125;
+-	fLogicalH = native ? 2400 : 2436;
+-	fOffX = (fLogicalW - 1080) / 2;
+-	fOffY = (fLogicalH - 2400) / 2;
++	/* Touch coordinates are panel pixels: sweet 1080x2400, beryllium 1080x2246. */
++	PE_current_console(&video);
++	fPanelW = video.v_width ? (int)video.v_width : 1080;
++	fPanelH = video.v_height ? (int)video.v_height : 2400;
++	fLogicalW = native ? fPanelW : 1125;
++	fLogicalH = native ? fPanelH : 2436;
++	fOffX = (fLogicalW - fPanelW) / 2;
++	fOffY = (fLogicalH - fPanelH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+ 	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
+@@ -458,8 +464,8 @@
+ 	if (finger < 0 || finger >= SWEET_TOUCH_FINGERS) {
+ 		return;
+ 	}
+-	x = x < 0 ? 0 : (x > 1079 ? 1079 : x);
+-	y = y < 0 ? 0 : (y > 2399 ? 2399 : y);
++	x = x < 0 ? 0 : (x > fPanelW - 1 ? fPanelW - 1 : x);
++	y = y < 0 ? 0 : (y > fPanelH - 1 ? fPanelH - 1 : y);
+ 
+ 	IOLockLock(fLock);
+ 	bool was = fDown[finger];
+@@ -472,8 +478,8 @@
+ 		return;
+ 	}
+ 	if (!was && down) {
+-		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > 1079 - SWEET_TOUCH_EDGE_PX ||
+-		    y < SWEET_TOUCH_EDGE_PX || y > 2399 - SWEET_TOUCH_EDGE_PX;
++		fEdge[finger] = x < SWEET_TOUCH_EDGE_PX || x > fPanelW - 1 - SWEET_TOUCH_EDGE_PX ||
++		    y < SWEET_TOUCH_EDGE_PX || y > fPanelH - 1 - SWEET_TOUCH_EDGE_PX;
+ 	}
+ 
+ 	collection = IOHIDEvent::digitizerEvent(now, 0, kIOHIDDigitizerTransducerTypeHand, false, 0, 0, 0);
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -11,6 +11,7 @@
+ void sweet_early_putc(char c);
+ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
++void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes);
+ void sweet_early_disable(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+@@ -19,6 +20,13 @@
+ 	(void)label;
+ }
+ static inline void sweet_early_disable(void) {}
++static inline void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
++{
++	(void)pa;
++	(void)width;
++	(void)height;
++	(void)rowbytes;
++}
+ #endif
+ 
+ #endif
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -11,11 +11,20 @@
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
+ 
+-static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)0x9c000000;
++/*
++ * start.s and arm_vm_init map one 32MB block at 0x9c000000. It holds the
++ * splash framebuffer of both boards (sweet 0x9c000000 1080x2400, Poco F1
++ * 0x9d400000 1080x2246); sweet_early_set_video picks it from boot_args.
++ */
++#define EARLY_BLOCK_PA 0x9c000000ull
++#define EARLY_BLOCK_SIZE 0x2000000ull
++static volatile uint32_t *early_fb = (volatile uint32_t *)(uintptr_t)EARLY_BLOCK_PA;
++static unsigned int early_width = 1080u, early_height = 2400u, early_stride = 4320u / 4;
++static uint64_t early_off;
+ #define EARLY_FB early_fb
+-#define EARLY_WIDTH 1080u
+-#define EARLY_HEIGHT 2400u
+-#define EARLY_STRIDE (4320u / 4)
++#define EARLY_WIDTH early_width
++#define EARLY_HEIGHT early_height
++#define EARLY_STRIDE early_stride
+ #define EARLY_SCALE 2u
+ #define EARLY_CELL_W (8u * EARLY_SCALE)
+ #define EARLY_CELL_H (16u * EARLY_SCALE)
+@@ -126,10 +135,24 @@
+ }
+ 
+ void
++sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
++{
++	if (pa < EARLY_BLOCK_PA || width == 0 || height <= 32 || rowbytes < width * 4 ||
++	    pa + height * rowbytes > EARLY_BLOCK_PA + EARLY_BLOCK_SIZE) {
++		return; /* keep the sweet default */
++	}
++	early_off = pa - EARLY_BLOCK_PA;
++	early_width = (unsigned int)width;
++	early_height = (unsigned int)height;
++	early_stride = (unsigned int)(rowbytes / 4);
++	early_fb = (volatile uint32_t *)(uintptr_t)pa; /* bootstrap V=P */
++}
++
++void
+ sweet_early_relocate(uint64_t base)
+ {
+ 	sweet_early_mark(8, "leaving bootstrap TTBR0");
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	early_fb = (volatile uint32_t *)(uintptr_t)(base + early_off);
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_mark(9, "kernel framebuffer VA live");
+ }
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -347,6 +347,8 @@
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++	sweet_early_set_video(args->Video.v_baseAddr, args->Video.v_width,
++	    args->Video.v_height, args->Video.v_rowBytes);
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
+ 
+ 	arm_setup_pre_sign();

@@ -1,0 +1,81 @@
+Scan-out: a GPU-copied buffer is shown only once its copy has landed (1 s, not 100 ms, before giving up). The 100 ms
+give-up scanned a buffer still holding the frame from two swaps ago: an old frame flashed and the panel stuttered.
+kern.sweet_fb gains scan_gpu_submit_fails / scan_gpu_late / scan_gpu_wait_us_max. CPU: the A55 saturation boost
+(sweetcpufreq_little_boost) is on by default; iOS animations after a touch ran at the 902 MHz cap.
+
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -387,6 +387,7 @@
+ 		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
+ 		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
+ 		uint64_t scanGpuCopies, scanGpuFallbacks;               /* 0240: of those, copied by the GPU / by the CPU after a GPU failure */
++		uint64_t scanGpuSubmitFails, scanGpuLate, scanGpuWaitMaxAbs; /* 0247: blits not submitted / not landed in 1 s; longest wait */
+ 	} fSt, fStPrev;
+ 	/*
+ 	 * Direct scanout (sweetfb_direct=1, patch 0211): hw scaler + page flipping + zero-copy
+@@ -1165,7 +1166,8 @@
+ 	    "pool_used=%u pool_total=%u pool_surfaces=%llu pool_fallbacks=%llu "
+ 	    "swapsync=%d swap_waits=%llu swap_wait_us=%u.%02u swap_wait_timeouts=%llu replace_waits=%llu replace_timeouts=%llu "
+ 	    "gpu_holds=%llu gpu_hold_timeouts=%llu empty_swaps=%llu empty_kept=%llu "
+-	    "scancopy=%d scan_copies=%llu scan_copy_us=%u.%02u scan_copy_us_max=%llu scan_gpu=%d scan_gpu_copies=%llu scan_gpu_fallbacks=%llu\n",
++	    "scancopy=%d scan_copies=%llu scan_copy_us=%u.%02u scan_copy_us_max=%llu scan_gpu=%d scan_gpu_copies=%llu scan_gpu_fallbacks=%llu "
++	    "scan_gpu_submit_fails=%llu scan_gpu_late=%llu scan_gpu_wait_us_max=%llu\n",
+ 	    mode, hz, fFlushTicks, fHw ? 1 : 0, fFlip ? 1 : 0, smmu, fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : (fZcCleanMode == 2 ? "auto" : "tracked")),
+ 	    sweet_abs_us(now) / 1000000, winUS / 1000,
+ 	    swaps, SW_F2(PER_S(dSwaps)), coalesced, SW_F2(PER_S(dCoal)),
+@@ -1176,7 +1178,8 @@
+ 	    fSwapSync ? 1 : 0, c.swapWaits, SW_F2(swAvg), c.swapWaitTimeouts, c.replaceWaits, c.replaceTimeouts,
+ 	    c.gpuHolds, c.gpuHoldTimeouts, c.emptySwaps, c.emptyKept,
+ 	    fScanCopy && !fScanFailed ? 1 : 0, c.scanCopies, SW_F2(scAvg), sweet_abs_us(c.scanCopyMaxAbs),
+-	    fScanGpu && !fScanGpuOff ? (fScanGpuRest ? 2 : 1) : 0, c.scanGpuCopies, c.scanGpuFallbacks);
++	    fScanGpu && !fScanGpuOff ? (fScanGpuRest ? 2 : 1) : 0, c.scanGpuCopies, c.scanGpuFallbacks,
++	    c.scanGpuSubmitFails, c.scanGpuLate, sweet_abs_us(c.scanGpuWaitMaxAbs));
+ 	#undef PER_S
+ 	sweet_fb_stats_publish(line);
+ 	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
+@@ -2271,14 +2274,24 @@
+ 	if (fScanBlitT < 0) {
+ 		return;
+ 	}
++	/*
++	 * 0247: the buffer is shown only once the copy has landed. It still holds the frame from two swaps ago, so the old
++	 * 100 ms give-up flashed that older frame (and the panel stuttered behind it). Only a GPU that is gone (1 s) gets the
++	 * buffer scanned anyway, as before, so the panel cannot freeze for good.
++	 */
++	uint64_t waited = mach_absolute_time() - fScanBlitAbs;
+ 	if (!sweet_gpu_fence_passed(fScanBlitFence)) {
+ 		uint64_t lim;
+-		nanoseconds_to_absolutetime(100 * NSEC_PER_MSEC, &lim);
+-		if (mach_absolute_time() - fScanBlitAbs < lim) {
++		nanoseconds_to_absolutetime(1000 * NSEC_PER_MSEC, &lim);
++		if (waited < lim) {
+ 			fSwapTimer->setTimeoutUS(250);
+ 			return;
+ 		}
+ 		fSt.scanGpuFallbacks++;
++		fSt.scanGpuLate++;
++	}
++	if (waited > fSt.scanGpuWaitMaxAbs) {
++		fSt.scanGpuWaitMaxAbs = waited;
+ 	}
+ 	int t = fScanBlitT;
+ 	fScanBlitT = -1;
+@@ -2396,6 +2409,7 @@
+ 			viaGpu = false;
+ 			{
+ 				fSt.scanGpuFallbacks++;
++				fSt.scanGpuSubmitFails++;
+ 				if (++fScanGpuFails >= 3) {
+ 					fScanGpuFails = 0;
+ 					fScanGpuRest = 120;
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -168,7 +168,7 @@
+ static unsigned cf_ncpus;
+ static unsigned cf_log_secs = 10;
+ static int cf_force;
+-static int cf_boost;
++static int cf_boost = 1;      /* 0247: on by default (sweetcpufreq_little_boost=0 turns it off) */
+ static int cf_boost_pct = 100;
+ static int cf_amp = 1;
+ static int cf_amp_pri = 31;             /* BASEPRI_DEFAULT */

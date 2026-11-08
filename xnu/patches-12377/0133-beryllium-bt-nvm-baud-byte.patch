@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index f90322189acfab4b963327b6d57921b43ea308f9..ce2d014bad42e54a222649cd4e5e05d4ef6d5f02 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -2006,7 +2006,8 @@ wl_nvm_scan_at(const uint8_t *d, size_t limit, unsigned start, struct wl_nvm_sca
+ 
+ /*
+  * qca_tlv_check_data(), TLV_TYPE_NVM: HCI transport tag (17): data[0] |= 0x80
+- * (software in-band sleep), data[1] = UART baud rate code (WCN399x); deep sleep
++ * (software in-band sleep), UART baud rate code in data[2] on WCN3990 (data[1] only
++ * on WCN3991 and later: btqca.c 'soc_type >= QCA_WCN3991'); deep sleep
+  * tag (27): data[0] |= 0x01. Linux enables both because it runs IBS; this stage
+  * has no IBS (a sleeping controller would need the 0xfd/0xfc/0xfe protocol), so
+  * unless sweetbtibs=1 the two bits are cleared instead.
+@@ -2035,13 +2036,19 @@ wl_qca_nvm_edit(uint8_t *fw, size_t size, int baud_code)
+ 		printf("SWEET WLAN: BT fw NVM: tag layout not recognised, NVM sent unmodified\n");
+ 		return true;
+ 	}
+-	if (s->idx17 && le16(fw + s->idx17 + 2) >= 2) {
++	if (s->idx17 && le16(fw + s->idx17 + 2) >= 3) {
++		/*
++		 * WCN3990: the baud code is data[2]; data[1] is another UART
++		 * setting (0x01 in both Android's and linux-firmware's crnv21).
++		 * Writing the baud into data[1] (0118-0132) garbled every event
++		 * after the NVM took effect ('84 08 81 20 08' for a reset reply).
++		 */
+ 		uint8_t *t = fw + s->idx17 + 12;
+-		uint8_t old0 = t[0], old1 = t[1];
++		uint8_t old0 = t[0], old1 = t[1], old2 = t[2];
+ 		t[0] = wl.bt_ibs ? (t[0] | 0x80) : (t[0] & ~0x80);
+-		t[1] = (uint8_t)baud_code;
+-		printf("SWEET WLAN: BT fw NVM: HCI tag: data[0] %#04x -> %#04x (IBS %s), data[1] (baud) %#04x -> %#04x\n",
+-		    old0, t[0], wl.bt_ibs ? "on" : "off", old1, t[1]);
++		t[2] = (uint8_t)baud_code;
++		printf("SWEET WLAN: BT fw NVM: HCI tag: data[0] %#04x -> %#04x (IBS %s), data[1] %#04x kept, "
++		    "data[2] (baud) %#04x -> %#04x\n", old0, t[0], wl.bt_ibs ? "on" : "off", old1, old2, t[2]);
+ 	} else {
+ 		printf("SWEET WLAN: BT fw NVM: no HCI tag 17, baud not patched\n");
+ 	}

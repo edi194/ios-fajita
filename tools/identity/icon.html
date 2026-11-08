@@ -1,0 +1,13 @@
+<!doctype html>
+<!-- The app icon (tools/identity/mkicon.sh renders it at 1024 px): Newton's head on the lime halftone ground,
+     a macOS rounded square (824 px body in the 1024 canvas, radius 185) with a soft shadow. -->
+<html><head><meta charset="utf-8">
+<style>
+html, body { margin: 0; background: transparent; }
+.icon { position: absolute; left: 100px; top: 92px; width: 824px; height: 824px; border-radius: 185px; overflow: hidden;
+  background-color: #d7e98a; background-image: radial-gradient(circle, #c6dc72 3.2px, transparent 3.8px); background-size: 20px 20px;
+  box-shadow: 0 14px 28px rgba(0,0,0,.28), 0 2px 6px rgba(0,0,0,.18); }
+/* head and shoulders, the hair inside the lime ground, the coat running off the bottom edge */
+.fig { position: absolute; left: -128px; top: 46px; width: 1060px; }
+</style></head>
+<body><div class="icon"><img class="fig" src="newton-halftone.png"></div></body></html>

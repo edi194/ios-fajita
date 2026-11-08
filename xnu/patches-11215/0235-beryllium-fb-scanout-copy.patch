@@ -1,0 +1,264 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -295,6 +295,22 @@
+ 	uint64_t      fZcFrames, fCopyFrames;
+ 	bool          zcPresent(const uint8_t *rec, uint32_t mask);
+ 	/*
++	 * Scan-out copy (patch 0235, boot-arg sweetfb_scancopy=1, direct mode): CoreAnimation's IOMFBFlipBook keeps one swap
++	 * in flight and recycles the surface of swap N-1 as soon as swap N is reported complete, assuming N-1 left the glass.
++	 * Scanning its surfaces in place therefore forces SwapWait to wait for the latch (swapdepth 1: ~10 ms of every frame),
++	 * and answering earlier (swapdepth 2) lets it draw into the surface on the panel (tearing). Here every frame is copied
++	 * into one of three buffers the framebuffer owns and that is scanned instead; the swap is complete when the copy is.
++	 * Three, so the copy never writes the buffer on the panel (fScanPanel) nor the one queued for the next vsync
++	 * (fScanQueued). fScanForeign: something else was scanned since (copy path, ABL buffer): ours are all free once that
++	 * latched.
++	 */
++	bool          fScanCopy, fScanFailed, fScanForeign, fScanFront;
++	IOMemoryMap  *fScanMap[3];
++	uint64_t      fScanPA[3];
++	uint32_t      fScanStride;
++	int           fScanPanel, fScanQueued;
++	bool          scanCopyPresent(SweetSurface *s, uint32_t id);
++	/*
+ 	 * Honest swap completion (patch 0216, boot-arg sweetfb_swapsync, default on in direct mode). backboardd's
+ 	 * CA::WindowServer::IOMFBDisplay::can_update_ calls IOMobileFramebufferSwapWait(swap id) (selector 6) before it starts
+ 	 * a frame and treats 0 as "that swap is done, the surface is free"; selector 6 used to return 0 at once, so
+@@ -338,6 +354,7 @@
+ 		uint64_t gpuHolds, gpuHoldTimeouts;                     /* 0229: pending swaps held for the GPU, held past 50 ms */
+ 		uint64_t replaceWaits, replaceTimeouts;                 /* 0220: frames that waited for the previous one's latch / gave up */
+ 		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
++		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
+ 	} fSt, fStPrev;
+ 	/*
+ 	 * Direct scanout (sweetfb_direct=1, patch 0211): hw scaler + page flipping + zero-copy
+@@ -681,6 +698,13 @@
+ 				int ss = 1, va = 1, depth = 2;
+ 				PE_parse_boot_argn("sweetfb_swapdepth", &depth, sizeof(depth));
+ 				fSwapDepth = depth <= 1 ? 1 : 2;
++				int sc = 0;
++				PE_parse_boot_argn("sweetfb_scancopy", &sc, sizeof(sc));
++				fScanCopy = fEarly && sc != 0;
++				fScanPanel = fScanQueued = -1;
++				if (fScanCopy) {
++					IOLog("SWEET FB: scan-out copy on (0235): frames are copied to three framebuffer-owned buffers, a swap is complete when copied\n");
++				}
+ 				PE_parse_boot_argn("sweetfb_swapsync", &ss, sizeof(ss));
+ 				PE_parse_boot_argn("sweetfb_vsyncalign", &va, sizeof(va));
+ 				int lc = 1, nr = 0, lg = 0, vs = 0;
+@@ -781,7 +805,7 @@
+ 		return ENODEV;
+ 	}
+ 	uint32_t id = __atomic_load_n(&fb->fShotId, __ATOMIC_ACQUIRE);
+-	if (fb->fZcFront && id != 0 && (s = sweet_surface_copy(id)) != NULL && s != fb->fSurface &&
++	if ((fb->fZcFront || fb->fScanFront) && id != 0 && (s = sweet_surface_copy(id)) != NULL && s != fb->fSurface &&
+ 	    s->kernelAddress() != 0 && s->width >= fb->fLogicalW && s->height >= fb->fLogicalH) {
+ 		src = s->kernelAddress() + s->offset;
+ 		w = fb->fLogicalW;
+@@ -1035,6 +1059,8 @@
+ 	uint64_t dLw = c.latchWaits - p.latchWaits, dCl = c.cleans - p.cleans;
+ 	#define PER_S(n) ((uint64_t)(n) * 100000000ull / winUS)
+ 	uint64_t copyAvg = dCopy ? sweet_abs_us(c.copyAbs - p.copyAbs) * 100 / dCopy : 0;
++	uint64_t dSc = c.scanCopies - p.scanCopies;
++	uint64_t scAvg = dSc ? sweet_abs_us(c.scanCopyAbs - p.scanCopyAbs) * 100 / dSc : 0;
+ 	uint64_t zcAvg = dZc ? sweet_abs_us(c.zcAbs - p.zcAbs) * 100 / dZc : 0;
+ 	uint64_t clAvg = dCl ? sweet_abs_us(c.cleanAbs - p.cleanAbs) * 100 / dCl : 0;
+ 	uint64_t dSwW = c.swapWaits - p.swapWaits;
+@@ -1055,7 +1081,8 @@
+ 	    "latch_waits=%llu latch_wait_us=%u.%02u latch_timeouts=%llu vsync_s=%u.%02u "
+ 	    "pool_used=%u pool_total=%u pool_surfaces=%llu pool_fallbacks=%llu "
+ 	    "swapsync=%d swap_waits=%llu swap_wait_us=%u.%02u swap_wait_timeouts=%llu replace_waits=%llu replace_timeouts=%llu "
+-	    "gpu_holds=%llu gpu_hold_timeouts=%llu empty_swaps=%llu empty_kept=%llu\n",
++	    "gpu_holds=%llu gpu_hold_timeouts=%llu empty_swaps=%llu empty_kept=%llu "
++	    "scancopy=%d scan_copies=%llu scan_copy_us=%u.%02u scan_copy_us_max=%llu\n",
+ 	    mode, hz, fFlushTicks, fHw ? 1 : 0, fFlip ? 1 : 0, smmu, fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : (fZcCleanMode == 2 ? "auto" : "tracked")),
+ 	    sweet_abs_us(now) / 1000000, winUS / 1000,
+ 	    swaps, SW_F2(PER_S(dSwaps)), coalesced, SW_F2(PER_S(dCoal)),
+@@ -1064,7 +1091,8 @@
+ 	    c.latchWaits, SW_F2(lwAvg), c.latchTimeouts, SW_F2(PER_S(dTicks)),
+ 	    used, total, pallocs, pfails,
+ 	    fSwapSync ? 1 : 0, c.swapWaits, SW_F2(swAvg), c.swapWaitTimeouts, c.replaceWaits, c.replaceTimeouts,
+-	    c.gpuHolds, c.gpuHoldTimeouts, c.emptySwaps, c.emptyKept);
++	    c.gpuHolds, c.gpuHoldTimeouts, c.emptySwaps, c.emptyKept,
++	    fScanCopy && !fScanFailed ? 1 : 0, c.scanCopies, SW_F2(scAvg), sweet_abs_us(c.scanCopyMaxAbs));
+ 	#undef PER_S
+ 	sweet_fb_stats_publish(line);
+ 	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
+@@ -1658,6 +1686,7 @@
+ 		__atomic_store_n(&fSwapPrevScan, fSwapScanID, __ATOMIC_RELEASE);        /* the frame before this one (it is, or was, on the panel) */
+ 	}
+ 	fLatchSeenAbs = 0;      /* a new frame is queued: the release guard starts over at its latch */
++	fScanForeign = true;    /* 0235: scanCopyPresent clears it right after its own scanAddr */
+ 	__atomic_store_n(&fSwapScanID, fCurSwapID, __ATOMIC_RELEASE);   /* before the flush: a poller that sees it clear sees this id */
+ 	if (struct sweet_fb_trace_rec *tr = sweet_fb_trace_of(fCurSwapID)) {
+ 		tr->scan = mach_absolute_time();
+@@ -1681,6 +1710,7 @@
+ 	scanAddr((uint32_t)fBufPA[idx], hwFrame ? fHwStride : ((fBootStride & 0xffff0000u) | fRowBytes), hwFrame);
+ 	fFront = idx;
+ 	fZcFront = false;       /* the scan left the pooled surface (zcPoll lets go once this latched) */
++	fScanFront = false;
+ }
+ 
+ /*
+@@ -2070,6 +2100,14 @@
+ 		}
+ 		OSSafeReleaseNULL(s);
+ 		return false;
++	}
++	if (fScanCopy && !fScanFailed) {
++		bool copied = scanCopyPresent(s, id);
++		s->release();
++		if (copied) {
++			return true;
++		}
++		return zcDecline(11, "scan-out copy failed", id);
+ 	}
+ 	zcPoll();
+ 	if (fNoReplace && fLastFlush != 0 &&
+@@ -2130,7 +2168,95 @@
+ 	}
+ 	if (((fZcFrames + fCopyFrames) & 255) == 0) {
+ 		zcStats("counters");
++	}
++	return true;
++}
++
++/*
++ * 0235: copy the swapped canvas into a framebuffer-owned buffer and scan that (see fScanCopy). The first call allocates the
++ * three buffers from the low pool; if that fails the scan-out copy stays off for the rest of the boot (fScanFailed) and
++ * frames are scanned in place again. Work loop, like zcPresent. True: the frame is queued and its swap complete.
++ */
++bool
++AppleCLCD::scanCopyPresent(SweetSurface *s, uint32_t id)
++{
++	uint32_t rowBytes = fLogicalW * 4;
++	if (fScanMap[0] == NULL) {
++		fScanStride = (rowBytes + 63) & ~63u;
++		uint32_t bytes = (uint32_t)round_page_64((uint64_t)fScanStride * fLogicalH);
++		for (int i = 0; i < 3; i++) {
++			fScanPA[i] = sweet_lowpool_scanbuf(bytes, &fScanMap[i]);
++			if (fScanPA[i] == 0 || fScanPA[i] + bytes > (1ull << 32) || (fScanPA[i] & 63) != 0) {
++				IOLog("SWEET FB: scan-out copy off: buffer %d of %u bytes not available from the low pool (0x%llx)\n",
++				    i, bytes, fScanPA[i]);
++				fScanFailed = true;     /* the blocks we got stay allocated: three canvases at most, once per boot */
++				return false;
++			}
++		}
++		IOLog("SWEET FB: scan-out copy buffers 0x%llx 0x%llx 0x%llx, stride %u, %u bytes each\n",
++		    fScanPA[0], fScanPA[1], fScanPA[2], fScanStride, bytes);
+ 	}
++	uintptr_t kva = s->kernelAddress();
++	if (kva == 0) {
++		return false;
++	}
++	zcPoll();
++	if (fScanForeign) {
++		/* the panel shows (or is about to show) something that is not ours: once that latched, all three are free */
++		if (fLastFlush != 0 && !latchedNow()) {
++			waitLatch();
++		}
++		fScanPanel = fScanQueued = -1;
++		fScanForeign = false;
++	} else if (fScanQueued >= 0 && latchedNow()) {
++		fScanPanel = fScanQueued;       /* the queued frame reached the glass */
++		fScanQueued = -1;
++	}
++	int t = 0;
++	while (t == fScanPanel || t == fScanQueued) {
++		t++;
++	}
++	if (fScanQueued >= 0) {
++		fSt.coalesced++;        /* the queued copy is replaced before its vsync: never shown, now free */
++	}
++	uint64_t t0 = mach_absolute_time();
++	const uint8_t *src = (const uint8_t *)(kva + s->offset);
++	uint64_t span = (uint64_t)s->bytesPerRow * (fLogicalH - 1) + rowBytes;
++	if (sweet_lowpool_cacheable()) {
++		/* the GPU wrote DRAM behind this write-back mapping; a CPU draw may sit dirty in it (civac keeps that) */
++		sweet_dma_sync_va((const void *)src, (size_t)span);
++	}
++	uint8_t *dst = (uint8_t *)fScanMap[t]->getVirtualAddress();
++	if (s->bytesPerRow == fScanStride) {
++		memcpy(dst, src, (size_t)span);
++	} else {
++		for (uint32_t y = 0; y < fLogicalH; y++) {
++			memcpy(dst + (size_t)y * fScanStride, src + (size_t)y * s->bytesPerRow, rowBytes);
++		}
++	}
++	scanAddr((uint32_t)fScanPA[t], fScanStride, true);      /* dsb before the address write: the WC stores land first */
++	fScanForeign = false;
++	fScanQueued = t;
++	fScanFront = true;
++	__atomic_store_n(&fShotId, id, __ATOMIC_RELEASE);
++	/* CoreAnimation may reuse its surface now: the swap is complete */
++	if ((int32_t)(fCurSwapID - __atomic_load_n(&fSwapDone, __ATOMIC_ACQUIRE)) > 0) {
++		__atomic_store_n(&fSwapDone, fCurSwapID, __ATOMIC_RELEASE);
++		if (struct sweet_fb_trace_rec *tr = sweet_fb_trace_of(fCurSwapID)) {
++			tr->done = mach_absolute_time();
++		}
++	}
++	uint64_t d = mach_absolute_time() - t0;
++	fSt.scanCopies++;
++	fSt.scanCopyAbs += d;
++	if (d > fSt.scanCopyMaxAbs) {
++		fSt.scanCopyMaxAbs = d;
++	}
++	fSt.zc++;
++	if (fZcFrames++ == 0) {
++		IOLog("SWEET FB: first scan-out copy: surface %u -> buffer %d at 0x%llx (%ux%u canvas)\n",
++		    id, t, fScanPA[t], fLogicalW, fLogicalH);
++	}
+ 	return true;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -505,6 +505,36 @@
+ 	ok = sweet_surface_insert_locked(s);
+ 	IOLockUnlock(sweet_surface_lock);
+ 	return ok;
++}
++
++/*
++ * A scan-out buffer the framebuffer owns (patch 0235, sweetfb_scancopy): a low-pool block (contiguous, below 4 GiB,
++ * page aligned) mapped write-combined in the kernel only, zeroed. 0: the pool is not set up or is full.
++ */
++uint64_t
++sweet_lowpool_scanbuf(uint32_t bytes, IOMemoryMap **mapOut)
++{
++	*mapOut = NULL;
++	if (!sweet_lowpool.ready || bytes == 0) {
++		return 0;
++	}
++	uint32_t np = (bytes + PAGE_SIZE - 1) / PAGE_SIZE;
++	uint64_t pa = sweet_lowpool_alloc(bytes);
++	if (pa == 0) {
++		return 0;
++	}
++	IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(pa, (IOByteCount)np * PAGE_SIZE, kIODirectionInOut);
++	IOMemoryMap *map = md != NULL ? md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache) : NULL;
++	OSSafeReleaseNULL(md);         /* the map keeps the descriptor */
++	if (map == NULL || map->getVirtualAddress() == 0) {
++		OSSafeReleaseNULL(map);
++		sweet_lowpool_free(pa, np);
++		return 0;
++	}
++	bzero((void *)map->getVirtualAddress(), (size_t)np * PAGE_SIZE);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*mapOut = map;
++	return pa;
+ }
+ 
+ /*
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -105,6 +105,7 @@
+ 
+ /* Pool statistics: pages in use / total, allocations, failed allocations (fell back to normal memory). */
+ void sweet_lowpool_stats(uint32_t *usedPages, uint32_t *totalPages, uint64_t *allocs, uint64_t *fails);
++uint64_t sweet_lowpool_scanbuf(uint32_t bytes, class IOMemoryMap **mapOut);     /* 0235: framebuffer-owned scan-out block, WC mapped */
+ 
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);

@@ -1,0 +1,25 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 204207f707a956e7314754a76c14ab35ef324602..d7139452fee117653b91c0dcf82129152a848b11 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -965,6 +965,20 @@ touch_beryllium_start(void)
+ 		st.kind = TOUCH_FT8719;
+ 		return true;
+ 	}
++	/*
++	 * boot-arg sweettouchnvtrst=1: pulse reset before the first read even when the IC answers. iOS 26 sleeps and wakes
++	 * the panel (DSI) before this thread starts; on this TDDI panel the touch firmware then answers I2C (the
++	 * parameters read fine) but stops scanning: no IRQ edges, and reads return its memory instead of event frames.
++	 */
++	unsigned nvt_force_rst = 0;
++	(void)PE_parse_boot_argn("sweettouchnvtrst", &nvt_force_rst, sizeof(nvt_force_rst));
++	if (nvt_force_rst) {
++		printf("SWEET TOUCH: pulsing NT36672A reset first (sweettouchnvtrst=1)\n");
++		touch_gpio(tb->rst, 0, 0, 0, true, false);
++		touch_wait(10);
++		touch_gpio(tb->rst, 0, 0, 0, true, true);
++		touch_wait(300);
++	}
+ 	int err = touch_nvt_params();
+ 	if (err) {
+ 		printf("SWEET TOUCH: nvt silent (%d); pulsing reset\n", err);

@@ -1,0 +1,13 @@
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -99,6 +99,9 @@
+ 	setProperty(kIOHIDPrimaryUsagePageKey, getPrimaryUsagePage(), 32);
+ 	setProperty(kIOHIDPrimaryUsageKey, getPrimaryUsage(), 32);
+ 	setProperty(kIOHIDBuiltInKey, kOSBooleanTrue);
++	/* iOS 26: backboardd keeps an "authenticated" flag per HID service (BKIOHIDService isAuthenticated); ours never
++	 * set it and its touches reached the event system but not the screen. */
++	setProperty("Authenticated", kOSBooleanTrue);
+ 	OSSafeReleaseNULL(transport);
+ 	OSSafeReleaseNULL(product);
+ 

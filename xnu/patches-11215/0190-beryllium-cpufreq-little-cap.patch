@@ -1,0 +1,620 @@
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index f2f409f..954b5fc 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -1,72 +1,544 @@
+ /*
+- * Poco F1 (SDM845): run both CPU clusters at their top cpufreq-hw state.
+- * XNU has no cpufreq driver, so the cores otherwise stay where ABL left
+- * them, and everything (CoreAnimation renders on the CPU) runs slow.
+- * SDM845 "qcom,cpufreq-hw" (Linux qcom-cpufreq-hw.c, v1 register layout,
+- * as ios-topaz patch 0094 for SM6225): freq-domain0 (A55) 0x17d43000,
+- * freq-domain1 (A75) 0x17d45800; LUT at +0x110 (32-byte rows, bits 31:30
+- * clock source, 7:0 L-value x 19.2 MHz), PERF_STATE at +0x920.
+- * The firmware (OSM/LMh) still applies its voltage and thermal limits.
+- * Boot-arg sweetcpufreq=0 leaves the frequencies alone.
++ * Poco F1 (SDM845, beryllium): CPU frequency governor on the OSM /
++ * "qcom,cpufreq-hw" block. XNU has no cpufreq driver, so the clusters would
++ * stay wherever the firmware left them. Policy (user decision): the four
++ * Cortex-A75 (cluster 1, CPU 4-7) may go to the top LUT state under load, the
++ * four Cortex-A55 (cluster 0, CPU 0-3) are capped (default 50% of their max);
++ * both clusters fall to their lowest state when idle.
++ *
++ * Hardware facts (Linux drivers/cpufreq/qcom-cpufreq-hw.c, "qcom,cpufreq-hw"
++ * v1 variant, qcom_soc_data{ reg_enable 0x0, reg_freq_lut 0x110, reg_volt_lut
++ * 0x114, reg_perf_state 0x920, lut_row_size 32 }; register facts only, no code
++ * taken from it):
++ *   ENABLE      +0x000  bit 0: domain enabled by the firmware
++ *   FREQ_LUT    +0x110 + 32 * i   bits 31:30 clock source (0 = the 300 MHz
++ *                                  alternate clock, GPLL0 / 2; else XO 19.2 MHz
++ *                                  x L-value), bits 7:0 L-value, bits 18:16
++ *                                  cores allowed at this state
++ *   VOLT_LUT    +0x114 + 32 * i   bits 11:0 voltage (Linux: mV)
++ *   PERF_STATE  +0x920  LUT index requested from / reported by the OSM
++ * The LUT ends where a row repeats the previous frequency.
++ * Live DT (dtb/beryllium/live.dts, /soc/qcom,cpufreq-hw): reg windows
++ * freq-domain0 0x17d43000 (A55, cpu@0-300) and freq-domain1 0x17d45800 (A75,
++ * cpu@400-700), 0x1400 bytes each, qcom,lut-max-entries = 27, clocks xo +
++ * alternate. The addresses are hard coded for this board (like the other
++ * sweet_* drivers); they do not need to pass through the ADT. The timer is the
++ * 19.2 MHz architectural counter (ADT timebase-frequency), independent of CPU
++ * frequency. The firmware (OSM / LMh) still applies its own voltage and
++ * thermal limits.
++ *
++ * Governor (default): a kernel thread samples every 25 ms. Load of a cluster =
++ * the busiest of its CPUs, 100% - idle residency, from the scheduler's
++ * per-processor idle time (recount, fed by processor_idle(), i.e. the WFI idle
++ * path). Rule: required = cur_khz * load / 80 (target utilisation 80%); load
++ * >= 90% jumps straight to the cluster's cap; the smallest LUT state with
++ * khz >= required (within [lowest, cap]) is the target. Up: immediately. Down:
++ * only after 3 consecutive samples (75 ms) below the current state, then by at
++ * most 2 LUT states per decision. At idle the target is the lowest state.
++ * A write is one MMIO store + dsb: no locks, safe from thread context.
++ *
++ * Boot-args:
++ *   sweetcpufreq=gov|fixed|off   (default gov; 0 = off, 1 = gov)
++ *     off   leave the frequencies as the firmware set them
++ *     fixed set each domain once (see _little / _big) and keep it
++ *   sweetcpufreq_little_max=<10..100>  gov: A55 cap, % of max (default 50)
++ *   sweetcpufreq_big_max=<10..100>     gov: A75 cap, % of max (default 100)
++ *   sweetcpufreq_little=<10..100>      fixed: A55 % of max (default 40)
++ *   sweetcpufreq_big=<10..100>         fixed: A75 % of max (default 100)
++ *   sweetcpufreq_log=<seconds>         time-in-state summary period (default
++ *                                      10, 0 = none)
++ *   sweetcpufreq_force=1               also act when ENABLE bit 0 is clear
++ * The closest LUT entry to the percentage is used (100 = highest index).
++ * Starts once every selected CPU is up (after iokit/Kernel/arm/SweetCPU.cpp's
++ * SMP bring-up). All logs start with "SWEET CPUFREQ:".
++ *
++ * sysctl kern.sweet_cpufreq (read-only string, stable format "v1", for the
++ * Bergamota metrics panel). Lines are separated by '\n'; each line is a
++ * sequence of space-separated key=value words:
++ *   line 1:  sweet_cpufreq v1 mode=<gov|fixed|off> period_ms=<sample period>
++ *   line 2:  cluster0 name=A55 cpus=0-3 state=<applied|off|skipped|pending>
++ *            mode=<gov|fixed|off> idx=<current LUT index> cur_khz=<current>
++ *            min_khz=<lowest LUT> max_khz=<highest LUT> cap_khz=<policy max,
++ *            gov cap or fixed target> lut_n=<entries> load=<last load %> changes=<perf
++ *            state writes> tis_ms=<khz>:<ms>,<khz>:<ms>,...  (every LUT state in
++ *            index order, cumulative milliseconds spent there since start; the
++ *            states are the ones listed in lut_khz=)
++ *   line 3:  cluster1 ... (A75, cpus=4-7), same keys
++ * idx/cur_khz are read live from PERF_STATE; they are 0 unless state=applied.
++ * lut_khz=<khz>,<khz>,... is also present on each cluster line (before tis_ms).
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
++#include <arm/cpu_topology.h>
+ #include <pexpert/pexpert.h>
+ #include "sweet_board.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern uint64_t sweet_processor_idle_time(int cpu);
++extern kern_return_t thread_terminate(thread_t);
++extern boolean_t sweet_cpu_signal_is_enabled(unsigned int cpu);
+ void sweet_cpufreq_max(void);
+ 
++#define CPUFREQ_ENABLE          0x000u
+ #define CPUFREQ_FREQ_LUT        0x110u
+-#define CPUFREQ_LUT_ROW         0x20u
++#define CPUFREQ_VOLT_LUT        0x114u
+ #define CPUFREQ_PERF_STATE      0x920u
+-#define CPUFREQ_LUT_MAX         40u
++#define CPUFREQ_LUT_ROW         0x20u
++#define CPUFREQ_WINDOW          0x1400u
++#define CPUFREQ_LUT_MAX         27u     /* qcom,lut-max-entries in the live DT */
++#define CPUFREQ_XO_KHZ          19200u
++#define CPUFREQ_ALT_KHZ         300000u /* source 0: GPLL0 / 2 */
++#define CPUFREQ_UP_WAIT_S       120
++#define GOV_PERIOD_MS           25u
++#define GOV_TARGET_PCT          80u
++#define GOV_JUMP_PCT            90u
++#define GOV_DOWN_SAMPLES        3u
++#define GOV_DOWN_STEP           2u
++#define FIXED_PERIOD_MS         250u
++
++enum { CF_PENDING, CF_OFF, CF_APPLIED, CF_SKIPPED };
++enum { MODE_OFF, MODE_GOV, MODE_FIXED };
++
++static struct cf_domain {
++	const char *name;
++	const char *cpus;
++	vm_offset_t pa;
++	unsigned first_cpu;             /* lowest logical CPU of the cluster */
++	unsigned ncpu;
++	int percent;                    /* fixed target or gov cap, % of max */
++	vm_offset_t base;
++	int state;
++	uint32_t n;
++	uint32_t top;                   /* highest-frequency LUT index */
++	uint32_t cap;                   /* policy ceiling (LUT index) */
++	uint32_t req;                   /* last requested LUT index */
++	uint32_t load;                  /* last load, % */
++	uint32_t changes;
++	uint32_t down_cnt;
++	uint32_t khz[CPUFREQ_LUT_MAX];
++	uint64_t tis_ns[CPUFREQ_LUT_MAX];
++	uint64_t tis_snap[CPUFREQ_LUT_MAX];
++	uint64_t prev_idle[4];
++} cf_dom[2] = {
++	{ "A55", "0-3", 0x17d43000u, 0, 4, 50 },
++	{ "A75", "4-7", 0x17d45800u, 4, 4, 100 },
++};
++
++static bool cf_started;
++static int cf_mode = MODE_OFF;
++static unsigned cf_ncpus;
++static unsigned cf_log_secs = 10;
++static int cf_force;
++
++static inline uint32_t
++cf_rd(const struct cf_domain *d, uint32_t off)
++{
++	return *(volatile uint32_t *)(d->base + off);
++}
++
++static uint32_t
++cf_khz(uint32_t row)
++{
++	return ((row >> 30) & 3u) ? CPUFREQ_XO_KHZ * (row & 0xffu) : CPUFREQ_ALT_KHZ;
++}
++
++static uint32_t
++cf_state_khz(const struct cf_domain *d, uint32_t idx)
++{
++	return idx < d->n ? d->khz[idx] : 0;
++}
+ 
+ static void
+-cpufreq_domain_max(const char *name, vm_offset_t pa)
++cf_sleep_ms(unsigned ms)
+ {
+-	vm_offset_t b = ml_io_map(pa, 0x1400);
+-	if (b == 0) {
+-		printf("SWEET CPUFREQ: %s: map failed\n", name);
+-		return;
+-	}
+-	uint32_t best = 0, bestKHz = 0, prevKHz = 0, n = 0;
++	static int chan;
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* One MMIO store + barrier: cheap, lock-free. */
++static void
++cf_request(struct cf_domain *d, uint32_t idx)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(d->base + CPUFREQ_PERF_STATE) = idx;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	d->req = idx;
++	d->changes++;
++}
++
++/* Read and log the LUT; false if it does not look like a cpufreq-hw LUT. */
++static bool
++cf_read_lut(unsigned id, struct cf_domain *d)
++{
++	uint32_t en = cf_rd(d, CPUFREQ_ENABLE);
++	uint32_t prev = 0;
++
++	d->n = 0;
+ 	for (uint32_t i = 0; i < CPUFREQ_LUT_MAX; i++) {
+-		uint32_t v = *(volatile uint32_t *)(b + CPUFREQ_FREQ_LUT + i * CPUFREQ_LUT_ROW);
+-		uint32_t src = (v >> 30) & 3u, lval = v & 0xffu;
+-		uint32_t khz = src ? 19200u * lval : 300000u;
+-		if (i > 0 && khz == prevKHz) {
++		uint32_t row = cf_rd(d, CPUFREQ_FREQ_LUT + i * CPUFREQ_LUT_ROW);
++		uint32_t volt = cf_rd(d, CPUFREQ_VOLT_LUT + i * CPUFREQ_LUT_ROW);
++		if (row == 0xffffffffu) {
++			printf("SWEET CPUFREQ: domain %u: LUT row %u reads all-ones (block not clocked?)\n", id, i);
++			d->n = 0;
++			return false;
++		}
++		uint32_t khz = cf_khz(row);
++		if (i > 0 && khz == prev) {
+ 			break;          /* the LUT repeats its last entry */
+ 		}
+-		prevKHz = khz;
+-		n++;
+-		if (khz > bestKHz) {
+-			bestKHz = khz;
++		if (i > 0 && khz < prev) {
++			printf("SWEET CPUFREQ: domain %u: LUT[%u] %u kHz below the previous entry, not monotonic\n",
++			    id, i, khz);
++			d->n = 0;
++			return false;
++		}
++		prev = khz;
++		d->khz[i] = khz;
++		d->n = i + 1;
++		printf("SWEET CPUFREQ: domain %u: LUT[%2u] %7u kHz  src %u lval %3u  volt %4u  cores %u\n",
++		    id, i, khz, (row >> 30) & 3u, row & 0xffu, volt & 0xfffu, (row >> 16) & 7u);
++	}
++	printf("SWEET CPUFREQ: domain %u (%s, 0x%lx): ENABLE 0x%x, %u LUT entries\n",
++	    id, d->name, (unsigned long)d->pa, en, d->n);
++	d->top = d->n ? d->n - 1 : 0;
++	return d->n >= 2;
++}
++
++/* LUT index closest to pct % of the top frequency (100 = top; ties: lower). */
++static uint32_t
++cf_pick(const struct cf_domain *d, int pct)
++{
++	if (pct >= 100) {
++		return d->top;
++	}
++	uint64_t target = (uint64_t)d->khz[d->top] * (uint64_t)pct / 100;
++	uint32_t best = 0;
++	uint64_t bestdiff = ~0ULL;
++	for (uint32_t i = 0; i < d->n; i++) {
++		uint64_t diff = d->khz[i] > target ? d->khz[i] - target : target - d->khz[i];
++		if (diff < bestdiff) {
++			bestdiff = diff;
+ 			best = i;
+ 		}
+ 	}
+-	uint32_t old = *(volatile uint32_t *)(b + CPUFREQ_PERF_STATE);
+-	uint32_t oldv = old < CPUFREQ_LUT_MAX ?
+-	    *(volatile uint32_t *)(b + CPUFREQ_FREQ_LUT + old * CPUFREQ_LUT_ROW) : 0;
+-	uint32_t oldKHz = ((oldv >> 30) & 3u) ? 19200u * (oldv & 0xffu) : 300000u;
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	*(volatile uint32_t *)(b + CPUFREQ_PERF_STATE) = best;
+-	__asm__ volatile("dsb sy" ::: "memory");
+-	printf("SWEET CPUFREQ: %s: %u LUT states, perf state %u (%u MHz) -> %u (%u MHz)\n",
+-	    name, n, old, oldKHz / 1000, best, bestKHz / 1000);
++	return best;
++}
++
++static void
++cf_readback(unsigned id, struct cf_domain *d, uint32_t idx)
++{
++	unsigned waited = 0;
++	uint32_t now = cf_rd(d, CPUFREQ_PERF_STATE);
++	while (now != idx && waited < 50) {
++		cf_sleep_ms(1);
++		waited++;
++		now = cf_rd(d, CPUFREQ_PERF_STATE);
++	}
++	printf("SWEET CPUFREQ: domain %u: readback perf state %u (%u kHz) after %u ms: %s\n",
++	    id, now, cf_state_khz(d, now), waited,
++	    now == idx ? "as requested" : "DIFFERS (firmware/LMh may limit it)");
++}
++
++static void
++cf_setup(unsigned id, struct cf_domain *d)
++{
++	d->state = CF_SKIPPED;
++	if (d->first_cpu >= cf_ncpus) {
++		printf("SWEET CPUFREQ: domain %u: CPU %u not online, skipped\n", id, d->first_cpu);
++		return;
++	}
++	d->base = ml_io_map(d->pa, CPUFREQ_WINDOW);
++	if (d->base == 0) {
++		printf("SWEET CPUFREQ: domain %u: map 0x%lx failed\n", id, (unsigned long)d->pa);
++		return;
++	}
++	if (!cf_read_lut(id, d)) {
++		printf("SWEET CPUFREQ: domain %u: LUT invalid, not touching the perf state\n", id);
++		return;
++	}
++	if (!(cf_rd(d, CPUFREQ_ENABLE) & 1u) && !cf_force) {
++		printf("SWEET CPUFREQ: domain %u: ENABLE bit 0 clear (firmware did not enable the domain), "
++		    "not touching it (sweetcpufreq_force=1 forces)\n", id);
++		return;
++	}
++	uint32_t old = cf_rd(d, CPUFREQ_PERF_STATE);
++	printf("SWEET CPUFREQ: domain %u: current perf state %u (%u kHz)\n", id, old, cf_state_khz(d, old));
++	d->cap = cf_pick(d, d->percent);
++	printf("SWEET CPUFREQ: domain %u: %s %d%% of max -> perf state %u (%u kHz)\n", id,
++	    cf_mode == MODE_GOV ? "cap" : "fixed target", d->percent, d->cap, d->khz[d->cap]);
++	/* gov starts at the cap and lets the first idle samples bring it down */
++	cf_request(d, d->cap);
++	d->changes = 0;
++	cf_readback(id, d, d->cap);
++	d->state = CF_APPLIED;
++}
++
++/* Busiest CPU of the cluster, % busy since the last call. */
++static uint32_t
++cf_cluster_load(struct cf_domain *d, uint64_t wall)
++{
++	uint32_t worst = 0;
++	for (unsigned k = 0; k < d->ncpu && d->first_cpu + k < cf_ncpus; k++) {
++		uint64_t idle = sweet_processor_idle_time((int)(d->first_cpu + k));
++		if (idle == ~0ULL) {
++			continue;
++		}
++		uint64_t didle = idle - d->prev_idle[k];
++		d->prev_idle[k] = idle;
++		if (wall == 0 || didle >= wall) {
++			continue;
++		}
++		uint32_t busy = (uint32_t)((wall - didle) * 100 / wall);
++		if (busy > worst) {
++			worst = busy;
++		}
++	}
++	return worst;
++}
++
++static void
++cf_gov_step(unsigned id, struct cf_domain *d, uint64_t wall)
++{
++	uint32_t cur = cf_rd(d, CPUFREQ_PERF_STATE);
++	if (cur >= d->n) {
++		cur = d->req;
++	}
++	uint32_t load = cf_cluster_load(d, wall);
++	d->load = load;
++	if (cf_mode != MODE_GOV) {
++		return;
++	}
++	uint32_t target;
++	if (load >= GOV_JUMP_PCT) {
++		target = d->cap;
++	} else {
++		uint64_t need = (uint64_t)d->khz[cur] * load / GOV_TARGET_PCT;
++		target = 0;
++		while (target < d->cap && d->khz[target] < need) {
++			target++;
++		}
++	}
++	if (target > d->cap) {
++		target = d->cap;
++	}
++	uint32_t next = cur;
++	if (target > cur) {
++		next = target;
++		d->down_cnt = 0;
++	} else if (target < cur) {
++		if (++d->down_cnt >= GOV_DOWN_SAMPLES) {
++			d->down_cnt = 0;
++			next = (cur - target > GOV_DOWN_STEP) ? cur - GOV_DOWN_STEP : target;
++		}
++	} else {
++		d->down_cnt = 0;
++	}
++	if (next != cur) {
++		cf_request(d, next);
++	}
++	(void)id;
++}
++
++static void
++cf_log_summary(unsigned id, struct cf_domain *d)
++{
++	char line[512];
++	size_t n = 0;
++	n += snprintf(line + n, sizeof(line) - n, "SWEET CPUFREQ: %s cluster%u load %u%% idx %u (%u kHz) changes %u tis_ms(%us):",
++	    cf_mode == MODE_GOV ? "gov" : "fixed", id, d->load, d->req, cf_state_khz(d, d->req), d->changes, cf_log_secs);
++	for (uint32_t i = 0; i < d->n && n < sizeof(line); i++) {
++		uint64_t ms = (d->tis_ns[i] - d->tis_snap[i]) / NSEC_PER_MSEC;
++		d->tis_snap[i] = d->tis_ns[i];
++		if (ms) {
++			n += snprintf(line + n, sizeof(line) - n, " %u:%llu", d->khz[i], ms);
++		}
++	}
++	printf("%s\n", line);
++}
++
++static void
++cf_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	/* After the SMP bring-up: every selected CPU must be alive (their OSM domains powered). */
++	cf_ncpus = ml_get_topology_info()->num_cpus;
++	if (cf_ncpus > 8) {
++		cf_ncpus = 8;
++	}
++	for (unsigned t = 0; t < CPUFREQ_UP_WAIT_S * 10; t++) {
++		unsigned up = 0;
++		for (unsigned c = 0; c < cf_ncpus; c++) {
++			up += sweet_cpu_signal_is_enabled(c) ? 1 : 0;
++		}
++		if (up == cf_ncpus && cf_ncpus > 0) {
++			break;
++		}
++		if (t == CPUFREQ_UP_WAIT_S * 10 - 1) {
++			printf("SWEET CPUFREQ: only %u/%u CPUs up after %d s, leaving the frequencies alone\n",
++			    up, cf_ncpus, CPUFREQ_UP_WAIT_S);
++			cf_dom[0].state = cf_dom[1].state = CF_SKIPPED;
++			goto out;
++		}
++		cf_sleep_ms(100);
++	}
++	printf("SWEET CPUFREQ: %u CPUs up; mode %s; A55 %d%%, A75 %d%% of max\n", cf_ncpus,
++	    cf_mode == MODE_GOV ? "gov" : "fixed", cf_dom[0].percent, cf_dom[1].percent);
++	for (unsigned i = 0; i < 2; i++) {
++		cf_setup(i, &cf_dom[i]);
++	}
++	if (cf_dom[0].state != CF_APPLIED && cf_dom[1].state != CF_APPLIED) {
++		goto out;
++	}
++
++	/* Accounting loop (also in fixed mode, slower): time-in-state, load, governor. */
++	unsigned period = cf_mode == MODE_GOV ? GOV_PERIOD_MS : FIXED_PERIOD_MS;
++	uint64_t last = mach_absolute_time(), last_log = last;
++	for (unsigned i = 0; i < 2; i++) {
++		(void)cf_cluster_load(&cf_dom[i], 1);   /* prime prev_idle */
++	}
++	for (;;) {
++		cf_sleep_ms(period);
++		uint64_t now = mach_absolute_time();
++		uint64_t wall = now - last, wall_ns;
++		last = now;
++		absolutetime_to_nanoseconds(wall, &wall_ns);
++		for (unsigned i = 0; i < 2; i++) {
++			struct cf_domain *d = &cf_dom[i];
++			if (d->state != CF_APPLIED) {
++				continue;
++			}
++			uint32_t cur = cf_rd(d, CPUFREQ_PERF_STATE);
++			if (cur < d->n) {
++				d->tis_ns[cur] += wall_ns;      /* the state held during this interval */
++			}
++			cf_gov_step(i, d, wall);
++		}
++		uint64_t since_log_ns;
++		absolutetime_to_nanoseconds(now - last_log, &since_log_ns);
++		if (cf_log_secs && since_log_ns >= (uint64_t)cf_log_secs * NSEC_PER_SEC) {
++			last_log = now;
++			for (unsigned i = 0; i < 2; i++) {
++				if (cf_dom[i].state == CF_APPLIED) {
++					cf_log_summary(i, &cf_dom[i]);
++				}
++			}
++		}
++	}
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static int
++cf_percent_arg(const char *name, int dflt)
++{
++	int v = dflt;
++	if (PE_parse_boot_argn(name, &v, sizeof(v)) && (v < 10 || v > 100)) {
++		printf("SWEET CPUFREQ: %s=%d out of range 10..100, using %d\n", name, v, dflt);
++		v = dflt;
++	}
++	return v;
+ }
+ 
++/* Name kept from the first version (patch 0093), called from sweet_ufs_init(). */
+ void
+ sweet_cpufreq_max(void)
+ {
+-	int on = 1;
+-	PE_parse_boot_argn("sweetcpufreq", &on, sizeof(on));
+-	if (!on || !sweet_board_beryllium()) {
++	char arg[16] = "gov";
++	thread_t thread;
++
++	if (!sweet_board_beryllium() || cf_started) {
+ 		return;
+ 	}
+-	cpufreq_domain_max("silver (A55)", 0x17d43000u);
+-	cpufreq_domain_max("gold (A75)", 0x17d45800u);
++	cf_started = true;
++	(void)PE_parse_boot_argn("sweetcpufreq", arg, sizeof(arg));
++	if (!strcmp(arg, "off") || !strcmp(arg, "0")) {
++		cf_mode = MODE_OFF;
++		cf_dom[0].state = cf_dom[1].state = CF_OFF;
++		printf("SWEET CPUFREQ: off (sweetcpufreq=%s), frequencies left as the firmware set them\n", arg);
++		return;
++	}
++	if (!strcmp(arg, "fixed")) {
++		cf_mode = MODE_FIXED;
++		cf_dom[0].percent = cf_percent_arg("sweetcpufreq_little", 40);
++		cf_dom[1].percent = cf_percent_arg("sweetcpufreq_big", 100);
++	} else {
++		if (strcmp(arg, "gov") && strcmp(arg, "1")) {
++			printf("SWEET CPUFREQ: unknown sweetcpufreq=%s, using gov\n", arg);
++		}
++		cf_mode = MODE_GOV;
++		cf_dom[0].percent = cf_percent_arg("sweetcpufreq_little_max", 50);
++		cf_dom[1].percent = cf_percent_arg("sweetcpufreq_big_max", 100);
++	}
++	int v = 10;
++	(void)PE_parse_boot_argn("sweetcpufreq_log", &v, sizeof(v));
++	cf_log_secs = v < 0 ? 0 : (unsigned)v;
++	(void)PE_parse_boot_argn("sweetcpufreq_force", &cf_force, sizeof(cf_force));
++	if (kernel_thread_start((thread_continue_t)cf_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		printf("SWEET CPUFREQ: kernel_thread_start failed\n");
++	}
++}
++
++static size_t
++cf_cat(char *buf, size_t size, size_t n, const char *fmt, ...) __printflike(4, 5);
++static size_t
++cf_cat(char *buf, size_t size, size_t n, const char *fmt, ...)
++{
++	va_list ap;
++	if (n >= size) {
++		return n;
++	}
++	va_start(ap, fmt);
++	int r = vsnprintf(buf + n, size - n, fmt, ap);
++	va_end(ap);
++	return r < 0 ? n : n + (size_t)r;
++}
++
++static int
++cf_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[1536];
++	size_t n = 0;
++	const char *modes[] = { "off", "gov", "fixed" };
++
++	n = cf_cat(buf, sizeof(buf), n, "sweet_cpufreq v1 mode=%s period_ms=%u\n", modes[cf_mode],
++	    cf_mode == MODE_GOV ? GOV_PERIOD_MS : FIXED_PERIOD_MS);
++	for (unsigned i = 0; i < 2; i++) {
++		const struct cf_domain *d = &cf_dom[i];
++		const char *st = d->state == CF_OFF ? "off" : d->state == CF_PENDING ? "pending" :
++		    d->state == CF_SKIPPED ? "skipped" : "applied";
++		bool ok = d->state == CF_APPLIED;
++		uint32_t cur = ok ? cf_rd(d, CPUFREQ_PERF_STATE) : 0;
++		n = cf_cat(buf, sizeof(buf), n,
++		    "cluster%u name=%s cpus=%s state=%s mode=%s idx=%u cur_khz=%u min_khz=%u max_khz=%u cap_khz=%u "
++		    "lut_n=%u load=%u changes=%u lut_khz=", i, d->name, d->cpus, st, modes[cf_mode], cur,
++		    ok ? cf_state_khz(d, cur) : 0, ok ? d->khz[0] : 0, ok ? d->khz[d->top] : 0,
++		    ok ? d->khz[d->cap] : 0, ok ? d->n : 0, d->load, d->changes);
++		for (uint32_t k = 0; ok && k < d->n; k++) {
++			n = cf_cat(buf, sizeof(buf), n, "%s%u", k ? "," : "", d->khz[k]);
++		}
++		n = cf_cat(buf, sizeof(buf), n, " tis_ms=");
++		for (uint32_t k = 0; ok && k < d->n; k++) {
++			n = cf_cat(buf, sizeof(buf), n, "%s%u:%llu", k ? "," : "", d->khz[k],
++			    d->tis_ns[k] / NSEC_PER_MSEC);
++		}
++		n = cf_cat(buf, sizeof(buf), n, "\n");
++	}
++	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
+ }
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq,
++    CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, cf_sysctl, "A",
++    "Poco F1 cpufreq governor state per cluster (see bsd/dev/sweet_cpufreq.c)");
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/osfmk/kern/processor.c b/osfmk/kern/processor.c
+index 899c093..aaa671e 100644
+--- a/osfmk/kern/processor.c
++++ b/osfmk/kern/processor.c
+@@ -746,6 +746,26 @@ processor_cpu_load_info(processor_t processor,
+ 	ticks[CPU_STATE_IDLE] += (uint32_t)(idle_time / hz_tick_interval);
+ }
+ 
++/*
++ * Poco F1 cpufreq governor (bsd/dev/sweet_cpufreq.c): up-to-date idle time of a
++ * CPU in mach absolute time units, from the scheduler's idle accounting
++ * (processor_idle(), the WFI path). ~0 if the processor is not registered.
++ */
++uint64_t sweet_processor_idle_time(int cpu);
++uint64_t
++sweet_processor_idle_time(int cpu)
++{
++	processor_t processor = (cpu >= 0 && cpu < MAX_SCHED_CPUS) ? processor_array[cpu] : PROCESSOR_NULL;
++	struct recount_usage usage = { 0 };
++	uint64_t idle_time = 0;
++
++	if (processor == PROCESSOR_NULL) {
++		return ~0ULL;
++	}
++	recount_processor_usage(&processor->pr_recount, &usage, &idle_time);
++	return idle_time;
++}
++
+ kern_return_t
+ processor_info(
+ 	processor_t     processor,

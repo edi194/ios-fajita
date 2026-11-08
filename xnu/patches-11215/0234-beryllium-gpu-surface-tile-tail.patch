@@ -1,0 +1,147 @@
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -86,7 +86,8 @@
+ 	uint8_t                  *kva;          /* kernel alias (write-combined for GEM_NEW BOs) */
+ 	uint64_t                  size;
+ 	uint64_t                  iova;
+-	uint64_t                  vaLen;        /* what was taken from the allocator (size + guard) */
++	uint64_t                  vaLen;        /* what was taken from the allocator (size + tail + guard) */
++	uint64_t                  tail;         /* 0234: bytes after size mapped to the shared scratch page */
+ 	uint32_t                  flags;
+ 	uint32_t                  lastFence;    /* last submission that referenced the BO */
+ 	uint32_t                  lastWrite;    /* last one that wrote it */
+@@ -120,7 +121,7 @@
+ 	IOReturn copyIn(uint64_t addr, void *dst, size_t len);
+ 	bool waitFence(uint32_t fence, uint64_t ns);
+ 	void releaseGem(struct sweet_gem *g);
+-	IOReturn mapGem(struct sweet_gem *g, uint32_t flags, uint32_t *handle, uint64_t setIova);
++	IOReturn mapGem(struct sweet_gem *g, uint32_t flags, uint32_t *handle, uint64_t setIova, uint64_t tail = 0);
+ 
+ 	IOReturn gemNew(struct sweet_msm_gem_new *r);
+ 	IOReturn gemInfo(struct sweet_msm_gem_info *r);
+@@ -401,7 +402,7 @@
+ 			g->surface->retain();
+ 		}
+ 	} else if (g->iova != IOVA_UNSET) {
+-		sweet_gpu_vm_unmap(g->iova, g->size);
++		sweet_gpu_vm_unmap(g->iova, g->size + g->tail);
+ 		sweet_gpu_iova_free(g->iova, g->vaLen);
+ 	}
+ 	if (g->alias != NULL) {
+@@ -427,22 +428,77 @@
+ 	}
+ 	g->kva = NULL;
+ 	g->iova = IOVA_UNSET;
++}
++
++/*
++ * 0234: one zeroed GPU page, writable, that the tails of surface BOs map to. The Adreno writes a render target in
++ * whole tiles (rows rounded up), so on a surface whose height is not a multiple of the tile height it writes up to a
++ * tile of rows past the last one: on IOSurfaces sized to the pixel (an app snapshot 281x609, bpr 1152, 704512 bytes)
++ * that ran over the one-page guard into the NEXT BO (black wedges on the lock-screen editor) or faulted on the
++ * unmapped guard (SMMU write fault 64 bytes past the end; three of them and the GPU is lost). Those rows are
++ * outside the image: they may land anywhere harmless, and here they all land on this page.
++ */
++static IOBufferMemoryDescriptor *gScratchBuf;
++static addr64_t gScratchPA;
++
++static bool
++sweet_gpu_scratch(void)
++{
++	if (gScratchPA != 0) {
++		return true;
++	}
++	IOBufferMemoryDescriptor *b = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++	    kIODirectionInOut | kIOMapWriteCombineCache, PAGE_SIZE, PAGE_SIZE);
++	if (b == NULL) {
++		return false;
++	}
++	bzero(b->getBytesNoCopy(), PAGE_SIZE);
++	IOByteCount length = 0;
++	addr64_t pa = b->getPhysicalSegment(0, &length, kIOMemoryMapperNone);
++	if (pa == 0 || (pa & (GPU_PAGE - 1)) != 0) {
++		b->release();
++		return false;
++	}
++	gScratchBuf = b;
++	gScratchPA = pa;
++	return true;
++}
++
++/* Bytes past size a surface's tiles may write: rows rounded up to 32, for every plane (0 when nothing sticks out). */
++static uint64_t
++sweet_surface_tail(const SweetSurface *s, uint64_t offset, uint64_t size)
++{
++	uint64_t need = 0;
++	if (s->planeCount == 0) {
++		need = offset + (uint64_t)((s->height + 31u) & ~31u) * s->bytesPerRow;
++	} else {
++		for (uint32_t i = 0; i < s->planeCount && i < 3; i++) {
++			uint64_t e = (uint64_t)s->planes[i].offset + (uint64_t)((s->planes[i].height + 31u) & ~31u) * s->planes[i].bytesPerRow;
++			need = e > need ? e : need;
++		}
++	}
++	need = (need + GPU_PAGE - 1) & ~(GPU_PAGE - 1);
++	uint64_t tail = need > size ? need - size : 0;
++	return tail > (4ull << 20) ? (4ull << 20) : tail;
+ }
+ 
+ /* Enter the pages of g->md into the GPU address space and give out a handle (lock held). */
+ IOReturn
+-SweetAdrenoUserClient::mapGem(struct sweet_gem *slot, uint32_t flags, uint32_t *handle, uint64_t setIova)
++SweetAdrenoUserClient::mapGem(struct sweet_gem *slot, uint32_t flags, uint32_t *handle, uint64_t setIova, uint64_t tail)
+ {
+ 	uint64_t iova, taken, size = slot->size;
+ 	bool ro = (flags & SWEET_MSM_BO_GPU_READONLY) != 0;
+ 
++	if (tail != 0 && (setIova != 0 || gScratchPA == 0)) {
++		tail = 0;
++	}
+ 	if (setIova != 0) {
+ 		if (!sweet_gpu_iova_reserve(setIova, size)) {
+ 			return kIOReturnNoSpace;
+ 		}
+ 		iova = setIova;
+ 		taken = size;
+-	} else if (!sweet_gpu_iova_alloc(size, &iova, &taken)) {
++	} else if (!sweet_gpu_iova_alloc(size + tail, &iova, &taken)) {
+ 		IOLog("SWEET GPU: no GPU address space for %llu bytes\n", size);
+ 		return kIOReturnNoSpace;
+ 	}
+@@ -454,6 +510,9 @@
+ 		addr64_t pa = slot->md->getPhysicalSegment(mapped, &length, kIOMemoryMapperNone);
+ 		ok = pa != 0 && (pa & (GPU_PAGE - 1)) == 0 && sweet_gpu_vm_map(iova + mapped, pa, ro);
+ 	}
++	for (uint64_t t = 0; t < tail && ok; t += GPU_PAGE, mapped += GPU_PAGE) {
++		ok = sweet_gpu_vm_map(iova + size + t, gScratchPA, false);
++	}
+ 	sweet_gpu_vm_flush();
+ 	if (!ok) {
+ 		sweet_gpu_vm_unmap(iova, mapped);
+@@ -463,6 +522,7 @@
+ 	}
+ 	slot->iova = iova;
+ 	slot->vaLen = taken;
++	slot->tail = tail;
+ 	slot->flags = flags;
+ 	*handle = (uint32_t)(slot - fGems) + 1;
+ 	return kIOReturnSuccess;
+@@ -990,6 +1050,7 @@
+ 		s->release();
+ 		return kIOReturnBadArgument;
+ 	}
++	(void)sweet_gpu_scratch();      /* 0234: allocated outside the GPU lock, once */
+ 	sweet_gpu_lock();
+ 	ret = kIOReturnNoResources;
+ 	if (!sweet_gpu_ready()) {
+@@ -1019,7 +1080,8 @@
+ 				uintptr_t ka = s->kernelAddress();      /* of the first pixel (+wrapDelta): the BO starts at the page */
+ 				g->kva = ka != 0 ? (uint8_t *)(ka - (wrapped ? s->wrapDelta : 0)) : NULL;
+ 				g->size = size;
+-				ret = mapGem(g, wrapped ? SWEET_MSM_BO_GPU_READONLY : 0, &r->handle, 0);
++				ret = mapGem(g, wrapped ? SWEET_MSM_BO_GPU_READONLY : 0, &r->handle, 0,
++				    wrapped ? 0 : sweet_surface_tail(s, r->offset, size));
+ 				if (ret != kIOReturnSuccess) {
+ 					g->md->release();
+ 					bzero(g, sizeof(*g));

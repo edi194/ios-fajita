@@ -1,0 +1,22 @@
+diff --git a/osfmk/ipc/mach_port.c b/osfmk/ipc/mach_port.c
+index 0d82f0d09494218222ff12316d742778d24b9ee7..a7604f08e81b17d7f12d4a835e518e25bf7dc6f4 100644
+--- a/osfmk/ipc/mach_port.c
++++ b/osfmk/ipc/mach_port.c
+@@ -3155,10 +3155,13 @@ mach_port_is_connection_for_service(
+ 		return KERN_INVALID_ARGUMENT;
+ 	}
+ 
+-	if (!mach_msg_filter_at_least(MACH_MSG_FILTER_CALLBACKS_VERSION_1)) {
+-		return KERN_NOT_SUPPORTED;
+-	}
+-
++	/*
++	 * sweet (0156): no Sandbox message filter callbacks are registered, which made this return
++	 * KERN_NOT_SUPPORTED. libxpc accepts only KERN_SUCCESS / KERN_INVALID_CAPABILITY here and otherwise
++	 * logs "Failed to verify check-in connection port ..." and drops every peer check-in ("Bogus check-in
++	 * attempt"), so no XPC listener ever accepted a client. Without a filter there is nothing to check: fall
++	 * through, ip_service_port_get_sblabel() yields no label -> KERN_SUCCESS with filter id 0.
++	 */
+ 	ret = ipc_port_translate_receive(space, service_port_name, &service_port);
+ 	if (ret) {
+ 		return ret;

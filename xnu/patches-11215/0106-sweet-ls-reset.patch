@@ -1,0 +1,49 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 92ac3b8c77982456224250078a58bab7eb5b9279..6943eac52725391bc4dfd9a8327e2c4df624f027 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -406,6 +406,35 @@ LCK_MTX_DECLARE_ATTR(proc_list_mlock, &proc_mlock_grp, &proc_lck_attr);
+ #if XNU_TARGET_OS_OSX
+ /* hook called after root is mounted XXX temporary hack */
+ void (*mountroot_post_hook)(void);
++
++/*
++ * SWEET: boot-arg sweetlsreset=1 deletes the LaunchServices database before
++ * launchd starts, so lsd re-seeds it. A database seeded while the extension
++ * catalog was unreadable (before patch 0099) is reused as "seeded" forever
++ * and keeps every app extension ignored (no wallpapers; see
++ * docs/EXTENSION_POINTS_2.md). Goes through HFS+ and its journal, unlike
++ * editing the partition from a recovery. One-shot: drop the boot-arg after.
++ */
++extern int unlink1(vfs_context_t, vnode_t, user_addr_t, enum uio_seg, int);
++
++static void
++sweet_ls_reset(void)
++{
++	static const char *const paths[] = {
++		"/private/var/mobile/Containers/Data/InternalDaemon/3ED48A87-B795-429E-9BCB-E3502EA1A6EC/Library/Caches/com.apple.LaunchServices-4035-v2.csstore",
++		"/private/var/mobile/Containers/Data/InternalDaemon/3ED48A87-B795-429E-9BCB-E3502EA1A6EC/Library/Caches/com.apple.LaunchServices-4035-v2.csstore-journal",
++	};
++	uint32_t on = 0;
++
++	if (!PE_parse_boot_argn("sweetlsreset", &on, sizeof(on)) || on != 1) {
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++) {
++		int error = unlink1(vfs_context_kernel(), NULLVP, CAST_USER_ADDR_T(paths[i]),
++		    UIO_SYSSPACE, 0);
++		printf("SWEET LS: unlink %s -> %d\n", paths[i], error);
++	}
++}
+ void (*unmountroot_pre_hook)(void);
+ #endif
+ void set_rootvnode(vnode_t);
+@@ -1064,6 +1093,8 @@ bsd_init(void)
+ 	bsd_init_kprintf("calling siginit\n");
+ 	siginit(kernproc);
+ 
++	sweet_ls_reset();
++
+ 	bsd_init_kprintf("calling bsd_utaskbootstrap\n");
+ 	bsd_utaskbootstrap();
+ 

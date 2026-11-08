@@ -1,0 +1,150 @@
+--- a/osfmk/kern/ipc_kobject.c
++++ b/osfmk/kern/ipc_kobject.c
+@@ -158,6 +158,122 @@
+ 
+ static void ipc_kobject_subst_once_no_senders(ipc_port_t, mach_msg_type_number_t);
+ 
++/*
++ * iOS 18 userland on this xnu-8796 kernel (docs/IOS18_PORT.md, sweetarm64e=1).
++ *
++ * xnu-10002+ replaced the kernel side of task routines 3403/3404 (same
++ * msgh_ids) by _kernelrpc_mach_ports_register3 / _kernelrpc_mach_ports_lookup3:
++ * three plain mach_port_t arguments instead of one OOL array of ports.
++ *   register3 request: header, body{3}, 3 x port descriptor (COPY_SEND), no NDR
++ *   lookup3 reply:     header, body{3}, 3 x port descriptor (MOVE_SEND), no NDR
++ * iOS 18's libsystem_kernel validates exactly that (size 0x40, 3 descriptors,
++ * no NDR) and returns MIG_TYPE_ERROR (-300) for the old OOL reply, which made
++ * launchd 18 exit with "mach_ports_lookup() failed: -300".
++ * The two layouts cannot share a MIG stub, so intercept here:
++ *  - lookup (request has no arguments, identical for both layouts): only for
++ *    arm64e callers, with sweetarm64e=1; arm64 (iOS 16) callers keep the OOL reply.
++ *  - register: by request shape (3 descriptors, size of the new layout); the
++ *    old request (1 OOL descriptor + NDR + count) has a different size.
++ */
++#define SWEET_MSGH_ID_PORTS_REGISTER 3403
++#define SWEET_MSGH_ID_PORTS_LOOKUP   3404
++
++extern bool sweet_arm64e_enabled(void);
++extern bool sweet_proc_is_arm64e(struct proc *p);
++
++#pragma pack(push, 4)
++typedef struct {
++	mach_msg_header_t Head;
++	mach_msg_body_t msgh_body;
++	mach_msg_port_descriptor_t port[TASK_PORT_REGISTER_MAX];
++} sweet_ports3_msg_t;
++#pragma pack(pop)
++
++static bool
++sweet_ports3_register_shape(const mach_msg_header_t *hdr)
++{
++	const sweet_ports3_msg_t *m = (const sweet_ports3_msg_t *)hdr;
++
++	if (!(hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX) ||
++	    hdr->msgh_size != sizeof(sweet_ports3_msg_t) ||
++	    m->msgh_body.msgh_descriptor_count != TASK_PORT_REGISTER_MAX) {
++		return false;
++	}
++	for (int i = 0; i < TASK_PORT_REGISTER_MAX; i++) {
++		if (m->port[i].type != MACH_MSG_PORT_DESCRIPTOR) {
++			return false;
++		}
++	}
++	return true;
++}
++
++/* Returns true when the request was answered here (reply filled in). */
++static bool
++sweet_ports3_intercept(
++	mach_msg_header_t *req_hdr,
++	mach_msg_header_t *reply_hdr,
++	struct proc       *curproc)
++{
++	mig_reply_error_t *err = (mig_reply_error_t *)reply_hdr;
++	sweet_ports3_msg_t *out = (sweet_ports3_msg_t *)reply_hdr;
++	sweet_ports3_msg_t *in = (sweet_ports3_msg_t *)req_hdr;
++	task_t target_task;
++	kern_return_t kr;
++
++	if (req_hdr->msgh_id == SWEET_MSGH_ID_PORTS_LOOKUP) {
++		mach_port_array_t ports = NULL;
++		mach_msg_type_number_t cnt = 0;
++
++		if (!sweet_arm64e_enabled() || !sweet_proc_is_arm64e(curproc)) {
++			return false;
++		}
++		if ((req_hdr->msgh_bits & MACH_MSGH_BITS_COMPLEX) ||
++		    req_hdr->msgh_size != sizeof(mach_msg_header_t)) {
++			err->RetCode = MIG_BAD_ARGUMENTS;
++			return true;
++		}
++		target_task = convert_port_to_task_mig(req_hdr->msgh_remote_port);
++		kr = mach_ports_lookup(target_task, &ports, &cnt);
++		task_deallocate_mig(target_task);
++		if (kr != KERN_SUCCESS) {
++			err->RetCode = kr;
++			return true;
++		}
++		assert(cnt == TASK_PORT_REGISTER_MAX);
++		for (int i = 0; i < TASK_PORT_REGISTER_MAX; i++) {
++			out->port[i].name = ports[i];
++			out->port[i].disposition = MACH_MSG_TYPE_PORT_SEND;
++			out->port[i].type = MACH_MSG_PORT_DESCRIPTOR;
++		}
++		kfree_type(ipc_port_t, TASK_PORT_REGISTER_MAX, ports);
++		out->msgh_body.msgh_descriptor_count = TASK_PORT_REGISTER_MAX;
++		out->Head.msgh_bits |= MACH_MSGH_BITS_COMPLEX;
++		out->Head.msgh_size = (mach_msg_size_t)sizeof(sweet_ports3_msg_t);
++		return true;
++	}
++
++	if (req_hdr->msgh_id == SWEET_MSGH_ID_PORTS_REGISTER &&
++	    sweet_arm64e_enabled() && sweet_ports3_register_shape(req_hdr)) {
++		mach_port_array_t ports;
++
++		ports = kalloc_type(mach_port_t, TASK_PORT_REGISTER_MAX,
++		    Z_WAITOK | Z_ZERO | Z_NOFAIL);
++		for (int i = 0; i < TASK_PORT_REGISTER_MAX; i++) {
++			ports[i] = in->port[i].name;
++		}
++		target_task = convert_port_to_task_mig(req_hdr->msgh_remote_port);
++		/* takes over the rights and the array on success */
++		kr = mach_ports_register(target_task, ports, TASK_PORT_REGISTER_MAX);
++		task_deallocate_mig(target_task);
++		if (kr != KERN_SUCCESS) {
++			kfree_type(mach_port_t, TASK_PORT_REGISTER_MAX, ports);
++		}
++		err->RetCode = kr;
++		return true;
++	}
++	return false;
++}
++
+ IPC_KOBJECT_DEFINE(IKOT_MEMORY_OBJECT);   /* vestigial, no real instance */
+ IPC_KOBJECT_DEFINE(IKOT_PORT_SUBST_ONCE,
+     .iko_op_no_senders = ipc_kobject_subst_once_no_senders);
+@@ -404,6 +520,11 @@
+ 	} else {
+ 		reply_size = ptr->size;
+ 	}
++	if (request_msgh_id == SWEET_MSGH_ID_PORTS_LOOKUP &&
++	    reply_size < sizeof(sweet_ports3_msg_t)) {
++		/* iOS 18 layout reply (3 port descriptors) is larger than the old one */
++		reply_size = sizeof(sweet_ports3_msg_t);
++	}
+ 
+ 	/*
+ 	 * MIG should really assure no data leakage -
+@@ -444,7 +565,11 @@
+ #endif /* CONFIG_MACF */
+ 
+ 		__BeforeKobjectServerTrace(idx);
+-		(*ptr->routine)(req_hdr, reply_hdr);
++		if (!((request_msgh_id == SWEET_MSGH_ID_PORTS_LOOKUP ||
++		    request_msgh_id == SWEET_MSGH_ID_PORTS_REGISTER) &&
++		    sweet_ports3_intercept(req_hdr, reply_hdr, curproc))) {
++			(*ptr->routine)(req_hdr, reply_hdr);
++		}
+ 		__AfterKobjectServerTrace(idx);
+ 
+ #if CONFIG_MACF

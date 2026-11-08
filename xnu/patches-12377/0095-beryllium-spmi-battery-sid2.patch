@@ -1,0 +1,39 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 1981490ad6506cf2701939dea82b3420dc4f4d34..7f525c7cc8b144bf1f75e9aba3bf5846b73cd680 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -11,6 +11,7 @@
+ #include <machine/machine_routines.h>
+ #include <IOKit/IOLocks.h>
+ #include "sweet_spmi.h"
++#include "sweet_board.h"
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ 
+@@ -86,11 +87,22 @@ sweet_spmi_init(void)
+ int
+ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ {
+-	/* Restrict access to the battery blocks; keys retain their own lanes. */
++	/*
++	 * Restrict access to the battery blocks; keys retain their own lanes.
++	 * sweet: PM6150 (SID 0) charger 0x10-0x13 and QG 0x48. Poco F1: PMI8998
++	 * (SID 2) SMB2 charger CHGR 0x10 / USBIN 0x13 and FG gen3 BATT_SOC 0x40 /
++	 * BATT_INFO 0x41 (patch 0092 read SID 2 and was refused here).
++	 */
+ 	unsigned peripheral = addr >> 8;
+-	if (!sp_ready || !out || sid != 0 || addr > 0xffffu ||
+-	    (peripheral != 0x10 && peripheral != 0x11 && peripheral != 0x12 &&
+-	    peripheral != 0x13 && peripheral != 0x48)) {
++	bool allowed;
++	if (sweet_board_beryllium()) {
++		allowed = sid == 2 && (peripheral == 0x10 || peripheral == 0x13 ||
++		    peripheral == 0x40 || peripheral == 0x41);
++	} else {
++		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
++		    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
++	}
++	if (!sp_ready || !out || addr > 0xffffu || !allowed) {
+ 		return -1;
+ 	}
+ 	IOLockLock(sp_lock);

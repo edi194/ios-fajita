@@ -1,0 +1,51 @@
+diff --git a/osfmk/console/serial_console.c b/osfmk/console/serial_console.c
+index 17e9ee267928293117d1d83d1394709c5c436819..892c26c81e2b442e26f5883f5a7528a7ee35770f 100644
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -548,6 +548,14 @@ void
+ console_write(char *str, int size)
+ {
+ 	if (disableConsoleOutput) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * xnu-11215 returns here before the ring and _cnputs() (8796 only checked
++		 * in _cnputs, where the persistent log / USB live log hook sits). Once
++		 * the graphics console takes over printf would vanish from both logs.
++		 */
++		sweet_log_append(str, size);
++#endif
+ 		return;
+ 	}
+ 
+@@ -633,6 +641,9 @@ void
+ console_write_unbuffered(char c)
+ {
+ 	if (disableConsoleOutput) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_log_append(&c, 1);
++#endif
+ 		return;
+ 	}
+ 
+diff --git a/pexpert/arm/pe_kprintf.c b/pexpert/arm/pe_kprintf.c
+index 65144c74239c3673649f9496a717be6fc6a316cd..6c319b399943e2c69b1f83e628da09ff9d2f3040 100644
+--- a/pexpert/arm/pe_kprintf.c
++++ b/pexpert/arm/pe_kprintf.c
+@@ -153,9 +153,17 @@ kprintf(const char *fmt, ...)
+ #pragma clang diagnostic pop
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++extern void sweet_log_append(const char *c, int size);  /* bsd/dev/sweet_ufs.c */
++#endif
++
+ static void
+ serial_putc_crlf(char c)
+ {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* kprintf() does not go through the console ring: tee it into the persistent / live log */
++	sweet_log_append(&c, 1);
++#endif
+ 	if (c == '\n') {
+ 		uart_putc('\r');
+ 	}

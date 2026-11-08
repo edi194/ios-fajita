@@ -1,0 +1,22 @@
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index 9b6d8284dee44e96b016468f2e2ac3831da05029..d41623d05fb5609bf6280ce9f5aaa21fe706ede4 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -2008,6 +2008,17 @@ proc_handle_critical_exit(proc_t p, int rv)
+ 	proc_crash_coredump(p);
+ 
+ 	sync(p, (void *)NULL, (int *)NULL);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * sweet: get the console ring (sweet_crash_log's lines for this process included) onto userdata before the panic.
++	 * The flusher runs about once a second, and launchd dying right after the root mount panicked before its first
++	 * flush (first iOS 26 boots: tools/sweet-log-pull.sh still found the previous iOS 18 log).
++	 */
++	{
++		extern void sweet_log_sync(void);
++		sweet_log_sync();
++	}
++#endif
+ 	const uint64_t panic_options_mask = DEBUGGER_OPTION_INITPROC_PANIC | DEBUGGER_OPTION_USERSPACE_INITIATED_PANIC;
+ 
+ 	if (p->p_exit_reason == OS_REASON_NULL) {

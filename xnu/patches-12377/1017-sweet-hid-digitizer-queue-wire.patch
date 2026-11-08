@@ -1,0 +1,130 @@
+From: Bergamota
+Subject: [PATCH] sweet: queued digitizer events in iOS 26's 160-byte layout (createBytes stays legacy)
+
+---
+diff --git a/iokit/Kernel/arm/hid/IOHIDEvent.cpp b/iokit/Kernel/arm/hid/IOHIDEvent.cpp
+--- a/iokit/Kernel/arm/hid/IOHIDEvent.cpp
++++ b/iokit/Kernel/arm/hid/IOHIDEvent.cpp
+@@ -1534,6 +1534,98 @@
+     SET_EVENT_VALUE(this, key, value, options, Double);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/*
++ * iOS 26 has two digitizer layouts. Events a kernel service queues (IOHIDEventServiceQueue -> getLength/readBytes ->
++ * appendBytes) are read in the native 160-byte layout: position, pressure, twist and orientation as doubles,
++ * generationCount / willUpdateMask / didUpdateMask at 0x90/0x94/0x98. Our legacy 104-byte IOFixed record reached
++ * backboardd shifted (bbhook trace, boot 25: TransducerType Unknown, TransducerIndex = our eventMask, X/Y 0), so
++ * no touch ever began. IOHIDEventCreateData/CreateWithData in user space still use the legacy layout, so
++ * createBytes stays legacy. The kernel keeps its IOFixed struct; only the queued bytes are converted.
++ */
++struct sweet_digitizer_wire {
++    uint32_t size, type, options;
++    uint8_t  depth, reserved[3];
++    uint64_t x, y, z;
++    uint32_t index, transducerType, identity, eventMask, childEventMask, buttonMask;
++    uint64_t pressure, auxPressure, twist;
++    uint32_t orientationType, pad;
++    uint64_t orientation[6];
++    uint32_t generationCount, willUpdateMask, didUpdateMask, tail;
++};
++static_assert(sizeof(struct sweet_digitizer_wire) == 160, "iOS 26 digitizer record");
++static_assert(__builtin_offsetof(struct sweet_digitizer_wire, orientation) == 0x60, "iOS 26 orientation offset");
++static_assert(__builtin_offsetof(struct sweet_digitizer_wire, generationCount) == 0x90, "iOS 26 generation offset");
++
++/* IEEE 754 double bits of a 16.16 fixed value, integer only (no FP in the kernel) */
++static uint64_t
++sweet_fixed_to_double_bits(int32_t v)
++{
++    if (v == (int32_t)0x80000000) {
++        return 0x7ff8000000000000ULL;   /* kIOFixedNaN -> NaN */
++    }
++    if (v == 0) {
++        return 0;
++    }
++    uint64_t sign = v < 0 ? (1ULL << 63) : 0;
++    uint32_t mag = v < 0 ? (uint32_t)(-(int64_t)v) : (uint32_t)v;
++    unsigned top = 31u - (unsigned)__builtin_clz(mag);          /* value = mag * 2^-16, leading bit at 2^(top-16) */
++    uint64_t exp = (uint64_t)(top + 1023u - 16u);
++    uint64_t frac = ((uint64_t)mag << (52u - top)) & 0xfffffffffffffULL;
++    return sign | (exp << 52) | frac;
++}
++
++static IOByteCount
++sweet_wire_size(const IOHIDEventData *d)
++{
++    return d->type == kIOHIDEventTypeDigitizer && d->size == sizeof(IOHIDDigitizerEventData) ?
++        sizeof(struct sweet_digitizer_wire) : d->size;
++}
++
++static void
++sweet_wire_write(const IOHIDEventData *d, void *out)
++{
++    if (sweet_wire_size(d) == d->size) {
++        bcopy(d, out, d->size);
++        return;
++    }
++    const IOHIDDigitizerEventData *v = (const IOHIDDigitizerEventData *)d;
++    struct sweet_digitizer_wire w;
++    bzero(&w, sizeof(w));
++    w.size = sizeof(w);
++    w.type = d->type;
++    bcopy(&v->options, &w.options, sizeof(w.options));
++    w.depth = v->depth;
++    w.x = sweet_fixed_to_double_bits(v->position.x);
++    w.y = sweet_fixed_to_double_bits(v->position.y);
++    w.z = sweet_fixed_to_double_bits(v->position.z);
++    w.index = v->transducerIndex;
++    w.transducerType = v->transducerType;
++    w.identity = v->identity;
++    w.eventMask = v->eventMask;
++    w.childEventMask = v->childEventMask;
++    w.buttonMask = v->buttonMask;
++    w.pressure = sweet_fixed_to_double_bits(v->pressure);
++    w.auxPressure = sweet_fixed_to_double_bits(v->auxPressure);
++    w.twist = sweet_fixed_to_double_bits(v->twist);
++    w.orientationType = v->orientationType;
++    int32_t o[6];
++    bcopy(&v->orientation, o, sizeof(o));
++    for (unsigned i = 0; i < 6; i++) {
++        w.orientation[i] = sweet_fixed_to_double_bits(o[i]);
++    }
++    w.generationCount = v->generationCount;
++    w.willUpdateMask = v->willUpdateMask;
++    w.didUpdateMask = v->didUpdateMask;
++    bcopy(&w, out, sizeof(w));
++}
++#define SWEET_WIRE_SIZE(d)          sweet_wire_size(d)
++#define SWEET_WIRE_WRITE(d, out)    sweet_wire_write((d), (out))
++#else
++#define SWEET_WIRE_SIZE(d)          ((d)->size)
++#define SWEET_WIRE_WRITE(d, out)    bcopy((d), (out), (d)->size)
++#endif
++
+ //==============================================================================
+ // IOHIDEvent::getLength
+ //==============================================================================
+@@ -1548,7 +1640,7 @@
+ //==============================================================================
+ IOByteCount IOHIDEvent::getLength(UInt32 * count)
+ {
+-    IOByteCount length = _data->size;
++    IOByteCount length = SWEET_WIRE_SIZE(_data);
+ 
+     length += sizeof(IOHIDSystemQueueElement);
+ 
+@@ -1579,12 +1671,12 @@
+ {
+     IOByteCount size = 0;
+ 
+-    size = _data->size;
++    size = SWEET_WIRE_SIZE(_data);
+ 
+     if ( size > withLength )
+         return 0;
+ 
+-    bcopy(_data, bytes, size);
++    SWEET_WIRE_WRITE(_data, bytes);
+ 
+     if ( _children )
+     {

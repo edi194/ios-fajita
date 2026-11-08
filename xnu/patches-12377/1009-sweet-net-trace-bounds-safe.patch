@@ -1,0 +1,21 @@
+diff --git a/bsd/netinet/in.c b/bsd/netinet/in.c
+index 1ad18b491d644d287cdcc9cd96b2b591e0be3ac3..41cf21f2daf4e61f19eee15326e6d431327b1b7c 100644
+--- a/bsd/netinet/in.c
++++ b/bsd/netinet/in.c
+@@ -1141,7 +1141,15 @@ in_control(struct socket *so, u_long cmd, caddr_t __sized_by(IOCPARM_LEN(cmd)) d
+ 	if ((cmd == SIOCAIFADDR || cmd == SIOCDIFADDR) && ifp != NULL) {
+ 		static int sweet_in_logged;
+ 		if (sweet_in_logged++ < 100) {
+-			const uint8_t *a = (const uint8_t *)&((struct in_aliasreq *)(void *)data)->ifra_addr.sin_addr;
++			/*
++			 * 12377 builds this file with -fbounds-safety and data is __sized_by(IOCPARM_LEN(cmd)): SIOCDIFADDR
++			 * carries a 32-byte struct ifreq, so casting it to the 64-byte struct in_aliasreq trapped (iOS 26
++			 * boot: "Bounds safety trap" in in_control). The address is at the same offset in both: copy 4 bytes.
++			 */
++			uint8_t a[4] = { 0 };
++			if (IOCPARM_LEN(cmd) >= offsetof(struct ifreq, ifr_addr) + offsetof(struct sockaddr_in, sin_addr) + sizeof(a)) {
++				memcpy(a, data + offsetof(struct ifreq, ifr_addr) + offsetof(struct sockaddr_in, sin_addr), sizeof(a));
++			}
+ 			char pname[20];
+ 			proc_name(proc_pid(p), pname, sizeof(pname));
+ 			printf("SWEET NET: %s %s %s %u.%u.%u.%u\n", pname, if_name(ifp),

@@ -1,0 +1,18 @@
+diff --git a/osfmk/vm/vm_map_internal.h b/osfmk/vm/vm_map_internal.h
+index d798dffee876c39e156391beb2daa25adb00c786..48cc8508ded0bb23be9fc8c828a8edd3cf518249 100644
+--- a/osfmk/vm/vm_map_internal.h
++++ b/osfmk/vm/vm_map_internal.h
+@@ -991,7 +991,12 @@ static inline bool
+ VM_MAP_POLICY_WRITABLE_SHARED_REGION(
+ 	vm_map_t map __unused)
+ {
+-#if __x86_64__
++#if __x86_64__ || defined(ARM64_BOARD_CONFIG_SWEET)
++	/*
++	 * sweet: no TPRO in the CPU, so iOS 26's dyld makes the shared cache's __TPRO_CONST writable with vm_protect(RW)
++	 * (launchd, first iOS 26 boots: refused against the task's r--/r-- shared region submap entry, then SIGSEGV).
++	 * With this policy, as on x86_64, the submap entry's max is VM_PROT_ALL and such a write gets a private COW copy.
++	 */
+ 	return true;
+ #else /* __x86_64__ */
+ 	if (VM_MAP_IS_EXOTIC(map)) {

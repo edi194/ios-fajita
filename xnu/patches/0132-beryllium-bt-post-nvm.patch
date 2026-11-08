@@ -1,0 +1,251 @@
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -472,6 +472,7 @@
+ #define SE_UART_TX_PARITY       0x2a4u
+ #define SE_UART_RX_PARITY       0x2a8u
+ #define SE_UART_MANUAL_RFR      0x2acu
++#define SE_GENI_IOS             0x908u  /* bit 1 = IO2_DATA_IN = CTS pin level (low = asserted), bit 0 = RX */
+ #define SE_BYTE_GRAN            0x254u
+ #define SE_M_CMD0               0x600u
+ #define SE_M_CMD_CTRL           0x604u
+@@ -535,7 +536,8 @@
+ 	bool ibs_asleep, ibs_ack_pending;       /* hci_qca in-band sleep: controller asleep / WAKE_ACK owed */
+ 	unsigned ibs_logged, rx_st, rx_left, raw_budget, ibs_sleeps;   /* IBS log budget, H4 parser state, raw RX log budget, SLEEP_INDs seen */
+ 	unsigned ev_cc, ev_other;       /* events seen while downloading firmware */
+-	unsigned bt_fw, bt_baud, bt_fast, bt_ibs, bt_poweroff;   /* sweetbt* boot-args */
++	unsigned bt_fw, bt_baud, bt_fast, bt_ibs, bt_poweroff;
++	unsigned bt_nvmdelay, bt_probe, bt_nowake, bt_rfr, bt_noflow;   /* sweetbt* boot-args */
+ 	unsigned stage, delay_s;
+ 	int sleep_chan;
+ 	bool started;
+@@ -1247,10 +1249,42 @@
+ wl_flow(bool hw)
+ {
+ 	uint32_t v = wl_rd(wl.se, SE_UART_TX_TRANS_CFG);
++	hw = hw && !wl.bt_noflow;                     /* sweetbtnoflow=1: CTS never honoured */
+ 	v = hw ? (v & ~UART_CTS_MASK) : (v | UART_CTS_MASK);
+ 	wl_wr(wl.se, SE_UART_TX_TRANS_CFG, v);
+ }
+ 
++/* ms since boot, for the IBS / raw RX trace */
++static unsigned
++wl_ms(void)
++{
++	uint64_t t, ns;
++	clock_get_uptime(&t);
++	absolutetime_to_nanoseconds(t, &ns);
++	return (unsigned)(ns / 1000000ull);
++}
++
++/*
++ * Flow control state for the post-NVM diagnosis: the GENI UART config (CTS mask = bit 1 of TX_TRANS_CFG,
++ * auto RFR unless MANUAL_RFR bit 31 is set: bit 0 ready, bit 1 not ready), GENI_IOS (CTS pin level, bit 1,
++ * active low) and the four TLMM input levels (CTS gpio45, RFR gpio46, TX gpio47, RX gpio48).
++ */
++static void
++wl_flow_diag(const char *label)
++{
++	uint32_t pin[4];
++	for (unsigned i = 0; i < 4; i++) {
++		pin[i] = wl_rd(wl.tlmm, (45 + i) * 0x1000u + 4) & 1;
++	}
++	printf("SWEET WLAN: BT flow (%s) at %u ms: baud %u tx_trans_cfg %#x (CTS %s) rx_trans_cfg %#x manual_rfr %#x "
++	    "ios %#x (CTS pin %s) gpio in: CTS %u RFR %u TX %u RX %u, s_status %#x rx_fifo %#x\n", label,
++	    wl_ms(), wl.baud, wl_rd(wl.se, SE_UART_TX_TRANS_CFG),
++	    (wl_rd(wl.se, SE_UART_TX_TRANS_CFG) & UART_CTS_MASK) ? "ignored" : "honoured",
++	    wl_rd(wl.se, SE_UART_RX_TRANS_CFG), wl_rd(wl.se, SE_UART_MANUAL_RFR), wl_rd(wl.se, SE_GENI_IOS),
++	    (wl_rd(wl.se, SE_GENI_IOS) & 2) ? "high = controller not ready" : "low = controller ready", pin[0], pin[1],
++	    pin[2], pin[3], wl_rd(wl.se, SE_STATUS), wl_rd(wl.se, SE_RX_FIFO_STATUS));
++}
++
+ /* geni_se_config_packing(8, 4, false, true, true) */
+ static void
+ wl_packing(void)
+@@ -1360,16 +1394,6 @@
+  * 0x04, code, length, payload), acted on and kept out of wl.rxq. The ACK for a
+  * controller wake-up is sent later by wl_ibs_service(), never in the middle of a TX packet.
+  */
+-/* ms since boot, for the IBS / raw RX trace */
+-static unsigned
+-wl_ms(void)
+-{
+-	uint64_t t, ns;
+-	clock_get_uptime(&t);
+-	absolutetime_to_nanoseconds(t, &ns);
+-	return (unsigned)(ns / 1000000ull);
+-}
+-
+ #define IBS_SLEEP_IND   0xfeu
+ #define IBS_WAKE_IND    0xfdu
+ #define IBS_WAKE_ACK    0xfcu
+@@ -1619,7 +1643,9 @@
+ 		return false;
+ 	}
+ 	wl_ibs_service();
+-	wl_ibs_wake();
++	if (!wl.bt_nowake) {
++		wl_ibs_wake();
++	}
+ 	wl_pkt[0] = 0x01;
+ 	wl_pkt[1] = (uint8_t)opcode;
+ 	wl_pkt[2] = (uint8_t)(opcode >> 8);
+@@ -1630,6 +1656,23 @@
+ 	return wl_tx_buf(wl_pkt, 4 + plen);
+ }
+ 
++/* does a run of unmatched bytes look like an HCI event with a damaged bit pattern? */
++static void
++wl_garbage_hint(const uint8_t *b, unsigned n)
++{
++	char a[3 * 16 + 1], r[3 * 16 + 1];
++	unsigned oa = 0, or = 0;
++	for (unsigned i = 0; i < n && i < 16; i++) {
++		uint8_t rev = 0;
++		for (unsigned k = 0; k < 8; k++) {
++			rev |= (uint8_t)(((b[i] >> k) & 1) << (7 - k));
++		}
++		oa += (unsigned)snprintf(a + oa, sizeof(a) - oa, "%02x ", b[i] & 0x7f);
++		or += (unsigned)snprintf(r + or, sizeof(r) - or, "%02x ", rev);
++	}
++	printf("SWEET WLAN: BT RX garbage hint (an event would start 04 xx len): MSB cleared: %s| bit reversed: %s\n", a, r);
++}
++
+ /*
+  * Wait for one event of the wanted kind. The event and every byte before it are
+  * removed from the RX queue; rsp = event code, parameter length, parameters
+@@ -1674,6 +1717,7 @@
+ 	}
+ 	if (wl.rxn) {
+ 		wl_print_hex("(unmatched RX bytes at timeout)", wl.rxq, MIN(wl.rxn, 48u));
++		wl_garbage_hint(wl.rxq, MIN(wl.rxn, 16u));
+ 	}
+ 	return ETIMEDOUT;
+ }
+@@ -2116,6 +2160,70 @@
+ }
+ 
+ /*
++ * First command after the NVM. Linux (qca_uart_setup) sends HCI Reset (10 s timeout) right away, with
++ * QCA_IBS_DISABLED set so the host ignores IBS entirely during setup (no wake handshake, SLEEP_IND from the
++ * controller is only noted). Here: sweetbtnowake=1 (default) does the same; with sweetbtprobe=1 (default)
++ * a silent controller is probed further: for the current baud and then 115200, 3200000 and 921600 (the speed
++ * the controller may have fallen back to or switched to when the NVM applied) the Reset is tried directly
++ * and again after an explicit 0xfd wake handshake, 1.5 s each, with the raw RX bytes (sweetbtraw budget)
++ * and the flow control state logged for every step.
++ */
++static int
++wl_bt_post_nvm_reset(uint8_t *rsp, unsigned *rlen)
++{
++	static const unsigned cand[] = { 0, 115200, 3200000, 921600 };
++	unsigned first = wl.baud, div;
++	int err = ETIMEDOUT;
++
++	wl_flow_diag("after NVM");
++	if (wl.bt_rfr) {
++		wl_wr(wl.se, SE_UART_MANUAL_RFR, (1u << 31) | 1u);      /* RFR forced ready */
++		printf("SWEET WLAN: BT flow: RFR forced ready (sweetbtrfr=1)\n");
++		wl_flow_diag("RFR forced");
++	}
++	if (!wl.bt_probe) {
++		return wl_hci_cmd(0x0c03, NULL, 0, rsp, rlen, 10000);   /* qca_send_reset */
++	}
++	for (unsigned i = 0; i < sizeof(cand) / sizeof(cand[0]); i++) {
++		unsigned baud = cand[i] ? cand[i] : first;
++		if (i > 0 && baud == first) {
++			continue;
++		}
++		if (baud != wl.baud) {
++			if (wl_pick_row(baud, &div) < 0 || !wl_baud(baud)) {
++				printf("SWEET WLAN: BT probe: cannot run the UART at %u baud, skipped\n", baud);
++				continue;
++			}
++			wl.rxn = 0;
++			wl_rx_start();
++		}
++		for (unsigned wake = 0; wake < 2; wake++) {
++			wl.raw_budget = 16;
++			wl.rxn = 0;
++			wl_flow_diag(wake ? "probe, before wake" : "probe, before reset");
++			printf("SWEET WLAN: BT probe: HCI Reset at %u baud, %s at %u ms\n", baud,
++			    wake ? "after a 0xfd wake handshake" : "sent directly", wl_ms());
++			if (wake) {
++				wl.ibs_asleep = true;
++				wl_ibs_wake();
++			}
++			if (!wl_hci_send(0x0c03, NULL, 0)) {
++				printf("SWEET WLAN: BT probe: Reset TX failed\n");
++				continue;
++			}
++			err = wl_hci_wait(0x0c03, WL_EVT_CC, rsp, rlen, 1500);
++			wl_flow_diag(err ? "probe, no reply" : "probe, reply");
++			if (!err) {
++				printf("SWEET WLAN: BT probe: Reset answered at %u baud (%s)\n", baud,
++				    wake ? "after wake" : "direct");
++				return 0;
++			}
++		}
++	}
++	return err;
++}
++
++/*
+  * qca_uart_setup() for QCA_WCN3990 plus hci_qca.c qca_setup(). Order here:
+  * rampatch, 10 ms, NVM, HCI Reset, QCA baud change to wl.bt_baud + Read Local Version
+  * there, Read BD_ADDR. (sweetbtfast=1: baud change first, as Linux does, so the
+@@ -2164,7 +2272,8 @@
+ 	if (!wl_qca_send_tlv("NVM", nbuf, nlen, 0)) {
+ 		goto out;
+ 	}
+-	wl_sleep(10);
++	printf("SWEET WLAN: BT fw: waiting %u ms after the NVM (sweetbtnvmdelay; Linux: none)\n", wl.bt_nvmdelay);
++	wl_sleep(wl.bt_nvmdelay);
+ 	wl.raw_budget = 40;     /* log the raw RX bytes (with timestamps) around the reset and the wake-up */
+ 	/*
+ 	 * qca_send_reset(): plain HCI Reset, HCI_INIT_TIMEOUT (10 s). Linux has no further delay after the NVM
+@@ -2178,20 +2287,26 @@
+ 			wl_sleep(10);
+ 		}
+ 	}
+-	err = wl_hci_cmd(0x0c03, NULL, 0, rsp, &rlen, 10000);      /* qca_send_reset */
++	err = wl_bt_post_nvm_reset(rsp, &rlen);
+ 	if (err) {
+ 		printf("SWEET WLAN: BT fw: HCI Reset after download: no event (%d)\n", err);
+ 		goto out;
+ 	}
+ 	wl_print_hex("Reset event after download", rsp, rlen);
++	wl.bt_nowake = 0;       /* setup's QCA_IBS_DISABLED ends with the reset: from here on the wake handshake applies */
+ 	{
+ 		struct wl_qca_ver nv;
+ 		(void)wl_qca_read_version(&nv, "version after download");
+ 	}
+-	if (!wl.bt_fast && !wl_qca_set_baud(wl.bt_baud)) {
+-		goto out;
+-	}
+-	if (wl.bt_fast && !wl_hci_read_local_version("after download")) {
++	if (!wl.bt_fast || wl.baud != wl.bt_baud) {
++		/* the probe may have found the controller at another speed than the one we set */
++		if (wl.baud != wl.bt_baud) {
++			printf("SWEET WLAN: BT fw: controller is at %u baud, not %u: changing again\n", wl.baud, wl.bt_baud);
++		}
++		if (!wl_qca_set_baud(wl.bt_baud)) {
++			goto out;
++		}
++	} else if (!wl_hci_read_local_version("after download")) {
+ 		goto out;
+ 	}
+ 	err = wl_hci_cmd(0x1009, NULL, 0, rsp, &rlen, 1000);        /* Read_BD_ADDR */
+@@ -2365,6 +2480,14 @@
+ 	(void)PE_parse_boot_argn("sweetbtfast", &wl.bt_fast, sizeof(wl.bt_fast));       /* 1: baud change before the download */
+ 	(void)PE_parse_boot_argn("sweetbtibs", &wl.bt_ibs, sizeof(wl.bt_ibs));          /* 1: Linux NVM IBS/deep-sleep bits */
+ 	(void)PE_parse_boot_argn("sweetbtpoweroff", &wl.bt_poweroff, sizeof(wl.bt_poweroff));
++	wl.bt_nvmdelay = 10;            /* ms after the NVM; Linux: 0 (10 ms only between patch and NVM) */
++	wl.bt_probe = 1;                /* silent after the NVM: try 115200/3200000/921600, with and without wake */
++	wl.bt_nowake = 1;               /* Linux QCA_IBS_DISABLED during setup: no 0xfd wake before commands */
++	(void)PE_parse_boot_argn("sweetbtnvmdelay", &wl.bt_nvmdelay, sizeof(wl.bt_nvmdelay));
++	(void)PE_parse_boot_argn("sweetbtprobe", &wl.bt_probe, sizeof(wl.bt_probe));
++	(void)PE_parse_boot_argn("sweetbtnowake", &wl.bt_nowake, sizeof(wl.bt_nowake));
++	(void)PE_parse_boot_argn("sweetbtrfr", &wl.bt_rfr, sizeof(wl.bt_rfr));          /* 1: force RFR ready after the NVM */
++	(void)PE_parse_boot_argn("sweetbtnoflow", &wl.bt_noflow, sizeof(wl.bt_noflow)); /* 1: ignore CTS (no hw flow control) */
+ 	wl.started = true;
+ 	wl.stage = stage;
+ 	wl.delay_s = delay_s;

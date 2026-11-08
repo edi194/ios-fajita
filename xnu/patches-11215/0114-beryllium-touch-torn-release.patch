@@ -1,0 +1,42 @@
+diff --git a/bsd/dev/sweet_touch.c b/bsd/dev/sweet_touch.c
+index 16175cfdd2487820a7091c846a5a975c2ef832cf..e7f397fbe3300517f6ad5abe6e7069768b4990fd 100644
+--- a/bsd/dev/sweet_touch.c
++++ b/bsd/dev/sweet_touch.c
+@@ -46,6 +46,7 @@ void sweet_touch_init(void);
+ #define NVT_CHIP_ID      0x08u
+ #define NVT_RECORD       6u
+ #define NVT_EMPTY_RELEASE 3u  /* empty frames before an unannounced release */
++#define NVT_BAD_RELEASE   20u /* torn frames in a row before a forced release */
+ 
+ /* Per-board wiring of the touch bus; the GENI SE programming is common. */
+ struct touch_board {
+@@ -684,7 +685,7 @@ touch_novatek(void)
+ 	 * drop torn frames, and release a contact only on its release record or
+ 	 * after NVT_EMPTY_RELEASE empty frames in a row.
+ 	 */
+-	static unsigned empty_frames;
++	static unsigned empty_frames, bad_run;
+ 	uint8_t buf[NVT_RECORD * TOUCH_MAX];
+ 	int x[TOUCH_MAX] = {0}, y[TOUCH_MAX] = {0};
+ 	uint32_t mask = 0, released = 0;
+@@ -744,8 +745,20 @@ touch_novatek(void)
+ 		    buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8]);
+ 	}
+ 	if (verdict == 'b') {
++		/*
++		 * A long run of torn frames while touched (e.g. after the panel
++		 * and its touch IC were power-cycled with the display) must not
++		 * keep a contact down forever: that blocks every new touch.
++		 */
++		if (st.active && ++bad_run >= NVT_BAD_RELEASE) {
++			printf("SWEET TOUCH: %u torn frames in a row while touched; releasing\n", bad_run);
++			bad_run = 0;
++			empty_frames = 0;
++			touch_report(0, x, y);
++		}
+ 		return 0;
+ 	}
++	bad_run = 0;
+ 	if (verdict == 'w') {
+ 		/* keep the vanished contacts where they were; report the rest */
+ 		uint32_t keep = st.active & ~mask & ~released;

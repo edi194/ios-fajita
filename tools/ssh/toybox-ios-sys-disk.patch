@@ -1,0 +1,17 @@
+--- a/lib/portability.c	2026-10-20 08:12:11
++++ b/lib/portability.c	2026-10-20 08:12:11
+@@ -596,7 +596,14 @@
+ }
+ 
+ #if defined(__APPLE__)
++#if __has_include(<sys/disk.h>)
+ #include <sys/disk.h>
++#else
++/* ios-beryllium: the iPhoneOS SDK ships no sys/disk.h; same values as macOS */
++#include <sys/ioccom.h>
++#define DKIOCGETBLOCKSIZE _IOR('d', 24, uint32_t)
++#define DKIOCGETBLOCKCOUNT _IOR('d', 25, uint64_t)
++#endif
+ int get_block_device_size(int fd, unsigned long long* size)
+ {
+   unsigned long block_size, block_count;

@@ -1,0 +1,466 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -62,6 +62,7 @@
+ extern int sweet_ufs_read_part(const char *name, uint64_t off, void *dst, uint64_t len);
+ extern int sweet_ufs_part_size(const char *name, uint8_t *lun, uint64_t *bytes);
+ extern int sweet_rpmh_vreg_set(const char *res, unsigned mv, bool enable);
++extern int sweet_smmu_map_sid(unsigned sid);
+ extern int sweet_rpmh_lookup(const char *res, uint32_t *address);
+ void beryllium_wlan_init(void);
+ /* bsd/dev/beryllium_bt_hci.c: the kernel control the iOS userland talks to */
+@@ -2206,7 +2207,7 @@
+ 	bool intent_asked;
+ 	uint32_t next_liid;
+ 	uint32_t node;                  /* the modem's QRTR node, learned from its packets */
+-	bool hello_seen, announced, tftp, pdm, wlfw_seen, wlfw;
++	bool hello_seen, announced, tftp, pdm, wlfw_seen, wlfw, ce;
+ 	unsigned pdm_reqs;
+ 	char notes[3072];               /* the stage's key events, printed again at the end (ipc_note) */
+ 	uint32_t notes_len;
+@@ -3608,9 +3609,10 @@
+ enum { WF_IND_REGISTER = 0x20, WF_FW_READY_IND = 0x21, WF_CAP = 0x24, WF_BDF_DOWNLOAD = 0x25, WF_CAL_REPORT = 0x26,
+        WF_MSA_READY_IND = 0x2b, WF_MSA_INFO = 0x2d, WF_MSA_READY = 0x2e };
+ enum { WS_OFF, WS_IND, WS_MSA_INFO, WS_MSA_READY, WS_CAP, WS_WAIT_MSA_IND, WS_BDF, WS_CAL, WS_WAIT_FW_READY, WS_READY,
+-       WS_FAILED };
++       WS_CFG, WS_MODE, WS_CE, WS_HTC_READY, WS_MODE_OFF, WS_FAILED };
+ static const char *const wf_state_name[] = { "off", "ind-register", "msa-info", "msa-ready", "cap", "wait msa-ready-ind",
+-	                                     "bdf", "cal-report", "wait fw-ready-ind", "FW READY", "failed" };
++	                                     "bdf", "cal-report", "wait fw-ready-ind", "FW READY", "wlan-cfg", "mode-on",
++	                                     "wait HTC ready", "HTC READY", "mode-off", "failed" };
+ 
+ static struct {
+ 	int state;
+@@ -3788,7 +3790,316 @@
+ 	return ms_assign_list("wlan msa back", wf.reg[k].addr, wf.reg[k].size, vm, cnt, &h, &rw, 1);
+ }
+ 
++/*
++ * ---- data path (sweetce=1, after FW READY): ath10k snoc.c ath10k_snoc_hif_power_up() + hif_start(). The WLAN DMA
++ * streams (iommus = <&apps_smmu 0x40 0x1>) get the shared identity-mapping SMMU bank first (an unmatched stream faults
++ * and resets the SoC), then WLAN_CFG (the target CE, service and shadow tables of snoc.c), WLAN_MODE mission, and
++ * only after the mode-ON response the copy engines (the CE block is powered by then, as in Linux): read indices in
++ * DDR, source rings CE0 (HTC control) / CE3 (WMI), destination rings CE1 (HTT + HTC control) / CE2 (WMI + HTC
++ * control) with buffers posted. Polled (no CE interrupts) until the target's first HTC message, HTC READY; nothing
++ * is sent on the rings yet. WLAN_MODE off again before the modem stops. All DMA memory is a fixed slice below 4 GiB
++ * outside xnu's RAM (like the MPSS metadata at 0xe0000000), mapped non-cacheable, IOVA == PA.
++ */
++#define WCE_MEMBASE_PA          0x18800000ull   /* &wifi reg "membase" */
++#define WCE_MEMBASE_LEN         0x250000u       /* through the CE wrap registers at 0x24c000 */
++#define WCE_POOL_PA             0xe0100000ull
++#define WCE_POOL_LEN            0x100000u
++#define WCE_BASE(ce)            (0x240000u + (ce) * 0x1000u)    /* wcn3990_regs ce0..ce11_base_address */
++#define WCE_RRI_LOW             0x24c004u       /* wcn3990_ce_regs ce_rri_low / high */
++#define WCE_RRI_HIGH            0x24c008u
++#define CE_SR_BA_LO             0x00u
++#define CE_SR_BA_HI             0x04u
++#define CE_SR_SIZE              0x08u
++#define CE_DR_BA_LO             0x0cu
++#define CE_DR_BA_HI             0x10u
++#define CE_DR_SIZE              0x14u
++#define CE_CTRL1                0x18u
++#define CE_SR_WR_IDX            0x3cu
++#define CE_DST_WR_IDX           0x40u
++#define CE_CURRENT_SRRI         0x44u
++#define CE_CURRENT_DRRI         0x48u
++#define CE_SRC_WM               0x4cu
++#define CE_DST_WM               0x50u
++#define CE_CTRL1_DMAX           0xffffu
++#define CE_CTRL1_SRC_SWAP       (1u << 17)
++#define CE_CTRL1_DST_SWAP       (1u << 18)
++#define CE_CTRL1_UPD            (1u << 19)      /* wcn3990_ctrl1_upd: read indices to DDR */
++#define CE_ADDR_HI              0x1fu           /* CE_DESC_ADDR_HI_MASK */
++#define CE_RX_BUF               2048u
++#define WF_WLAN_MODE            0x22u
++#define WF_WLAN_CFG             0x23u
++
++/* target_ce_config_wlan: pipe, dir (1 in, 2 out, 3 inout, 4 host only), nentries, nbytes_max, flags (8 = no intr) */
++static const uint32_t wce_tgt[12][5] = {
++	{ 0, 2, 32, 2048, 0 }, { 1, 1, 32, 2048, 0 }, { 2, 1, 64, 2048, 0 }, { 3, 2, 32, 2048, 0 },
++	{ 4, 2, 256, 256, 8 }, { 5, 2, 1024, 64, 8 }, { 6, 3, 32, 16384, 0 }, { 7, 4, 0, 0, 8 },
++	{ 8, 1, 32, 2048, 0 }, { 9, 1, 32, 2048, 0 }, { 10, 1, 32, 2048, 0 }, { 11, 1, 32, 2048, 0 },
++};
++/* target_service_to_ce_map_wlan, terminator included (ath10k sends it): service, dir, pipe */
++static const uint32_t wce_svc[21][3] = {
++	{ 0x104, 2, 3 }, { 0x104, 1, 2 }, { 0x102, 2, 3 }, { 0x102, 1, 2 }, { 0x101, 2, 3 }, { 0x101, 1, 2 },
++	{ 0x103, 2, 3 }, { 0x103, 1, 2 }, { 0x100, 2, 3 }, { 0x100, 1, 2 }, { 0x001, 2, 0 }, { 0x001, 1, 2 },
++	{ 0xfe00, 2, 0 }, { 0xfe00, 1, 2 }, { 0x300, 2, 4 }, { 0x300, 1, 1 }, { 0xfe00, 2, 5 }, { 0x301, 1, 9 },
++	{ 0x302, 1, 10 }, { 0x600, 1, 11 }, { 0, 0, 0 },
++};
++/* target_shadow_reg_cfg_map: CE id, register (0x3c source write index, 0x40 destination write index) */
++static const uint16_t wce_shadow[12][2] = {
++	{ 0, 0x3c }, { 3, 0x3c }, { 4, 0x3c }, { 5, 0x3c }, { 7, 0x3c }, { 1, 0x40 },
++	{ 2, 0x40 }, { 7, 0x40 }, { 8, 0x40 }, { 9, 0x40 }, { 10, 0x40 }, { 11, 0x40 },
++};
++/* host rings of this step: CE, entries (host side, power of 2), source?, ring offset, buffer offset, dmax */
++static const struct {
++	unsigned ce, n;
++	bool src;
++	uint32_t ring, bufs, dmax;
++} wce_ring[4] = {
++	{ 0, 16, true, 0x1000, 0, 2048 }, { 3, 32, true, 0x2000, 0, 2048 },
++	{ 1, 32, false, 0x3000, 0x10000, 0 }, { 2, 64, false, 0x4000, 0x20000, 0 },
++};
++
++struct wce_desc {                       /* struct ce_desc_64 */
++	uint64_t addr;
++	uint16_t nbytes;
++	uint16_t flags;
++	uint32_t hash;
++};
++
++static struct {
++	vm_offset_t regs, pool;
++	bool pool_ok, mode_on, mode_sent, rings;
++	int prev_state;                 /* the state to report again after mode off */
++	uint32_t sw[4], wr[4];
++	unsigned msgs, logged;
++	uint16_t credits, credit_size;
++	uint8_t max_ep, htc_version;
++} wce;
++
++/* the SMMU bank and the DMA pool, before WLAN_CFG */
++static bool
++wce_prepare(void)
++{
++	int e0 = sweet_smmu_map_sid(0x40), e1 = sweet_smmu_map_sid(0x41);
++	printf("SWEET IPC: wce: apps_smmu WLAN streams 0x40 -> %d, 0x41 -> %d (0 = identity bank)\n", e0, e1);
++	if (e0 || e1) {
++		return false;
++	}
++	if (!wce.pool) {
++		wce.pool = ml_io_map_unmappable(WCE_POOL_PA, WCE_POOL_LEN, VM_WIMG_WCOMB);
++	}
++	if (!wce.pool) {
++		printf("SWEET IPC: wce: DMA pool mapping failed\n");
++		return false;
++	}
++	bzero((void *)wce.pool, WCE_POOL_LEN);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wce.pool_ok = true;
++	return true;
++}
++
+ static void
++wce_send_cfg(void)
++{
++	uint8_t *b = wf.buf;
++	uint32_t n = 7;
++	b[n] = 0x11;                            /* tgt_cfg: u8 count, 12 x 5 u32 */
++	uint16_t l = 1 + 12 * 20;
++	memcpy(b + n + 1, &l, 2);
++	b[n + 3] = 12;
++	memcpy(b + n + 4, wce_tgt, sizeof(wce_tgt));
++	n += 3u + l;
++	b[n] = 0x12;                            /* svc_cfg: u8 count, 21 x 3 u32 */
++	l = 1 + 21 * 12;
++	memcpy(b + n + 1, &l, 2);
++	b[n + 3] = 21;
++	memcpy(b + n + 4, wce_svc, sizeof(wce_svc));
++	n += 3u + l;
++	b[n] = 0x13;                            /* shadow_reg: u8 count, 12 x 2 u16 */
++	l = 1 + 12 * 4;
++	memcpy(b + n + 1, &l, 2);
++	b[n + 3] = 12;
++	memcpy(b + n + 4, wce_shadow, sizeof(wce_shadow));
++	n += 3u + l;
++	wf_request(WF_WLAN_CFG, b, n, WS_CFG);
++}
++
++static void
++wce_send_mode(uint32_t mode, int next)
++{
++	uint8_t zero = 0;
++	uint32_t n = 7;
++	if (mode == 0) {
++		wce.mode_sent = true;
++	}
++	wf_tlv(wf.buf, &n, 0x01, &mode, 4);     /* mode: 0 mission, 4 off */
++	wf_tlv(wf.buf, &n, 0x10, &zero, 1);     /* hw_debug */
++	wf_request(WF_WLAN_MODE, wf.buf, n, next);
++}
++
++static struct wce_desc *
++wce_desc(unsigned r, uint32_t i)
++{
++	return (struct wce_desc *)(wce.pool + wce_ring[r].ring) + i;
++}
++
++/* ath10k_ce_alloc_rri() + ath10k_ce_init_src_ring() / ath10k_ce_init_dest_ring() + ath10k_snoc_rx_post() */
++static bool
++wce_up(void)
++{
++	if (!wce.regs) {
++		wce.regs = ml_io_map(WCE_MEMBASE_PA, WCE_MEMBASE_LEN);
++	}
++	if (!wce.regs) {
++		return false;
++	}
++	vm_offset_t m = wce.regs;
++	/* the first access to the CE block: a NoC timeout here would freeze the SoC (as it would in Linux) */
++	printf("SWEET IPC: wce: mode on: first access to the CE registers at %#llx\n", WCE_MEMBASE_PA + WCE_BASE(0));
++	sweet_log_sync();
++	wl_sleep(200);
++	wl_wr(m, WCE_RRI_LOW, (uint32_t)WCE_POOL_PA);
++	wl_wr(m, WCE_RRI_HIGH, (uint32_t)(WCE_POOL_PA >> 32) & CE_ADDR_HI);
++	for (unsigned ce = 0; ce < 12; ce++) {
++		wl_wr(m, WCE_BASE(ce) + CE_CTRL1, wl_rd(m, WCE_BASE(ce) + CE_CTRL1) | CE_CTRL1_UPD);
++	}
++	for (unsigned r = 0; r < 4; r++) {
++		uint32_t b = WCE_BASE(wce_ring[r].ce), n = wce_ring[r].n, mask = n - 1;
++		uint64_t pa = WCE_POOL_PA + wce_ring[r].ring;
++		uint32_t c1 = wl_rd(m, b + CE_CTRL1);
++		if (wce_ring[r].src) {
++			wce.sw[r] = wl_rd(m, b + CE_CURRENT_SRRI) & mask;
++			wce.wr[r] = wl_rd(m, b + CE_SR_WR_IDX) & mask;
++			wl_wr(m, b + CE_SR_BA_LO, (uint32_t)pa);
++			wl_wr(m, b + CE_SR_BA_HI, (wl_rd(m, b + CE_SR_BA_HI) & ~CE_ADDR_HI) | ((uint32_t)(pa >> 32) & CE_ADDR_HI));
++			wl_wr(m, b + CE_SR_SIZE, n);
++			wl_wr(m, b + CE_CTRL1, (c1 & ~(CE_CTRL1_DMAX | CE_CTRL1_SRC_SWAP)) | (wce_ring[r].dmax & CE_CTRL1_DMAX));
++			wl_wr(m, b + CE_SRC_WM, (wl_rd(m, b + CE_SRC_WM) & ~0xffffffffu) | (n & 0xffff));
++		} else {
++			wce.sw[r] = wl_rd(m, b + CE_CURRENT_DRRI) & mask;
++			wce.wr[r] = wl_rd(m, b + CE_DST_WR_IDX) & mask;
++			wl_wr(m, b + CE_DR_BA_LO, (uint32_t)pa);
++			wl_wr(m, b + CE_DR_BA_HI, (wl_rd(m, b + CE_DR_BA_HI) & ~CE_ADDR_HI) | ((uint32_t)(pa >> 32) & CE_ADDR_HI));
++			wl_wr(m, b + CE_DR_SIZE, n);
++			wl_wr(m, b + CE_CTRL1, c1 & ~CE_CTRL1_DST_SWAP);
++			wl_wr(m, b + CE_DST_WM, (wl_rd(m, b + CE_DST_WM) & ~0xffffffffu) | (n & 0xffff));
++			/* fill the free slots (CE_RING_DELTA(mask, wr, sw - 1): a full ring keeps one empty); slot i uses buffer i */
++			uint32_t wr = wce.wr[r], nfree = (wce.sw[r] - 1 - wr) & mask;
++			for (uint32_t k = 0; k < nfree; k++) {
++				struct wce_desc *d = wce_desc(r, wr);
++				d->addr = (WCE_POOL_PA + wce_ring[r].bufs + (uint64_t)wr * CE_RX_BUF) & 0x7ffffffffull;
++				d->nbytes = 0;
++				wr = (wr + 1) & mask;
++			}
++			__asm__ volatile ("dsb sy" ::: "memory");
++			wce.wr[r] = wr;
++			wl_wr(m, b + CE_DST_WR_IDX, wr);
++		}
++		printf("SWEET IPC: wce: CE%u %s ring %u entries at %#llx: sw %u wr %u, ctrl1 %#x\n", wce_ring[r].ce,
++		    wce_ring[r].src ? "source" : "destination", n, pa, wce.sw[r], wce.wr[r], wl_rd(m, b + CE_CTRL1));
++	}
++	wce.rings = true;
++	return true;
++}
++
++/* one received HTC message (ath10k_htc_rx_completion_handler: 8-byte header, endpoint 0 = control) */
++static void
++wce_htc(unsigned ce, const uint8_t *p, uint32_t len)
++{
++	wce.msgs++;
++	if (wce.logged < 8) {
++		char hex[3 * 32 + 1];
++		uint32_t hl = 0;
++		for (uint32_t i = 0; i < MIN(len, 32u); i++) {
++			hl += (uint32_t)snprintf(hex + hl, sizeof(hex) - hl, "%02x ", p[i]);
++		}
++		wce.logged++;
++		printf("SWEET IPC: wce: CE%u message %u bytes: %s\n", ce, len, hex);
++	}
++	if (len < 8 + 8) {
++		return;
++	}
++	uint16_t hlen, id;
++	memcpy(&hlen, p + 2, 2);
++	memcpy(&id, p + 8, 2);
++	if (p[0] == 0 && id == 1 && wf.state == WS_CE) {   /* ATH10K_HTC_MSG_READY_ID */
++		memcpy(&wce.credits, p + 10, 2);
++		memcpy(&wce.credit_size, p + 12, 2);
++		wce.max_ep = p[14];
++		wce.htc_version = hlen >= 12 && len >= 20 ? p[16] : 0xff;  /* ath10k_htc_ready_extended */
++		printf("SWEET IPC: wce: HTC READY: %u credits of %u bytes, %u endpoints, HTC version %u: the WCN3990 "
++		    "talks to the host\n", wce.credits, wce.credit_size, wce.max_ep, wce.htc_version);
++		ipc_note(" wce HTC-READY %u x %u ep %u v %u;", wce.credits, wce.credit_size, wce.max_ep, wce.htc_version);
++		wf.state = WS_HTC_READY;
++	}
++}
++
++/* destination rings: ath10k_ce_completed_recv_next_nolock() (nbytes != 0 = done), slot reposted at once */
++static void
++wce_poll(void)
++{
++	if (!wce.rings) {
++		return;
++	}
++	for (unsigned r = 0; r < 4; r++) {
++		if (wce_ring[r].src) {
++			continue;
++		}
++		uint32_t mask = wce_ring[r].n - 1;
++		for (unsigned guard = 0; guard < wce_ring[r].n; guard++) {
++			struct wce_desc *d = wce_desc(r, wce.sw[r]);
++			uint16_t nb = *(volatile uint16_t *)&d->nbytes;
++			if (nb == 0) {
++				break;
++			}
++			__asm__ volatile ("dmb ld" ::: "memory");      /* the data after the descriptor */
++			const uint8_t *buf = (const uint8_t *)(wce.pool + wce_ring[r].bufs + (uint64_t)wce.sw[r] * CE_RX_BUF);
++			wce_htc(wce_ring[r].ce, buf, MIN((uint32_t)nb, CE_RX_BUF));
++			d->nbytes = 0;
++			wce.sw[r] = (wce.sw[r] + 1) & mask;
++			struct wce_desc *w = wce_desc(r, wce.wr[r]);
++			w->addr = (WCE_POOL_PA + wce_ring[r].bufs + (uint64_t)wce.wr[r] * CE_RX_BUF) & 0x7ffffffffull;
++			w->nbytes = 0;
++			__asm__ volatile ("dsb sy" ::: "memory");
++			wce.wr[r] = (wce.wr[r] + 1) & mask;
++			wl_wr(wce.regs, WCE_BASE(wce_ring[r].ce) + CE_DST_WR_IDX, wce.wr[r]);
++		}
++	}
++}
++
++/* FW READY reached: with sweetce=1 continue into the data path (SMMU + pool, then WLAN_CFG) */
++static void
++wf_data_path(void)
++{
++	if (!ipc.ce || wf.state != WS_READY) {
++		return;
++	}
++	if (!wce_prepare()) {
++		wf_fail("SMMU or DMA pool not ready", 0);
++		return;
++	}
++	wce_send_cfg();
++}
++
++/* end of the service loop, modem still up: WLAN_MODE off (ath10k_snoc_wlan_disable), at most 3 s */
++static void
++wf_shutdown(void)
++{
++	wce.rings = false;
++	/* also when mission mode was requested but never confirmed (timeout, hold over): the chip may be in it */
++	if (!(wce.mode_on || wce.mode_sent) || wf.state == WS_OFF) {
++		return;
++	}
++	wce.prev_state = wf.state;
++	wce_send_mode(4, WS_MODE_OFF);
++	uint64_t end = ms_now_ms() + 3000;
++	while (wf.state == WS_MODE_OFF && ms_now_ms() < end) {
++		ipc_rx_poll();
++		ipc_flush();
++		wl_sleep(1);
++	}
++	printf("SWEET IPC: wce: mode off %s\n", wce.mode_sent ? "NOT confirmed" : "confirmed");
++}
++
++static void
+ wf_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
+ {
+ 	if (len < 7 || (p[0] != 2 && p[0] != 4) || node != wf.node || port != wf.port || wf.state == WS_OFF) {
+@@ -3814,8 +4125,9 @@
+ 			    wf_state_name[wf.state]);
+ 			ipc_note(" wlfw FW-READY;");
+ 			wf.fw_ready = true;
+-			if (!wf.pending && wf.state != WS_FAILED) {
++			if (!wf.pending && wf.state != WS_FAILED && wf.state < WS_READY) {
+ 				wf.state = WS_READY;
++				wf_data_path();
+ 			}
+ 		} else {
+ 			printf("SWEET IPC: wlfw: indication %#x (%u bytes)\n", msg, len);
+@@ -3967,8 +4279,39 @@
+ 		} else {
+ 			wf.state = wf.fw_ready ? WS_READY : WS_WAIT_FW_READY;
+ 			wf.sent_ms = ms_now_ms();
++			if (wf.state == WS_READY) {
++				wf_data_path();
++			}
+ 		}
+ 		break;
++	case WF_WLAN_CFG:
++		printf("SWEET IPC: wce: wlan-cfg result %u error %u\n", res, err);
++		ipc_note(" wce cfg %u/%u;", res, err);
++		if (res) {
++			wf_fail("wlan-cfg rejected", err);
++		} else {
++			wce_send_mode(0, WS_MODE);
++		}
++		break;
++	case WF_WLAN_MODE:
++		printf("SWEET IPC: wce: wlan-mode %s result %u error %u\n", wf.state == WS_MODE_OFF ? "off" : "mission", res, err);
++		ipc_note(" wce mode %s %u/%u;", wf.state == WS_MODE_OFF ? "off" : "on", res, err);
++		if (wf.state == WS_MODE_OFF) {
++			wce.mode_on = res != 0;
++			wce.mode_sent = res != 0;
++			wf.state = wce.prev_state;
++		} else if (res) {
++			wf_fail("wlan-mode mission rejected", err);
++		} else {
++			wce.mode_on = true;
++			if (wce_up()) {
++				wf.state = WS_CE;
++				wf.sent_ms = ms_now_ms();
++			} else {
++				wf_fail("copy engine setup failed", 0);
++			}
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
+@@ -4002,6 +4345,8 @@
+ 	}
+ 	memset(&wf, 0, sizeof(wf));
+ 	wf.buf = buf;
++	wce.rings = false;
++	wce.mode_on = false;
+ }
+ 
+ /* NEW_SERVER 0x45: connect and start (ath10k_qmi_new_server + server_arrive) */
+@@ -4035,10 +4380,12 @@
+ {
+ 	if (wf.state == WS_WAIT_FW_READY && wf.fw_ready) {
+ 		wf.state = WS_READY;
++		wf_data_path();
+ 	}
+-	bool waiting = wf.pending || wf.state == WS_WAIT_MSA_IND || wf.state == WS_WAIT_FW_READY;
++	wce_poll();
++	bool waiting = wf.pending || wf.state == WS_WAIT_MSA_IND || wf.state == WS_WAIT_FW_READY || wf.state == WS_CE;
+ 	if (ipc.wlfw && waiting && wf.state != WS_FAILED && ms_now_ms() > wf.sent_ms + WLFW_TIMEOUT_MS) {
+-		wf_fail(wf.pending ? "no response" : "no indication", wf.pending);
++		wf_fail(wf.pending ? "no response" : (wf.state == WS_CE ? "no HTC message" : "no indication"), wf.pending);
+ 	}
+ }
+ 
+@@ -4050,6 +4397,14 @@
+ wf_teardown(void)
+ {
+ 	wf_reset(true);
++	if (wce.pool) {
++		/*
++		 * The slice is not xnu RAM: only our mapping goes; the SMMU bank and the register mapping stay. If mode off
++		 * was not confirmed the CE may still hold ring/RRI addresses in 0xe0100000..: never reuse that slice.
++		 */
++		ml_io_unmap(wce.pool, WCE_POOL_LEN);
++		wce.pool = 0;
++	}
+ }
+ 
+ static void
+@@ -4166,6 +4521,9 @@
+ 	int wlfw = 0;
+ 	(void)PE_parse_boot_argn("sweetwlfw", &wlfw, sizeof(wlfw));
+ 	ipc.wlfw = wlfw == 1;
++	int ce = 0;
++	(void)PE_parse_boot_argn("sweetce", &ce, sizeof(ce));
++	ipc.ce = ipc.wlfw && ce == 1;
+ 	memset(&wf, 0, sizeof(wf));
+ 	if (ipc.wlfw && !wf_rails()) {
+ 		ipc.wlfw = false;
+@@ -4235,6 +4593,15 @@
+ 	    ipc.version_acked ? "versioned" : "no version-ack", ipc.open_acked ? "open" : "not open",
+ 	    ipc.hello_seen ? "seen" : "not seen", ipc.rx_pkts, ipc.tx_pkts, ipc.reads, ipc.read_bytes, ipc.writes,
+ 	    ipc.write_bytes, ipc.pdm_reqs, ipc.wlfw_seen ? "up" : "not seen");
++	if (ipc.ce) {
++		printf("SWEET IPC: wce: %u target messages, HTC %s (%u credits of %u bytes, %u endpoints)\n", wce.msgs,
++		    wce.credits ? "READY" : "not seen", wce.credits, wce.credit_size, wce.max_ep);
++	}
++	if (alive) {
++		wf_shutdown();
++	} else {
++		wce.rings = false;
++	}
+ 	if (ipc.wlfw) {
+ 		printf("SWEET IPC: wlfw client: %s; chip %#x board %#x soc %#x fw %#x, %s %u bytes in %u segments\n",
+ 		    wf_state_name[wf.state], wf.chip_id, wf.board_id, wf.soc_id, wf.fw_version, wf.bdf_name[0] ? wf.bdf_name : "no bdf",

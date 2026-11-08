@@ -1,0 +1,28 @@
+--- a/bsd/sweet_hfs/core/hfs.h
++++ b/bsd/sweet_hfs/core/hfs.h
+@@ -903,7 +903,15 @@
+ 
+ void hfs_mark_inconsistent(struct hfsmount *hfsmp,
+ 						   hfs_inconsistency_reason_t reason);
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* 0155: report which call site flags the volume corrupt (file:line, pid, reason) */
++#define hfs_mark_inconsistent(h, r) ({ \
++	printf("SWEET HFSINC %s:%d pid %d reason %d\n", __FILE__, __LINE__, proc_selfpid(), (int)(r)); \
++	hfs_mark_inconsistent((h), (r)); \
++})
++#endif
+ 
++
+ void hfs_scan_blocks (struct hfsmount *hfsmp);
+ int hfs_vfs_root(struct mount *mp, struct vnode **vpp, vfs_context_t context);
+ 
+--- a/bsd/sweet_hfs/core/hfs_vfsops.c
++++ b/bsd/sweet_hfs/core/hfs_vfsops.c
+@@ -4433,6 +4433,7 @@
+  * a repair operation fails.  The bit should be cleared only from file system 
+  * verify/repair utility like fsck_hfs when a verify/repair succeeds.
+  */
++#undef hfs_mark_inconsistent
+ void hfs_mark_inconsistent(struct hfsmount *hfsmp,
+ 								  hfs_inconsistency_reason_t reason)
+ {

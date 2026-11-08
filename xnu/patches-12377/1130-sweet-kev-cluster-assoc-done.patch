@@ -1,0 +1,120 @@
+diff --git a/bsd/kern/kern_event.c b/bsd/kern/kern_event.c
+--- a/bsd/kern/kern_event.c
++++ b/bsd/kern/kern_event.c
+@@ -8922,12 +8922,16 @@
+ 		total_size += event_msg->dv[i].data_length;
+ 	}
+ 
+-	if (total_size > MLEN) {
++	/*
++	 * SWEET: IO80211's async join reads a >= 460-byte APPLE80211_M_ASSOC_DONE (docs/WIFI_IOS26.md 6.3): events
++	 * up to one cluster go in a cluster mbuf (m_copym shares it with every listener), the rest as before.
++	 */
++	if (total_size > MCLBYTES) {
+ 		os_atomic_inc(&kevtstat.kes_toobig, relaxed);
+ 		return EMSGSIZE;
+ 	}
+ 
+-	m = m_get(wait, MT_DATA);
++	m = total_size > MLEN ? m_getcl(wait, MT_DATA, 0) : m_get(wait, MT_DATA);
+ 	if (m == 0) {
+ 		os_atomic_inc(&kevtstat.kes_nomem, relaxed);
+ 		return ENOMEM;
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -6101,10 +6101,14 @@
+ 	printf("SWEET WLAN sta: join FAILED in %s: %s (result %d)\n", st_name[sta.state], why, result);
+ 	ipc_note(" sta FAIL %s/%d;", st_name[sta.state], result);
+ 	lck_mtx_lock(&sta_lock);
+-	if (!sta.req_pending) {
++	bool report = !sta.req_pending;
++	if (report) {
+ 		sta.result = result;            /* not when a newer join is already waiting */
+ 	}
+ 	lck_mtx_unlock(&sta_lock);
++	if (report) {
++		sweet80211_join_failed(result); /* the async join waits for ASSOC_DONE */
++	}
+ 	sta_teardown_start(1);
+ }
+ 
+@@ -6211,6 +6215,7 @@
+ 			sta.state = ST_IDLE;
+ 			sta.result = SWEET_WLAN_JOIN_UNSUPPORTED;
+ 			printf("SWEET WLAN sta: RSN element not CCMP/CCMP/PSK: refused\n");
++			sweet80211_join_failed(sta.result);
+ 			return;
+ 		}
+ 	}
+@@ -6218,6 +6223,7 @@
+ 		sta.state = ST_IDLE;
+ 		sta.result = SWEET_WLAN_JOIN_NO_BSS;
+ 		printf("SWEET WLAN sta: no BSS with that SSID and security in the last scan\n");
++		sweet80211_join_failed(sta.result);
+ 		return;
+ 	}
+ 	sta_set_state(ST_STOPSCAN);
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -812,6 +812,34 @@
+ 	ifnet_event(s8.ifp, h);
+ }
+ 
++/*
++ * APPLE80211_M_ASSOC_DONE. Boot 54: wifid joins with the async API (no GET 21 polls), whose handler
++ * (_dispatchAsyncAssocEvent) reads a >= 460-byte status blob: 10 x 44-byte per-BSS records, then u32s @440, @448
++ * (extended status), @452 (result) and @456 (result valid). A 4-byte payload left it reading its own 0xAA fill:
++ * "Unable to join" over a working link. With valid = 0 it asks GET 21 for the result instead (the sync API's
++ * source of truth too; IO80211 does the same GET for any ASSOC_DONE that is not 4 bytes long).
++ */
++static void
++s8_assoc_done(void)
++{
++	uint8_t *blob = kalloc_data(460, Z_WAITOK | Z_ZERO);
++	if (blob != NULL) {
++		s8_post_event(M_ASSOC_DONE, blob, 460);
++		kfree_data(blob, 460);
++	}
++}
++
++/* the WLAN service thread: a join failed (the result is already in GET 21) */
++void
++sweet80211_join_failed(int result)
++{
++	if (s8.ifp == NULL || s8.stage != 3) {
++		return;
++	}
++	printf("SWEET 80211: join failed (result %d)\n", result);
++	s8_assoc_done();
++}
++
+ /* the WLAN service thread: joined (keys in) or the association ended */
+ void
+ sweet80211_link(int up, uint16_t reason, int by_ap)
+@@ -830,11 +858,10 @@
+ 			memcpy(lc + 10, &noise, 2);
+ 		}
+ 		s8.link = 1;
+-		uint32_t ok = 0;
+ 		ifnet_set_flags(s8.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
+ 		s8_post_event(M_SSID_CHANGED, NULL, 0);
+ 		s8_post_event(M_BSSID_CHANGED, NULL, 0);
+-		s8_post_event(M_ASSOC_DONE, &ok, sizeof(ok));
++		s8_assoc_done();
+ 		if (s8.auth_upper) {
+ 			s8_post_event(M_RSN_HANDSHAKE_DONE, NULL, 0);
+ 		}
+diff --git a/bsd/dev/sweet_wlan.h b/bsd/dev/sweet_wlan.h
+--- a/bsd/dev/sweet_wlan.h
++++ b/bsd/dev/sweet_wlan.h
+@@ -88,6 +88,8 @@
+ /* sweet_80211.c, from the service thread: the link came up (joined), or went down (802.11 reason; by_ap = the AP
+  * deauthenticated / disassociated us or the firmware lost it, else we left) */
+ void sweet80211_link(int up, uint16_t reason, int by_ap);
++/* sweet_80211.c, from the service thread: a join ended without a link (result = SWEET_WLAN_JOIN_*) */
++void sweet80211_join_failed(int result);
+ /* sweet_80211.c, from the service thread: one received Ethernet II frame for en0 */
+ void sweet80211_input(const uint8_t *eth, size_t len);
+ 

@@ -1,0 +1,138 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -206,6 +206,10 @@
+ #define GMU_BOOT_SLUMBER_OPTION R(0x23f8)       /* in the GMU DTCM */
+ #define GMU_GX_VOTE_IDX         R(0x23f9)
+ #define GMU_MX_VOTE_IDX         R(0x23fa)
++#define GMU_DCVS_ACK_OPTION     R(0x23fc)       /* a6xx_gmu.xml 0x1cbfc..0x1cbff, less the GMU block base 0x1a800 */
++#define GMU_DCVS_PERF_SETTING   R(0x23fd)
++#define GMU_DCVS_BW_SETTING     R(0x23fe)
++#define GMU_DCVS_RETURN         R(0x23ff)
+ #define GMU_GX_SPTPRAC_CLOCK_CONTROL R(0x0080)
+ #define GMU_GX_SPTPRAC_POWER_CONTROL R(0x0081)
+ #define GMU_AO_HOST_INTERRUPT_STATUS R(0x9305)
+@@ -1769,6 +1773,7 @@
+ #define OOB_SLUMBER_OPTION      1
+ #define OOB_GPU                 0               /* GPU_SET: set bit 16, ack bit 24, clear bit 24 */
+ #define OOB_BOOT_SLUMBER        6               /* set bit 22, ack bit 30, clear bit 30 */
++#define OOB_DCVS                7               /* DCVS_SET: set bit 23, ack bit 31, clear bit 31 (Linux legacy oob table) */
+ #define SPTPRAC_POWERON_CTRL    0x00778000u
+ #define SPTPRAC_POWEROFF_CTRL   0x00778001u
+ #define SPTPRAC_ON_MASK         0x38u
+@@ -2471,6 +2476,7 @@
+ static bool a630_awake;
+ static uint32_t a630_timed;      /* last submission whose stamps were added to the busy time */
+ static bool gpu_resume(void);
++static bool gpu_hfi_start_dcvs(bool gx_on);
+ bool sweet_gpu_recover(const char *why);
+ 
+ static vm_offset_t ptp;
+@@ -3158,7 +3164,7 @@
+ 	}
+ 	gpu_hfi_table();
+ 	ok = gmu_fw && gpu_gmu_boot((const uint32_t *)gmu_fw, gmu_fw_size, false) && gpu_gx_rail_on() && gpu_sptprac(true) &&
+-	    gpu_hfi_start() && gmu_oob_set(OOB_GPU, "gpu") && gpu_cp_hw_init() && gpu_cp_start();
++	    gpu_hfi_start_dcvs(true) && gmu_oob_set(OOB_GPU, "gpu") && gpu_cp_hw_init() && gpu_cp_start();
+ 	if (ok) {
+ 		ring_emit(pkt7(CP_SET_SECURE_MODE, 1));
+ 		ring_emit(0);
+@@ -3227,21 +3233,68 @@
+ 
+ /* ---- DCVS ---- */
+ 
++/*
++ * Level changes as Linux a6xx_gmu_set_freq does for a legacy GMU (a630, firmware 1.6, HFI version 0). HFI message 30
++ * (H2F_MSG_GX_BW_PERF_VOTE) is the non-legacy protocol: this firmware refused every vote sent that way. The legacy path
++ * writes the DCVS registers in the GMU DTCM and pokes the GMU with the DCVS_SET OOB: ACK_OPTION 0, PERF_SETTING =
++ * (3 << 28) | perf index, BW_SETTING 0xff (an invalid index: the firmware picks the DDR vote itself, so no bandwidth
++ * table index is needed), OOB DCVS_SET (set bit 23, ack bit 31, clear bit 31), then DCVS_RETURN != 0 is an error. The
++ * perf index is the index into the PERF_TBL of gpu_hfi_tables(), i.e. our level (entry 0 is the 0 Hz level). Linux
++ * takes no GPU_SET OOB or keep-alive for this, only needs the GMU up with HFI started, which holds whenever we get here.
++ */
++static unsigned a630_level_sets, a630_dcvs_errors, dcvs_log_n;
++static uint64_t dcvs_log_t;
++static bool a630_dcvs_broken;           /* first failure: no more attempts, the level stays where it is */
++
+ static bool
+ gpu_set_level(unsigned lvl)
+ {
+-	uint32_t m[4] = { MSG_HDR(30 /* H2F_MSG_GX_BW_PERF_VOTE */, 4, 0), 1 /* blocking ack */, lvl, 0 }, ack[19];
++	int quiet = a630_quiet;                 /* called from inside a wake as well, whose own setting must survive */
++	uint32_t ret = 0;
+ 
+ 	a630_quiet = 1;
+-	bool ok = hfi_cmd("GX_BW_PERF_VOTE", m, 4, ack, 19);
+-	a630_quiet = 0;
+-	if (ok) {
++	gpu_wr(gmu, GMU_DCVS_ACK_OPTION, 0);
++	gpu_wr(gmu, GMU_DCVS_PERF_SETTING, (3u << 28) | lvl);
++	gpu_wr(gmu, GMU_DCVS_BW_SETTING, 0xff);
++	bool ok = gmu_oob_set(OOB_DCVS, "dcvs");
++	gmu_oob_clear(OOB_DCVS);                /* Linux clears even when the ack timed out */
++	ret = gpu_rd(gmu, GMU_DCVS_RETURN);
++	a630_quiet = quiet;
++	if (ok && ret == 0) {
+ 		a630_level = lvl;
+-	} else {
+-		printf("SWEET GPU: GX level vote %u failed; governor off\n", lvl);
+-		a630_gov = 0;
++		a630_level_sets++;
++		dcvs_log_n++;
++		if (dcvs_log_t == 0 || ns_since(dcvs_log_t) >= NSEC_PER_SEC) {  /* one line per second at most */
++			printf("SWEET GPU: GX level %u (%u MHz) via DCVS OOB (%u change%s since the last line)\n", lvl, gpu_levels[lvl].mhz,
++			    dcvs_log_n, dcvs_log_n == 1 ? "" : "s");
++			dcvs_log_t = mach_absolute_time();
++			dcvs_log_n = 0;
++		}
++		return true;
+ 	}
+-	return ok;
++	a630_dcvs_errors++;
++	a630_dcvs_broken = true;
++	printf("SWEET GPU: GX level vote %u failed (OOB DCVS_SET %s, DCVS_RETURN 0x%08x); %sstaying at level %u\n", lvl,
++	    ok ? "acknowledged" : "TIMED OUT", ret, a630_gov ? "governor off, " : "", a630_level);
++	a630_gov = 0;
++	return false;
++}
++
++/*
++ * gpu_hfi_start(), then with GX up the GMU is told the current level like a6xx_gmu_set_initial_freq does in Linux's
++ * resume: a cold-booted GMU only knows the boot vote, and this is the one place every wake (resume, recovery) and the
++ * first bring-up pass through. A failed vote is not fatal to the start; it only turns the governor off.
++ */
++static bool
++gpu_hfi_start_dcvs(bool gx_on)
++{
++	if (!gpu_hfi_start()) {
++		return false;
++	}
++	if (gx_on && !a630_dcvs_broken) {
++		(void)gpu_set_level(a630_level);
++	}
++	return true;
+ }
+ 
+ static uint64_t gov_win_ns, gov_win_busy_ns, gov_busy_pct, res_ns[8];
+@@ -3360,10 +3413,10 @@
+ 	}
+ 	n = snprintf(buf, sizeof(buf),
+ 	    "state=%s level=%u mhz=%u max_level=%u freq=%s busy_pct=%llu clients=%u pids=%s submitted=%u completed=%u "
+-	    "suspends=%u resumes=%u recoveries=%u hangs=%u idle_ms=%u hwcg=%u boost_level=%u boosted=%u submits_100ms=%u total_ms=%llu res_ms=",
++	    "suspends=%u resumes=%u recoveries=%u hangs=%u idle_ms=%u hwcg=%u boost_level=%u boosted=%u submits_100ms=%u dcvs_sets=%u dcvs_errors=%u total_ms=%llu res_ms=",
+ 	    state, lvl, lvl ? gpu_levels[lvl].mhz : 0, a630_level_max, a630_gov ? "gov" : "fixed", gov_busy_pct, clients, pids,
+ 	    a630_dev.seqno, a630_dev.ready && cp_memory ? *(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) : 0,
+-	    a630_suspends, a630_resumes, a630_recoveries, a630_dev.hangs, a630_idle_ms, a630_hwcg, a630_boost_level, (unsigned)(a630_boost_level && mach_absolute_time() < gov_boost_until), gov_rate, tot / NSEC_PER_MSEC);
++	    a630_suspends, a630_resumes, a630_recoveries, a630_dev.hangs, a630_idle_ms, a630_hwcg, a630_boost_level, (unsigned)(a630_boost_level && mach_absolute_time() < gov_boost_until), gov_rate, a630_level_sets, a630_dcvs_errors, tot / NSEC_PER_MSEC);
+ 	(void)now_in;
+ 	for (unsigned i = 0; i < 8 && n > 0 && (size_t)n < sizeof(buf); i++) {
+ 		if (i) {
+@@ -3537,7 +3590,7 @@
+ 		rail = gpu_gx_rail_on();
+ 		gx = rail && gpu_sptprac(true);
+ 	}
+-	if (booted && (mode < 5 || gx) && gpu_hfi_start() && mode >= 5) {
++	if (booted && (mode < 5 || gx) && gpu_hfi_start_dcvs(mode >= 5) && mode >= 5) {
+ 		if (!gpu_gx_test(mode)) {
+ 			return;
+ 		}

@@ -1,0 +1,348 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -186,6 +186,20 @@
+ #include <IOKit/IOBSD.h>
+ 
+ #include "kern_exec_internal.h"
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* 0153: every EINVAL return in this file reports its source line ("SWEET EINVAL file:line pid") */
++static inline int
++sweet_einval(int line, const char *file)
++{
++	printf("SWEET EINVAL %s:%d pid %d\n", file, line, proc_getpid(current_proc()));
++	return EINVAL;
++}
++#define SWEET_EINVAL() sweet_einval(__LINE__, __FILE__)
++#else
++#define SWEET_EINVAL() EINVAL
++#endif
++
+ 
+ extern boolean_t vm_darkwake_mode;
+ 
+@@ -1793,7 +1807,7 @@
+ 				set_proc_name(imgp, p);
+ 				exec_failure_reason->osr_flags |= OS_REASON_FLAG_GENERATE_CRASH_REPORT;
+ 			}
+-			error = EINVAL;
++			error = SWEET_EINVAL();
+ 			goto badtoolate;
+ 		}
+ 	}
+@@ -2434,7 +2448,7 @@
+ 	if (port_actions->registered_count) {
+ 		if (mach_ports_register(proc_task(p), port_actions->registered_array,
+ 		    port_actions->registered_count)) {
+-			return EINVAL;
++			return SWEET_EINVAL();
+ 		}
+ 		/* mach_ports_register() consumed the array */
+ 		port_actions->registered_array = NULL;
+@@ -2513,31 +2527,31 @@
+ 			break;
+ 		case PSPA_IMP_WATCHPORTS:
+ 			if (++actions->portwatch_count > TASK_MAX_WATCHPORT_COUNT) {
+-				ret = EINVAL;
++				ret = SWEET_EINVAL();
+ 				goto done;
+ 			}
+ 			break;
+ 		case PSPA_REGISTERED_PORTS:
+ 			if (++actions->registered_count > TASK_PORT_REGISTER_MAX) {
+-				ret = EINVAL;
++				ret = SWEET_EINVAL();
+ 				goto done;
+ 			}
+ 			break;
+ 		case PSPA_PTRAUTH_TASK_PORT:
+ 			if (++ptrauth_task_port_count > 1) {
+-				ret = EINVAL;
++				ret = SWEET_EINVAL();
+ 				goto done;
+ 			}
+ 			break;
+ 		default:
+-			ret = EINVAL;
++			ret = SWEET_EINVAL();
+ 			goto done;
+ 		}
+ 	}
+ 
+ 	if (actions->portwatch_count) {
+ 		if (in_exec && task_has_watchport_boost) {
+-			ret = EINVAL;
++			ret = SWEET_EINVAL();
+ 			goto done;
+ 		}
+ 		actions->portwatch_array = kalloc_type(ipc_port_t,
+@@ -2566,7 +2580,7 @@
+ 			    (ipc_object_t *) &port, 0, NULL, IPC_OBJECT_COPYIN_FLAGS_ALLOW_IMMOVABLE_SEND);
+ 
+ 			if (kr != KERN_SUCCESS) {
+-				ret = EINVAL;
++				ret = SWEET_EINVAL();
+ 				goto done;
+ 			}
+ 		} else {
+@@ -2579,7 +2593,7 @@
+ 			kr = task_set_special_port(task, act->which, port);
+ 
+ 			if (kr != KERN_SUCCESS) {
+-				ret = EINVAL;
++				ret = SWEET_EINVAL();
+ 			}
+ 			break;
+ 
+@@ -2587,7 +2601,7 @@
+ 			kr = task_set_exception_ports(task, act->mask, port,
+ 			    act->behavior, act->flavor);
+ 			if (kr != KERN_SUCCESS) {
+-				ret = EINVAL;
++				ret = SWEET_EINVAL();
+ 			}
+ 			break;
+ #if CONFIG_AUDIT
+@@ -2618,7 +2632,7 @@
+ 			ipc_port_release_send(port);
+ 			break;
+ 		default:
+-			ret = EINVAL;
++			ret = SWEET_EINVAL();
+ 			break;
+ 		}
+ 
+@@ -2761,7 +2775,7 @@
+ 			int origfd;
+ 
+ 			if (!MACH_PORT_VALID(psfa->psfaa_fileport)) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				break;
+ 			}
+ 
+@@ -2770,7 +2784,7 @@
+ 			    (ipc_object_t *) &port, 0, NULL, IPC_OBJECT_COPYIN_FLAGS_ALLOW_IMMOVABLE_SEND);
+ 
+ 			if (kr != KERN_SUCCESS) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				break;
+ 			}
+ 
+@@ -2866,7 +2880,7 @@
+ 		break;
+ 
+ 		default:
+-			error = EINVAL;
++			error = SWEET_EINVAL();
+ 			break;
+ 		}
+ 
+@@ -2944,7 +2958,7 @@
+ 		return EOVERFLOW;
+ 	}
+ 	if (__improbable(dataend > px_s->datalen)) {
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	return 0;
+@@ -3002,7 +3016,7 @@
+ 
+ 	if (px_args->mac_extensions_size < PS_MAC_EXTENSIONS_SIZE(1) ||
+ 	    px_args->mac_extensions_size > PAGE_SIZE) {
+-		error = EINVAL;
++		error = SWEET_EINVAL();
+ 		goto bad;
+ 	}
+ 
+@@ -3019,14 +3033,14 @@
+ 
+ 	size_t extsize = PS_MAC_EXTENSIONS_SIZE(psmx->psmx_count);
+ 	if (extsize == 0 || extsize > px_args->mac_extensions_size) {
+-		error = EINVAL;
++		error = SWEET_EINVAL();
+ 		goto bad;
+ 	}
+ 
+ 	for (int i = 0; i < psmx->psmx_count; i++) {
+ 		_ps_mac_policy_extension_t *extension = &psmx->psmx_extensions[i];
+ 		if (extension->datalen == 0 || extension->datalen > PAGE_SIZE) {
+-			error = EINVAL;
++			error = SWEET_EINVAL();
+ 			goto bad;
+ 		}
+ 		if (__improbable(os_add_overflow(datalen, extension->datalen, &datalen))) {
+@@ -3096,7 +3110,7 @@
+ 
+ 	if (px_persona->pspi_flags & POSIX_SPAWN_PERSONA_GROUPS) {
+ 		if (px_persona->pspi_ngroups > NGROUPS_MAX) {
+-			return EINVAL;
++			return SWEET_EINVAL();
+ 		}
+ 	}
+ 
+@@ -3514,7 +3528,7 @@
+ 
+ 			if (px_args.file_actions_size < PSF_ACTIONS_SIZE(1) ||
+ 			    maxfa_size == 0 || px_args.file_actions_size > maxfa_size) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				goto bad;
+ 			}
+ 
+@@ -3533,7 +3547,7 @@
+ 			/* Verify that the action count matches the struct size */
+ 			size_t psfsize = PSF_ACTIONS_SIZE(px_sfap->psfa_act_count);
+ 			if (psfsize == 0 || psfsize != px_args.file_actions_size) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				goto bad;
+ 			}
+ 		}
+@@ -3541,7 +3555,7 @@
+ 			/* Limit port_actions to one page of data */
+ 			if (px_args.port_actions_size < PS_PORT_ACTIONS_SIZE(1) ||
+ 			    px_args.port_actions_size > PAGE_SIZE) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				goto bad;
+ 			}
+ 
+@@ -3560,7 +3574,7 @@
+ 			/* Verify that the action count matches the struct size */
+ 			size_t pasize = PS_PORT_ACTIONS_SIZE(px_spap->pspa_count);
+ 			if (pasize == 0 || pasize != px_args.port_actions_size) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				goto bad;
+ 			}
+ 		}
+@@ -3616,7 +3630,7 @@
+ 
+ 			if (px_pcred_info->pspci_flags & POSIX_SPAWN_POSIX_CRED_GROUPS) {
+ 				if (px_pcred_info->pspci_ngroups > NGROUPS_MAX) {
+-					error = EINVAL;
++					error = SWEET_EINVAL();
+ 					goto bad;
+ 				}
+ 			}
+@@ -3773,7 +3787,7 @@
+ 			 */
+ 			if (coal[COALITION_TYPE_RESOURCE] == COALITION_NULL) {
+ 				spawn_coalitions_release_all(coal);
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 				goto bad;
+ 			}
+ 		}
+@@ -3795,7 +3809,7 @@
+ 		if (error == 0) {
+ 			kr = coalitions_set_roles(coal, new_task, coal_role);
+ 			if (kr != KERN_SUCCESS) {
+-				error = EINVAL;
++				error = SWEET_EINVAL();
+ 			}
+ 			if (kdebug_debugid_enabled(MACHDBG_CODE(DBG_MACH_COALITION,
+ 			    MACH_COALITION_ADOPT))) {
+@@ -5444,7 +5458,7 @@
+ 	 * should have aligned their sub-area
+ 	 */
+ 	if (imgp->ip_strspace % ptr_size != 0) {
+-		error = EINVAL;
++		error = SWEET_EINVAL();
+ 		goto bad;
+ 	}
+ 
+@@ -7239,7 +7253,7 @@
+ 		execargs_wakeup_waiters();
+ 	}
+ 
+-	return kret == KERN_SUCCESS ? 0 : EINVAL;
++	return kret == KERN_SUCCESS ? 0 : SWEET_EINVAL();
+ }
+ 
+ void
+@@ -7348,7 +7362,7 @@
+ 	kern_return_t kr = machine_task_process_signature(proc_get_task_raw(p), proc_platform(p), proc_sdk(p), &error_msg);
+ 
+ 	if (kr != KERN_SUCCESS) {
+-		error = EINVAL;
++		error = SWEET_EINVAL();
+ 
+ 		if (error_msg != NULL) {
+ 			uint32_t error_msg_len = (uint32_t)strlen(error_msg) + 1;
+@@ -7602,7 +7616,7 @@
+ 		kr = thread_process_signature(imgp->ip_new_thread, proc_get_task_raw(p));
+ 
+ 		if (kr != KERN_SUCCESS) {
+-			error = EINVAL;
++			error = SWEET_EINVAL();
+ 			signature_failure_reason = os_reason_create(OS_REASON_EXEC, EXEC_EXIT_REASON_MACHINE_THREAD);
+ 		}
+ 	}
+--- a/bsd/kern/kern_persona.c
++++ b/bsd/kern/kern_persona.c
+@@ -52,6 +52,20 @@
+ #include <security/audit/audit.h>
+ 
+ #include <os/log.h>
++
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* 0153: every EINVAL return in this file reports its source line ("SWEET EINVAL file:line pid") */
++static inline int
++sweet_einval(int line, const char *file)
++{
++	printf("SWEET EINVAL %s:%d pid %d\n", file, line, proc_getpid(current_proc()));
++	return EINVAL;
++}
++#define SWEET_EINVAL() sweet_einval(__LINE__, __FILE__)
++#else
++#define SWEET_EINVAL() EINVAL
++#endif
++
+ #define pna_err(fmt, ...) \
+ 	os_log_error(OS_LOG_DEFAULT, "ERROR: " fmt, ## __VA_ARGS__)
+ 
+@@ -211,7 +225,7 @@
+ 	uid_t id;
+ 
+ 	if (!persona || (persona->pna_valid != PERSONA_ALLOC_TOKEN)) {
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	id = persona->pna_id;
+@@ -488,11 +502,11 @@
+ 	if ((persona_type > PERSONA_INVALID) && (persona_type <= PERSONA_TYPE_MAX)) {
+ 		match++;
+ 	} else if (persona_type != PERSONA_INVALID) {
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	if (match == 0) {
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	persona_dbg("Searching with %d parameters (l:\"%s\", u:%d)",
+@@ -794,7 +808,7 @@
+ 	struct persona *old_persona;
+ 
+ 	if (!persona) {
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	persona_dbg("%d adopting Persona %d (%s)", proc_pid(p),
+@@ -804,7 +818,7 @@
+ 	if (!persona_valid(persona)) {
+ 		persona_dbg("Invalid persona (%s)!", persona_desc(persona, 1));
+ 		persona_unlock(persona);
+-		return EINVAL;
++		return SWEET_EINVAL();
+ 	}
+ 
+ 	/*

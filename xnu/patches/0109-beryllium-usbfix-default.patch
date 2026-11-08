@@ -1,0 +1,16 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -987,7 +987,12 @@
+ static int
+ sweet_usb_fix_mask(void)
+ {
+-	int fix = 0;
++	/*
++	 * Default on for the Poco F1: with it the gadget enumerates and carries
++	 * traffic (2026-10-20, boots 0105u/0108l); QUSB2 PWR_CTRL1.POWER_DOWN
++	 * left set by ABL was the cause. sweetusbfix=0 turns it off.
++	 */
++	int fix = sweet_board_beryllium() ? 1 : 0;
+ 	PE_parse_boot_argn("sweetusbfix", &fix, sizeof(fix));
+ 	return fix == 1 ? 7 : (fix & 7);
+ }

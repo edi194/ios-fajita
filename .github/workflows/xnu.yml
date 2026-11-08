@@ -1,0 +1,307 @@
+name: Heartwood kernel (xnu)
+
+on:
+  workflow_dispatch:
+    inputs:
+      macos_version:
+        description: macOS release whose xnu to build (13.5 = xnu-8796 / iOS 16 era; 15.3 = xnu-11215.81.4 / iOS 18.3 era; 26.5 = xnu-12377.121.6 / iOS 26.5 era)
+        default: "15.3"
+      xcode_version:
+        description: Xcode on the runner (empty = oldest installed for 13.x/14.x, 16.2 for 15.x, 26.1 for 26.x)
+        default: ""
+      kernel_config:
+        description: RELEASE / DEVELOPMENT / DEBUG
+        default: DEVELOPMENT
+      machine_config:
+        description: xnu MACHINE_CONFIG
+        default: SWEET
+      use_kdk:
+        description: 26.x only - download the KDK (true) or build without it (false; CoreEntitlements V2 stubs, but TrustCache/API.h is KDK-only)
+        default: "true"
+      keep_going:
+        description: make -k (collect all compile errors in one run)
+        default: "true"
+  push:
+    branches: [main, develop, xnu11215, ios26]
+    paths:
+      - "xnu/patches/**"
+      - "xnu/patches-11215/**"
+      - "xnu/patches-12377/**"
+      - ".github/workflows/xnu.yml"
+
+concurrency:
+  group: xnu-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DXB_REPO: https://github.com/blacktop/darwin-xnu-build
+  DXB_SHA: 663906528d1cd5ea8fde7de6f16de73db9511549
+  MACOS_VERSION: ${{ inputs.macos_version || (github.ref_name == 'main' && '13.5' || (github.ref_name == 'ios26' && '26.5' || '15.3')) }}
+  KERNEL_CONFIG: ${{ inputs.kernel_config || 'DEVELOPMENT' }}
+  MACHINE_CONFIG: ${{ inputs.machine_config || 'SWEET' }}
+  # Bump to throw away every cache (host tools + ccache) at once. See docs/CI_CACHE.md.
+  CACHE_VERSION: v2
+  # ccache: xnu's makedefs honour `CCACHE ?=` (KCC/KC++ = $(CCACHE) $(CC)), so the env var is
+  # enough; it deliberately does not wrap $(CC), which would confuse mig.
+  CCACHE: ccache
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+  # NOT CCACHE_BASEDIR / CCACHE_NOHASHDIR: base_dir rewrote __FILE__ to ../../../../../xnu/... in
+  # the kernel (functionally harmless, but not byte-identical to an uncached build). The
+  # runner workspace path is constant, so absolute paths in the hash cost nothing.
+  CCACHE_COMPRESS: "1"
+  CCACHE_MAXSIZE: 2G
+  # fresh checkouts/generated headers have new mtimes; contents are still hashed
+  CCACHE_SLOPPINESS: include_file_mtime,include_file_ctime
+  CCACHE_COMPILERCHECK: content
+
+jobs:
+  build:
+    # 13.x/14.x sources: macos-14 still ships Xcode 15.x, whose iig matches the xnu-8796 IORPC ABI
+    # (Xcode 16's iig emits IORPC.kernelContent, which that xnu lacks).
+    # 15.x sources (xnu-11215): macos-15 with Xcode 16.2 (the macOS 15.2/15.3 era toolchain).
+    # 26.x sources (xnu-12377): macos-26 with Xcode 26.1 (what dxb's own CI builds 26.5 with).
+    runs-on: ${{ startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || (github.ref_name == 'ios26' && '26.5' || '15.3')), '26.') && 'macos-26' || (startsWith(inputs.macos_version || (github.ref_name == 'main' && '13.5' || '15.3'), '15.') && 'macos-15' || 'macos-14') }}
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch build script
+        run: |
+          git init -q dxb
+          git -C dxb fetch -q --depth 1 "$DXB_REPO" "$DXB_SHA"
+          git -C dxb checkout -q FETCH_HEAD
+          if [[ "$MACOS_VERSION" == 26.* ]]; then
+            # xnu-12377 series (docs/XNU12377_MIGRATION.md): same scheme as 15.x, dxb's patches/26.0
+            # (its 00_setup_coreentitlements.sh and fixes) first, ours after them.
+            for f in xnu/patches-12377/*.patch xnu/patches-12377/*.sh; do
+              [ -e "$f" ] || continue
+              cp "$f" "dxb/patches/26.0/sweet-$(basename "$f")"
+            done
+            PDIR=dxb/patches/26.0
+            if [ "${{ inputs.use_kdk || 'true' }}" != "true" ]; then
+              # SWEET needs nothing from the KDK (link_kdk only force-loads closed libs for Apple SoCs,
+              # kernel collections are not built): drop dxb's KDK header copy (our
+              # 0027-stage-coreentitlements-v2-stub.sh stands in) and point KDKROOT at an empty dir so
+              # build.sh does not download one.
+              rm "$PDIR/00_setup_coreentitlements.sh"
+              mkdir -p "$RUNNER_TEMP/no-kdk"
+              echo "KDKROOT=$RUNNER_TEMP/no-kdk" >> "$GITHUB_ENV"
+            fi
+          elif [[ "$MACOS_VERSION" == 15.* ]]; then
+            # xnu-11215 series (docs/XNU11215_MIGRATION.md). dxb applies patches/15.0/*.sh, then
+            # patches/15.0/*.patch in name order: its own fixes (disable_bti, entitlements, iokit,
+            # link_kdk, skywalk, ...) come first and ours ("sweet-" prefix) after them.
+            for f in xnu/patches-11215/*.patch xnu/patches-11215/*.sh; do
+              [ -e "$f" ] || continue
+              cp "$f" "dxb/patches/15.0/sweet-$(basename "$f")"
+            done
+            PDIR=dxb/patches/15.0
+          else
+            # 12.5-14.3 use the top-level patches dir; ours go next to blacktop's
+            cp xnu/patches/*.patch xnu/patches/*.sh dxb/patches/
+            PDIR=dxb/patches
+          fi
+          # libfirehose_kernel is built arm64e-only; the SWEET kernel is plain arm64
+          sed -i '' 's/ARCHS="x86_64 arm64e" VALID_ARCHS="x86_64 arm64e"/ARCHS="x86_64 arm64e arm64" VALID_ARCHS="x86_64 arm64e arm64"/' dxb/build.sh
+          grep -c 'VALID_ARCHS="x86_64 arm64e arm64"' dxb/build.sh
+          # dxb only warns and carries on when a patch does not apply; for ours that would silently
+          # produce a kernel without it, so make it fatal.
+          python3 - <<'PY'
+          p = 'dxb/build.sh'
+          s = open(p).read()
+          needle = '                warning "Skipping patch ${PATCH} (already upstream, previously applied, or malformed): ${APPLY_CHECK}"\n'
+          assert needle in s, 'build.sh patches() layout changed; update the fatal-patch hook'
+          s = s.replace(needle, needle + '                case "$(basename "${PATCH}")" in [0-9]*|sweet-*) error "our patch does not apply: ${PATCH}"; exit 1 ;; esac\n')
+          open(p, 'w').write(s)
+          PY
+          ls "$PDIR"
+
+      - name: Deps
+        run: |
+          brew install jq gum bash cmake ninja ccache
+          # build.sh only checks that xcodes exists (Xcode is preinstalled); no bottle on macOS 14
+          printf '#!/bin/sh\nexit 0\n' | sudo tee /usr/local/bin/xcodes >/dev/null
+          sudo chmod +x /usr/local/bin/xcodes
+          sw_vers
+          ls -d /Applications/Xcode*.app
+          if [ -n "${{ inputs.xcode_version }}" ]; then
+            XC=$(ls -d /Applications/Xcode_${{ inputs.xcode_version }}*.app | sort -V | tail -1)
+          elif [[ "$MACOS_VERSION" == 26.* ]]; then
+            XC=$(ls -d /Applications/Xcode_26.1*.app 2>/dev/null | sort -V | tail -1)
+            [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_26.*.app | sort -V | head -1)
+          elif [[ "$MACOS_VERSION" == 15.* ]]; then
+            XC=$(ls -d /Applications/Xcode_16.2*.app 2>/dev/null | sort -V | tail -1)
+            [ -n "$XC" ] || XC=$(ls -d /Applications/Xcode_16.*.app | sort -V | head -1)
+          else
+            XC=$(ls -d /Applications/Xcode_*.app | sort -V | head -1)
+          fi
+          echo "DEVELOPER_DIR=$XC/Contents/Developer" >> "$GITHUB_ENV"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+          xcrun --find iig
+          echo "XCODE_VER=$(xcodebuild -version | tr '\n ' '--')" >> "$GITHUB_ENV"
+          ccache --version | head -1
+
+      # Host tools (mig, ctfconvert/ctfmerge/ctfdump, availability.pl) are built from Apple's
+      # bootstrap_cmds/dtrace/AvailabilityVersions repos: nothing in xnu/patches touches them,
+      # so they are keyed on toolchain + dxb + macOS release only. Anything that depends on the
+      # patched xnu (xnu headers, libfirehose_kernel) is NOT cached.
+      - name: Restore host tools cache
+        id: hosttools
+        uses: actions/cache/restore@v4
+        with:
+          path: hosttools-cache
+          key: hosttools-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ runner.arch }}-${{ env.XCODE_VER }}-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}
+
+      - name: Restore ccache
+        id: ccache
+        uses: actions/cache/restore@v4
+        with:
+          path: .ccache
+          key: ccache-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ env.XCODE_VER }}-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ env.CACHE_VERSION }}-${{ runner.os }}-${{ env.XCODE_VER }}-${{ env.DXB_SHA }}-${{ env.MACOS_VERSION }}-${{ env.KERNEL_CONFIG }}-${{ env.MACHINE_CONFIG }}-
+
+      - name: Prepare host tools / ccache
+        run: |
+          mkdir -p hosttools-cache
+          if [ -f hosttools-cache/hosttools.tgz ]; then
+            echo "host tools cache hit: unpacking into dxb/fakeroot"
+            mkdir -p dxb/fakeroot
+            tar xzf hosttools-cache/hosttools.tgz -C dxb/fakeroot
+            find dxb/fakeroot -name mig -o -name ctfmerge -o -name availability.pl
+          else
+            echo "host tools cache miss: build.sh will build them and snapshot the result"
+            # snapshot the fakeroot right after the host-tool steps, before xnu headers
+            # (which come from the patched xnu) are installed into it
+            python3 - <<'PY'
+          p = 'dxb/build.sh'
+          s = open(p).read()
+          needle = '    build_availabilityversions\n    xnu_headers\n'
+          assert needle in s, 'build.sh main() layout changed; update the snapshot hook'
+          s = s.replace(needle, '    build_availabilityversions\n'
+                        '    (cd "${FAKEROOT_DIR}" && find . \\( -type f -o -type l \\) | sort > "${WORK_DIR}/hosttools.list")\n'
+                        '    xnu_headers\n')
+          open(p, 'w').write(s)
+          PY
+            grep -n -B1 -A1 hosttools.list dxb/build.sh
+          fi
+          ccache -z
+          ccache -p | grep -E 'base_dir|cache_dir|max_size|sloppiness|compiler_check|hash_dir|compression ' || true
+
+      - name: Build
+        working-directory: dxb
+        env:
+          # keep going after errors so one run reports every compile failure
+          MAKEFLAGS: ${{ inputs.keep_going == 'false' && '' || '-k' }}
+        # the full log is hundreds of MB of warnings: keep it as a file, summarise the errors
+        run: |
+          set +e
+          bash build.sh > build.log 2>&1
+          rc=$?
+          grep -aE "error:|our patch does not apply|Staged|Applying patch|Skipping patch" build.log | grep -v "warning" | head -300
+          tail -40 build.log
+          exit $rc
+
+      - name: Error summary
+        if: always()
+        run: |
+          mkdir -p out
+          grep -aoE "[A-Za-z0-9_./+-]+\.(c|cpp|h|hpp|s|exports|iig)(:[0-9]+){1,2}: (fatal )?error: .*" dxb/build.log \
+            | sed 's|.*/dxb/||' | sort | uniq -c | sort -rn > out/errors.txt || true
+          grep -aE "^ld: |Undefined symbols|ld: symbol|error: linker" -A3 dxb/build.log | head -200 > out/link-errors.txt || true
+          wc -l out/errors.txt out/link-errors.txt
+          head -100 out/errors.txt
+          { echo '### compile errors (first 60)'; echo '```'; head -60 out/errors.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          gzip -c dxb/build.log > out/build.log.gz || true
+          # parallel make interleaves compiler output: re-run every failed compile serially for clean errors
+          objs=$(grep -aoE "\[[A-Za-z0-9_+-]+\.(o|cpo)\] Error" dxb/build.log | sed -E 's/^\[(.*)\.(o|cpo)\] Error$/\1/' | sort -u)
+          srcs=""
+          for o in $objs; do
+            f=$(find dxb/xnu -name "$o.c" -o -name "$o.cpp" -o -name "$o.s" | head -1)
+            [ -n "$f" ] && srcs="$srcs ${f#dxb/xnu/}"
+          done
+          echo "failed objects: $objs"
+          if [ -n "$srcs" ]; then
+            XNU_CC_TARGET=arm64-apple-macos26.0 python3 tools/xnu-cc.py dxb/build.log dxb $srcs --per-file > out/recompile.txt 2>&1 || true
+            grep -E "error" out/recompile.txt | head -150
+            { echo '### failed compiles, re-run serially'; echo '```'; grep -E "error" out/recompile.txt | head -80; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: ccache stats
+        if: always()
+        id: ccstats
+        run: |
+          ccache -s
+          miss=$(ccache --print-stats | awk '$1=="cache_miss"{print $2}')
+          echo "cache misses this run: ${miss:-unknown}"
+          if [ "${miss:-1}" != "0" ]; then echo "dirty=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Snapshot host tools
+        if: always() && hashFiles('hosttools-cache/hosttools.tgz') == '' && hashFiles('dxb/hosttools.list') != ''
+        run: tar czf hosttools-cache/hosttools.tgz -C dxb/fakeroot -T dxb/hosttools.list && ls -la hosttools-cache
+
+      - name: Save host tools cache
+        if: success() && steps.hosttools.outputs.cache-hit != 'true' && hashFiles('hosttools-cache/hosttools.tgz') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: hosttools-cache
+          key: ${{ steps.hosttools.outputs.cache-primary-key }}
+
+      # only write a new ccache entry when this run compiled something new
+      - name: Save ccache
+        if: always() && steps.ccstats.outputs.dirty == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ${{ steps.ccache.outputs.cache-primary-key }}
+
+      - name: Package build tree for local compiles
+        if: always()
+        run: |
+          # Generated headers, config option headers, mig output and the patched
+          # source: enough to re-run any single compile command from the log locally.
+          SDK=$(xcrun --sdk macosx --show-sdk-path)
+          mkdir -p sdk-kernel-platform
+          cp -R "$SDK/System/Library/Frameworks/Kernel.framework/Versions/A/PrivateHeaders/platform" sdk-kernel-platform/ || true
+          tar czf buildtree.tgz \
+            --exclude='*.o' --exclude='*.cpo' --exclude='*.a' --exclude='*.dSYM' --exclude='*.unstripped' \
+            --exclude='kernel.development.*' --exclude='.git' \
+            -C dxb build/xnu.obj fakeroot/usr/local/include xnu \
+            -C .. sdk-kernel-platform
+          ls -la buildtree.tgz
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-buildtree
+          path: buildtree.tgz
+          retention-days: 7
+
+      - name: Inspect closed KDK support libs
+        if: always()
+        run: |
+          mkdir -p out/kdk-libs
+          for lib in /Library/Developer/KDKs/*/System/Library/KernelSupport/lib*.a; do
+            [ -e "$lib" ] || continue
+            b=$(basename "$lib" .a)
+            ar t "$lib" > "out/kdk-libs/$b.members.txt" 2>&1 || true
+            nm -m "$lib" > "out/kdk-libs/$b.nm.txt" 2>&1 || true
+            lipo -info "$lib" >> out/kdk-libs/arch.txt 2>&1 || true
+          done
+          ls -la out/kdk-libs
+
+      - name: Collect
+        if: always()
+        run: |
+          mkdir -p out
+          cp -R dxb/fakeroot/System/Library/Kernels/. out/ 2>/dev/null || true
+          ls -la out
+          (cd out && shasum -a 256 kernel.* > SHA256SUMS) || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: xnu-kernel
+          path: out/
+          if-no-files-found: warn

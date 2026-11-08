@@ -1,0 +1,666 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+index 2edadc1..6148ba8 100644
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -3431,6 +3431,23 @@ sweet_gpu_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_gpu, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_gpu_sysctl, "A",
+     "Adreno 630 metrics: key=value line (docs/GPU_KERNEL.md)");
+ 
++/*
++ * The same numbers as kern.sweet_gpu's level/mhz/busy_pct/freq/state, for the framebuffer's on-screen HUD (patch 0213):
++ * no formatting, no locks, plain reads of the governor's words. state: 0 off, 1 on, 2 slumber, 3 lost; gov: 1 governor.
++ */
++void sweet_gpu_hud_state(unsigned *mhz, unsigned *level, unsigned *busy_pct, int *gov, int *state);
++void
++sweet_gpu_hud_state(unsigned *mhz, unsigned *level, unsigned *busy_pct, int *gov, int *state)
++{
++	unsigned lvl = a630_awake ? a630_level : 0;
++
++	*mhz = lvl ? gpu_levels[lvl].mhz : 0;
++	*level = lvl;
++	*busy_pct = (unsigned)gov_busy_pct;
++	*gov = a630_gov != 0;
++	*state = !a630_dev.ready ? 0 : a630_dev.lost ? 3 : a630_awake ? 1 : 2;
++}
++
+ /* ---- the PM thread: idle slumber, governor, residency, heartbeat ---- */
+ 
+ static void
+diff --git a/bsd/dev/sweet_cpufreq.c b/bsd/dev/sweet_cpufreq.c
+index 50b04be..578f6b9 100644
+--- a/bsd/dev/sweet_cpufreq.c
++++ b/bsd/dev/sweet_cpufreq.c
+@@ -634,4 +634,20 @@ cf_sysctl SYSCTL_HANDLER_ARGS
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_cpufreq,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, cf_sysctl, "A",
+     "Poco F1 cpufreq governor state per cluster (see bsd/dev/sweet_cpufreq.c)");
++
++/*
++ * Current clock of the A55 and A75 clusters in MHz (0 = cluster not under our control), read live from
++ * PERF_STATE like cur_khz above; for the framebuffer's on-screen HUD (patch 0213).
++ */
++void sweet_cpufreq_hud_mhz(unsigned *a55_mhz, unsigned *a75_mhz);
++void
++sweet_cpufreq_hud_mhz(unsigned *a55_mhz, unsigned *a75_mhz)
++{
++	unsigned *out[2] = { a55_mhz, a75_mhz };
++
++	for (unsigned i = 0; i < 2; i++) {
++		const struct cf_domain *d = &cf_dom[i];
++		*out[i] = d->state == CF_APPLIED ? cf_state_khz(d, cf_rd(d, CPUFREQ_PERF_STATE)) / 1000 : 0;
++	}
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_fb.c b/bsd/dev/sweet_fb.c
+index 3cd194d..2afd1f2 100644
+--- a/bsd/dev/sweet_fb.c
++++ b/bsd/dev/sweet_fb.c
+@@ -52,6 +52,15 @@ static int sweet_fb_sysctl SYSCTL_HANDLER_ARGS
+ 	return sysctl_handle_string(oidp, buf, sizeof(buf), req);
+ }
+ 
++/*
++ * sysctl kern.sweet_fb_hud (patch 0213): the on-screen performance HUD drawn by the framebuffer
++ * (SweetFramebuffer.cpp hudTick/hudBlit). 0 = off (default), nonzero = on; boot-arg sweetfb_hud=1 sets
++ * the initial value. The framebuffer only reads it (a relaxed load per frame / vsync tick).
++ */
++int sweet_fb_hud;
++SYSCTL_INT(_kern, OID_AUTO, sweet_fb_hud, CTLFLAG_RW | CTLFLAG_LOCKED, &sweet_fb_hud, 0,
++    "Poco F1 on-screen performance HUD (0 off, 1 on); needs the copy scan-out path");
++
+ SYSCTL_PROC(_kern, OID_AUTO, sweet_fb,
+     CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sweet_fb_sysctl, "A",
+     "Poco F1 display path statistics, key=value string (see bsd/dev/sweet_fb.c)");
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index e401748..56b6f9c 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -17,6 +17,22 @@
+ extern "C" int sweet_spmi_init(void);
+ extern "C" int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+ 
++/*
++ * Last published state of charge and charge current (positive = charging), for the framebuffer's on-screen
++ * HUD (patch 0213, sweet_battery_hud): two words written by publish(), read without a lock.
++ */
++static volatile int sweet_batt_percent = -1, sweet_batt_ma;
++extern "C" int sweet_battery_hud(int *percent, int *ma);
++extern "C" int
++sweet_battery_hud(int *percent, int *ma)
++{
++	int p = sweet_batt_percent;
++
++	*percent = p < 0 ? 0 : p;
++	*ma = sweet_batt_ma;
++	return p >= 0;
++}
++
+ class SweetBattery : public IOPMPowerSource {
+ 	OSDeclareDefaultStructors(SweetBattery);
+ public:
+@@ -111,6 +127,8 @@ SweetBattery::publish(unsigned percent, unsigned mv, int ma, bool external,
+ 	 * item, powerd's "Current Capacity") saw 5020 here. DT nominal = 5020 mAh.
+ 	 */
+ 	const unsigned capacity = (5020u * percent + 50u) / 100u;
++	sweet_batt_ma = ma;
++	sweet_batt_percent = (int)percent;
+ 	setBatteryInstalled(true);
+ 	setCurrentCapacity(percent);
+ 	setMaxCapacity(100);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 5ebf6d7..bc5e687 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -47,6 +47,11 @@ extern "C" void sweet_busy_init(void);          /* iokit/Kernel/arm/SweetBusy.cp
+ #include "../../../bsd/dev/sweet_spmi.h"
+ extern "C" int sweet_smmu_probe_sid(unsigned sid, unsigned level); /* bsd/dev/sweet_smmu.c, read only */
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
++extern "C" int sweet_fb_hud;                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
++extern "C" unsigned char iso_font[256 * 16];    /* osfmk/console/iso_font.c: the 8x16 console font */
++extern "C" void sweet_gpu_hud_state(unsigned *mhz, unsigned *level, unsigned *busy_pct, int *gov, int *state); /* bsd/dev/sweet_a630.c */
++extern "C" void sweet_cpufreq_hud_mhz(unsigned *a55_mhz, unsigned *a75_mhz);    /* bsd/dev/sweet_cpufreq.c */
++extern "C" int sweet_battery_hud(int *percent, int *ma);        /* iokit/Kernel/arm/SweetBattery.cpp, 0 = nothing published yet */
+ class SweetSurface;
+ static void sweet_hold_release(SweetSurface **set);
+ static uint32_t get32(const uint8_t *p, uint32_t off);
+@@ -85,6 +90,9 @@ enum {
+ #define SWEET_FB_DOT_PITCH              458     /* ppi, as the iPhone X panel */
+ #define SWEET_FB_BL_STEPS               12      /* vsyncs of backlight ramp */
+ #define SWEET_FB_STATS_MAX              1024    /* kern.sweet_fb line (bsd/dev/sweet_fb.c) */
++#define SWEET_FB_HUD_ROWS               6       /* patch 0213: text rows of the performance HUD */
++#define SWEET_FB_HUD_COLS               26      /* and columns (8x16 glyph cells) */
++#define SWEET_FB_HUD_PERIOD_US          500000  /* text refresh: twice a second */
+ /*
+  * The iOS userland only has status bar / layout data for real iPhone
+  * screens (UIKit: "No status bar visual provider for screen", the red
+@@ -257,6 +265,44 @@ public:
+ 	uint32_t      fStLogSecs;       /* sweetfb_statlog: seconds between IOLog lines, 0 = sysctl only */
+ 	int           fSmmuA, fSmmuB;   /* MDP SMMU probe results, -2 = not probed */
+ 	void          statsTick(uint64_t now);
++	/*
++	 * Performance HUD (patch 0213, sysctl kern.sweet_fb_hud, boot-arg sweetfb_hud=1). A box of text drawn
++	 * into the frame the panel scans: the copy path draws it into the back buffer after the copy (hudBlit,
++	 * before scanTo) and hudTick redraws it into the front buffer on a static screen. Both run on the work
++	 * loop thread. The box is rendered (hudRender) into a cached image once per refresh, so a frame costs
++	 * one write-only pass over the box rectangle. Zero-copy / direct scanout has no buffer of ours to draw
++	 * into (the scanned memory is the app's IOSurface): the HUD stays off there.
++	 */
++	uint32_t     *fHudImg;          /* box image, 0 = transparent (the box is a 50% stipple, text outlined) */
++	uint32_t      fHudW, fHudH, fHudX, fHudY, fHudScale;    /* box size/position in drawn-buffer pixels */
++	bool          fHudReady, fHudWarned;
++	uint64_t      fHudT, fHudDrawAbs, fHudCopyMaxAbs;       /* abs units: HUD draw time total, copy max in the window */
++	struct {
++		uint64_t swaps, coalesced, zc, copy, copyAbs;
++	} fHudPrev;
++	char          fHudText[SWEET_FB_HUD_ROWS][SWEET_FB_HUD_COLS + 1];
++	/*
++	 * Zero-copy / direct scan-out (patch 0213): the scanned buffer is the app's IOSurface, so the box is a
++	 * second hardware layer instead: a DMA pipe (fHudPipe, an index into sweet_mdp_pipes) fetches a small
++	 * ARGB image of ours (two buffers at the end of the splash carve-out, double buffered) and the mixer
++	 * (LM0) blends it above ABL's base layer at the box position, coverage blend. fHudLayerOn: the mixer
++	 * stage is enabled; fHudLayerFail: setup failed once, never tried again (scan-out is not touched).
++	 */
++	bool          fHudLayerOn, fHudLayerFail, fHudLayerTried;
++	int           fHudPipe;
++	uint32_t      fHudShift, fHudMix, fHudOrigLayer, fHudStride, fHudCur;
++	uint64_t      fHudBufPA[2];
++	uintptr_t     fHudBufVA[2];
++	IOMemoryMap  *fHudBufMap[2];
++	bool          fHudStyleLayer;   /* the image is rendered for the layer (real alpha) rather than the stipple */
++	bool          hudLayerSetup(void);
++	void          hudLayerUpdate(void);
++	void          hudLayerHide(void);
++	bool          hudUsable(void);
++	bool          hudSetup(void);
++	void          hudTick(uint64_t now);
++	void          hudRender(void);
++	void          hudBlit(uintptr_t base, uint32_t stride);
+ 	bool          zcDecline(uint32_t why, const char *text, uint32_t id);
+ 	void          zcStats(const char *when);
+ 	void          zcPoll(void);
+@@ -425,6 +471,13 @@ AppleCLCD::start(IOService *provider)
+ 		PE_parse_boot_argn("sweetfb_statlog", &secs, sizeof(secs));
+ 		fStLogSecs = secs;
+ 	}
++	{
++		int hud = 0;
++		if (PE_parse_boot_argn("sweetfb_hud", &hud, sizeof(hud))) {
++			__atomic_store_n(&sweet_fb_hud, hud != 0, __ATOMIC_RELAXED);    /* sysctl kern.sweet_fb_hud (patch 0213) */
++			IOLog("SWEET FB: sweetfb_hud=%d: performance HUD %s (sysctl kern.sweet_fb_hud)\n", hud, hud ? "on" : "off");
++		}
++	}
+ 	if (sweet_board_beryllium()) {
+ 		mdpProbe();
+ 		int flip = 0;
+@@ -616,6 +669,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	sweet_hold_release(taken);      /* copied: CA may render into them again */
+ 	fb->statsTick(now);
++	fb->hudTick(now);
+ 	sender->setTimeoutUS(fb->fVsyncUS);
+ }
+ 
+@@ -904,6 +958,11 @@ static const struct {
+ #define SWEET_MDP_LM_BORDER0    0x08u   /* LM0 +0x08 / +0x10, flushed with CTL_FLUSH BIT(6) (LM_0) */
+ #define SWEET_MDP_LM_BORDER1    0x10u
+ #define SWEET_MDP_LM0_FLUSH     (1u << 6)
++#define SSPP_SRC_UNPACK         0x34u   /* HUD layer (patch 0213) */
++#define SSPP_DANGER_LUT         0x60u   /* DANGER, SAFE, CREQ LUTs and QOS_CTRL, cloned from the base pipe */
++#define SSPP_QOS_CTRL           0x6cu
++#define SWEET_MDP_LM_BLEND0     0x20u   /* LM0 blend block of stage 0 (sdm845 blendstage_base 0x20, 0x38, 0x50 ...) */
++#define SWEET_MDP_LM_BLEND_STRIDE 0x18u
+ 
+ /*
+  * panic: put back everything the page flipper / scaler changed, so ABL's
+@@ -1297,6 +1356,7 @@ AppleCLCD::scanAddr(uint32_t pa, uint32_t stride, bool hwFrame)
+ 	} else if (!hwFrame && fHwOn) {
+ 		sweet_mdp_restore_apply();      /* boot geometry, scaler off (address/stride follow below) */
+ 		fHwOn = false;
++		fHudLayerOn = false;    /* the table put the boot mixer layer config back: the HUD stage is gone (patch 0213) */
+ 		fLmPending = fBorderFix;
+ 	}
+ 	if (fLastFlush != 0 &&
+@@ -1703,6 +1763,409 @@ AppleCLCD::blStep(int dir)
+ 	return true;
+ }
+ 
++/*
++ * Performance HUD (patch 0213).
++ *
++ * Boot-arg sweetfb_hud=1 sets the initial value of sysctl kern.sweet_fb_hud (bsd/dev/sweet_fb.c), 0 = off.
++ * Rows (every 500 ms, one window):
++ *   DISP  frames pushed to the panel per second (zero-copy + copy), and the vsync rate in Hz
++ *   APP   backboardd swaps per second, and the ones coalesced (replaced before they were shown)
++ *   COPY  copy time per frame, average and maximum of the window (latch waits and the HUD excluded)
++ *   GPU   MHz, level, busy % and governor mode (sweet_a630.c, as kern.sweet_gpu)
++ *   CPU   current MHz of the A55 and A75 clusters (sweet_cpufreq.c, live PERF_STATE)
++ *   BAT   percent and charge current, + charging (SweetBattery.cpp; "--" until it published)
++ * Everything is read through exported getters or the driver's own counters: nothing is parsed, and the
++ * only per frame work is hudBlit (write-only, no allocation). The buffers we draw into are write-combined
++ * mappings (kIOMapWriteCombineCache), so a "dsb sy" is the whole cache maintenance; there are no dirty
++ * lines to clean. The box sits at the left below the status bar (y = height / 16), clear of the clock.
++ */
++bool
++AppleCLCD::hudUsable(void)
++{
++	return !(fZc && fZcOK);         /* the CPU copy path: drawn into our own scan-out buffers; else the layer */
++}
++
++bool
++AppleCLCD::hudSetup(void)
++{
++	bool hwFrame = fHw && fFlip && hudUsable();
++	uint32_t bw = hwFrame ? fLogicalW : fWidth, bh = hwFrame ? fLogicalH : fHeight;     /* the layer is in panel pixels */
++	uint32_t s = bw >= 1000 ? 3 : 2;
++	uint32_t pad = 2 * s;
++	uint32_t w = SWEET_FB_HUD_COLS * 8 * s + 2 * pad, h = SWEET_FB_HUD_ROWS * 16 * s + 2 * pad;
++
++	if (w + 8 > bw || h + bh / 16 > bh) {
++		fHudWarned = true;
++		IOLog("SWEET FB: HUD does not fit the %ux%u buffer\n", bw, bh);
++		return false;
++	}
++	fHudImg = (uint32_t *)IOMallocData((size_t)w * h * sizeof(uint32_t));       /* once, never per frame */
++	if (fHudImg == NULL) {
++		fHudWarned = true;
++		IOLog("SWEET FB: HUD: no memory for the box image\n");
++		return false;
++	}
++	fHudW = w;
++	fHudH = h;
++	fHudX = 8 + (hudUsable() ? 0 : fHwDstX);        /* the layer: inside the picture, not in the fit margin */
++	fHudY = bh / 16;
++	fHudStyleLayer = !hudUsable();
++	fHudScale = s;
++	IOLog("SWEET FB: HUD box %ux%u at %u,%u in the %ux%u %s %s, font x%u\n", w, h, fHudX, fHudY, bw, bh,
++	    hwFrame ? "canvas" : "panel", fHudStyleLayer ? "(hardware layer)" : "buffer", s);
++	return true;
++}
++
++/* Paint the text rows into the box image: stipple background, black outline, white glyphs. */
++void
++AppleCLCD::hudRender(void)
++{
++	const uint32_t W = fHudW, s = fHudScale, pad = 2 * s;
++	const uint32_t black = 0xff000000u, white = 0xffffffffu;
++
++	for (uint32_t y = 0; y < fHudH; y++) {
++		uint32_t *row = fHudImg + (size_t)y * W;
++		for (uint32_t x = 0; x < W; x++) {
++			if (fHudStyleLayer) {
++				row[x] = 0xa0000000u;           /* the layer: black at alpha 0xa0, the mixer blends it */
++			} else {
++				row[x] = ((x + y) & 1) ? 0 : black;     /* every other pixel: 50% opaque, no read of the frame */
++			}
++		}
++	}
++	for (uint32_t r = 0; r < SWEET_FB_HUD_ROWS; r++) {
++		for (uint32_t c = 0; c < SWEET_FB_HUD_COLS && fHudText[r][c] != 0; c++) {
++			unsigned char ch = (unsigned char)fHudText[r][c];
++			if (ch == ' ') {
++				continue;
++			}
++			const unsigned char *g = iso_font + ch * 16;
++			for (int pass = 0; pass < 2; pass++) {
++				for (int gy = 0; gy < 16; gy++) {
++					for (int gx = 0; gx < 8; gx++) {
++						bool on = (g[gy] >> gx) & 1;
++						uint32_t color;
++						if (pass == 0) {
++							/* outline: an unset pixel next to a set one (inside the cell) */
++							if (on ||
++							    !((gx > 0 && ((g[gy] >> (gx - 1)) & 1)) || (gx < 7 && ((g[gy] >> (gx + 1)) & 1)) ||
++							    (gy > 0 && ((g[gy - 1] >> gx) & 1)) || (gy < 15 && ((g[gy + 1] >> gx) & 1)))) {
++								continue;
++							}
++							color = black;
++						} else {
++							if (!on) {
++								continue;
++							}
++							color = white;
++						}
++						uint32_t px = pad + (c * 8 + (uint32_t)gx) * s, py = pad + (r * 16 + (uint32_t)gy) * s;
++						for (uint32_t yy = 0; yy < s; yy++) {
++							uint32_t *d = fHudImg + (size_t)(py + yy) * W + px;
++							for (uint32_t xx = 0; xx < s; xx++) {
++								d[xx] = color;
++							}
++						}
++					}
++				}
++			}
++		}
++	}
++}
++
++/* Write the box into the frame at base (stride in bytes): only the box rectangle, write-only. */
++void
++AppleCLCD::hudBlit(uintptr_t base, uint32_t stride)
++{
++	uint64_t t0 = mach_absolute_time();
++
++	for (uint32_t y = 0; y < fHudH; y++) {
++		const uint32_t *src = fHudImg + (size_t)y * fHudW;
++		uint32_t *dst = (uint32_t *)(base + (uint64_t)(fHudY + y) * stride) + fHudX;
++		for (uint32_t x = 0; x < fHudW; x++) {
++			uint32_t v = src[x];
++			if (v != 0) {
++				dst[x] = v;
++			}
++		}
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");       /* write-combined mapping: nothing to clean, the writes must land */
++	fHudDrawAbs += mach_absolute_time() - t0;
++}
++
++/*
++ * The hardware layer (zero-copy / direct scan-out). Everything is MMIO through the same CTL as the scan-out
++ * (CTL0 FLUSH, latched at the next vsync), on the work loop thread like scanAddr. Registers (SDM845, Linux
++ * dpu_hw_sspp.c / dpu_hw_lm.c / dpu_hw_ctl.c, from memory: the first boot of this is the test):
++ *   pipe (DMA0, else DMA1): SRC_SIZE = SRC_IMG_SIZE = OUT_SIZE = (h << 16) | w, SRC_XY 0, OUT_XY = box position,
++ *     SRC0_ADDR / YSTRIDE0 = the buffer, SRC_FORMAT / UNPACK_PATTERN and the danger/safe/creq LUTs and QOS_CTRL
++ *     cloned from ABL's base pipe (same ARGB layout, same fetch priorities), SRC_OP_MODE 0 (1:1, hardware pixel
++ *     extension, no scaler: DMA pipes have none).
++ *   mixer CTL0 LAYER0 (+0x00): the pipe's 3-bit field (DMA0 << 18, DMA1 << 21) = base stage value + 1, i.e. one
++ *     stage above ABL's base pipe (stage value = blend stage + 1, value 1 is the base).
++ *   LM0 blend block of that stage, 0x20 + 0x18 * (value - 2): FG_ALPHA (+4) 0xff, BG_ALPHA (+8) 0, OP (+0)
++ *     0x602 = FG alpha from the pixel | BG alpha from the pixel, inverted (Linux "coverage": out = fg * a + bg * (1 - a)).
++ *   CTL0 FLUSH: pipe bit | CTL bit 17 (| LM0 bit 6 when the mixer config changed).
++ * A failed check or write-back mismatch logs once and leaves the layer off; the base pipe, LM0 geometry and the
++ * scan-out buffers are never written. The boot value of LAYER0 goes into the panic restore table, so the panic
++ * console shows without the box. sweetfb_hudlayer=0 turns the layer off altogether.
++ */
++static const struct { int pipe; uint32_t shift; } sweet_hud_pipes[] = { { 4, 18 }, { 5, 21 } };  /* DMA0, DMA1 */
++
++static uint32_t
++sweet_mix_shift(int pipe)       /* CTL_LAYER field of a source pipe; 0xff = not known */
++{
++	static const uint8_t shifts[] = { 0, 3, 6, 26, 18, 21, 0xff, 0xff };    /* VIG0-3, DMA0-3 */
++	return shifts[pipe];
++}
++
++bool
++AppleCLCD::hudLayerSetup(void)
++{
++	fHudLayerTried = true;
++	int dis = 1;
++	PE_parse_boot_argn("sweetfb_hudlayer", &dis, sizeof(dis));
++	if (!dis) {
++		IOLog("SWEET FB: HUD layer disabled by sweetfb_hudlayer=0: no HUD with zero-copy / direct scan-out\n");
++		return false;
++	}
++	if (fMdp == 0 || fPipe < 0 || !fFlip || !fHw || fHudImg == NULL) {
++		IOLog("SWEET FB: HUD layer: no MDP pipe / page flipping / scaler state\n");
++		return false;
++	}
++	vm_offset_t ctl = fMdp + SWEET_MDP_CTL0;
++	uint32_t layer0 = mdp_rd(ctl, 0x00);
++	uint32_t bshift = sweet_mix_shift(fPipe);
++	uint32_t m0 = bshift == 0xff ? 0 : (layer0 >> bshift) & 7u;
++	if (m0 == 0 || m0 >= 7) {
++		IOLog("SWEET FB: HUD layer: base pipe %s is at mixer value %u (layer0 0x%08x): no stage above it\n",
++		    sweet_mdp_pipes[fPipe].name, m0, layer0);
++		return false;
++	}
++	int pi = -1;
++	for (unsigned i = 0; i < sizeof(sweet_hud_pipes) / sizeof(sweet_hud_pipes[0]); i++) {
++		if (sweet_hud_pipes[i].pipe != fPipe && ((layer0 >> sweet_hud_pipes[i].shift) & 7u) == 0) {
++			pi = (int)i;
++			break;
++		}
++	}
++	vm_offset_t base = fMdp + sweet_mdp_pipes[fPipe].off;
++	uint32_t fmt = mdp_rd(base, SSPP_SRC_FORMAT);
++	if (pi < 0 || !((fmt >> 8) & 1)) {
++		IOLog("SWEET FB: HUD layer: no free DMA pipe in the mixer (layer0 0x%08x) or the base format 0x%x has no alpha\n", layer0, fmt);
++		return false;
++	}
++	/* two buffers at the end of the splash carve-out, past the flip buffers */
++	const uint64_t region_end = (uint64_t)fPhys + 0x2400000u;
++	fHudStride = (fHudW * 4 + 63) & ~63u;
++	uint64_t bytes = (uint64_t)fHudStride * fHudH;
++	uint64_t slot = (bytes + 0xfffffu) & ~0xfffffull;
++	uint64_t flipEnd = fBufPA[2] + (fHw ? (uint64_t)fHwStride * fLogicalH : (uint64_t)fRowBytes * fHeight);
++	if (region_end - 2 * slot < flipEnd || (region_end >> 32)) {
++		IOLog("SWEET FB: HUD layer: no room behind the flip buffers (end 0x%llx, need 2 x 0x%llx before 0x%llx)\n",
++		    flipEnd, slot, region_end);
++		return false;
++	}
++	for (uint32_t i = 0; i < 2; i++) {
++		fHudBufPA[i] = region_end - slot * (2 - i);
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fHudBufPA[i], (IOByteCount)bytes, kIODirectionInOut);
++		if (md == NULL) {
++			return false;
++		}
++		fHudBufMap[i] = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
++		md->release();
++		if (fHudBufMap[i] == NULL) {
++			return false;
++		}
++		fHudBufVA[i] = (uintptr_t)fHudBufMap[i]->getVirtualAddress();
++		bzero((void *)fHudBufVA[i], (size_t)bytes);
++	}
++	fHudPipe = sweet_hud_pipes[pi].pipe;
++	fHudShift = sweet_hud_pipes[pi].shift;
++	fHudMix = m0 + 1;
++	fHudOrigLayer = layer0;
++	fHudCur = 1;
++	/* the boot mixer layer config comes back on panic / boot-frame scan-out */
++	if (sweet_mdp_restore.base != 0 && sweet_mdp_restore.n < SWEET_MDP_RESTORE_MAX) {
++		sweet_mdp_restore.r[sweet_mdp_restore.n].off = SWEET_MDP_CTL0 + 0x00;
++		sweet_mdp_restore.r[sweet_mdp_restore.n++].val = layer0;
++		sweet_mdp_restore.flush |= SWEET_MDP_LM0_FLUSH | sweet_mdp_pipes[fHudPipe].flush;
++	}
++	IOLog("SWEET FB: HUD layer: %s above %s (mixer value %u -> %u, layer0 0x%08x), %ux%u ARGB at panel %u,%u, buffers 0x%llx 0x%llx stride %u\n",
++	    sweet_mdp_pipes[fHudPipe].name, sweet_mdp_pipes[fPipe].name, m0, fHudMix, layer0, fHudW, fHudH, fHudX, fHudY,
++	    fHudBufPA[0], fHudBufPA[1], fHudStride);
++	return true;
++}
++
++/* Take the HUD stage out of the mixer (sysctl off): the boot layer config again, latched with the mixer. */
++void
++AppleCLCD::hudLayerHide(void)
++{
++	if (!fHudLayerOn) {
++		return;
++	}
++	vm_offset_t ctl = fMdp + SWEET_MDP_CTL0;
++	mdp_wr(ctl, 0x00, fHudOrigLayer);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	mdp_wr(ctl, SWEET_MDP_CTL_FLUSH, SWEET_MDP_LM0_FLUSH | sweet_mdp_pipes[fHudPipe].flush | SWEET_MDP_CTL_BIT);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fHudLayerOn = false;
++}
++
++/* fHudImg holds a fresh box: copy it into the idle buffer and flip the HUD pipe to it (latched at the next vsync). */
++void
++AppleCLCD::hudLayerUpdate(void)
++{
++	vm_offset_t ctl = fMdp + SWEET_MDP_CTL0;
++	uint32_t pflush = sweet_mdp_pipes[fHudPipe].flush;
++	uint32_t next = fHudCur ^ 1u;
++
++	if (mdp_rd(ctl, SWEET_MDP_CTL_FLUSH) & pflush) {
++		return;         /* the last update has not latched: the idle buffer may still be scanned; next refresh */
++	}
++	uint64_t t0 = mach_absolute_time();
++	for (uint32_t y = 0; y < fHudH; y++) {
++		memcpy((void *)(fHudBufVA[next] + (uint64_t)y * fHudStride), fHudImg + (size_t)y * fHudW, (size_t)fHudW * 4);
++	}
++	vm_offset_t p = fMdp + sweet_mdp_pipes[fHudPipe].off;
++	vm_offset_t b = fMdp + sweet_mdp_pipes[fPipe].off;
++	uint32_t flush = pflush | SWEET_MDP_CTL_BIT;
++	if (!fHudLayerOn) {
++		uint32_t size = (fHudH << 16) | fHudW;
++		mdp_wr(p, SSPP_SRC_SIZE, size);
++		mdp_wr(p, SSPP_SRC_IMG_SIZE, size);
++		mdp_wr(p, SSPP_SRC_XY, 0);
++		mdp_wr(p, SSPP_OUT_SIZE, size);
++		mdp_wr(p, SSPP_OUT_XY, (fHudY << 16) | fHudX);
++		mdp_wr(p, SSPP_SRC_FORMAT, mdp_rd(b, SSPP_SRC_FORMAT));
++		mdp_wr(p, SSPP_SRC_UNPACK, mdp_rd(b, SSPP_SRC_UNPACK));
++		for (uint32_t o = SSPP_DANGER_LUT; o <= SSPP_QOS_CTRL; o += 4) {
++			mdp_wr(p, o, mdp_rd(b, o));
++		}
++		mdp_wr(p, SSPP_OP_MODE, 0);
++		vm_offset_t lm = fMdp + SWEET_MDP_LM0 + SWEET_MDP_LM_BLEND0 + SWEET_MDP_LM_BLEND_STRIDE * (fHudMix - 2);
++		mdp_wr(lm, 0x04, 0xff);         /* FG_ALPHA */
++		mdp_wr(lm, 0x08, 0);            /* BG_ALPHA */
++		mdp_wr(lm, 0x00, 0x602);        /* OP: coverage blend */
++	}
++	mdp_wr(p, SSPP_SRC0_ADDR, (uint32_t)fHudBufPA[next]);
++	mdp_wr(p, SSPP_YSTRIDE0, fHudStride);
++	__asm__ volatile ("dsb sy" ::: "memory");      /* the WC writes of the image land first */
++	if (!fHudLayerOn) {
++		mdp_wr(ctl, 0x00, (mdp_rd(ctl, 0x00) & ~(7u << fHudShift)) | (fHudMix << fHudShift));
++		if (((mdp_rd(ctl, 0x00) >> fHudShift) & 7u) != fHudMix) {
++			mdp_wr(ctl, 0x00, fHudOrigLayer);       /* the mixer did not take it: leave everything as it was */
++			fHudLayerFail = true;
++			IOLog("SWEET FB: HUD layer: mixer layer register reads back 0x%08x, layer disabled\n", mdp_rd(ctl, 0x00));
++			return;
++		}
++		flush |= SWEET_MDP_LM0_FLUSH;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		fHudLayerOn = true;
++	}
++	mdp_wr(ctl, SWEET_MDP_CTL_FLUSH, flush);
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fHudCur = next;
++	fHudDrawAbs += mach_absolute_time() - t0;
++}
++
++/* Every vsync tick: cheap when off; every 500 ms one window of numbers, a new box image, and a redraw if the screen is still. */
++void
++AppleCLCD::hudTick(uint64_t now)
++{
++	if (__atomic_load_n(&sweet_fb_hud, __ATOMIC_RELAXED) == 0) {
++		fHudReady = false;      /* the next enable starts a fresh window */
++		fHudT = 0;
++		hudLayerHide();
++		return;
++	}
++	if (fHudImg == NULL && (fHudWarned || !hudSetup())) {
++		return;
++	}
++	if (!hudUsable()) {
++		if (fHudLayerFail) {
++			return;
++		}
++		if (!fHudLayerTried && !hudLayerSetup()) {
++			fHudLayerFail = true;
++			fHudWarned = true;
++			IOLog("SWEET FB: HUD unavailable with zero-copy / direct scan-out (no usable hardware layer): kern.sweet_fb_hud ignored\n");
++			return;
++		}
++	}
++	uint64_t swaps, coalesced;
++	IOLockLock(fLock);
++	swaps = fSt.swaps;
++	coalesced = fSt.coalesced;
++	IOLockUnlock(fLock);
++	if (fHudT == 0) {
++		fHudT = now;
++		fHudPrev.swaps = swaps;
++		fHudPrev.coalesced = coalesced;
++		fHudPrev.zc = fSt.zc;
++		fHudPrev.copy = fSt.copy;
++		fHudPrev.copyAbs = fSt.copyAbs;
++		fHudCopyMaxAbs = 0;
++		return;
++	}
++	uint64_t winUS = sweet_abs_us(now - fHudT);
++	if (winUS < SWEET_FB_HUD_PERIOD_US) {
++		return;
++	}
++	uint64_t dSw = swaps - fHudPrev.swaps, dCo = coalesced - fHudPrev.coalesced;
++	uint64_t dFr = (fSt.zc - fHudPrev.zc) + (fSt.copy - fHudPrev.copy), dCp = fSt.copy - fHudPrev.copy;
++	#define HUD_S10(n) ((unsigned)((uint64_t)(n) * 10000000ull / winUS))   /* per second x10 */
++	uint64_t cpAvg = dCp ? sweet_abs_us(fSt.copyAbs - fHudPrev.copyAbs) / dCp : 0;
++	uint64_t cpMax = sweet_abs_us(fHudCopyMaxAbs);
++	unsigned gmhz = 0, glvl = 0, gbusy = 0, a55 = 0, a75 = 0;
++	int ggov = 0, gstate = 0, bpct = 0, bma = 0;
++	sweet_gpu_hud_state(&gmhz, &glvl, &gbusy, &ggov, &gstate);
++	sweet_cpufreq_hud_mhz(&a55, &a75);
++	int bat = sweet_battery_hud(&bpct, &bma);
++	unsigned fr = HUD_S10(dFr), sw = HUD_S10(dSw), co = HUD_S10(dCo);
++	uint32_t hz = fVsyncUS ? 1000000u / fVsyncUS : 0;
++	snprintf(fHudText[0], sizeof(fHudText[0]), "DISP %u.%u/s  VSYNC %uHz", fr / 10, fr % 10, hz);
++	snprintf(fHudText[1], sizeof(fHudText[1]), "APP  %u.%u/s  COAL %u.%u/s", sw / 10, sw % 10, co / 10, co % 10);
++	snprintf(fHudText[2], sizeof(fHudText[2]), "COPY %u.%ums MAX %u.%ums", (unsigned)(cpAvg / 1000),
++	    (unsigned)(cpAvg % 1000 / 100), (unsigned)(cpMax / 1000), (unsigned)(cpMax % 1000 / 100));
++	if (gstate == 1) {
++		snprintf(fHudText[3], sizeof(fHudText[3]), "GPU %uMHz L%u %u%% %s", gmhz, glvl, gbusy, ggov ? "gov" : "fixed");
++	} else {
++		snprintf(fHudText[3], sizeof(fHudText[3]), "GPU %s", gstate == 0 ? "off" : (gstate == 2 ? "slumber" : "lost"));
++	}
++	snprintf(fHudText[4], sizeof(fHudText[4]), "CPU A55 %u A75 %uMHz", a55, a75);
++	if (bat) {
++		snprintf(fHudText[5], sizeof(fHudText[5]), "BAT %d%% %c%dmA", bpct, bma < 0 ? '-' : '+', bma < 0 ? -bma : bma);
++	} else {
++		snprintf(fHudText[5], sizeof(fHudText[5]), "BAT --");
++	}
++	#undef HUD_S10
++	hudRender();
++	fHudReady = true;
++	fHudT = now;
++	fHudPrev.swaps = swaps;
++	fHudPrev.coalesced = coalesced;
++	fHudPrev.zc = fSt.zc;
++	fHudPrev.copy = fSt.copy;
++	fHudPrev.copyAbs = fSt.copyAbs;
++	fHudCopyMaxAbs = 0;
++	if (!hudUsable()) {
++		/* the hardware layer: not while the panel is off or still showing ABL's boot frame */
++		if (!fPowerOff && fHwOn) {
++			hudLayerUpdate();
++		}
++		return;
++	}
++	/*
++	 * A frame waiting for the next tick draws the box itself (present). Otherwise the screen is still:
++	 * draw into what the panel scans now, once a frame was copied (not over the boot console or the
++	 * power-off fade). The box then belongs to that frame; the next copied frame brings its own.
++	 */
++	if (fCopyFrames != 0 && !fPowerOff && !fDirty && !(fFlip && fFront == 0)) {
++		hudBlit(fFlip ? fBufVA[fFront] : fPixels, fHw && fFlip ? fHwStride : fRowBytes);
++	}
++}
++
+ /*
+  * Hardware-scaled present: the frame is copied 1:1 (no per-pixel math) into
+  * the canvas-sized back buffer; the scaler does the rest. Same clipping as
+@@ -1841,7 +2304,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 	if (fZc && zcPresent(rec, mask)) {
+ 		return;         /* scanned in place */
+ 	}
+-	uint64_t tcp0 = mach_absolute_time(), tlw0 = fSt.latchWaitAbs;
++	uint64_t tcp0 = mach_absolute_time(), tlw0 = fSt.latchWaitAbs, thd0 = fHudDrawAbs;
+ 	uint32_t back = 0;
+ 	if (fFlip) {
+ 		back = fFront == 1 ? 2 : 1;
+@@ -1937,16 +2400,23 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	if (fHudReady && __atomic_load_n(&sweet_fb_hud, __ATOMIC_RELAXED) != 0 && hudUsable()) {
++		hudBlit(fDraw, fHw && fFlip ? fHwStride : fRowBytes);   /* on top of the copied frame, before it is scanned */
++	}
+ 	if (fFlip) {
+ 		scanTo(back);
+ 	}
+ 	uint64_t tcpd = mach_absolute_time() - tcp0;
+-	tcpd = tcpd > fSt.latchWaitAbs - tlw0 ? tcpd - (fSt.latchWaitAbs - tlw0) : 0;
++	uint64_t tcpx = (fSt.latchWaitAbs - tlw0) + (fHudDrawAbs - thd0);      /* latch waits and the HUD are not the copy */
++	tcpd = tcpd > tcpx ? tcpd - tcpx : 0;
+ 	fSt.copy++;
+ 	fSt.copyAbs += tcpd;
+ 	if (tcpd > fSt.copyMaxAbs) {
+ 		fSt.copyMaxAbs = tcpd;
+ 	}
++	if (tcpd > fHudCopyMaxAbs) {
++		fHudCopyMaxAbs = tcpd;
++	}
+ 	fCopyFrames++;
+ 	if (fZc && ((fZcFrames + fCopyFrames) & 255) == 0) {
+ 		zcStats("counters");

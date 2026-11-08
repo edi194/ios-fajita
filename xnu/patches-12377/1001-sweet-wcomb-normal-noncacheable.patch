@@ -1,0 +1,21 @@
+diff --git a/osfmk/arm/pmap/pmap.c b/osfmk/arm/pmap/pmap.c
+index fae3c3bf9b9d6cbeb2eedca54bc67a5b1d9f1a4f..13c4b9728ec6e8d84873668ac9bfc308b77c5369 100644
+--- a/osfmk/arm/pmap/pmap.c
++++ b/osfmk/arm/pmap/pmap.c
+@@ -6029,7 +6029,16 @@ wimg_to_pte(unsigned int wimg, pmap_paddr_t pa)
+ 		pte |= ARM_PTE_NX | ARM_PTE_PNX;
+ 		break;
+ 	case VM_WIMG_WCOMB:
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		/*
++		 * sweet: Normal non-cacheable wherever it is, as in xnu-11215. gDramBase/gDramSize are only the kernel's RAM, and
++		 * the display low pool (framebuffer flip and scan-out buffers) is DRAM below it: as Device-GRE, bzero's DC ZVA
++		 * took an alignment fault in AppleCLCD::flipSetup (first iOS 26 boot).
++		 */
++		if (true) {
++#else
+ 		if (is_dram_addr(pa)) {
++#endif
+ 			pte = ARM_PTE_ATTRINDX(CACHE_ATTRINDX_WRITECOMB);
+ 		} else {
+ #if HAS_FEAT_XS

@@ -1,0 +1,548 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c94ccc8bf3cb499b8178854dbeb953c178f674d8..050ff12200c21acd20c36bbbfb175dd1f6bc311a 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
++bsd/dev/sweet_reboot.c			standard
+ bsd/dev/sweet_usb.c			standard
+ bsd/dev/sweet_cpufreq.c			standard
+ bsd/dev/sweet_smmu.c			standard
+diff --git a/bsd/dev/sweet_reboot.c b/bsd/dev/sweet_reboot.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..15ebee60b5145db4d51de2128a34478bb2bfc285
+--- /dev/null
++++ b/bsd/dev/sweet_reboot.c
+@@ -0,0 +1,237 @@
++/*
++ * Poco F1 (beryllium) reboot: the SoC reset path, with a reboot reason.
++ *
++ * Until this file XNU had no restart path on this board (PE_halt_restart was
++ * never set: "MACH Reboot" and spin). Reset = write 0 to PS_HOLD (0x0c264000,
++ * live DT restart@10ac000 "qcom,pshold"); the PMIC then warm/hard resets the
++ * SoC as configured by firmware. If PS_HOLD does not take (2 s), PSCI
++ * SYSTEM_RESET follows.
++ *
++ * Reboot reason, so that a reboot can land in fastboot / recovery:
++ *  - PM8998 PON block (SID 0, base 0x800), PON_SOFT_RB_SPARE (0x8f): Linux
++ *    drivers/power/reset/qcom-pon.c with the pm8998 data (reason_shift = 1,
++ *    GEN2_REASON_SHIFT) and reboot-mode: regmap_update_bits(0x88f,
++ *    GENMASK(7, 1), magic << 1). Magics from arch/arm64/boot/dts/qcom/
++ *    pm8998.dtsi (v6.12): mode-bootloader = <0x2>, mode-recovery = <0x1>
++ *    (the same values the Qualcomm ABL uses: FASTBOOT_MODE 2, RECOVERY_MODE 1).
++ *    Like the reboot-mode core, every reboot writes the field (0 for normal)
++ *    so a stale reason cannot stick; an unchanged value is not rewritten.
++ *  - The live DT (dtb/beryllium/live.dts) has no reboot-mode node; the
++ *    downstream way is qpnp-power-on + msm-poweroff: the same PON reason AND
++ *    the IMEM restart_reason word (qcom,msm-imem@146bf000 / restart_reason@65c
++ *    = 0x146bf65c) with 0x77665500 (bootloader) / 0x77665502 (recovery). Both
++ *    are written (IMEM only for non-normal reasons; XBL clears it).
++ *
++ * Control: boot-arg sweetreboot=bootloader|recovery|normal (default normal),
++ * overridden for the next reboot by the root-only sysctl
++ * kern.sweet_reboot_mode (string; "fastboot" is accepted for "bootloader").
++ *
++ * Panic: unchanged (no reset, the screen/log stays) unless the boot-arg is
++ * sweetreboot=bootloader; then a panic also resets into fastboot (unattended
++ * tests). The sysctl does not affect panics.
++ *
++ * Reset time may be non-preemptible (halt_all_cpus, panic): everything is
++ * mapped by sweet_reboot_init() and the SPMI helpers run lock-less there.
++ * All logs start with "SWEET REBOOT:".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/sysctl.h>
++#include <sys/errno.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++#include "sweet_spmi.h"
++#include "sweet_board.h"
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void delay(int usec);
++
++#define SR_PSHOLD_PA     0x0c264000u
++#define SR_IMEM_PA       0x146bf000u
++#define SR_IMEM_RESTART  0x65cu            /* restart_reason@65c */
++#define SR_IMEM_BOOTLOADER 0x77665500u
++#define SR_IMEM_RECOVERY   0x77665502u
++
++#define SR_PON_SID       0u
++#define SR_PON_SPARE     0x088fu           /* PON base 0x800 + PON_SOFT_RB_SPARE 0x8f */
++#define SR_REASON_SHIFT  1u                /* qcom,pm8998-pon: GEN2_REASON_SHIFT */
++#define SR_REASON_MASK   (0xffu & ~((1u << SR_REASON_SHIFT) - 1u))   /* GENMASK(7, 1) */
++#define SR_MAGIC_NORMAL     0u
++#define SR_MAGIC_RECOVERY   0x1u           /* pm8998.dtsi mode-recovery */
++#define SR_MAGIC_BOOTLOADER 0x2u           /* pm8998.dtsi mode-bootloader */
++
++enum { SR_NORMAL = 0, SR_BOOTLOADER = 1, SR_RECOVERY = 2 };
++
++static int sr_bootarg = SR_NORMAL;
++static int sr_override = -1;               /* sysctl; -1 = none */
++static volatile uint32_t *sr_pshold;
++static volatile uint32_t *sr_imem;
++static bool sr_ready, sr_pon_ready, sr_in_panic;
++
++static const char *
++sr_name(int mode)
++{
++	return mode == SR_BOOTLOADER ? "bootloader" : mode == SR_RECOVERY ? "recovery" : "normal";
++}
++
++static int
++sr_parse(const char *s)
++{
++	if (!strcmp(s, "bootloader") || !strcmp(s, "fastboot")) {
++		return SR_BOOTLOADER;
++	}
++	if (!strcmp(s, "recovery")) {
++		return SR_RECOVERY;
++	}
++	if (!strcmp(s, "normal") || !strcmp(s, "")) {
++		return SR_NORMAL;
++	}
++	return -1;
++}
++
++static int
++sr_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(arg1, arg2)
++	char buf[16];
++	int error;
++
++	strlcpy(buf, sr_name(sr_override >= 0 ? sr_override : sr_bootarg), sizeof(buf));
++	error = sysctl_handle_string(oidp, buf, sizeof(buf), req);
++	if (error || !req->newptr) {
++		return error;
++	}
++	/* tolerate a trailing newline from echo */
++	size_t n = strlen(buf);
++	while (n && (buf[n - 1] == '\n' || buf[n - 1] == ' ')) {
++		buf[--n] = 0;
++	}
++	int mode = sr_parse(buf);
++	if (mode < 0) {
++		return EINVAL;
++	}
++	sr_override = mode;
++	printf("SWEET REBOOT: next reboot mode set to %s (sysctl)\n", sr_name(mode));
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, sweet_reboot_mode,
++    CTLTYPE_STRING | CTLFLAG_RW | CTLFLAG_LOCKED, 0, 0, sr_sysctl, "A",
++    "Reboot mode of the next reboot: bootloader (fastboot), recovery, normal");
++
++/* PSCI SYSTEM_RESET (SMCCC 1.0): fallback when PS_HOLD does not reset. */
++static void
++sr_psci_system_reset(void)
++{
++	register uint64_t x0 __asm__("x0") = 0x84000009ULL;
++	__asm__ volatile ("smc #0" : "+r"(x0) : : "x1", "x2", "x3", "x4", "x5", "x6", "x7",
++	    "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++}
++
++/* Thread context, after the SPMI driver can start. Idempotent. */
++void
++sweet_reboot_init(void)
++{
++	char arg[16] = "";
++
++	if (sr_ready || !sweet_board_beryllium()) {
++		return;
++	}
++	if (PE_parse_boot_argn("sweetreboot", arg, sizeof(arg))) {
++		int mode = sr_parse(arg);
++		if (mode < 0) {
++			printf("SWEET REBOOT: unknown boot-arg sweetreboot=%s (normal)\n", arg);
++		} else {
++			sr_bootarg = mode;
++		}
++	}
++	sr_pshold = (volatile uint32_t *)ml_io_map(SR_PSHOLD_PA, 0x1000);
++	sr_imem = (volatile uint32_t *)ml_io_map(SR_IMEM_PA, 0x1000);
++	if (sweet_spmi_init() == 0 && sweet_spmi_prepare_write(SR_PON_SID, SR_PON_SPARE) == 0) {
++		sr_pon_ready = true;
++	}
++	sr_ready = sr_pshold != NULL;
++	printf("SWEET REBOOT: boot-arg mode %s, PS_HOLD %s, IMEM %s, PON spare write %s\n",
++	    sr_name(sr_bootarg), sr_pshold ? "mapped" : "NOT mapped",
++	    sr_imem ? "mapped" : "NOT mapped", sr_pon_ready ? "ready" : "unavailable");
++}
++
++/*
++ * qcom-pon.c qcom_pon_reboot_mode_write(): regmap_update_bits(base + 0x8f,
++ * GENMASK(7, shift), magic << shift) through a read-modify-write.
++ */
++static void
++sr_pon_set_reason(unsigned magic)
++{
++	uint8_t old = 0, upd, back = 0;
++
++	if (!sr_pon_ready) {
++		printf("SWEET REBOOT: PON spare not writable, reason not stored\n");
++		return;
++	}
++	if (sweet_spmi_read(SR_PON_SID, SR_PON_SPARE, &old) != 0) {
++		printf("SWEET REBOOT: PON spare read failed, reason not stored\n");
++		return;
++	}
++	upd = (uint8_t)((old & ~SR_REASON_MASK) | ((magic << SR_REASON_SHIFT) & SR_REASON_MASK));
++	if (upd == old) {
++		printf("SWEET REBOOT: PON_SOFT_RB_SPARE 0x88f = 0x%02x already\n", old);
++		return;
++	}
++	if (sweet_spmi_write(SR_PON_SID, SR_PON_SPARE, &upd, 1) != 0) {
++		printf("SWEET REBOOT: PON_SOFT_RB_SPARE 0x88f write 0x%02x -> 0x%02x FAILED\n", old, upd);
++		return;
++	}
++	(void)sweet_spmi_read(SR_PON_SID, SR_PON_SPARE, &back);
++	printf("SWEET REBOOT: PON_SOFT_RB_SPARE 0x88f 0x%02x -> 0x%02x (read back 0x%02x)\n", old, upd, back);
++}
++
++/* Called by SweetPlatformExpert::haltRestart for panic notifications. */
++void
++sweet_reboot_note_panic(void)
++{
++	sr_in_panic = true;
++}
++
++/*
++ * Reset the SoC. Returns only if nothing reset it (or no reset was wanted:
++ * -1, the old behaviour). panic_restart: the call comes from a panic restart.
++ */
++int
++sweet_reboot_restart(int panic_restart)
++{
++	int mode;
++
++	if (!sr_ready) {
++		return -1;
++	}
++	if (panic_restart || sr_in_panic) {
++		/* Panics keep their old behaviour (stay up) unless asked for fastboot. */
++		if (sr_bootarg != SR_BOOTLOADER) {
++			return -1;
++		}
++		mode = SR_BOOTLOADER;
++	} else {
++		mode = sr_override >= 0 ? sr_override : sr_bootarg;
++	}
++	sweet_spmi_atomic();
++	printf("SWEET REBOOT: resetting, mode %s%s\n", sr_name(mode), panic_restart || sr_in_panic ? " (panic)" : "");
++	sr_pon_set_reason(mode == SR_BOOTLOADER ? SR_MAGIC_BOOTLOADER :
++	    mode == SR_RECOVERY ? SR_MAGIC_RECOVERY : SR_MAGIC_NORMAL);
++	if (sr_imem && mode != SR_NORMAL) {
++		uint32_t magic = mode == SR_BOOTLOADER ? SR_IMEM_BOOTLOADER : SR_IMEM_RECOVERY;
++		sr_imem[SR_IMEM_RESTART / 4] = magic;
++		__asm__ volatile ("dsb sy" ::: "memory");
++		printf("SWEET REBOOT: IMEM restart_reason 0x146bf65c = 0x%08x\n", magic);
++	}
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*sr_pshold = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	delay(2000 * 1000);
++	printf("SWEET REBOOT: PS_HOLD did not reset, PSCI SYSTEM_RESET\n");
++	sr_psci_system_reset();
++	delay(2000 * 1000);
++	return -1;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index f1aea0ea4ca37a12a49eac51b45092f67878cc88..928c6a85e529e8a0eb022649ab8ed3e07dd977cb 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -31,12 +31,37 @@ static unsigned sp_count;
+ static bool sp_attempted, sp_ready;
+ static volatile uint32_t sp_init_lock;
+ /* Write channels mapped on demand (one 4 KiB page of the APID's 64 KiB window). */
+-#define SP_WCH_MAX 4
++#define SP_WCH_MAX 6
+ static struct { uint16_t apid; vm_offset_t va; } sp_wch[SP_WCH_MAX];
+ static unsigned sp_nwch;
+ /* A timed-out command may complete late: never reuse that lane this boot. */
+ static bool sp_poisoned[512];
+ 
++/*
++ * Reset time (sweet_reboot.c) may be non-preemptible, or in a panic: from
++ * sweet_spmi_atomic() on, the lock is only tried (and ignored when taken by
++ * someone else, the SoC is about to reset) and nothing is mapped.
++ */
++static volatile bool sp_atomic;
++
++static bool
++sp_take(void)
++{
++	if (sp_atomic) {
++		return IOLockTryLock(sp_lock);
++	}
++	IOLockLock(sp_lock);
++	return true;
++}
++
++static void
++sp_put(bool got)
++{
++	if (got) {
++		IOLockUnlock(sp_lock);
++	}
++}
++
+ static uint32_t
+ sp_rd(vm_offset_t base, unsigned off)
+ {
+@@ -125,9 +150,11 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	bool allowed;
+ 	if (sweet_board_beryllium()) {
+ 		/* SID 3: PMI8998 WLED ctrl 0xd8 / sink 0xd9 (backlight fade, reads only here) */
++		/* SID 0: PM8998 PON 0x08 (reboot reason read-modify-write, sweet_reboot.c) */
+ 		allowed = (sid == 2 && (peripheral == 0x10 || peripheral == 0x13 ||
+ 		    peripheral == 0x40 || peripheral == 0x41)) ||
+-		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9));
++		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9)) ||
++		    (sid == 0 && peripheral == 0x08);
+ 	} else {
+ 		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
+ 		    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
+@@ -135,10 +162,10 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	if (!sp_ready || !out || addr > 0xffffu || !allowed) {
+ 		return -1;
+ 	}
+-	IOLockLock(sp_lock);
++	bool got = sp_take();
+ 	uint16_t apid = sp_find_apid((sid << 8) | peripheral);
+ 	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+-		IOLockUnlock(sp_lock);
++		sp_put(got);
+ 		return -1;
+ 	}
+ 	unsigned off = 0x80u * apid;
+@@ -150,11 +177,11 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 		uint32_t status = sp_rd(sp_obs, off + 0x08u);
+ 		if (status & 1u) {
+ 			if (status & 0x0eu) {
+-				IOLockUnlock(sp_lock);
++				sp_put(got);
+ 				return -1;
+ 			}
+ 			*out = (uint8_t)sp_rd(sp_obs, off + 0x18u);
+-			IOLockUnlock(sp_lock);
++			sp_put(got);
+ 			return 0;
+ 		}
+ 		delay(1);
+@@ -162,7 +189,7 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	sp_poisoned[apid] = true;
+ 	printf("SWEET BATTERY: SPMI timeout sid=%u addr=%#x APID=%u disabled\n",
+ 	    sid, addr, apid);
+-	IOLockUnlock(sp_lock);
++	sp_put(got);
+ 	return -1;
+ }
+ 
+@@ -173,11 +200,19 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+  *   0x57 0x67   WLED4_SINK_REG_BRIGHT(0/1), 16-bit little endian (1 or 2 bytes)
+  *   0x58 0x68   their high bytes (one byte)
+  * Nothing in the control module (0xd8: MOD_EN, OVP, boost) is writable.
++ * SID 0: PM8998 PON_SOFT_RB_SPARE (0x88f, one byte) only, the reboot reason
++ * of qcom-pon.c (written by sweet_reboot.c, read-modify-write).
+  */
+ static bool
+ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ {
+-	if (!sweet_board_beryllium() || sid != 3 || len < 1 || len > 2) {
++	if (!sweet_board_beryllium() || len < 1 || len > 2) {
++		return false;
++	}
++	if (sid == 0) {
++		return addr == 0x088fu && len == 1;
++	}
++	if (sid != 3) {
+ 		return false;
+ 	}
+ 	switch (addr) {
+@@ -202,7 +237,7 @@ sp_wch_map(uint16_t apid)
+ 			return sp_wch[i].va;
+ 		}
+ 	}
+-	if (sp_nwch >= SP_WCH_MAX) {
++	if (sp_nwch >= SP_WCH_MAX || sp_atomic) {
+ 		return 0;
+ 	}
+ 	vm_offset_t va = ml_io_map(SP_CHNL_PA + 0x10000u * apid, 0x1000);
+@@ -229,10 +264,10 @@ sweet_spmi_write(unsigned sid, unsigned addr, const uint8_t *data, unsigned len)
+ 	if (!sp_ready || !data || addr > 0xffffu || !sp_write_allowed(sid, addr, len)) {
+ 		return -1;
+ 	}
+-	IOLockLock(sp_lock);
++	bool got = sp_take();
+ 	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
+ 	if (apid == SP_NO_APID || sp_poisoned[apid]) {
+-		IOLockUnlock(sp_lock);
++		sp_put(got);
+ 		return -1;
+ 	}
+ 	unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u;
+@@ -242,12 +277,12 @@ sweet_spmi_write(unsigned sid, unsigned addr, const uint8_t *data, unsigned len)
+ 			printf("SWEET SPMI: APID %u (sid %u peripheral 0x%x) is owned by EE %u: write refused\n",
+ 			    apid, sid, addr >> 8, owner);
+ 		}
+-		IOLockUnlock(sp_lock);
++		sp_put(got);
+ 		return -1;
+ 	}
+ 	vm_offset_t ch = sp_wch_map(apid);
+ 	if (!ch) {
+-		IOLockUnlock(sp_lock);
++		sp_put(got);
+ 		return -1;
+ 	}
+ 	uint32_t wdata = data[0] | (len > 1 ? (uint32_t)data[1] << 8 : 0);
+@@ -260,7 +295,7 @@ sweet_spmi_write(unsigned sid, unsigned addr, const uint8_t *data, unsigned len)
+ 	for (unsigned i = 0; i < 1000; ++i) {
+ 		uint32_t status = sp_rd(ch, 0x08u);
+ 		if (status & 1u) {
+-			IOLockUnlock(sp_lock);
++			sp_put(got);
+ 			if (status & 0x0eu) {
+ 				printf("SWEET SPMI: write sid=%u addr=%#x status %#x (failed/denied)\n", sid, addr, status);
+ 				return -1;
+@@ -271,7 +306,40 @@ sweet_spmi_write(unsigned sid, unsigned addr, const uint8_t *data, unsigned len)
+ 	}
+ 	sp_poisoned[apid] = true;
+ 	printf("SWEET SPMI: write timeout sid=%u addr=%#x APID=%u disabled\n", sid, addr, apid);
+-	IOLockUnlock(sp_lock);
++	sp_put(got);
+ 	return -1;
+ }
++
++/*
++ * Thread context: make a whitelisted register writable later from atomic
++ * context: find its APID, check EE ownership and map its write channel.
++ * 0 ready, -1 not (not whitelisted, no APID, owned by another EE, no map).
++ */
++int
++sweet_spmi_prepare_write(unsigned sid, unsigned addr)
++{
++	if (!sp_ready || addr > 0xffffu || !sp_write_allowed(sid, addr, 1)) {
++		return -1;
++	}
++	IOLockLock(sp_lock);
++	uint16_t apid = sp_find_apid((sid << 8) | (addr >> 8));
++	if (apid == SP_NO_APID || sp_poisoned[apid]) {
++		IOLockUnlock(sp_lock);
++		printf("SWEET SPMI: no usable APID for sid %u peripheral 0x%x\n", sid, addr >> 8);
++		return -1;
++	}
++	unsigned owner = sp_rd(sp_cfg, 0x700u + 4u * apid) & 7u;
++	vm_offset_t ch = owner == 0 ? sp_wch_map(apid) : 0;
++	IOLockUnlock(sp_lock);
++	printf("SWEET SPMI: sid %u peripheral 0x%x APID %u owner EE %u write channel %s\n",
++	    sid, addr >> 8, apid, owner, ch ? "mapped" : "unavailable");
++	return ch ? 0 : -1;
++}
++
++/* From here on SPMI accesses never sleep or map (reset time, see sp_take). */
++void
++sweet_spmi_atomic(void)
++{
++	sp_atomic = true;
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index 1368b80e0316be273800ed9a13658e246a378816..cb2b3c8cc46d7f361de4e0a7909539f64ccb6b77 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -13,6 +13,10 @@ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+  * brightness/sync registers (see sweet_spmi.c). Thread context only.
+  */
+ int sweet_spmi_write(unsigned sid, unsigned addr, const uint8_t *data, unsigned len);
++/* Thread context: prepare a whitelisted write for later atomic use (0 ok). */
++int sweet_spmi_prepare_write(unsigned sid, unsigned addr);
++/* Reset time: no more sleeping locks or mappings in this module. */
++void sweet_spmi_atomic(void);
+ #ifdef __cplusplus
+ }
+ #endif
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 94f541dc2d93a6700b013df360666556396ea7d6..d22cbe6a8111d2cb695d5435d6c1c070054f6d04 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -53,6 +53,7 @@ extern int hz;
+ static void sweet_log_start(void);
+ extern void sweet_sample_start(void);
+ extern void sweet_keys_init(void);
++extern void sweet_reboot_init(void);
+ extern void sweet_touch_init(void);
+ extern void beryllium_wlan_init(void);
+ extern void sweet_usb_probe(void);
+@@ -843,6 +844,7 @@ sweet_ufs_init(void)
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
+ 	sweet_cpufreq_max();
+ 	sweet_keys_init();
++	sweet_reboot_init();	/* beryllium: PS_HOLD reset + reboot reason, SWEET REBOOT: */
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
+ 	sweet_a630_probe();	/* sweetgpu=N, beryllium only, off by default */
+diff --git a/iokit/Kernel/arm/SweetPlatformExpert.cpp b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+index 0631685e90870c78f9460cff6d984c364f2bc6ef..cbb362d2e7ca5911473006a4e26c9c407bce34b2 100644
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -10,6 +10,9 @@
+ #include <IOKit/IODeviceTreeSupport.h>
+ #include <IOKit/IOLib.h>
+ 
++extern "C" int sweet_reboot_restart(int panic_restart);
++extern "C" void sweet_reboot_note_panic(void);
++
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+ 
+@@ -18,6 +21,7 @@ public:
+ 	void processTopLevel(IORegistryEntry *root) APPLE_KEXT_OVERRIDE;
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
++	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+@@ -34,6 +38,34 @@ SweetPlatformExpert::start(IOService *provider)
+ 	return true;
+ }
+ 
++/*
++ * Reset path (bsd/dev/sweet_reboot.c, Poco F1: PS_HOLD + reboot reason).
++ * Other boards, and every type not handled here, keep the stock behaviour.
++ * Panics only reset with boot-arg sweetreboot=bootloader (the helper checks).
++ */
++int
++SweetPlatformExpert::haltRestart(unsigned int type)
++{
++	switch (type) {
++	case kPEPanicBegin:
++	case kPEPanicSync:
++	case kPEPanicDiagnosticsInProgress:
++	case kPEPanicDiagnosticsDone:
++		sweet_reboot_note_panic();
++		break;
++	case kPEPanicRestartCPU:
++		sweet_reboot_note_panic();
++		(void)sweet_reboot_restart(1);
++		break;
++	case kPERestartCPU:
++		(void)sweet_reboot_restart(0);
++		break;
++	default:
++		break;
++	}
++	return IODTPlatformExpert::haltRestart(type);
++}
++
+ const char *
+ SweetPlatformExpert::deleteList(void)
+ {

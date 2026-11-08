@@ -1,0 +1,457 @@
+diff --git a/bsd/dev/sweet_usb.c b/bsd/dev/sweet_usb.c
+index aaf91f3d36cdc34671c1b6ed227aa14ac237f3c5..9ece7c3b7b993e6c212afab3367ea566d8a75837 100644
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -37,12 +37,18 @@
+ #include <net/if_media.h>
+ #include <net/dlil.h>
+ #include <sys/kern_event.h>
++#include <net/route.h>
++#include <libkern/OSAtomic.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern int sweet_smmu_map_sid(unsigned sid);
+ void sweet_usb_probe(void);
+ static void sweet_usb_gadget_start(vm_offset_t dwc);
+ extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++/* iokit/Kernel/arm/SweetNetwork.cpp */
++extern int sweet_net_publish(const char *bsd_name, const char *prefix, unsigned unit,
++    const uint8_t *mac, const char *ip, const char *mask, const char *router,
++    const char *dns1, const char *dns2);
+ 
+ #define GCC_PA                  0x00100000
+ #define GCC_SIZE                0x00090000
+@@ -245,6 +251,8 @@ static struct {
+ 	uint8_t     xfer_res[6];    /* its transfer resource index */
+ 	uint32_t    resets;
+ 	uint8_t     notify_stage;   /* 1 NETWORK_CONNECTION sent, 2 SPEED_CHANGE sent */
++	int         net_route;      /* sweetnetroute=1: add the default route via the host at link-up */
++	volatile UInt32 route_thread; /* a route thread is running */
+ } ud;
+ 
+ static inline void
+@@ -393,6 +401,8 @@ ud_string(unsigned idx, uint8_t *out)
+ static void ud_rx_arm(void);
+ static void ud_tx_kick_locked(void);
+ static void ud_link_event(bool up);
++static void ud_route_kick(void);
++static void ud_net_start(void);
+ 
+ /* NETWORK_CONNECTION notification: the host brings its link up on it. */
+ static void
+@@ -625,6 +635,9 @@ ud_link_event(bool up)
+ {
+ 	if (ud.ifp != NULL) {
+ 		dlil_post_msg(ud.ifp, KEV_DL_SUBCLASS, up ? KEV_DL_LINK_ON : KEV_DL_LINK_OFF, NULL, 0, FALSE);
++		if (up && ud.net_route) {
++			ud_route_kick();
++		}
+ 	}
+ }
+ 
+@@ -668,6 +681,98 @@ ud_if_detach(ifnet_t ifp __unused)
+ {
+ }
+ 
++/*
++ * Boot-arg sweetnet: publish ue0 to IOKit (SweetNetwork.cpp) so configd
++ * adopts it as a built-in, pre-configured service (static address, router
++ * 192.168.7.1, DNS 1.1.1.1 / 8.8.8.8). Default on for the Poco F1 (this code
++ * only runs with sweetusb=2), off elsewhere; sweetnet=0 disables.
++ * sweetnetroute=1 additionally adds the default route from the kernel.
++ */
++static void
++ud_net_start(void)
++{
++	int net = sweet_board_beryllium() ? 1 : 0;
++	int route = 0;
++
++	PE_parse_boot_argn("sweetnet", &net, sizeof(net));
++	PE_parse_boot_argn("sweetnetroute", &route, sizeof(route));
++	if (ud.ifp == NULL) {
++		return;
++	}
++	ud.net_route = route;
++	if (!net) {
++		printf("SWEET NET: disabled (boot-arg sweetnet=0); IOKit interface not published%s\n",
++		    route ? ", kernel default route still enabled" : "");
++		return;
++	}
++	printf("SWEET NET: publishing ue0 to IOKit (sweetnet=%d, sweetnetroute=%d)\n", net, route);
++	int ok = sweet_net_publish("ue0", "ue", 0, ud_phone_mac, "192.168.7.2", "255.255.255.0",
++	    "192.168.7.1", "1.1.1.1", "8.8.8.8");
++	printf("SWEET NET: IOKit publish %s\n", ok ? "done" : "FAILED");
++}
++
++/*
++ * Fallback for configd ignoring ue0 (boot-arg sweetnetroute=1, off by
++ * default): add 0.0.0.0/0 via 192.168.7.1 with a PF_ROUTE RTM_ADD sent from
++ * the kernel (what route(8) does). Runs in its own short-lived thread at
++ * link-up, a moment after the ifnet is up, so the USB control path never
++ * waits on the routing locks. EEXIST (already routed, e.g. by configd) is fine.
++ */
++struct ud_rtmsg {
++	struct rt_msghdr        hdr;
++	struct sockaddr_in      dst, gw, mask;
++};
++
++static void
++ud_route_thread(void *arg __unused, wait_result_t wr __unused)
++{
++	struct ud_rtmsg m;
++	socket_t so = NULL;
++	errno_t err;
++
++	ud_sleep_ms(500);
++	err = sock_socket(PF_ROUTE, SOCK_RAW, 0, NULL, NULL, &so);
++	if (err == 0) {
++		bzero(&m, sizeof(m));
++		m.hdr.rtm_msglen = sizeof(m);
++		m.hdr.rtm_version = RTM_VERSION;
++		m.hdr.rtm_type = RTM_ADD;
++		m.hdr.rtm_flags = RTF_UP | RTF_GATEWAY | RTF_STATIC;
++		m.hdr.rtm_addrs = RTA_DST | RTA_GATEWAY | RTA_NETMASK;
++		m.hdr.rtm_seq = 1;
++		m.dst.sin_len = sizeof(m.dst);
++		m.dst.sin_family = AF_INET;
++		m.gw.sin_len = sizeof(m.gw);
++		m.gw.sin_family = AF_INET;
++		m.gw.sin_addr.s_addr = htonl(0xc0a80701);       /* 192.168.7.1 */
++		m.mask.sin_len = sizeof(m.mask);
++		m.mask.sin_family = AF_INET;
++		struct iovec iov = { .iov_base = &m, .iov_len = sizeof(m) };
++		struct msghdr msg = { .msg_iov = &iov, .msg_iovlen = 1 };
++		size_t sent = 0;
++		err = sock_send(so, &msg, 0, &sent);
++		sock_close(so);
++	}
++	printf("SWEET NET: default route via 192.168.7.1 on ue0: %s (errno %d)\n",
++	    err == 0 ? "added" : (err == EEXIST ? "already present" : "FAILED"), (int)err);
++	ud.route_thread = 0;
++}
++
++static void
++ud_route_kick(void)
++{
++	thread_t thread;
++
++	if (!OSCompareAndSwap(0, 1, &ud.route_thread)) {
++		return;
++	}
++	if (kernel_thread_start(ud_route_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	} else {
++		ud.route_thread = 0;
++	}
++}
++
+ /* ue0, 192.168.7.2/24 (the host side is 192.168.7.1). */
+ static void
+ ud_if_create(void)
+@@ -941,6 +1046,7 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			continue;
+ 		}
+ 		uint32_t n;
++		uint64_t sent_upto = pos;
+ 		while ((n = sweet_log_copy(&pos, chunk, sizeof(chunk))) > 0) {
+ 			struct iovec iov = { .iov_base = chunk, .iov_len = n };
+ 			struct msghdr msg = {
+@@ -949,8 +1055,11 @@ ud_log_thread(void *arg __unused, wait_result_t wr __unused)
+ 			};
+ 			size_t sent = 0;
+ 			if (sock_send(so, &msg, 0, &sent) != 0) {
+-				break;          /* no route/ARP yet: retry later */
++				/* no route/ARP yet (host not configured): keep the chunk for the next try */
++				pos = sent_upto;
++				break;
+ 			}
++			sent_upto = pos;
+ 		}
+ 	}
+ }
+@@ -1062,6 +1171,7 @@ sweet_usb_gadget_start(vm_offset_t dwc)
+ 	}
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
++	ud_net_start();
+ 
+ 	/*
+ 	 * SDM845: the DWC3 is USB3-capable and clocks its PIPE side (and RAM)
+diff --git a/iokit/Kernel/arm/SweetNetwork.cpp b/iokit/Kernel/arm/SweetNetwork.cpp
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c97872a5ae4caa0e27e671bce60d9897bba8c80
+--- /dev/null
++++ b/iokit/Kernel/arm/SweetNetwork.cpp
+@@ -0,0 +1,260 @@
++/*
++ * SWEET: IOKit stand-ins so iOS configd adopts the kernel's USB Ethernet
++ * ifnet (bsd/dev/sweet_usb.c, "ue0") as a network service.
++ *
++ * Ported from anonbeat1/ios-sweet (Nothing Phone (1) / Spacewar) patches
++ * 0092 (commit 6ac39a4c1, plus the IOPlatformExpert.h include fix 2dd5af44f)
++ * and 0093 (commit 0a377a715, process-name trace of IONetworkStack opens)
++ * (https://github.com/anonbeat1/ios-sweet). The class layout, the property
++ * set and the publish sequence are theirs; changes here: a common base that
++ * logs every user-client open request (stack, controller, interface) with
++ * the calling process name, a return value / extra log lines, and the
++ * board guard.
++ *
++ * configd (configd-1241.140.6) builds its interface list from IOKit, not
++ * from BSD ifnets: SCNetworkInterface.c createInterface() walks an object
++ * that conforms to "IONetworkInterface" (IOInterfaceType, IOBuiltin, BSD
++ * Name, IOInterfaceNamePrefix, IOInterfaceUnit), its parent controller
++ * (IOMACAddress, SelfNamed) and the controller's parent (bus). Apple's
++ * IONetworkingFamily kext is not part of this kernel, so these classes
++ * carry the same names with only those properties.
++ *
++ * InterfaceNamer only processes interfaces once it can open the
++ * "IONetworkStack" service; the controller is SelfNamed, so the stack never
++ * receives naming commands and its user client does nothing.
++ *
++ * An interface that is built-in and has HiddenConfiguration counts as
++ * "Apple pre-configured" (_SCNetworkInterfaceIsApplePreconfigured):
++ * PreferencesMonitor creates its network service itself, with the
++ * template overrides from "NetworkConfigurationOverrides" (IPv4 manual
++ * address/router, DNS servers). No preferences.plist edit is needed.
++ *
++ * All log lines start with "SWEET NET:".
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <IOKit/IOService.h>
++#include <IOKit/IOPlatformExpert.h>
++#include <IOKit/IOUserClient.h>
++#include <IOKit/IOKitKeys.h>
++#include <IOKit/IOLib.h>
++#include <sys/proc.h>
++#include <libkern/OSAtomic.h>
++#include <libkern/c++/OSArray.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSString.h>
++
++/*
++ * Common base: log which process asks for a user client on any of our
++ * objects (the first 64 requests), then behave like IOService (the stack
++ * has kIOUserClientClassKey set so it succeeds; the others answer
++ * kIOReturnUnsupported, as an IOService without a user client does).
++ */
++class SweetNetService : public IOService {
++	OSDeclareDefaultStructors(SweetNetService);
++public:
++	IOReturn newUserClient(task_t owningTask, void *securityID, UInt32 type,
++	    OSDictionary *properties, IOUserClient **handler) APPLE_KEXT_OVERRIDE;
++	using IOService::newUserClient;
++};
++OSDefineMetaClassAndStructors(SweetNetService, IOService);
++
++IOReturn
++SweetNetService::newUserClient(task_t owningTask, void *securityID, UInt32 type,
++    OSDictionary *properties, IOUserClient **handler)
++{
++	static volatile SInt32 count;
++	IOReturn ret = IOService::newUserClient(owningTask, securityID, type, properties, handler);
++	if (OSIncrementAtomic(&count) < 64) {
++		char name[32] = "?";
++		proc_selfname(name, sizeof(name));
++		IOLog("SWEET NET: %s opened %s user client (type %u): 0x%x\n",
++		    name, getMetaClass()->getClassName(), (unsigned)type, (unsigned)ret);
++	}
++	return ret;
++}
++
++class IONetworkInterface : public SweetNetService {
++	OSDeclareDefaultStructors(IONetworkInterface);
++};
++OSDefineMetaClassAndStructors(IONetworkInterface, SweetNetService);
++
++class IOEthernetInterface : public IONetworkInterface {
++	OSDeclareDefaultStructors(IOEthernetInterface);
++};
++OSDefineMetaClassAndStructors(IOEthernetInterface, IONetworkInterface);
++
++class SweetEthernetController : public SweetNetService {
++	OSDeclareDefaultStructors(SweetEthernetController);
++};
++OSDefineMetaClassAndStructors(SweetEthernetController, SweetNetService);
++
++class SweetNetworkBus : public IOService {
++	OSDeclareDefaultStructors(SweetNetworkBus);
++};
++OSDefineMetaClassAndStructors(SweetNetworkBus, IOService);
++
++class IONetworkStack : public SweetNetService {
++	OSDeclareDefaultStructors(IONetworkStack);
++};
++OSDefineMetaClassAndStructors(IONetworkStack, SweetNetService);
++
++class SweetNetworkStackUserClient : public IOUserClient {
++	OSDeclareDefaultStructors(SweetNetworkStackUserClient);
++public:
++	IOReturn clientClose(void) APPLE_KEXT_OVERRIDE;
++};
++OSDefineMetaClassAndStructors(SweetNetworkStackUserClient, IOUserClient);
++
++IOReturn
++SweetNetworkStackUserClient::clientClose(void)
++{
++	terminate();
++	return kIOReturnSuccess;
++}
++
++static OSArray *
++sweet_net_strings(const char *a, const char *b)
++{
++	OSArray *arr = OSArray::withCapacity(2);
++	if (arr == NULL) {
++		return NULL;
++	}
++	const char *v[2] = { a, b };
++	for (unsigned i = 0; i < 2; i++) {
++		if (v[i] == NULL) {
++			continue;
++		}
++		OSString *s = OSString::withCString(v[i]);
++		if (s != NULL) {
++			arr->setObject(s);
++			s->release();
++		}
++	}
++	return arr;
++}
++
++/* Attach obj under provider and publish it; drops the caller's reference. */
++static bool
++sweet_net_attach(IOService *obj, IOService *provider)
++{
++	bool ok = obj->attach(provider);
++	if (ok) {
++		obj->registerService();
++	}
++	obj->release();
++	return ok;
++}
++
++static void
++sweet_net_set_overrides(IOService *intf, const char *ip, const char *mask,
++    const char *router, const char *dns1, const char *dns2)
++{
++	OSDictionary *ov = OSDictionary::withCapacity(2);
++	OSDictionary *v4 = OSDictionary::withCapacity(4);
++	OSDictionary *dns = OSDictionary::withCapacity(1);
++	OSArray *addrs = sweet_net_strings(ip, NULL);
++	OSArray *masks = sweet_net_strings(mask, NULL);
++	OSArray *servers = sweet_net_strings(dns1, dns2);
++	OSString *method = OSString::withCString("Manual");
++	OSString *gw = OSString::withCString(router);
++
++	if (ov && v4 && dns && addrs && masks && servers && method && gw) {
++		v4->setObject("ConfigMethod", method);
++		v4->setObject("Addresses", addrs);
++		v4->setObject("SubnetMasks", masks);
++		v4->setObject("Router", gw);
++		dns->setObject("ServerAddresses", servers);
++		ov->setObject("IPv4", v4);
++		ov->setObject("DNS", dns);
++		intf->setProperty("NetworkConfigurationOverrides", ov);
++	}
++	OSSafeReleaseNULL(ov);
++	OSSafeReleaseNULL(v4);
++	OSSafeReleaseNULL(dns);
++	OSSafeReleaseNULL(addrs);
++	OSSafeReleaseNULL(masks);
++	OSSafeReleaseNULL(servers);
++	OSSafeReleaseNULL(method);
++	OSSafeReleaseNULL(gw);
++}
++
++/*
++ * Publish bus -> controller -> interface for one BSD ifnet, plus the
++ * IONetworkStack (once). Called by sweet_usb.c after creating its ifnet.
++ * Returns 1 when the interface object was published, else 0.
++ */
++extern "C" int
++sweet_net_publish(const char *bsd_name, const char *prefix, unsigned unit,
++    const uint8_t *mac, const char *ip, const char *mask, const char *router,
++    const char *dns1, const char *dns2)
++{
++	static bool stack_published;
++	IOService *platform = IOService::getPlatform();
++
++	if (platform == NULL) {
++		IOLog("SWEET NET: no platform expert; IOKit interface not published\n");
++		return 0;
++	}
++
++	if (!stack_published) {
++		IONetworkStack *stack = OSTypeAlloc(IONetworkStack);
++		if (stack != NULL && stack->init()) {
++			stack->setProperty(kIOUserClientClassKey, "SweetNetworkStackUserClient");
++			stack_published = sweet_net_attach(stack, platform);
++		} else {
++			OSSafeReleaseNULL(stack);
++		}
++	}
++
++	SweetNetworkBus *bus = OSTypeAlloc(SweetNetworkBus);
++	if (bus == NULL || !bus->init()) {
++		OSSafeReleaseNULL(bus);
++		return 0;
++	}
++	bus->setName("sweet-usb");
++	bus->retain();          /* keep it until the controller is attached */
++	if (!sweet_net_attach(bus, platform)) {
++		bus->release();
++		return 0;
++	}
++
++	SweetEthernetController *ctrl = OSTypeAlloc(SweetEthernetController);
++	if (ctrl == NULL || !ctrl->init()) {
++		OSSafeReleaseNULL(ctrl);
++		bus->release();
++		return 0;
++	}
++	ctrl->setProperty("IOMACAddress", (void *)mac, 6);
++	ctrl->setProperty("SelfNamed", kOSBooleanTrue);
++	ctrl->retain();
++	bool ctrl_ok = sweet_net_attach(ctrl, bus);
++	bus->release();
++	if (!ctrl_ok) {
++		ctrl->release();
++		return 0;
++	}
++
++	IOEthernetInterface *intf = OSTypeAlloc(IOEthernetInterface);
++	if (intf == NULL || !intf->init()) {
++		OSSafeReleaseNULL(intf);
++		ctrl->release();
++		return 0;
++	}
++	intf->setProperty("IOInterfaceType", 6ULL, 32);         /* IFT_ETHER */
++	intf->setProperty("IOBuiltin", kOSBooleanTrue);
++	intf->setProperty("IOPrimaryInterface", kOSBooleanFalse);
++	intf->setProperty("BSD Name", bsd_name);
++	intf->setProperty("IOInterfaceNamePrefix", prefix);
++	intf->setProperty("IOInterfaceUnit", (unsigned long long)unit, 32);
++	intf->setProperty("HiddenConfiguration", kOSBooleanTrue);
++	sweet_net_set_overrides(intf, ip, mask, router, dns1, dns2);
++	bool intf_ok = sweet_net_attach(intf, ctrl);
++	ctrl->release();
++
++	IOLog("SWEET NET: IOKit interface %s %s (built-in, pre-configured %s via %s, DNS %s %s, stack %s)\n",
++	    bsd_name, intf_ok ? "published" : "NOT published", ip, router, dns1, dns2,
++	    stack_published ? "up" : "missing");
++	return intf_ok ? 1 : 0;
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index 949b5162389f85bb9a9dd8db079dce5b6be18843..189554fcd3eb78d1c36caa3e5c99b24f1d6be1ec 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetKeyStore.cpp                               optional iokitc
+ iokit/Kernel/arm/SweetWatchdog.cpp                               optional iokitcpp
+ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
++iokit/Kernel/arm/SweetNetwork.cpp                                optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/SweetHID.cpp                                optional iokitcpp
+ iokit/Kernel/arm/hid/IOHIDEvent.cpp                              optional iokitcpp

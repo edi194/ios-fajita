@@ -1,0 +1,28 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -867,6 +867,7 @@
+ 	ud_if_create();
+ 
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
++	uint32_t gctl_abl = dwc_rd(GCTL);
+ 	dwc_wr(DCTL, DCTL_CSFTRST);
+ 	int i;
+ 	for (i = 0; i < 500 && (dwc_rd(DCTL) & DCTL_CSFTRST); i++) {
+@@ -876,6 +877,17 @@
+ 	    (dwc_rd(DCTL) & DCTL_CSFTRST) ? "STUCK" : "done", i, dwc_rd(GCTL), dwc_rd(DCFG));
+ 	if (dwc_rd(DCTL) & DCTL_CSFTRST) {
+ 		return;
++	}
++	/*
++	 * SDM845 (DWC3 3.00a, USB3-capable): the soft reset reloads GCTL with
++	 * RAMCLKSEL = PIPE clock, which only runs with the QMP SuperSpeed PHY
++	 * that nobody started; endpoint commands then time out. Keep ABL's
++	 * GCTL (bus clock). No change on sweet, whose GCTL survives the reset.
++	 */
++	if (dwc_rd(GCTL) != gctl_abl) {
++		dwc_wr(GCTL, gctl_abl);
++		printf("SWEET USB: GCTL restored to 0x%08x (now 0x%08x), GUSB3PIPECTL 0x%08x\n",
++		    gctl_abl, dwc_rd(GCTL), dwc_rd(0xc2c0));
+ 	}
+ 
+ 	dwc_wr(GEVNTADRLO, (uint32_t)(ud.dma_pa + UD_EVT));

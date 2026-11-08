@@ -1,0 +1,98 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -5623,7 +5623,8 @@
+ 	/* firmware state */
+ 	bool vdev_started, vdev_up, peer, peer_mapped, start_resp, stopped, sec_ind, ptk_installed, connected, by_ap;
+ 	unsigned down_step;
+-	bool had_peer;
++	bool had_peer, flushed;
++	unsigned txlog;                 /* TX completions logged (budget) */
+ 	uint8_t eapol_hold[256];        /* message 1 that arrived before PEER_ASSOC / VDEV_UP were through */
+ 	uint16_t eapol_hold_len;
+ 	uint16_t peer_id, seq;
+@@ -5815,7 +5816,13 @@
+ 	}
+ 	uint16_t sc = (uint16_t)(sta.seq++ << 4);
+ 	memcpy(fr + 22, &sc, 2);
+-	if (!sta_htt_tx((unsigned)id, (uint16_t)n, false, !prot, 16)) {   /* ext tid 16: non-QoS */
++	/*
++	 * ath10k_htt_tx_get_tid: a QoS (WMM) peer gets mac80211's QoS data with the TID moved into the descriptor
++	 * (EAPOL priority 7, best effort 0); ext tid 16 (NON_QOS_MCAST_BCAST) only for non-QoS peers. Boot 52: EAPOL
++	 * message 2 sent with 16 to a WMM AP never reached it.
++	 */
++	unsigned tid = sta.ar.wmm ? (eapol ? 7u : 0u) : 16u;
++	if (!sta_htt_tx((unsigned)id, (uint16_t)n, false, !prot, tid)) {
+ 		sta_txid_free((unsigned)id);
+ 		sta.tx_drop++;
+ 		return ENOBUFS;
+@@ -5823,6 +5830,9 @@
+ 	if (eapol) {
+ 		sta.eapol_msdu = id;
+ 		sta.tx_eapol++;
++		uint16_t ki = len >= 14 + 7 ? (uint16_t)((eth[14 + 5] << 8) | eth[14 + 6]) : 0;
++		printf("SWEET WLAN sta: EAPOL out: %zu bytes, key info %#x, msdu %d, tid %u, %s, CE4 wr %u\n", len - 14, ki, id,
++		    tid, prot ? "protected" : "clear", wce.wr[4]);
+ 	}
+ 	sta.tx_frames++;
+ 	sta.tx_bytes += len;
+@@ -6158,6 +6168,9 @@
+ 	sta.eapol_msdu = -1;
+ 	sta.eapol_hold_len = 0;
+ 	sta.aid = 0;
++	sta.flushed = false;
++	sta.txlog = 0;
++	memset(&sta.ar, 0, sizeof(sta.ar));
+ 	sta.svc_mgmt_wmi = wmi_svc_on(76);      /* WMI_TLV_SERVICE_MGMT_TX_WMI */
+ 	printf("SWEET WLAN sta: join \"%.*s\" (%s), management TX %s, rx reorder offload %s\n", sta.req.ssid_len,
+ 	    sta.req.ssid, sta.req.rsn_ie_len ? "WPA2-PSK" : "open", sta.svc_mgmt_wmi ? "WMI by reference" : "HTT",
+@@ -6439,8 +6452,24 @@
+ 	case ST_DOWN: {
+ 		uint8_t c[32];
+ 		uint32_t v[3] = { 0, 0, 0 };
+-		if (sta.down_step == 0 && (!sta.mgmt_busy || in > 300)) {
+-			/* the deauthentication out (or given up), then VDEV_DOWN and PEER_DELETE */
++		if (sta.down_step == 0 && sta.tx_inflight && sta.peer && !sta.flushed && in > 800) {
++			/* frames still in the firmware: PEER_FLUSH_TIDS (all TIDs), as ath10k does before a peer goes */
++			uint32_t fl[4] = { 0, 0, 0, 0xffffffffu };
++			memcpy(&fl[1], sta.bssid, 6);
++			sta_wmi(c, scan_cmd(c, 0x6003, 99, fl, 16), "peer flush tids");
++			sta.flushed = true;
++			printf("SWEET WLAN sta: %u frames still in flight at teardown: flushing the peer's TIDs\n", sta.tx_inflight);
++		}
++		if (sta.down_step == 0 && (!sta.mgmt_busy || in > 300) && ((sta.tx_inflight == 0 && sta.wq_n == 0) ||
++		    in > 2000)) {
++			/*
++			 * the deauthentication out and the TX queues empty (mac80211 flushes them before the driver's
++			 * disassoc; boot 52: VDEV_DOWN with frames pending asserted the firmware in _wlan_vdev_down), then
++			 * VDEV_DOWN and PEER_DELETE
++			 */
++			if (sta.tx_inflight) {
++				printf("SWEET WLAN sta: %u frames never completed: VDEV_DOWN anyway\n", sta.tx_inflight);
++			}
+ 			if (sta.vdev_up) {
+ 				sta_wmi(c, scan_cmd(c, 0x5007, 94, v, 4), "vdev down");
+ 				sta.vdev_up = false;
+@@ -6724,6 +6753,9 @@
+ 	if (plen < 4) {
+ 		return false;
+ 	}
++	if (pl[0] == 0x03 || pl[0] == 0x04 || pl[0] == 0x07 || pl[0] == 0x0b || pl[0] == 0x0e || pl[0] == 0x12) {
++		scan_tally(0x10000u | pl[0]);
++	}
+ 	switch (pl[0]) {
+ 	case 0x03:                              /* PEER_MAP: vdev, peer id, MAC */
+ 		if (plen >= 10 && memcmp(pl + 4, sta.bssid, 6) == 0) {
+@@ -6744,6 +6776,12 @@
+ 		return true;
+ 	case 0x07: {                            /* TX_COMPL_IND: status, count, flags2, msdu ids */
+ 		unsigned st = pl[1] & 7, num = pl[2];
++		if ((!sta.connected || st) && sta.txlog < 64) {
++			sta.txlog++;
++			printf("SWEET WLAN sta: TX completion: %u msdu(s) status %u (%s), first id %u, %u in flight\n", num, st,
++			    st == 0 ? "ok" : st == 1 ? "discard" : st == 2 ? "no ack" : st == 3 ? "postpone" : "?",
++			    plen >= 6 ? (unsigned)(pl[4] | (pl[5] << 8)) : 0xffffu, sta.tx_inflight);
++		}
+ 		for (unsigned k = 0; k < num && 4 + 2 * k + 2 <= plen; k++) {
+ 			uint16_t id;
+ 			memcpy(&id, pl + 4 + 2 * k, 2);

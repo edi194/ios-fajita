@@ -1,0 +1,353 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -3045,6 +3045,181 @@
+ }
+ 
+ /*
++ * 0240: a linear copy on the 2D engine for the framebuffer's scan-out copy (SweetFramebuffer, sweetfb_scancopy=2).
++ * The CPU copy of 0235 took ~6.5 ms of every frame (11 MB through memcpy plus a clean of the source), which held the
++ * panel near 30 fps while the GPU sat 13-17 % busy. Here the copy is one CP_BLIT, the same sequence freedreno emits
++ * for a linear RGBA8 blit (fd6_blitter.cc: emit_blit_setup, emit_blit_fini), with register values from Mesa's
++ * a6xx.xml.h for chip 630: a 2D-engine copy needs no shader and no state but its own registers.
++ *
++ * Source and destination are both in the framebuffer's low pool (pooled IOSurfaces, the three scan-out buffers), so
++ * the pool is mapped into the GPU once (sweet_gpu_blit_window) and an address in it is a fixed offset. The command
++ * stream is written into a small kernel-owned buffer, one slot per call, and handed to sweet_gpu_submit like a
++ * client's; the caller waits for the returned fence before it scans the destination.
++ */
++#define A6XX_RB_2D_BLIT_CNTL            0x8c00u
++#define A6XX_GRAS_2D_BLIT_CNTL          0x8400u
++#define A6XX_SP_2D_DST_FORMAT           0xacc0u
++#define A6XX_RB_2D_UNKNOWN_8C01         0x8c01u
++#define A6XX_SP_PS_2D_SRC_INFO          0xb4c0u /* INFO, SIZE, SRC lo/hi, PITCH */
++#define A6XX_RB_2D_DST_INFO             0x8c17u /* INFO, DST lo/hi, PITCH */
++#define A6XX_GRAS_2D_SRC_TL_X           0x8401u /* TL_X, BR_X, TL_Y, BR_Y */
++#define A6XX_GRAS_2D_DST_TL             0x8405u /* TL, BR */
++#define A6XX_RB_DBG_ECO_CNTL            0x8e04u
++#define A6XX_RB_CCU_CNTL                0x8e07u
++#define BLIT_CNTL_RGBA8                 0x10f03000u     /* MASK 0xf, FMT6_8_8_8_8_UNORM, R2D_UNORM8, ROTATE_0 */
++#define SP_2D_DST_FORMAT_RGBA8          0xf180u
++#define SRC_INFO_RGBA8_LINEAR           0x500030u       /* FMT6_8_8_8_8_UNORM, TILE6_LINEAR, WZYX, UNK20, UNK22 */
++#define DST_INFO_RGBA8_LINEAR           0x30u
++#define RB_DBG_ECO_CNTL_BLIT_A630       0x05100000u     /* freedreno_devices.py, a630 magic_regs */
++#define RB_CCU_CNTL_SYSMEM_A630         0x10000000u     /* colour cache after 2 CCUs x 64 KiB of depth: bypass */
++#define CP_BLIT                         44
++#define CP_BLIT_OP_SCALE                3
++#define EVT_LABEL                       0x3f
++#define EVT_PC_CCU_FLUSH_COLOR_TS       0x1d
++#define BLIT_IB_BYTES                   0x4000u         /* one 16 KiB page: 16 slots of 1 KiB */
++#define BLIT_IB_SLOT                    0x400u
++
++void sweet_gpu_lock(void);
++void sweet_gpu_unlock(void);
++
++static vm_offset_t blit_ib;
++static uint64_t blit_ib_pa, blit_ib_iova;
++static unsigned blit_slot;
++static uint64_t blit_win_pa, blit_win_size, blit_win_iova;
++
++static uint32_t
++pkt4(unsigned reg, unsigned cnt)
++{
++	return 0x40000000u | cnt | (pm4_parity(cnt) << 7) | ((reg & 0x3ffffu) << 8) | (pm4_parity(reg) << 27);
++}
++
++/* Map [pa, pa+size) at a fresh GPU address; 0 on failure (nothing left mapped). */
++static uint64_t
++blit_map(uint64_t pa, uint64_t size)
++{
++	uint64_t iova = 0, taken = 0, done = 0;
++
++	if (!sweet_gpu_iova_alloc(size, &iova, &taken)) {
++		return 0;
++	}
++	for (; done < size; done += 0x1000) {
++		if (!sweet_gpu_vm_map(iova + done, pa + done, false)) {
++			sweet_gpu_vm_unmap(iova, done);
++			sweet_gpu_iova_free(iova, taken);
++			return 0;
++		}
++	}
++	sweet_gpu_vm_flush();
++	return iova;
++}
++
++/* The framebuffer's low pool, mapped for the GPU once per boot. False: no GPU copies this boot. */
++bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);
++bool
++sweet_gpu_blit_window(uint64_t pa, uint64_t size)
++{
++	bool ok;
++
++	sweet_gpu_lock();
++	if (blit_win_iova == 0 && sweet_gpu_ready() && size != 0 && !(pa & 0xfff) && !(size & 0xfff)) {
++		if (!blit_ib && dma_alloc(BLIT_IB_BYTES, &blit_ib, &blit_ib_pa)) {
++			if ((blit_ib_iova = blit_map(blit_ib_pa, BLIT_IB_BYTES)) == 0) {
++				blit_ib = 0;    /* the pool page stays allocated: once per boot at most */
++			}
++		}
++		if (blit_ib && (blit_win_iova = blit_map(pa, size)) != 0) {
++			blit_win_pa = pa;
++			blit_win_size = size;
++			printf("SWEET GPU: scan-out blits on (0240): pool 0x%llx+%llu MiB at GPU 0x%llx, commands at 0x%llx\n",
++			    pa, size >> 20, blit_win_iova, blit_ib_iova);
++		}
++	}
++	ok = blit_win_iova != 0;
++	sweet_gpu_unlock();
++	return ok;
++}
++
++/*
++ * Copy w x h RGBA8 texels from src to dst (both linear, in the window, pitches multiples of 64 bytes, addresses
++ * 64-byte aligned). Returns the fence to wait for, 0 when nothing was submitted.
++ */
++uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
++uint32_t
++sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h)
++{
++	uint32_t fence = 0;
++
++	if (w == 0 || h == 0 || w > 0x4000 || h > 0x4000 || ((src_pa | dst_pa | src_pitch | dst_pitch) & 63)) {
++		return 0;
++	}
++	sweet_gpu_lock();
++	if (blit_win_iova == 0 || a630_dev.lost ||
++	    src_pa < blit_win_pa || src_pa + (uint64_t)src_pitch * h > blit_win_pa + blit_win_size ||
++	    dst_pa < blit_win_pa || dst_pa + (uint64_t)dst_pitch * h > blit_win_pa + blit_win_size) {
++		sweet_gpu_unlock();
++		return 0;
++	}
++	uint64_t src = blit_win_iova + (src_pa - blit_win_pa), dst = blit_win_iova + (dst_pa - blit_win_pa);
++	unsigned slot = blit_slot++ % (BLIT_IB_BYTES / BLIT_IB_SLOT);
++	volatile uint32_t *ib = (volatile uint32_t *)(blit_ib + slot * BLIT_IB_SLOT);
++	uint64_t junk = blit_ib_iova + slot * BLIT_IB_SLOT + BLIT_IB_SLOT - 16;  /* the CCU flush's timestamp lands here */
++	unsigned n = 0;
++
++	ib[n++] = pkt7(CP_WAIT_FOR_IDLE, 0);
++	ib[n++] = pkt4(A6XX_RB_CCU_CNTL, 1);    /* a client batch may have left the CCU in GMEM layout */
++	ib[n++] = RB_CCU_CNTL_SYSMEM_A630;
++	ib[n++] = pkt4(A6XX_RB_2D_BLIT_CNTL, 1);
++	ib[n++] = BLIT_CNTL_RGBA8;
++	ib[n++] = pkt4(A6XX_GRAS_2D_BLIT_CNTL, 1);
++	ib[n++] = BLIT_CNTL_RGBA8;
++	ib[n++] = pkt4(A6XX_SP_2D_DST_FORMAT, 1);
++	ib[n++] = SP_2D_DST_FORMAT_RGBA8;
++	ib[n++] = pkt4(A6XX_RB_2D_UNKNOWN_8C01, 1);
++	ib[n++] = 0;
++	ib[n++] = pkt4(A6XX_SP_PS_2D_SRC_INFO, 5);
++	ib[n++] = SRC_INFO_RGBA8_LINEAR;
++	ib[n++] = w | (h << 15);                        /* SP_PS_2D_SRC_SIZE */
++	ib[n++] = (uint32_t)src;
++	ib[n++] = (uint32_t)(src >> 32);
++	ib[n++] = (src_pitch >> 6) << 9;                /* SP_PS_2D_SRC_PITCH */
++	ib[n++] = pkt4(A6XX_RB_2D_DST_INFO, 4);
++	ib[n++] = DST_INFO_RGBA8_LINEAR;
++	ib[n++] = (uint32_t)dst;
++	ib[n++] = (uint32_t)(dst >> 32);
++	ib[n++] = dst_pitch >> 6;                       /* RB_2D_DST_PITCH */
++	ib[n++] = pkt4(A6XX_GRAS_2D_SRC_TL_X, 4);       /* source rectangle, 8 fractional bits */
++	ib[n++] = 0;
++	ib[n++] = (w - 1) << 8;
++	ib[n++] = 0;
++	ib[n++] = (h - 1) << 8;
++	ib[n++] = pkt4(A6XX_GRAS_2D_DST_TL, 2);
++	ib[n++] = 0;
++	ib[n++] = (w - 1) | ((h - 1) << 16);
++	ib[n++] = pkt7(CP_EVENT_WRITE, 1);
++	ib[n++] = EVT_LABEL;
++	ib[n++] = pkt7(CP_WAIT_FOR_IDLE, 0);
++	ib[n++] = pkt4(A6XX_RB_DBG_ECO_CNTL, 1);
++	ib[n++] = RB_DBG_ECO_CNTL_BLIT_A630;
++	ib[n++] = pkt7(CP_BLIT, 1);
++	ib[n++] = CP_BLIT_OP_SCALE;
++	ib[n++] = pkt7(CP_WAIT_FOR_IDLE, 0);
++	ib[n++] = pkt4(A6XX_RB_DBG_ECO_CNTL, 1);
++	ib[n++] = 0;
++	ib[n++] = pkt7(CP_EVENT_WRITE, 4);              /* the copy out of the colour cache, before the fence */
++	ib[n++] = EVT_PC_CCU_FLUSH_COLOR_TS;
++	ib[n++] = (uint32_t)junk;
++	ib[n++] = (uint32_t)(junk >> 32);
++	ib[n++] = 0;
++	ib[n++] = pkt7(CP_WAIT_FOR_IDLE, 0);
++	__asm__ volatile ("dsb sy" ::: "memory");       /* the command words are in memory before the CP is told */
++	uint64_t ibva = blit_ib_iova + slot * BLIT_IB_SLOT;
++	uint32_t dw = n;
++	fence = sweet_gpu_submit(&ibva, &dw, 1);
++	sweet_gpu_unlock();
++	return fence;
++}
++
++/*
+  * Stage 8 keep-up: called with the self-test passed, GX on, OOB_GPU held.
+  * Clears the boot-slumber OOB like Linux after HFI start, forbids GX collapse
+  * and sets up the address space for client buffers. Leaves OOB_GPU set.
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -50,6 +50,8 @@
+ extern "C" void sweet_fb_stats_publish(const char *text);       /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb */
+ extern "C" int sweet_fb_hud;
+ extern "C" uint32_t sweet_gpu_fence_snapshot(void);     /* bsd/dev/sweet_a630.c (0229) */
++extern "C" bool sweet_gpu_blit_window(uint64_t pa, uint64_t size);      /* bsd/dev/sweet_a630.c (0240) */
++extern "C" uint32_t sweet_gpu_blit(uint64_t src_pa, uint32_t src_pitch, uint64_t dst_pa, uint32_t dst_pitch, uint32_t w, uint32_t h);
+ extern "C" bool sweet_gpu_fence_passed(uint32_t fence);                    /* bsd/dev/sweet_fb.c: sysctl kern.sweet_fb_hud (patch 0213) */
+ 
+ /*
+@@ -305,6 +307,11 @@
+ 	 * latched.
+ 	 */
+ 	bool          fScanCopy, fScanFailed, fScanForeign, fScanFront;
++	/* 0240 (sweetfb_scancopy=2): the copy on the GPU's 2D engine instead of the CPU. fScanGpuOff: the pool could not be
++	 * mapped (for the boot). After 3 failed blits in a row (a client killed mid-frame, the GPU asleep or recovering) the
++	 * next 120 frames are copied on the CPU (fScanGpuRest) and then the GPU is tried again. */
++	bool          fScanGpu, fScanGpuWin, fScanGpuOff;
++	uint32_t      fScanGpuFails, fScanGpuRest;
+ 	IOMemoryMap  *fScanMap[3];
+ 	uint64_t      fScanPA[3];
+ 	uint32_t      fScanStride;
+@@ -355,6 +362,7 @@
+ 		uint64_t replaceWaits, replaceTimeouts;                 /* 0220: frames that waited for the previous one's latch / gave up */
+ 		uint64_t emptySwaps, emptyKept;                         /* 0233: swaps with no layer / of those, the ones that kept the frame */
+ 		uint64_t scanCopies, scanCopyAbs, scanCopyMaxAbs;       /* 0235: frames copied to a scan-out buffer, their time */
++		uint64_t scanGpuCopies, scanGpuFallbacks;               /* 0240: of those, copied by the GPU / by the CPU after a GPU failure */
+ 	} fSt, fStPrev;
+ 	/*
+ 	 * Direct scanout (sweetfb_direct=1, patch 0211): hw scaler + page flipping + zero-copy
+@@ -701,6 +709,7 @@
+ 				int sc = 0;
+ 				PE_parse_boot_argn("sweetfb_scancopy", &sc, sizeof(sc));
+ 				fScanCopy = fEarly && sc != 0;
++				fScanGpu = fScanCopy && sc == 2;
+ 				fScanPanel = fScanQueued = -1;
+ 				if (fScanCopy) {
+ 					IOLog("SWEET FB: scan-out copy on (0235): frames are copied to three framebuffer-owned buffers, a swap is complete when copied\n");
+@@ -1082,7 +1091,7 @@
+ 	    "pool_used=%u pool_total=%u pool_surfaces=%llu pool_fallbacks=%llu "
+ 	    "swapsync=%d swap_waits=%llu swap_wait_us=%u.%02u swap_wait_timeouts=%llu replace_waits=%llu replace_timeouts=%llu "
+ 	    "gpu_holds=%llu gpu_hold_timeouts=%llu empty_swaps=%llu empty_kept=%llu "
+-	    "scancopy=%d scan_copies=%llu scan_copy_us=%u.%02u scan_copy_us_max=%llu\n",
++	    "scancopy=%d scan_copies=%llu scan_copy_us=%u.%02u scan_copy_us_max=%llu scan_gpu=%d scan_gpu_copies=%llu scan_gpu_fallbacks=%llu\n",
+ 	    mode, hz, fFlushTicks, fHw ? 1 : 0, fFlip ? 1 : 0, smmu, fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : (fZcCleanMode == 2 ? "auto" : "tracked")),
+ 	    sweet_abs_us(now) / 1000000, winUS / 1000,
+ 	    swaps, SW_F2(PER_S(dSwaps)), coalesced, SW_F2(PER_S(dCoal)),
+@@ -1092,7 +1101,8 @@
+ 	    used, total, pallocs, pfails,
+ 	    fSwapSync ? 1 : 0, c.swapWaits, SW_F2(swAvg), c.swapWaitTimeouts, c.replaceWaits, c.replaceTimeouts,
+ 	    c.gpuHolds, c.gpuHoldTimeouts, c.emptySwaps, c.emptyKept,
+-	    fScanCopy && !fScanFailed ? 1 : 0, c.scanCopies, SW_F2(scAvg), sweet_abs_us(c.scanCopyMaxAbs));
++	    fScanCopy && !fScanFailed ? 1 : 0, c.scanCopies, SW_F2(scAvg), sweet_abs_us(c.scanCopyMaxAbs),
++	    fScanGpu && !fScanGpuOff ? (fScanGpuRest ? 2 : 1) : 0, c.scanGpuCopies, c.scanGpuFallbacks);
+ 	#undef PER_S
+ 	sweet_fb_stats_publish(line);
+ 	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
+@@ -2222,16 +2232,65 @@
+ 	uint64_t t0 = mach_absolute_time();
+ 	const uint8_t *src = (const uint8_t *)(kva + s->offset);
+ 	uint64_t span = (uint64_t)s->bytesPerRow * (fLogicalH - 1) + rowBytes;
+-	if (sweet_lowpool_cacheable()) {
+-		/* the GPU wrote DRAM behind this write-back mapping; a CPU draw may sit dirty in it (civac keeps that) */
+-		sweet_dma_sync_va((const void *)src, (size_t)span);
+-	}
+-	uint8_t *dst = (uint8_t *)fScanMap[t]->getVirtualAddress();
+-	if (s->bytesPerRow == fScanStride) {
+-		memcpy(dst, src, (size_t)span);
+-	} else {
+-		for (uint32_t y = 0; y < fLogicalH; y++) {
+-			memcpy(dst + (size_t)y * fScanStride, src + (size_t)y * s->bytesPerRow, rowBytes);
++	bool viaGpu = false;
++	if (fScanGpuRest != 0) {
++		fScanGpuRest--;
++	} else if (fScanGpu && !fScanGpuOff && s->pooled) {
++		/*
++		 * 0240: the GPU's 2D engine copies the frame (sweet_gpu_blit). It reads DRAM, so the only cache work left is a
++		 * CPU draw still dirty in the write-back mapping (a write-unlock since the last look); the GPU's own pixels need
++		 * none. The swap completes when the blit's fence has passed, which is ~1-2 ms instead of the CPU's ~6.5.
++		 */
++		if (!fScanGpuWin) {
++			uint64_t pb = 0, pn = 0;
++			fScanGpuWin = sweet_lowpool_window(&pb, &pn) && sweet_gpu_blit_window(pb, pn);
++			if (!fScanGpuWin) {
++				fScanGpuOff = true;
++				IOLog("SWEET FB: scan-out blits off: the pool could not be mapped for the GPU; copying on the CPU\n");
++			}
++		}
++		if (fScanGpuWin) {
++			uint32_t cw = __atomic_load_n(&s->cpuWrites, __ATOMIC_ACQUIRE);
++			if (cw != s->cpuWritesSeen && sweet_lowpool_cacheable()) {
++				sweet_dma_sync_va((const void *)src, (size_t)span);
++			}
++			s->cpuWritesSeen = cw;
++			uint32_t fence = sweet_gpu_blit(s->poolPA + s->offset, s->bytesPerRow, fScanPA[t], fScanStride, fLogicalW, fLogicalH);
++			uint64_t limit;
++			nanoseconds_to_absolutetime(50 * NSEC_PER_MSEC, &limit);
++			while (fence != 0 && !sweet_gpu_fence_passed(fence)) {
++				if (mach_absolute_time() - t0 > limit) {
++					fence = 0;
++					break;
++				}
++				IODelay(50);
++			}
++			viaGpu = fence != 0;
++			if (viaGpu) {
++				fScanGpuFails = 0;
++				fSt.scanGpuCopies++;
++			} else {
++				fSt.scanGpuFallbacks++;
++				if (++fScanGpuFails >= 3) {
++					fScanGpuFails = 0;
++					fScanGpuRest = 120;
++					IOLog("SWEET FB: 3 scan-out blits failed in a row; the next 120 frames are copied on the CPU\n");
++				}
++			}
++		}
++	}
++	if (!viaGpu) {
++		if (sweet_lowpool_cacheable()) {
++			/* the GPU wrote DRAM behind this write-back mapping; a CPU draw may sit dirty in it (civac keeps that) */
++			sweet_dma_sync_va((const void *)src, (size_t)span);
++		}
++		uint8_t *dst = (uint8_t *)fScanMap[t]->getVirtualAddress();
++		if (s->bytesPerRow == fScanStride) {
++			memcpy(dst, src, (size_t)span);
++		} else {
++			for (uint32_t y = 0; y < fLogicalH; y++) {
++				memcpy(dst + (size_t)y * fScanStride, src + (size_t)y * s->bytesPerRow, rowBytes);
++			}
+ 		}
+ 	}
+ 	scanAddr((uint32_t)fScanPA[t], fScanStride, true);      /* dsb before the address write: the WC stores land first */
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -198,6 +198,18 @@
+ 	return sweet_lowpool.ready && sweet_lowpool.cacheable;
+ }
+ 
++/* 0240: the pool's physical range (fixed for the boot), which SweetFramebuffer maps for the GPU once. */
++bool
++sweet_lowpool_window(uint64_t *base, uint64_t *bytes)
++{
++	if (!sweet_lowpool.ready) {
++		return false;
++	}
++	*base = sweet_lowpool.base;
++	*bytes = (uint64_t)sweet_lowpool.pages * PAGE_SIZE;
++	return true;
++}
++
+ void
+ sweet_lowpool_stats(uint32_t *usedPages, uint32_t *totalPages, uint64_t *allocs, uint64_t *fails)
+ {
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -106,6 +106,7 @@
+ /* Pool statistics: pages in use / total, allocations, failed allocations (fell back to normal memory). */
+ void sweet_lowpool_stats(uint32_t *usedPages, uint32_t *totalPages, uint64_t *allocs, uint64_t *fails);
+ uint64_t sweet_lowpool_scanbuf(uint32_t bytes, class IOMemoryMap **mapOut);     /* 0235: framebuffer-owned scan-out block, WC mapped */
++bool sweet_lowpool_window(uint64_t *base, uint64_t *bytes);                    /* 0240: the whole pool, for the GPU scan-out blit */
+ 
+ /* Send right for the surface in task (IOSurfaceLookupFromMachPort). */
+ mach_port_name_t sweet_surface_port_in_task(SweetSurface *surface, task_t task);

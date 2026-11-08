@@ -1,0 +1,23 @@
+diff --git a/bsd/dev/sweet_charger.c b/bsd/dev/sweet_charger.c
+--- a/bsd/dev/sweet_charger.c
++++ b/bsd/dev/sweet_charger.c
+@@ -294,14 +294,17 @@
+ }
+ 
+ /*
+- * Too hot / too cold / battery OV / safety timer: no raising, give back what we changed (0223). The JEITA soft limits (warm,
++ * Too hot / too cold / safety timer: no raising, give back what we changed (0223). The JEITA soft limits (warm,
+  * cool) are not a reason to hold: the charger's own JEITA compensation lowers FCC/FV there (Linux smb2 charges through
+  * them), and this phone's thermistor reads warm while charging, which held every charge at 500 mA.
++ * Battery OV (STATUS_2 bit 5) is not one either (0225): in the warm zone the compensated FV sits below the battery's
++ * voltage, the charger flags OV and stops charging by itself, and a 500 mA input limit only made the phone run from
++ * its battery (st2=0x28 warm+OV, usbin 414 mA, battery draining with the screen on).
+  */
+ static bool
+ sc_unsafe(const struct sc_snap *s)
+ {
+-	return (s->st2 & 0x63u) != 0 || (s->st7 & 0x0cu) != 0;
++	return (s->st2 & 0x43u) != 0 || (s->st7 & 0x0cu) != 0;
+ }
+ 
+ /*

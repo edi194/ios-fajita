@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -4391,6 +4391,7 @@
+ 		char ssid[33];          /* printable copy for the log */
+ 		uint8_t raw_ssid[32];
+ 		uint16_t beacon_int, cap, ie_len;
++		unsigned seen;          /* scan.count when last heard */
+ 	} bss[SCAN_MAX_BSS];
+ } scan;
+ /* the BSS cache's IEs (SCAN_MAX_BSS x SWEET_WLAN_IE_MAX) and the lock between the service thread and ioctls */
+@@ -4611,6 +4612,29 @@
+ 		wf.sent_ms = ms_now_ms();
+ 	}
+ 	return true;
++}
++
++/*
++ * Boot 53: a passive scan misses a beacon now and then, and a join right after such a scan found no BSS. The cache
++ * keeps a network until three scans in a row did not hear it (scan_lock held; IEs move with their entry).
++ */
++static void
++scan_age(void)
++{
++	unsigned w = 0;
++	for (unsigned k = 0; k < scan.nbss; k++) {
++		if (scan.bss[k].seen + 3 <= scan.count) {
++			continue;
++		}
++		if (w != k) {
++			scan.bss[w] = scan.bss[k];
++			if (scan_ie) {
++				memmove(scan_ie + w * SWEET_WLAN_IE_MAX, scan_ie + k * SWEET_WLAN_IE_MAX, SWEET_WLAN_IE_MAX);
++			}
++		}
++		w++;
++	}
++	scan.nbss = w;
+ }
+ 
+ /* SCAN_EVENT (tag 36: type, reason, freq, req id, scan id, vdev) */
+@@ -4648,6 +4672,7 @@
+ 		ipc_note(" scan done r%u: %u ch, %u frames, %u bss;", e[1], scan.foreign, scan.beacons, scan.nbss);
+ 		/* state and notice together under the cache lock (sweet_wlan_scan_request reads them under it) */
+ 		lck_mtx_lock(&scan_lock);
++		scan_age();
+ 		wf.state = WS_SCAN_DONE;
+ 		bool notify = scan_notify;
+ 		scan_notify = false;
+@@ -4704,6 +4729,7 @@
+ 	for (unsigned k = 0; k < scan.nbss; k++) {
+ 		if (memcmp(scan.bss[k].bssid, bssid, 6) == 0) {
+ 			scan.bss[k].rssi = (int8_t)MAX(-128, MIN(127, rssi));   /* the latest signal */
++			scan.bss[k].seen = scan.count;
+ 			lck_mtx_unlock(&scan_lock);
+ 			return;
+ 		}
+@@ -4713,6 +4739,7 @@
+ 		return;
+ 	}
+ 	unsigned k = scan.nbss++;
++	scan.bss[k].seen = scan.count;
+ 	memcpy(scan.bss[k].bssid, bssid, 6);
+ 	scan.bss[k].mhz = mhz;
+ 	scan.bss[k].rssi = (int8_t)MAX(-128, MIN(127, rssi));
+@@ -7060,7 +7087,6 @@
+ 	}
+ 	lck_mtx_lock(&scan_lock);
+ 	scan_req = false;
+-	scan.nbss = 0;
+ 	wf.state = WS_SCAN_SETUP;
+ 	lck_mtx_unlock(&scan_lock);
+ 	scan.beacons = 0;

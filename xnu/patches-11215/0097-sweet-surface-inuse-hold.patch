@@ -1,0 +1,97 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 2f8f29984b2900f298f3142ceb1e850f3ba573af..90f71401e95a1c6a7d28cfd1b5eddf4b11424124 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -40,6 +40,8 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ extern "C" void (*sweet_fb_panic_hook)(void);   /* osfmk/console/serial_console.c */
+ extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
+ #include "../../../bsd/dev/sweet_board.h"
++class SweetSurface;
++static void sweet_hold_release(SweetSurface **set);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -124,6 +126,7 @@ public:
+ 	 * flush, latched at the panel's next vsync). Frame 0 is ABL's own
+ 	 * framebuffer (console, panics, power-off fade).
+ 	 */
++	SweetSurface *fPendHold[4];     /* in-use holds of the swap not yet copied */
+ 	uintptr_t     fDraw;            /* where present() draws */
+ 	uint32_t      fDrawIdx;
+ 	uint8_t       fBarsMask;        /* frames whose scaling bars are black */
+@@ -338,11 +341,14 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+ 	uint8_t *rec = NULL;
++	SweetSurface *taken[4] = {};
+ 	if (flush) {
+ 		rec = (uint8_t *)IOMallocData(SWEET_FB_SWAP_REC_SIZE);
+ 		if (rec != NULL) {
+ 			memcpy(rec, fb->fPending, SWEET_FB_SWAP_REC_SIZE);
+ 			fb->fDirty = false;
++			memcpy(taken, fb->fPendHold, sizeof(taken));
++			bzero(fb->fPendHold, sizeof(fb->fPendHold));
+ 		}
+ 	}
+ 	IOLockUnlock(fb->fLock);
+@@ -350,6 +356,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++	sweet_hold_release(taken);      /* copied: CA may render into them again */
+ 	sender->setTimeoutUS(fb->fVsyncUS);
+ }
+ 
+@@ -390,13 +397,52 @@ static uint64_t sweet_fb_swap_count;
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+  * default 10 Hz).
+  */
++/*
++ * After ios-topaz 0099: IOSurfaceClientIsInUse (iOS 16.7 IOSurface.framework)
++ * reads a u64 use count at +0x18 of the surface's shared state page. Holding
++ * it from SwapEnd until the vsync tick has copied the frame stops
++ * CoreAnimation from rendering into a surface we are still reading (torn,
++ * half-drawn frames).
++ */
++static void
++sweet_hold(SweetSurface *s, bool on)
++{
++	if (s->state == NULL) {
++		return;
++	}
++	OSAddAtomic64(on ? 1 : -1, (volatile SInt64 *)((uint8_t *)s->state->getBytesNoCopy() + 0x18));
++}
++
++static void
++sweet_hold_release(SweetSurface **set)
++{
++	for (uint32_t i = 0; i < 4; i++) {
++		if (set[i] != NULL) {
++			sweet_hold(set[i], false);
++			set[i]->release();
++			set[i] = NULL;
++		}
++	}
++}
++
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+ {
++	SweetSurface *held[4] = {}, *dropped[4];
++	uint32_t mask = get32(rec, 0x104);
++	for (uint32_t i = 0; i < 4 && i < SWEET_FB_LAYERS; i++) {
++		uint32_t sid = get32(rec, 0x54 + 4 * i);
++		if ((mask & (1u << i)) && sid != 0 && (held[i] = sweet_surface_copy(sid)) != NULL) {
++			sweet_hold(held[i], true);
++		}
++	}
+ 	IOLockLock(fLock);
+ 	memcpy(fPending, rec, SWEET_FB_SWAP_REC_SIZE);
+ 	fDirty = true;
++	memcpy(dropped, fPendHold, sizeof(dropped));     /* replaced before it was copied */
++	memcpy(fPendHold, held, sizeof(held));
+ 	IOLockUnlock(fLock);
++	sweet_hold_release(dropped);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
+ 	}

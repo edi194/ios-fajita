@@ -1,0 +1,195 @@
+Poco F1 wall clock from the PM8998 RTC: raw seconds plus an offset kept in the RTC alarm data registers (alarm
+disabled); the platform expert publishes IORTC and serves get/setGMTTimeOfDay, so a boot no longer starts in 1970
+(coreduetd spun ~75 % of a core re-ingesting Biome history after the 1970 -> 2026 jump).
+
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -158,7 +158,7 @@
+ 		    peripheral == 0x16 || peripheral == 0x40 || peripheral == 0x41 ||
+ 		    peripheral == 0x45)) ||
+ 		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9)) ||
+-		    (sid == 0 && peripheral == 0x08);
++		    (sid == 0 && (peripheral == 0x08 || peripheral == 0x60 || peripheral == 0x61));  /* 0x60/0x61: PM8998 RTC, alarm (sweet_rtc_*) */
+ 	} else {
+ 		allowed = sid == 0 && (peripheral == 0x10 || peripheral == 0x11 ||
+ 		    peripheral == 0x12 || peripheral == 0x13 || peripheral == 0x48);
+@@ -248,7 +248,8 @@
+ 		}
+ 	}
+ 	if (sid == 0) {
+-		return addr == 0x088fu && len == 1;
++		/* PON spare (reboot reason); RTC alarm data 0x6140-0x6143 (the RTC offset, sweet_rtc_set) */
++		return (addr == 0x088fu && len == 1) || (addr >= 0x6140u && addr + len <= 0x6144u);
+ 	}
+ 	if (sid != 3) {
+ 		return false;
+@@ -380,4 +381,105 @@
+ {
+ 	sp_atomic = true;
+ }
++
++/*
++ * Poco F1 wall clock (patch 0245). The PM8998 RTC (SID 0, RTC_RW 0x60) counts seconds through reboots, but the
++ * application processor cannot set it (TZ-owned; Android keeps an offset in /data). iOS started every boot in 1970
++ * and jumped to 2026 when timed got network time; daemons with time-windowed history (coreduetd's Biome ingestion)
++ * then spun for the rest of the boot. Here the offset to Unix time lives in the RTC alarm's data registers
++ * (RTC_ALARM 0x61, DATA0-3 at 0x6140), used only while that alarm is disabled (ALARM_CTRL 0x6146 bit 7 clear), so
++ * it cannot wake the phone. Registers as Linux rtc-pm8xxx (pm8941 layout): ctrl 0x6046, read 0x6048-0x604b.
++ */
++#define SR_RTC_CTRL      0x6046u
++#define SR_RTC_READ      0x6048u
++#define SR_ALARM_DATA    0x6140u
++#define SR_ALARM_CTRL    0x6146u
++#define SR_EN            0x80u
++#define SR_T_MIN         1735689600ull   /* 2025-01-01: older is not a real wall clock */
++#define SR_T_MAX         4102444800ull   /* 2100-01-01 */
++
++static int
++sr_read32(unsigned addr, uint32_t *v)
++{
++	uint8_t b[4];
++	for (unsigned i = 0; i < 4; i++) {
++		if (sweet_spmi_read(0, addr + i, &b[i]) != 0) {
++			return -1;
++		}
++	}
++	*v = (uint32_t)b[0] | (uint32_t)b[1] << 8 | (uint32_t)b[2] << 16 | (uint32_t)b[3] << 24;
++	return 0;
++}
++
++/* Raw RTC seconds, read twice over a byte-0 rollover. */
++static int
++sr_raw(uint32_t *raw)
++{
++	uint8_t ctrl = 0, b0 = 0;
++	if (!sweet_board_beryllium() || sweet_spmi_init() != 0 || sweet_spmi_read(0, SR_RTC_CTRL, &ctrl) != 0 ||
++	    !(ctrl & SR_EN)) {
++		return -1;
++	}
++	for (int t = 0; t < 2; t++) {
++		if (sr_read32(SR_RTC_READ, raw) != 0 || sweet_spmi_read(0, SR_RTC_READ, &b0) != 0) {
++			return -1;
++		}
++		if (b0 == (uint8_t)*raw) {
++			return 0;
++		}
++	}
++	return -1;
++}
++
++/* The stored offset, or -1 when the alarm is armed (not ours) or unreadable. */
++static int
++sr_offset(uint32_t *off)
++{
++	uint8_t actl = SR_EN;
++	if (sweet_spmi_read(0, SR_ALARM_CTRL, &actl) != 0 || (actl & SR_EN)) {
++		return -1;
++	}
++	return sr_read32(SR_ALARM_DATA, off);
++}
++
++/* Thread context. Unix seconds from the RTC (raw + stored offset, or raw when that is already wall time); 0 none. */
++uint64_t
++sweet_rtc_get(void)
++{
++	static bool told;
++	uint32_t raw, off = 0;
++	if (sr_raw(&raw) != 0) {
++		return 0;
++	}
++	bool have = sr_offset(&off) == 0;
++	uint64_t t = (uint64_t)raw + off;
++	if (!have || t < SR_T_MIN || t >= SR_T_MAX) {
++		t = (raw >= SR_T_MIN && raw < SR_T_MAX) ? raw : 0;
++	}
++	if (!told) {
++		told = true;
++		printf("SWEET RTC: raw %u offset %u%s -> %llu\n", raw, off, have ? "" : " (alarm armed or unreadable)", t);
++	}
++	return t;
++}
++
++/* Thread context: keep the offset so the next boot starts at this time. Writes only when it moved by over 2 s. */
++void
++sweet_rtc_set(uint64_t unix_secs)
++{
++	uint32_t raw, off;
++	if (unix_secs < SR_T_MIN || unix_secs >= SR_T_MAX || sr_raw(&raw) != 0 || unix_secs < raw ||
++	    sr_offset(&off) != 0) {
++		return;
++	}
++	uint32_t want = (uint32_t)(unix_secs - raw);
++	if ((off > want ? off - want : want - off) <= 2) {
++		return;
++	}
++	uint8_t d[4] = { (uint8_t)want, (uint8_t)(want >> 8), (uint8_t)(want >> 16), (uint8_t)(want >> 24) };
++	uint32_t back = 0;
++	bool ok = sweet_spmi_write(0, SR_ALARM_DATA, &d[0], 2) == 0 && sweet_spmi_write(0, SR_ALARM_DATA + 2, &d[2], 2) == 0 &&
++	    sr_read32(SR_ALARM_DATA, &back) == 0 && back == want;
++	printf("SWEET RTC: offset %u -> %u (raw %u, time %llu)%s\n", off, want, raw, unix_secs, ok ? "" : " FAILED");
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -19,6 +19,9 @@
+ int sweet_spmi_prepare_write(unsigned sid, unsigned addr);
+ /* Reset time: no more sleeping locks or mappings in this module. */
+ void sweet_spmi_atomic(void);
++/* Poco F1 wall clock from the PM8998 RTC (patch 0245). Thread context. get: Unix seconds, 0 none. */
++uint64_t sweet_rtc_get(void);
++void sweet_rtc_set(uint64_t unix_secs);
+ #ifdef __cplusplus
+ }
+ #endif
+--- a/iokit/Kernel/arm/SweetPlatformExpert.cpp
++++ b/iokit/Kernel/arm/SweetPlatformExpert.cpp
+@@ -12,6 +12,8 @@
+ 
+ extern "C" int sweet_reboot_restart(int panic_restart);
+ extern "C" void sweet_reboot_note_panic(void);
++#include "../../../bsd/dev/sweet_board.h"
++#include "../../../bsd/dev/sweet_spmi.h"
+ 
+ class SweetPlatformExpert : public IODTPlatformExpert {
+ 	OSDeclareDefaultStructors(SweetPlatformExpert);
+@@ -22,6 +24,8 @@
+ 	const char *deleteList(void) APPLE_KEXT_OVERRIDE;
+ 	const char *excludeList(void) APPLE_KEXT_OVERRIDE;
+ 	int haltRestart(unsigned int type) APPLE_KEXT_OVERRIDE;
++	long getGMTTimeOfDay(void) APPLE_KEXT_OVERRIDE;
++	void setGMTTimeOfDay(long secs) APPLE_KEXT_OVERRIDE;
+ };
+ 
+ OSDefineMetaClassAndStructors(SweetPlatformExpert, IODTPlatformExpert);
+@@ -35,6 +39,9 @@
+ 	}
+ 	registerService();
+ 	IOLog("SWEET: platform expert registered\n");
++	if (sweet_board_beryllium()) {
++		publishResource("IORTC");       /* 0245: the PM8998 RTC below; IOKitInitializeTime waits up to 30 s for it */
++	}
+ 	return true;
+ }
+ 
+@@ -64,6 +71,21 @@
+ 		break;
+ 	}
+ 	return IODTPlatformExpert::haltRestart(type);
++}
++
++/* 0245: wall clock from the PM8998 RTC and the offset kept beside it (bsd/dev/sweet_spmi.c), so a boot is not in 1970. */
++long
++SweetPlatformExpert::getGMTTimeOfDay(void)
++{
++	return sweet_board_beryllium() ? (long)sweet_rtc_get() : 0;
++}
++
++void
++SweetPlatformExpert::setGMTTimeOfDay(long secs)
++{
++	if (sweet_board_beryllium() && secs > 0) {
++		sweet_rtc_set((uint64_t)secs);
++	}
+ }
+ 
+ const char *

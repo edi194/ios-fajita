@@ -1,0 +1,248 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -1023,7 +1023,8 @@
+  * and waits 1.5 s for the USB console; sweetmssstep=N stops after step N (then tears down).
+  * Steps: 1 map, 2 read mba.mbn, 3 copy MBA, 4 QMP, 5 ARC votes, 6 clocks + alt reset, 7 SCM assign,
+  * 8 QDSP6 boot; with sweetmpss=1: 9 SMP2P outbound item, 10 modem.mdt, 11 metadata auth, 12 segments,
+- * 13 AUTH_COMPLETE, 14 SMP2P watch; with sweetrmtfs=1: 15 rmtfs over QRTR over GLINK.
++ * 13 AUTH_COMPLETE, 14 SMP2P watch; with sweetrmtfs=1: 15 rmtfs over QRTR over GLINK (+ TFTP with
++ * sweettftp=1, the pd-mapper with sweetpdm=1).
+  */
+ static int ms_step_max = 99;
+ 
+@@ -2156,6 +2157,14 @@
+ #define QRTR_RMTFS_PORT         0x4000u
+ #define RMTFS_SERVICE           14u
+ #define RMTFS_INSTANCE          1u              /* qrtr_publish: instance << 8 | version 1 */
++#define PDM_SERVICE             0x40u           /* SERVREG_LOCATOR_SERVICE */
++#define PDM_INSTANCE            0x101u          /* qmi_add_server: version 0x101 | instance 0 << 8 */
++#define QRTR_PDM_PORT           0x4002u
++#define PDM_GET_DOMAIN_LIST     0x21u           /* SERVREG_GET_DOMAIN_LIST_REQ */
++#define PDM_PFR                 0x24u           /* SERVREG_LOC_PFR_REQ */
++#define PDM_NAME_MAX            64u             /* SERVREG_NAME_LENGTH */
++#define PDM_LIST_MAX            32u             /* SERVREG_DOMAIN_LIST_LENGTH */
++#define WLFW_SERVICE            0x45u
+ #define IPC_INTENTS             5u              /* qcom_glink_announce_create default: 5 x SZ_1K */
+ #define IPC_INTENT_SIZE         1024u
+ #define IPC_MAX_INTENTS         16u             /* ours */
+@@ -2200,7 +2209,8 @@
+ 	bool intent_asked;
+ 	uint32_t next_liid;
+ 	uint32_t node;                  /* the modem's QRTR node, learned from its packets */
+-	bool hello_seen, announced, tftp;
++	bool hello_seen, announced, tftp, pdm, wlfw_seen;
++	unsigned pdm_reqs;
+ 	uint64_t open_ms;
+ 	vm_offset_t win;                /* kernel window over the rmtfs buffer */
+ 	uint64_t win_base, win_len;
+@@ -2676,6 +2686,12 @@
+ 		printf("SWEET IPC: qrtr: tftp announced as service 4096 instance 1 at %u:0x4001 %s\n", QRTR_NODE_LOCAL,
+ 		    c ? "" : "(FAILED)");
+ 	}
++	if (ipc.pdm) {
++		uint32_t psrv[5] = { Q_NEW_SERVER, PDM_SERVICE, PDM_INSTANCE, QRTR_NODE_LOCAL, QRTR_PDM_PORT };
++		bool d = ipc_qrtr_send(Q_NEW_SERVER, QRTR_PORT_CTRL, ipc.node, QRTR_PORT_CTRL, psrv, sizeof(psrv));
++		printf("SWEET IPC: qrtr: pd-mapper announced as service %#x instance field %#x at %u:%#x %s\n", PDM_SERVICE,
++		    PDM_INSTANCE, QRTR_NODE_LOCAL, QRTR_PDM_PORT, d ? "" : "(FAILED)");
++	}
+ 	printf("SWEET IPC: qrtr: hello %s, rmtfs announced as service %u instance %u at %u:%#x %s\n", a ? "sent" : "FAILED",
+ 	    RMTFS_SERVICE, RMTFS_INSTANCE, QRTR_NODE_LOCAL, QRTR_RMTFS_PORT, b ? "" : "(FAILED)");
+ }
+@@ -3404,7 +3420,154 @@
+ 	memset(tftp_cl, 0, sizeof(tftp_cl));
+ }
+ 
++/*
++ * ---- pd-mapper (sweetpdm=1): the service locator the modem asks before it starts a protection domain.
++ * QMI SERVREG_LOCATOR (service 0x40, version 0x101, instance 0) answering GET_DOMAIN_LIST from the sdm845
++ * table of Linux drivers/soc/qcom/qcom_pd_mapper.c (v6.12); every domain also serves "tms/servreg". The
++ * WLAN PD (msm/modem/wlan_pd) is the one that loads wlanmdsp.mbn over TFTP and then offers WLFW (0x45).
++ */
++static const struct {
++	const char *domain;
++	uint32_t instance;
++	const char *services[3];        /* NULL-terminated */
++} pdm_domains[] = {
++	{ "msm/adsp/audio_pd", 74, { "avs/audio", NULL } },
++	{ "msm/adsp/root_pd", 74, { NULL } },
++	{ "msm/cdsp/root_pd", 76, { NULL } },
++	{ "msm/modem/root_pd", 180, { NULL } },
++	{ "msm/modem/wlan_pd", 180, { "kernel/elf_loader", "wlan/fw", NULL } },
++	{ "msm/slpi/root_pd", 90, { NULL } },
++	{ "msm/slpi/sensor_pd", 90, { NULL } },
++};
++
++static bool
++pdm_serves(unsigned d, const char *name)
++{
++	if (strcmp(name, "tms/servreg") == 0) {
++		return true;
++	}
++	for (unsigned k = 0; pdm_domains[d].services[k]; k++) {
++		if (strcmp(name, pdm_domains[d].services[k]) == 0) {
++			return true;
++		}
++	}
++	return false;
++}
++
++/* qcom_pdm_get_domain_list() / qcom_pdm_pfr(); the response TLVs in servreg_get_domain_list_resp_ei order */
+ static void
++pdm_rx(uint32_t node, uint32_t port, const uint8_t *p, uint32_t len)
++{
++	if (len < 7 || p[0] != 0) {
++		printf("SWEET IPC: pd-mapper: %u-byte message of type %u ignored\n", len, len ? p[0] : 0);
++		return;
++	}
++	uint16_t txn, msg, mlen;
++	memcpy(&txn, p + 1, 2);
++	memcpy(&msg, p + 3, 2);
++	memcpy(&mlen, p + 5, 2);
++	const uint8_t *t = p + 7;
++	uint32_t tl = MIN((uint32_t)mlen, len - 7);
++	uint16_t l1 = 0, l2 = 0, res = 0, err = 0, two = 2, four = 4;
++	const uint8_t *s1 = qmi_tlv(t, tl, 1, &l1), *s2 = qmi_tlv(t, tl, 2, &l2);
++	char name[PDM_NAME_MAX + 1], reason[PDM_NAME_MAX + 1], list[160];
++	memset(name, 0, sizeof(name));
++	memset(reason, 0, sizeof(reason));
++	if (s1) {
++		memcpy(name, s1, MIN((uint32_t)l1, PDM_NAME_MAX));
++	}
++	if (s2) {
++		memcpy(reason, s2, MIN((uint32_t)l2, PDM_NAME_MAX));
++	}
++	uint8_t r[512];
++	uint32_t n = 7;
++	r[0] = 2;                       /* QMI_RESPONSE */
++	memcpy(r + 1, &txn, 2);
++	memcpy(r + 3, &msg, 2);
++	ipc.pdm_reqs++;
++	switch (msg) {
++	case PDM_GET_DOMAIN_LIST: {     /* service name (TLV 1), optional offset (TLV 0x10) */
++		bool ok = true;
++		uint16_t lo = 0;
++		uint32_t offset = qmi_tlv(t, tl, 0x10, &lo) ? qmi_u32(t, tl, 0x10, &ok) : 0;
++		if (!s1 || l1 > PDM_NAME_MAX || !ok) {
++			res = 1;
++			err = 2;                /* QMI_ERR_MALFORMED_MSG */
++		}
++		r[n] = 2;                   /* qmi_result */
++		memcpy(r + n + 1, &four, 2);
++		memcpy(r + n + 3, &res, 2);
++		memcpy(r + n + 5, &err, 2);
++		n += 7;
++		if (res) {
++			printf("SWEET IPC: pd-mapper: malformed domain-list request (name %u bytes)\n", l1);
++			break;
++		}
++		/* TLV 0x10 at n, 0x11 at n + 5, 0x12 at n + 10: {u8 count, count x entry} */
++		uint16_t ndom = 0, rev = 1;
++		uint32_t hdr = n + 10, cnt_at = hdr + 3, list_at = cnt_at + 1, cnt = 0, lp = 0;
++		bool found = false;
++		list[0] = 0;
++		for (unsigned d = 0; d < sizeof(pdm_domains) / sizeof(pdm_domains[0]); d++) {
++			if (!pdm_serves(d, name)) {
++				continue;
++			}
++			found = true;
++			uint32_t i = ndom++;
++			uint32_t nl = (uint32_t)strlen(pdm_domains[d].domain);
++			if (i < offset || i >= PDM_LIST_MAX || list_at + 1 + nl + 9 > sizeof(r)) {
++				continue;
++			}
++			r[list_at] = (uint8_t)nl;   /* nested QMI_STRING: u8 length, no NUL */
++			memcpy(r + list_at + 1, pdm_domains[d].domain, nl);
++			list_at += 1 + nl;
++			memcpy(r + list_at, &pdm_domains[d].instance, 4);
++			r[list_at + 4] = 0;         /* service_data_valid */
++			bzero(r + list_at + 5, 4);  /* service_data */
++			list_at += 9;
++			cnt++;
++			lp += (uint32_t)snprintf(list + lp, sizeof(list) - lp, "%s%s/%u",
++			    cnt > 1 ? ", " : "", pdm_domains[d].domain, pdm_domains[d].instance);
++			lp = MIN(lp, (uint32_t)sizeof(list) - 1);
++		}
++		r[n] = 0x10;                /* total_domains */
++		memcpy(r + n + 1, &two, 2);
++		memcpy(r + n + 3, &ndom, 2);
++		r[n + 5] = 0x11;            /* db_rev_count */
++		memcpy(r + n + 6, &two, 2);
++		memcpy(r + n + 8, &rev, 2);
++		n = hdr;
++		if (found) {
++			/* domain_list_valid whenever the service is known, even past the offset (qcom_pd_mapper.c) */
++			uint16_t tlen = (uint16_t)(list_at - cnt_at);
++			r[hdr] = 0x12;
++			memcpy(r + hdr + 1, &tlen, 2);
++			r[cnt_at] = (uint8_t)cnt;
++			n = list_at;
++		}
++		printf("SWEET IPC: pd-mapper: \"%s\" offset %u -> %u of %u domains%s%s\n", name, offset, cnt, ndom,
++		    cnt ? ": " : "", list);
++		break;
++	}
++	case PDM_PFR:                   /* service (TLV 1) and reason (TLV 2) of a protection-domain crash */
++		printf("SWEET IPC: pd-mapper: PD failure report from %s: \"%s\"\n", name, reason);
++		r[n] = 2;
++		memcpy(r + n + 1, &four, 2);
++		memcpy(r + n + 3, &res, 2);
++		memcpy(r + n + 5, &err, 2);
++		n += 7;
++		break;
++	default:
++		printf("SWEET IPC: pd-mapper: unknown request %#x (%u bytes)\n", msg, len);
++		return;
++	}
++	uint16_t body = (uint16_t)(n - 7);
++	memcpy(r + 5, &body, 2);
++	(void)ipc_qrtr_send(Q_DATA, QRTR_PDM_PORT, node, port, r, n);
++	sweet_log_sync();
++}
++
++static void
+ ipc_qrtr_rx(const uint8_t *p, uint32_t len)
+ {
+ 	uint32_t h[8], type, snode, sport, confirm, size, dnode, dport, hdrlen;
+@@ -3457,11 +3620,17 @@
+ 			printf("SWEET IPC: qrtr: %s service %u (%#x) version %u instance %u at %u:%#x\n",
+ 			    type == Q_NEW_SERVER ? "modem offers" : "modem removes", s[1], s[1], s[2] & 0xff, s[2] >> 8, s[3],
+ 			    s[4]);
++			if (s[1] == WLFW_SERVICE && type == Q_NEW_SERVER) {
++				ipc.wlfw_seen = true;
++				printf("SWEET IPC: WLFW is up at %u:%#x: the WLAN PD runs\n", s[3], s[4]);
++			}
+ 		}
+ 		break;
+ 	case Q_DATA:
+ 		if (dport == QRTR_RMTFS_PORT) {
+ 			rmtfs_rx(snode, sport, pl, size);
++		} else if (ipc.pdm && dport == QRTR_PDM_PORT) {
++			pdm_rx(snode, sport, pl, size);
+ 		} else if (tftp_rx(dport, snode, sport, pl, size)) {
+ 			/* TFTP server or one of its transfers */
+ 		} else {
+@@ -3500,6 +3669,9 @@
+ 	int tftp = 0;
+ 	(void)PE_parse_boot_argn("sweettftp", &tftp, sizeof(tftp));
+ 	ipc.tftp = tftp == 1;
++	int pdm = 0;
++	(void)PE_parse_boot_argn("sweetpdm", &pdm, sizeof(pdm));
++	ipc.pdm = pdm == 1;
+ 	ipc.features = GLINK_FEATURE_REUSE;
+ 	ipc.node = 0;
+ 	ipc.rmtfs_perm = VMBIT(SCM_VMID_HLOS);
+@@ -3560,9 +3732,10 @@
+ 		wl_sleep(1);
+ 	}
+ 	printf("SWEET IPC: %u s: glink %s, IPCRTR %s, qrtr hello %s; %u packets in, %u out; rmtfs %u reads (%llu bytes), "
+-	    "%u writes kept in RAM (%llu bytes)\n", (unsigned)((ms_now_ms() - t0) / 1000), ipc.version_acked ? "versioned" : "no version-ack",
+-	    ipc.open_acked ? "open" : "not open", ipc.hello_seen ? "seen" : "not seen", ipc.rx_pkts, ipc.tx_pkts, ipc.reads,
+-	    ipc.read_bytes, ipc.writes, ipc.write_bytes);
++	    "%u writes kept in RAM (%llu bytes); pd-mapper %u requests; WLFW %s\n", (unsigned)((ms_now_ms() - t0) / 1000),
++	    ipc.version_acked ? "versioned" : "no version-ack", ipc.open_acked ? "open" : "not open",
++	    ipc.hello_seen ? "seen" : "not seen", ipc.rx_pkts, ipc.tx_pkts, ipc.reads, ipc.read_bytes, ipc.writes,
++	    ipc.write_bytes, ipc.pdm_reqs, ipc.wlfw_seen ? "up" : "not seen");
+ 	sweet_log_sync();
+ 	return alive;
+ }

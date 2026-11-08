@@ -1,0 +1,41 @@
+GPU zap loader: resume an interrupted SCM call the way Linux does (__scm_smc_do_quirk): x0 = 1, the ORIGINAL
+x1..x5, x6 = the continuation token TZ returned, x7 = 0. It re-sent the registers TZ returned (and left x7 as it was),
+so an interrupted PAS call would have handed TZ whatever it left in x1..x5. Latent: no interrupted call has been seen.
+Found by the Wi-Fi session's review against Linux; its ms_scm_call (xnu-12377 1106) does it this way.
+
+--- a/bsd/dev/sweet_a630_pas.c
++++ b/bsd/dev/sweet_a630_pas.c
+@@ -73,13 +73,19 @@
+ 	register uint64_t x4 __asm__("x4") = r->a[4];
+ 	register uint64_t x5 __asm__("x5") = r->a[5];
+ 	register uint64_t x6 __asm__("x6") = r->a[6];
++	register uint64_t x7 __asm__("x7") = 0;         /* SMCCC: x7 is the client id, 0 (Linux qcom_scm passes 0) */
+ 	__asm__ volatile ("smc #0"
+-	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6)
+-	    : : "x7", "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
++	    : "+r"(x0), "+r"(x1), "+r"(x2), "+r"(x3), "+r"(x4), "+r"(x5), "+r"(x6), "+r"(x7)
++	    : : "x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15", "x16", "x17", "cc", "memory");
+ 	*r = (struct scm_regs) { { x0, x1, x2, x3, x4, x5, x6 } };
+ }
+ 
+-/* Reissue interrupted calls (x0 == 1, x6 keeps the continuation token), retry busy ones. */
++/*
++ * Reissue interrupted calls, retry busy ones. An interrupted call is resumed the way Linux does it
++ * (__scm_smc_do_quirk): x0 = 1 (the interrupted status), the ORIGINAL x1..x5, x6 = the continuation token TZ
++ * returned, x7 = 0. Re-sending the registers TZ returned instead (as this did before patch 0251) passes TZ
++ * whatever it left in x1..x5.
++ */
+ static bool
+ scm_invoke(const struct scm_regs *initial, bool fast, struct scm_regs *out)
+ {
+@@ -90,6 +96,10 @@
+ 			if ((int32_t)out->a[0] != SCM_INTERRUPTED) {
+ 				break;
+ 			}
++			uint64_t token = out->a[6];
++			*out = *initial;
++			out->a[0] = SCM_INTERRUPTED;
++			out->a[6] = token;
+ 			if (resume == SCM_RESUME_LIMIT) {
+ 				printf("SWEET GPU: SCM interrupted call did not complete; no further calls\n");
+ 				return false;

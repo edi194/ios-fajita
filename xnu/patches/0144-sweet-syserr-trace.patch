@@ -1,0 +1,246 @@
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -86,6 +86,11 @@
+  *
+  * Outputs:	none
+  */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* bsd/kern/sweet_amfi.c: boot-arg sweetsyserr */
++void sweet_syserr_trace(struct proc *p, unsigned short code, int error, const uint64_t *arg);
++#endif
++
+ void
+ unix_syscall(
+ 	struct arm_saved_state * state,
+@@ -181,6 +186,12 @@
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (__improbable(error != 0)) {
++		sweet_syserr_trace(proc, code, error, &uthread->uu_arg[0]);
++	}
++#endif
++
+ #if CONFIG_MACF
+ skip_syscall:
+ #endif /* CONFIG_MACF */
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -35,6 +35,7 @@
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+ #include <machine/atomic.h>
++#include <pexpert/pexpert.h>
+ #include <security/mac_policy.h>
+ 
+ /* iokit/Kernel/arm/SweetEntitlements.cpp */
+@@ -563,5 +564,208 @@
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++}
++
++/*
++ * Failed-syscall tracer (boot-arg sweetsyserr, comma separated process names; default list below,
++ * "*" = every process, "-" = off). The iOS 18 boot has no userland log we can read (os_log goes to
++ * logd's tracev3 only), so a daemon that gives up quietly (backboardd: container lookup, lsd,
++ * mobileactivationd, replicatord, passd, ...) leaves nothing but its exit. This prints, once per
++ * distinct (process, syscall, errno, path), the syscalls that failed:
++ *
++ *   SWEET ERR: containermanagerd[41] mkdir(136) e=45 "/private/var/containers/Data/System/..."
++ *
++ * Names are compared against p_comm (16 characters: containermanagerd_system shows as
++ * "containermanager"). At most SWEET_SYSERR_MAX lines in total.
++ */
++#define SWEET_SYSERR_MAX        900
++#define SWEET_SYSERR_DEFAULT    "containermanagerd,containermanagerd_system,usermanagerd,backboardd," \
++	"lsd,mobileactivationd,replicatord,passd,appprotectiond,findmydeviced,cryptexd,dropbear," \
++	"financed,spaceattributiond,fairplayd.H2,PerfPowerServices,webinspectord"
++
++static char sweet_syserr_names[256];
++static int sweet_syserr_state;                  /* 0 = not parsed, 1 = off, 2 = on */
++static uint64_t sweet_syserr_keys[SWEET_SYSERR_MAX];
++static int _Atomic sweet_syserr_count;
++
++static uint64_t
++sweet_syserr_hash(uint64_t h, const char *s)
++{
++	while (*s) {
++		h = (h ^ (uint8_t)*s++) * 0x100000001b3ULL;
++	}
++	return h;
++}
++
++/* index of the path argument, -1 = none */
++static int
++sweet_syserr_path_arg(unsigned short code)
++{
++	switch (code) {
++	case 5: case 9: case 10: case 12: case 15: case 16: case 33: case 58: case 61:
++	case 128: case 136: case 137: case 138: case 157: case 200: case 191: case 216:
++	case 220: case 221: case 227: case 234: case 236: case 242: case 277: case 292:
++	case 338: case 340: case 345: case 398:
++		return 0;
++	case 463: case 464: case 466: case 467: case 468: case 469: case 470: case 472:
++	case 473: case 475:
++		return 1;
++	default:
++		return -1;
++	}
++}
++
++static const char *
++sweet_syserr_name(unsigned short code)
++{
++	switch (code) {
++	case 5: return "open";
++	case 9: return "link";
++	case 10: return "unlink";
++	case 12: return "chdir";
++	case 15: return "chmod";
++	case 16: return "chown";
++	case 33: return "access";
++	case 58: return "readlink";
++	case 92: return "fcntl";
++	case 128: return "rename";
++	case 136: return "mkdir";
++	case 137: return "rmdir";
++	case 157: return "statfs";
++	case 169: return "csops";
++	case 170: return "csops_audittoken";
++	case 191: return "pathconf";
++	case 200: return "truncate";
++	case 216: return "open_dprotected_np";
++	case 220: return "getattrlist";
++	case 221: return "setattrlist";
++	case 227: return "copyfile";
++	case 234: return "getxattr";
++	case 236: return "setxattr";
++	case 242: return "fsctl";
++	case 277: return "open_extended";
++	case 292: return "mkdir_extended";
++	case 336: return "proc_info";
++	case 338: return "stat64";
++	case 340: return "lstat64";
++	case 345: return "statfs64";
++	case 381: return "__mac_syscall";
++	case 398: return "open_nocancel";
++	case 463: return "openat";
++	case 464: return "openat_nocancel";
++	case 466: return "faccessat";
++	case 469: return "fstatat";
++	case 470: return "fstatat64";
++	case 472: return "unlinkat";
++	case 475: return "mkdirat";
++	case 494: return "persona";
++	default: return "";
++	}
++}
++
++static bool
++sweet_syserr_match(const char *name)
++{
++	size_t n = strlen(name);
++	for (const char *t = sweet_syserr_names; *t;) {
++		const char *end = strchr(t, ',');
++		size_t tl = end ? (size_t)(end - t) : strlen(t);
++		if (tl == 1 && t[0] == '*') {
++			return true;
++		}
++		if (n > 0 && ((tl == n && strncmp(t, name, n) == 0) ||
++		    (n >= 16 && tl > n && strncmp(t, name, n) == 0))) {
++			return true;
++		}
++		if (!end) {
++			break;
++		}
++		t = end + 1;
++	}
++	return false;
+ }
++
++void sweet_syserr_trace(struct proc *p, unsigned short code, int error, const uint64_t *arg);
++
++void
++sweet_syserr_trace(struct proc *p, unsigned short code, int error, const uint64_t *arg)
++{
++	if (error == EINTR || error == EAGAIN || error == ERESTART || error == EJUSTRETURN ||
++	    error == EWOULDBLOCK || error == EINPROGRESS) {
++		return;
++	}
++	if (sweet_syserr_state == 0) {
++		if (!PE_parse_boot_argn("sweetsyserr", sweet_syserr_names, sizeof(sweet_syserr_names))) {
++			strlcpy(sweet_syserr_names, SWEET_SYSERR_DEFAULT, sizeof(sweet_syserr_names));
++		}
++		sweet_syserr_state = (sweet_syserr_names[0] == '-') ? 1 : 2;
++	}
++	if (sweet_syserr_state != 2 || os_atomic_load(&sweet_syserr_count, relaxed) >= SWEET_SYSERR_MAX) {
++		return;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	if (!sweet_syserr_match(name)) {
++		return;
++	}
++
++	char detail[112];
++	detail[0] = '\0';
++	int pi = sweet_syserr_path_arg(code);
++	uint64_t key = sweet_syserr_hash(0xcbf29ce484222325ULL, name);
++	key = (key ^ code) * 0x100000001b3ULL;
++	key = (key ^ (uint32_t)error) * 0x100000001b3ULL;
++	if (pi >= 0 && arg[pi] != 0) {
++		char path[96];
++		size_t done = 0;
++		int ce = copyinstr((user_addr_t)arg[pi], path, sizeof(path), &done);
++		if (ce == 0 || ce == ENAMETOOLONG) {
++			path[sizeof(path) - 1] = '\0';
++			snprintf(detail, sizeof(detail), " \"%s\"", path);
++			key = sweet_syserr_hash(key, path);
++		} else {
++			snprintf(detail, sizeof(detail), " <path %llx e%d>", arg[pi], ce);
++		}
++	} else if (code == 494) {
++		snprintf(detail, sizeof(detail), " op=%llu flags=0x%llx", arg[0], arg[1]);
++		key = (key ^ (uint32_t)arg[0]) * 0x100000001b3ULL;
++	} else if (code == 169 || code == 170) {
++		snprintf(detail, sizeof(detail), " op=%llu", code == 169 ? arg[1] : arg[0]);
++		key = (key ^ (uint32_t)(code == 169 ? arg[1] : arg[0])) * 0x100000001b3ULL;
++	} else if (code == 92) {
++		snprintf(detail, sizeof(detail), " cmd=%llu", arg[1]);
++		key = (key ^ (uint32_t)arg[1]) * 0x100000001b3ULL;
++	} else if (code == 381) {
++		char pol[24];
++		size_t done = 0;
++		pol[0] = '\0';
++		if (arg[0] != 0 && copyinstr((user_addr_t)arg[0], pol, sizeof(pol), &done) != 0) {
++			pol[0] = '\0';
++		}
++		pol[sizeof(pol) - 1] = '\0';
++		snprintf(detail, sizeof(detail), " \"%s\" op=%llu", pol, arg[1]);
++		key = (key ^ (uint32_t)arg[1]) * 0x100000001b3ULL;
++	} else if (code == 336) {
++		snprintf(detail, sizeof(detail), " call=%llu flavor=%llu", arg[0], arg[2]);
++		key = (key ^ (uint32_t)arg[0]) * 0x100000001b3ULL;
++		key = (key ^ (uint32_t)arg[2]) * 0x100000001b3ULL;
++	}
++
++	int seen = os_atomic_load(&sweet_syserr_count, relaxed);
++	if (seen > SWEET_SYSERR_MAX) {
++		seen = SWEET_SYSERR_MAX;
++	}
++	for (int i = 0; i < seen; i++) {
++		if (sweet_syserr_keys[i] == key) {
++			return;
++		}
++	}
++	int slot = os_atomic_inc_orig(&sweet_syserr_count, relaxed);
++	if (slot >= SWEET_SYSERR_MAX) {
++		return;
++	}
++	sweet_syserr_keys[slot] = key;
++	printf("SWEET ERR: %s[%d] %s(%d) e=%d%s\n", name, proc_pid(p), sweet_syserr_name(code), code, error, detail);
++}
++
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

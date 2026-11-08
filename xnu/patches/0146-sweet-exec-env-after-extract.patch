@@ -1,0 +1,25 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -1290,6 +1290,14 @@
+ 	if (error) {
+ 		goto bad;
+ 	}
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	/* argv/envv strings are complete here (by the printf("exec %s") below ip_strings is already consumed) */
++	if (imgp->ip_startargv != NULL && imgp->ip_endargv != NULL && imgp->ip_endenvv != NULL) {
++		const char *leaf = strrchr(imgp->ip_startargv, '/');
++		sweet_exec_env_trace(leaf != NULL ? leaf + 1 : imgp->ip_startargv, proc_getpid(current_proc()),
++		    imgp->ip_endargv, imgp->ip_endenvv);
++	}
++#endif
+ 
+ 	AUDIT_ARG(argv, imgp->ip_startargv, imgp->ip_argc,
+ 	    imgp->ip_endargv - imgp->ip_startargv);
+@@ -7462,7 +7470,6 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+ 			printf("exec %s\n", p->p_name);
+-			sweet_exec_env_trace(p->p_name, proc_getpid(p), imgp->ip_strings, imgp->ip_strendp);
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "

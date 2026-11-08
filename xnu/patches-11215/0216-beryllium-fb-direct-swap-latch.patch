@@ -1,0 +1,421 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index bbe358f..99a3869 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -55,6 +55,7 @@ extern "C" int sweet_battery_hud(int *percent, int *ma);        /* iokit/Kernel/
+ class SweetSurface;
+ static void sweet_hold_release(SweetSurface **set);
+ static uint32_t get32(const uint8_t *p, uint32_t off);
++static uint64_t sweet_abs_us(uint64_t abs);
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -231,6 +232,26 @@ public:
+ 	uint32_t      fZcCount, fZcNo[8], fZcNoNext, fZcWhySeen;
+ 	uint64_t      fZcFrames, fCopyFrames;
+ 	bool          zcPresent(const uint8_t *rec, uint32_t mask);
++	/*
++	 * Honest swap completion (patch 0216, boot-arg sweetfb_swapsync, default on in direct mode). backboardd's
++	 * CA::WindowServer::IOMFBDisplay::can_update_ calls IOMobileFramebufferSwapWait(swap id) (selector 6) before it starts
++	 * a frame and treats 0 as "that swap is done, the surface is free"; selector 6 used to return 0 at once, so
++	 * CoreAnimation rendered the next frame while the previous one was still queued for the panel. Now a swap is
++	 * done when the MDP has LATCHED it (CTL_FLUSH bits cleared at vsync) and zcPoll has dropped the in-use holds of the
++	 * frames it replaced. fSwapNewest: newest swap id received (swap(), under fLock); fSwapScanID: swap id of the frame
++	 * last handed to the MDP (set by scanAddr before the flush write; work loop); fSwapDone: newest id known latched and
++	 * released (set by zcPoll on the work loop). Compared as signed differences (ids wrap).
++	 */
++	bool          fSwapSync;
++	uint32_t      fSwapNewest, fSwapScanID, fSwapPrevScan, fSwapDone, fCurSwapID;
++	uint32_t      fSwapDepth;       /* sweetfb_swapdepth: 1 = SwapWait(N) waits until N latched, 2 (default) = until N-1 latched */
++	bool          fWatching;        /* a frame is queued: the swap timer polls for its latch every 500 us */
++	void          latchWatch(void);
++	bool          fVsyncAlign;      /* sweetfb_vsyncalign: the vsync timer follows the latch times SwapWait observed */
++	uint64_t      fPhaseAbs;        /* a latch (vsync) as observed by SwapWait, abs time; 0 = none yet */
++	uint64_t      fPeriodAbs;       /* vsync period, abs units */
++	IOReturn      swapWait(uint32_t id);
++	bool          swapReady(uint32_t id);
+ 	/*
+ 	 * Display path statistics (patch 0210, sysctl kern.sweet_fb). Totals since
+ 	 * boot; once a second the window since the last publish is turned into
+@@ -247,6 +268,7 @@ public:
+ 		uint64_t copyAbs, copyMaxAbs;   /* copy path, latch waits excluded */
+ 		uint64_t zcAbs, zcMaxAbs;       /* zero-copy: cache clean + register programming */
+ 		uint64_t cleanAbs, cleans, cleanSkips;
++		uint64_t swapWaits, swapWaitAbs, swapWaitTimeouts;      /* SwapWait calls that had to wait, their time, those that gave up */
+ 	} fSt, fStPrev;
+ 	/*
+ 	 * Direct scanout (sweetfb_direct=1, patch 0211): hw scaler + page flipping + zero-copy
+@@ -502,10 +524,14 @@ AppleCLCD::start(IOService *provider)
+ 			zcReq = 1;
+ 		}
+ 		{
+-			/* 0 never clean, 1 always (0127), 2 clean only frames the GPU did not write; direct defaults to 2 */
+-			uint32_t cm = fDirect ? 2 : 1;
++			/*
++			 * 0 never clean, 1 always (0127; the default, also in direct mode since 0216), 2 clean only frames the GPU
++			 * did not announce (0212: CPU pixels drawn in a GPU frame are then never cleaned: unsafe), 3 clean unless
++			 * the frame is a GPU frame and no write-lock/unlock of the surface came since the last scan.
++			 */
++			uint32_t cm = 1;
+ 			PE_parse_boot_argn("sweetfb_zcclean", &cm, sizeof(cm));
+-			fZcCleanMode = cm > 2 ? 2 : cm;
++			fZcCleanMode = cm > 3 ? 3 : cm;
+ 		}
+ 		if (zcReq && smmuLevel == 0) {
+ 			smmuLevel = 1;
+@@ -545,13 +571,27 @@ AppleCLCD::start(IOService *provider)
+ 			}
+ 		}
+ 		if (fZc && fZcOK) {
+-			sweet_lowpool_gpu_nosync(fZcCleanMode != 1);
++			bool nosync = fZcCleanMode == 0 || fZcCleanMode == 2;
++			sweet_lowpool_gpu_nosync(nosync);
+ 			IOLog("SWEET FB: pool surface cache policy: clean at scan = %s, BO_SYNC of scanned GPU surfaces = %s\n",
+-			    fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : "only CPU-drawn frames"),
+-			    fZcCleanMode != 1 ? "skipped" : "clean+invalidate");
++			    fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : (fZcCleanMode == 2 ? "only frames nobody announced" :
++			    "unless a GPU-only frame")), nosync ? "skipped" : "clean+invalidate");
+ 		}
+ 		if (fDirect) {
+ 			fEarly = fZc && fZcOK;
++			{
++				int ss = 1, va = 1, depth = 2;
++				PE_parse_boot_argn("sweetfb_swapdepth", &depth, sizeof(depth));
++				fSwapDepth = depth <= 1 ? 1 : 2;
++				PE_parse_boot_argn("sweetfb_swapsync", &ss, sizeof(ss));
++				PE_parse_boot_argn("sweetfb_vsyncalign", &va, sizeof(va));
++				fSwapSync = fEarly && ss != 0;
++				fVsyncAlign = fSwapSync && va != 0;
++				if (fEarly) {
++					IOLog("SWEET FB: swap completion %s (depth %u: SwapWait(N) waits for swap N%s to latch; sweetfb_swapsync=0 = answer at once), vsync timer %s\n",
++					    fSwapSync ? "honest" : "immediate", fSwapDepth, fSwapDepth == 1 ? "" : "-1", fVsyncAlign ? "follows the observed latch (sweetfb_vsyncalign=0 = free running)" : "free running");
++				}
++			}
+ 			if (!fEarly) {
+ 				IOLog("SWEET FB: sweetfb_direct=1 but zero-copy is not available (%s): every frame is copied at sweetfb_hz\n",
+ 				    !fHw || !fFlip ? "no hardware scaler / page flipping" : (!fZcOK ? "MDP SMMU not verified bypass" : "no low pool"));
+@@ -612,9 +652,37 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	uint64_t now = mach_absolute_time();
+ 	uint64_t count = ++fb->fVsyncCount;
+ 	fb->fSt.ticks++;
++	/*
++	 * 0216: with sweetfb_vsyncalign the notification carries the time of the latest panel vsync that SwapWait saw (the
++	 * MDP latch, a real vsync of the panel) projected forward by whole periods, and the timer is re-armed for the next
++	 * one, so CoreAnimation's display link runs on the panel's phase instead of on a free-running 60 Hz clock.
++	 */
++	uint64_t stamp = now;
++	uint32_t nextUS = fb->fVsyncUS;
++	if (fb->fVsyncAlign) {
++		uint64_t ph = __atomic_load_n(&fb->fPhaseAbs, __ATOMIC_ACQUIRE);
++		if (fb->fPeriodAbs == 0) {
++			nanoseconds_to_absolutetime((uint64_t)fb->fVsyncUS * 1000, &fb->fPeriodAbs);
++		}
++		uint64_t per = fb->fPeriodAbs;
++		uint64_t second;
++		nanoseconds_to_absolutetime(NSEC_PER_SEC, &second);
++		if (ph != 0 && per != 0 && now > ph && now - ph < 2 * second) {
++			uint64_t since = (now - ph) % per;
++			stamp = now - since;
++			uint64_t left = per - since;
++			if (left < per / 4) {
++				left += per;    /* too close to the boundary we just served: aim for the next one */
++			}
++			nextUS = (uint32_t)sweet_abs_us(left);
++			if (nextUS < 1000) {
++				nextUS = 1000;
++			}
++		}
++	}
+ 	uint64_t values[6] = {
+ 		(uint32_t)count, (uint32_t)(count >> 32),
+-		(uint32_t)now, (uint32_t)(now >> 32),
++		(uint32_t)stamp, (uint32_t)(stamp >> 32),
+ 		0, 0,
+ 	};
+ 
+@@ -640,7 +708,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 			fb->fBlackDone = true;
+ 			fb->blackout();
+ 		}
+-		sender->setTimeoutUS(fb->fVsyncUS);
++		sender->setTimeoutUS(nextUS);
+ 		return;
+ 	}
+ 	bool flush = fb->fDirty && (count % fb->fFlushTicks) == 0;
+@@ -670,7 +738,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 	sweet_hold_release(taken);      /* copied: CA may render into them again */
+ 	fb->statsTick(now);
+ 	fb->hudTick(now);
+-	sender->setTimeoutUS(fb->fVsyncUS);
++	sender->setTimeoutUS(nextUS);
+ }
+ 
+ /*
+@@ -688,6 +756,8 @@ AppleCLCD::swapFired(OSObject *owner, IOTimerEventSource *)
+ 	if (fb->fPowerOff) {
+ 		return;         /* the vsync tick runs the backlight ramp and redraws on power on */
+ 	}
++	fb->zcPoll();           /* 0216: also kicked by SwapWait when it saw the latch, so the frame it waited for is released now */
++	fb->latchWatch();       /* 0217: while a frame is queued this timer comes back every 500 us */
+ 	IOLockLock(fb->fLock);
+ 	if (!fb->fDirty) {
+ 		IOLockUnlock(fb->fLock);
+@@ -702,6 +772,7 @@ AppleCLCD::swapFired(OSObject *owner, IOTimerEventSource *)
+ 	fb->quietConsole();
+ 	if (fb->zcPresent(fb->fEarlyRec, get32(fb->fEarlyRec, 0x104))) {
+ 		sweet_hold_release(taken);      /* zcPresent holds the surface itself until its frame latched */
++		fb->latchWatch();
+ 		return;
+ 	}
+ 	SweetSurface *dropped[4] = {};
+@@ -762,6 +833,8 @@ AppleCLCD::statsTick(uint64_t now)
+ 	uint64_t copyAvg = dCopy ? sweet_abs_us(c.copyAbs - p.copyAbs) * 100 / dCopy : 0;
+ 	uint64_t zcAvg = dZc ? sweet_abs_us(c.zcAbs - p.zcAbs) * 100 / dZc : 0;
+ 	uint64_t clAvg = dCl ? sweet_abs_us(c.cleanAbs - p.cleanAbs) * 100 / dCl : 0;
++	uint64_t dSwW = c.swapWaits - p.swapWaits;
++	uint64_t swAvg = dSwW ? sweet_abs_us(c.swapWaitAbs - p.swapWaitAbs) * 100 / dSwW : 0;
+ 	uint64_t lwAvg = dLw ? sweet_abs_us(c.latchWaitAbs - p.latchWaitAbs) * 100 / dLw : 0;
+ 	const char *mode = fZc && fZcOK ? (fDirect ? "direct" : "zc") : "copy";
+ 	const char *smmu = fSmmuA == -2 ? "untested" : ((fSmmuA == 1 && fSmmuB == 1) ? "bypass" : "translate-or-unknown");
+@@ -776,14 +849,16 @@ AppleCLCD::statsTick(uint64_t now)
+ 	    "zc_frames=%llu zc_s=%u.%02u copy_frames=%llu copy_s=%u.%02u scan_replaced=%llu scan_replaced_s=%u.%02u "
+ 	    "copy_us=%u.%02u copy_us_max=%llu zc_us=%u.%02u zc_us_max=%llu clean_us=%u.%02u cleans=%llu clean_skips=%llu "
+ 	    "latch_waits=%llu latch_wait_us=%u.%02u latch_timeouts=%llu vsync_s=%u.%02u "
+-	    "pool_used=%u pool_total=%u pool_surfaces=%llu pool_fallbacks=%llu\n",
+-	    mode, hz, fFlushTicks, fHw ? 1 : 0, fFlip ? 1 : 0, smmu, fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : "auto"),
++	    "pool_used=%u pool_total=%u pool_surfaces=%llu pool_fallbacks=%llu "
++	    "swapsync=%d swap_waits=%llu swap_wait_us=%u.%02u swap_wait_timeouts=%llu\n",
++	    mode, hz, fFlushTicks, fHw ? 1 : 0, fFlip ? 1 : 0, smmu, fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : (fZcCleanMode == 2 ? "auto" : "tracked")),
+ 	    sweet_abs_us(now) / 1000000, winUS / 1000,
+ 	    swaps, SW_F2(PER_S(dSwaps)), coalesced, SW_F2(PER_S(dCoal)),
+ 	    c.zc, SW_F2(PER_S(dZc)), c.copy, SW_F2(PER_S(dCopy)), c.scanReplaced, SW_F2(PER_S(dRepl)),
+ 	    SW_F2(copyAvg), sweet_abs_us(c.copyMaxAbs), SW_F2(zcAvg), sweet_abs_us(c.zcMaxAbs), SW_F2(clAvg), c.cleans, c.cleanSkips,
+ 	    c.latchWaits, SW_F2(lwAvg), c.latchTimeouts, SW_F2(PER_S(dTicks)),
+-	    used, total, pallocs, pfails);
++	    used, total, pallocs, pfails,
++	    fSwapSync ? 1 : 0, c.swapWaits, SW_F2(swAvg), c.swapWaitTimeouts);
+ 	#undef PER_S
+ 	sweet_fb_stats_publish(line);
+ 	if (fStLogSecs != 0 && (fStLogT == 0 || sweet_abs_us(now - fStLogT) >= (uint64_t)fStLogSecs * 1000000)) {
+@@ -878,6 +953,7 @@ AppleCLCD::swap(const uint8_t *rec)
+ 	}
+ 	IOLockLock(fLock);
+ 	fSt.swaps++;
++	__atomic_store_n(&fSwapNewest, get32(rec, 0x50), __ATOMIC_RELEASE);
+ 	if (fDirty) {
+ 		fSt.coalesced++;        /* the previous swap never reached the panel */
+ 	}
+@@ -1363,6 +1439,10 @@ AppleCLCD::scanAddr(uint32_t pa, uint32_t stride, bool hwFrame)
+ 	    (*(volatile uint32_t *)(fMdp + SWEET_MDP_CTL0 + SWEET_MDP_CTL_FLUSH) & fLastFlush) != 0) {
+ 		fSt.scanReplaced++;     /* the previous address was still waiting for its vsync: that frame is never shown */
+ 	}
++	if (fCurSwapID != fSwapScanID) {
++		__atomic_store_n(&fSwapPrevScan, fSwapScanID, __ATOMIC_RELEASE);        /* the frame before this one (it is, or was, on the panel) */
++	}
++	__atomic_store_n(&fSwapScanID, fCurSwapID, __ATOMIC_RELEASE);   /* before the flush: a poller that sees it clear sees this id */
+ 	__asm__ volatile ("dsb sy" ::: "memory");      /* WC writes of the frame land first */
+ 	p[SSPP_SRC0_ADDR / 4] = pa;
+ 	p[SSPP_YSTRIDE0 / 4] = stride;
+@@ -1442,17 +1522,17 @@ sweet_dcache_clean_va(const void *va, size_t len)
+ void
+ AppleCLCD::zcPoll(void)
+ {
+-	if (fZcCount == 0) {
++	volatile uint32_t *flush = (volatile uint32_t *)(fMdp + SWEET_MDP_CTL0 + SWEET_MDP_CTL_FLUSH);
++	if (fZcCount == 0 && !fSwapSync) {
+ 		return;
+ 	}
+-	volatile uint32_t *flush = (volatile uint32_t *)(fMdp + SWEET_MDP_CTL0 + SWEET_MDP_CTL_FLUSH);
+ 	if (*flush & fLastFlush) {
+ 		return;         /* the newest frame is not on the panel yet */
+ 	}
+ 	/* the newest scan is on the panel: everything older is free; if a copied frame
+ 	 * replaced the pooled one, that one is free as well */
+ 	uint32_t keep = fZcFront ? fZcCount - 1 : fZcCount;
+-	SweetSurface *newest = fZcFront ? fZcHeld[fZcCount - 1] : NULL;
++	SweetSurface *newest = fZcFront && fZcCount != 0 ? fZcHeld[fZcCount - 1] : NULL;
+ 	for (uint32_t i = 0; i < keep; i++) {
+ 		sweet_hold(fZcHeld[i], false);
+ 		fZcHeld[i]->release();
+@@ -1461,6 +1541,111 @@ AppleCLCD::zcPoll(void)
+ 	fZcHeld[0] = newest;
+ 	fZcHeld[1] = fZcHeld[2] = fZcHeld[3] = NULL;
+ 	fZcCount = newest != NULL ? 1 : 0;
++	/* 0216: only now (latched, older surfaces handed back) is the swap complete for SwapWait */
++	uint32_t scanned = __atomic_load_n(&fSwapScanID, __ATOMIC_ACQUIRE);
++	if ((int32_t)(scanned - fSwapDone) > 0) {
++		__atomic_store_n(&fSwapDone, scanned, __ATOMIC_RELEASE);
++	}
++}
++
++/*
++ * selector 6, IOMobileFramebufferSwapWait(swap id) (0216). 0 = the swap is complete: its frame was latched by the MDP and
++ * the surfaces it replaced are free again. Anything else (kIOReturnTimeout) = still pending; CoreAnimation then asks
++ * again every 100 us until its own timeout (swap_wait_timeout), so waiting here for up to a frame only saves it
++ * the polling. The wait polls the CTL flush bits (a register read) every 250 us; when it sees them clear it kicks the
++ * work loop (swapFired -> zcPoll) to release the holds and records the time as a real panel vsync (fPhaseAbs) when it
++ * watched the bits go from set to clear. Not in copy mode (frames are paced by sweetfb_hz there), with the display off,
++ * for ids that were never swapped, or with sweetfb_swapsync=0.
++ */
++/*
++ * Swap `id` may be answered "complete" (0217, one frame in flight): it was latched, or (depth 2) it is the frame now
++ * queued for the panel and the frame scanned before it has latched. CoreAnimation then renders N+1 while N waits for the
++ * vsync. What keeps N+1 off the surfaces still in use is not this call but the in-use hold (state page +0x18, read by
++ * IOSurfaceIsInUse when CoreAnimation picks its next target): every scanned surface stays held from SwapEnd until the
++ * frame that replaced it has latched (zcPoll), i.e. N and the frame on the panel are both held while N+1 is drawn.
++ */
++bool
++AppleCLCD::swapReady(uint32_t id)
++{
++	uint32_t done = __atomic_load_n(&fSwapDone, __ATOMIC_ACQUIRE);
++	if ((int32_t)(done - id) >= 0) {
++		return true;
++	}
++	if (fSwapDepth >= 2) {
++		uint32_t scan = __atomic_load_n(&fSwapScanID, __ATOMIC_ACQUIRE);
++		uint32_t prev = __atomic_load_n(&fSwapPrevScan, __ATOMIC_ACQUIRE);
++		return scan == id && (int32_t)(done - prev) >= 0;
++	}
++	return false;
++}
++
++/*
++ * A frame is queued (CTL flush bits set): poll for its latch every 500 us on the work loop, so the older surfaces are
++ * released (zcPoll, at the top of swapFired) within half a millisecond of the vsync and the vsync phase is learned
++ * (midpoint of the polling interval) without any caller having to wait for it.
++ */
++void
++AppleCLCD::latchWatch(void)
++{
++	volatile uint32_t *flush = (volatile uint32_t *)(fMdp + SWEET_MDP_CTL0 + SWEET_MDP_CTL_FLUSH);
++	uint32_t lf = fLastFlush;
++	if (lf != 0 && (*flush & lf) != 0) {
++		fWatching = true;
++		fSwapTimer->setTimeoutUS(500);
++	} else if (fWatching) {
++		fWatching = false;
++		if (fVsyncAlign) {
++			uint64_t half;
++			nanoseconds_to_absolutetime(250 * NSEC_PER_USEC, &half);
++			uint64_t now = mach_absolute_time();
++			__atomic_store_n(&fPhaseAbs, now > half ? now - half : now, __ATOMIC_RELEASE);
++		}
++	}
++}
++
++IOReturn
++AppleCLCD::swapWait(uint32_t id)
++{
++	if (!fSwapSync || !fEarly || fPowerOff || id == 0 || fSwapTimer == NULL) {
++		return kIOReturnSuccess;
++	}
++	if ((int32_t)(id - __atomic_load_n(&fSwapNewest, __ATOMIC_ACQUIRE)) > 0) {
++		return kIOReturnSuccess;        /* not a swap we know */
++	}
++	if (swapReady(id)) {
++		return kIOReturnSuccess;
++	}
++	volatile uint32_t *flush = (volatile uint32_t *)(fMdp + SWEET_MDP_CTL0 + SWEET_MDP_CTL_FLUSH);
++	uint64_t t0 = mach_absolute_time(), limit;
++	bool sawBusy = false, kicked = false;
++	nanoseconds_to_absolutetime((uint64_t)fVsyncUS * 1500, &limit);        /* 1.5 frames */
++	for (;;) {
++		if (swapReady(id)) {
++			fSt.swapWaits++;
++			fSt.swapWaitAbs += mach_absolute_time() - t0;
++			return kIOReturnSuccess;
++		}
++		uint32_t lf = fLastFlush;
++		bool busy = lf != 0 && (*flush & lf) != 0;
++		uint64_t now = mach_absolute_time();
++		if (busy) {
++			sawBusy = true;
++			kicked = false;         /* a newer frame was queued behind the one we kicked for: kick again when that latches */
++		} else if (!kicked && lf != 0) {
++			kicked = true;
++			if (sawBusy && fVsyncAlign) {
++				__atomic_store_n(&fPhaseAbs, now, __ATOMIC_RELEASE);    /* the bits just cleared: that was a vsync */
++			}
++			fSwapTimer->setTimeoutUS(1);
++		}
++		if (now - t0 > limit) {
++			fSt.swapWaits++;
++			fSt.swapWaitAbs += now - t0;
++			fSt.swapWaitTimeouts++;
++			return kIOReturnTimeout;
++		}
++		delay_for_interval(250, NSEC_PER_USEC);
++	}
+ }
+ 
+ void
+@@ -1500,6 +1685,7 @@ bool
+ AppleCLCD::zcPresent(const uint8_t *rec, uint32_t mask)
+ {
+ 	int only = -1;
++	fCurSwapID = get32(rec, 0x50);
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		if ((mask & (1u << layer)) && get32(rec, 0x54 + 4 * layer) != 0) {
+ 			if (only >= 0) {
+@@ -1589,7 +1775,11 @@ AppleCLCD::zcPresent(const uint8_t *rec, uint32_t mask)
+ 	uint32_t gpuBlits = __atomic_load_n(&s->gpuBlits, __ATOMIC_ACQUIRE);
+ 	bool gpuFrame = gpuBlits != s->gpuBlitsSeen;    /* the GPU wrote it since the last scan (BO_SYNC) */
+ 	s->gpuBlitsSeen = gpuBlits;
+-	bool clean = sweet_lowpool_cacheable() && (fZcCleanMode == 1 || (fZcCleanMode == 2 && !gpuFrame));
++	uint32_t cpuWrites = __atomic_load_n(&s->cpuWrites, __ATOMIC_ACQUIRE);
++	bool cpuWrote = cpuWrites != s->cpuWritesSeen;  /* a write-unlock (IOSurfaceUnlock without ReadOnly) since the last scan */
++	s->cpuWritesSeen = cpuWrites;
++	bool clean = sweet_lowpool_cacheable() && (fZcCleanMode == 1 || (fZcCleanMode == 2 && !gpuFrame) ||
++	    (fZcCleanMode == 3 && (!gpuFrame || cpuWrote)));
+ 	if (clean) {
+ 		/* the CPU drew through its cache (write-back mapping): the MDP reads DRAM */
+ 		uint64_t tc0 = mach_absolute_time();
+@@ -2299,6 +2489,7 @@ AppleCLCD::present(const uint8_t *rec)
+ {
+ 	uint32_t mask = get32(rec, 0x104);
+ 
++	fCurSwapID = get32(rec, 0x50);
+ 	quietConsole();
+ 
+ 	if (fZc && zcPresent(rec, mask)) {
+@@ -2611,6 +2802,10 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 		}
+ 		break;
+ 	case kSweetFBSwapWait:
++		if (args->scalarInputCount >= 1) {
++			ret = fFB->swapWait((uint32_t)args->scalarInput[0]);   /* 0216: done = latched on the panel */
++		}
++		break;
+ 	default:
+ 		break;
+ 	}
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 4eb32dc..c6d49ea 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -1645,6 +1645,9 @@ IOSurfaceRootUserClient::trapUnlock(void *id, void *options, void *seedOut,
+ 	if (s == NULL) {
+ 		return kIOReturnNotFound;
+ 	}
++	if (!((uintptr_t)options & kIOSurfaceLockReadOnly)) {
++		__atomic_add_fetch(&s->cpuWrites, 1, __ATOMIC_RELEASE);        /* the CPU may have written pixels: sweetfb_zcclean=3 cleans */
++	}
+ 	IOReturn ret = sweet_surface_seed_out(s, seedOut,
+ 	    !((uintptr_t)options & kIOSurfaceLockReadOnly));
+ 	s->release();
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index c44020b..171ed1e 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -50,8 +50,10 @@ public:
+ 	bool                      scanned;      /* pooled: the framebuffer has scanned this surface in place (patch 0212) */
+ 	uint32_t                  gpuBlits;     /* GPU writes announced through BO_SYNC (SweetAdreno), patch 0212 */
+ 	uint32_t                  gpuBlitsSeen; /* ... of which the framebuffer has already presented */
++	uint32_t                  cpuWrites;    /* write-unlocks (IOSurfaceUnlock without ReadOnly), patch 0216 */
++	uint32_t                  cpuWritesSeen;        /* ... of which the framebuffer has already scanned */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; pooled = false; poolPages = 0; poolPA = 0; scanned = false; gpuBlits = 0; gpuBlitsSeen = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; pooled = false; poolPages = 0; poolPA = 0; scanned = false; gpuBlits = 0; gpuBlitsSeen = 0; cpuWrites = 0; cpuWritesSeen = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use; wrapped memory: of the first pixel), or 0. */

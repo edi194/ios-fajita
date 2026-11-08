@@ -1,0 +1,24 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -967,6 +967,7 @@
+ 
+ extern int sweet_rpmh_arc_vote(const char *res, bool max);
+ extern vm_offset_t ml_io_map_wcomb(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, uint32_t flags);
+ extern void ml_io_unmap(vm_offset_t addr, vm_size_t sz);
+ extern void sweet_log_sync(void);
+ extern ppnum_t pmap_find_phys(pmap_t, addr64_t);
+@@ -1416,8 +1417,11 @@
+ 	 * Boot 35 froze in this copy too, with the modem untouched (sweetmssstep=3). Probe the carve-out one
+ 	 * access at a time, each logged and flushed first, so the last line tells whether it cannot be
+ 	 * read, cannot be written, or only part of it is protected.
++	 * Boot 36 (on-screen panic): the copy was fine; ml_io_unmap() panicked "Attempting to remove permanent
++	 * VM map entry", because ml_io_map_wcomb() maps with KMA_PERMANENT. The window must come from
++	 * ml_io_map_unmappable() to be unmapped (boots 34/35 were the same panic, hidden by sweetfb_noconsole).
+ 	 */
+-	vm_offset_t mba_va = ml_io_map_wcomb(MSS_MBA_PA, MSS_MBA_SIZE);
++	vm_offset_t mba_va = ml_io_map_unmappable(MSS_MBA_PA, MSS_MBA_SIZE, VM_WIMG_WCOMB);
+ 	if (!mba_va) {
+ 		printf("SWEET MSS: MBA carve-out mapping failed\n");
+ 		goto out;

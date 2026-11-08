@@ -1,0 +1,17 @@
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -1221,7 +1221,13 @@
+ 	}
+ out_rails:
+ 	{
+-		unsigned keep = 0;
++		/*
++		 * Leave the rails on by default. An APPS-DRV RPMh "off" vote also
++		 * drops any "on" vote ABL placed through this DRV: boot 0116hw
++		 * panicked right after voting ldoa7 (1.8 V) off, so something else
++		 * on the board needs it. sweetwlankeep=0 turns them off (unsafe).
++		 */
++		unsigned keep = 1;
+ 		(void)PE_parse_boot_argn("sweetwlankeep", &keep, sizeof(keep));
+ 		if (!keep) {
+ 			for (unsigned i = n >= sizeof(wl_bt_rails) / sizeof(wl_bt_rails[0]) ?

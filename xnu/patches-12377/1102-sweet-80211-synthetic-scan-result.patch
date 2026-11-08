@@ -1,0 +1,129 @@
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+index 4a2c43a9b2b7fafc47bba02160a984aaf47f76c9..682943460b620105c58864d2796a8ee292a64ec6 100644
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -16,7 +16,8 @@
+  * that interface's if_ioctl, so the ioctls arrive in sweet80211_if_ioctl below.
+  *
+  * Stage 1 (sweet80211=1) has a null backend: the radio "powers on", a scan finds nothing,
+- * transmitted packets are dropped. Every ioctl type is logged once per direction
++ * transmitted packets are dropped. Stage 2 (sweet80211=2) adds one synthetic open network,
++ * "Bergamota-test" on channel 6, to every scan (joining it fails: no radio). Every ioctl type is logged once per direction
+  * ("SWEET 80211: get type 12 (len 1316) -> 0"), so a boot shows what wifid asks for. The
+  * WCN3990 backend (docs/WIFI_BT_PLAN.md) plugs in behind sweet80211_power/scan later.
+  *
+@@ -120,6 +121,7 @@ static struct {
+ 	uint32_t        country_set;
+ 	char            country[3];
+ 	thread_call_t   scan_done;
++	uint32_t        scan_next;      /* sweet80211=2: index of the next synthetic result */
+ 	volatile SInt32 logged;         /* log lines used (budget 512) */
+ 	uint8_t         seen_get[IOC_MAX / 8];
+ 	uint8_t         seen_set[IOC_MAX / 8];
+@@ -213,6 +215,88 @@ s8_reply_string(struct sweet80211_req *req, const char *s)
+ 	return s8_reply(req, &d, sizeof(d));
+ }
+ 
++/*
++ * Scan result as IO80211 1565.3 reads it (_addScanResultToList; Apple80211Scan gets type 11
++ * into a 2272-byte buffer until EIO): the classic apple80211_scan_result layout.
++ */
++struct s8_scan_result {
++	uint32_t version;               /* 0: 1 */
++	uint32_t ch_version;            /* 4 */
++	uint32_t ch_channel;            /* 8 */
++	uint32_t ch_flags;              /* 12: C_FLAG_* */
++	int16_t  unk;                   /* 16: nonzero = noise and snr valid */
++	int16_t  noise;                 /* 18 */
++	int16_t  snr;                   /* 20 */
++	int16_t  rssi;                  /* 22 */
++	uint16_t beacon_int;            /* 24 */
++	uint16_t cap;                   /* 26: bit 0 ESS, 0x10 privacy */
++	uint8_t  bssid[6];              /* 28 */
++	uint8_t  nrates;                /* 34 */
++	uint8_t  pad0;
++	uint32_t rates[15];             /* 36: Mb/s */
++	uint8_t  ssid_len;              /* 96 */
++	uint8_t  ssid[32];              /* 97 */
++	uint8_t  pad1[3];
++	uint32_t age;                   /* 132 */
++	uint16_t flags;                 /* 136 */
++	uint16_t ie_len;                /* 138 */
++	uint8_t  ie[2048];              /* 140 */
++} __attribute__((packed));
++static_assert(__builtin_offsetof(struct s8_scan_result, ssid_len) == 96, "scan result layout");
++static_assert(__builtin_offsetof(struct s8_scan_result, ie_len) == 138, "scan result layout");
++
++/* sweet80211=2: one synthetic open network per scan, to exercise wifid's scan path and Settings */
++static int
++s8_fake_result(struct sweet80211_req *req)
++{
++	static const char ssid[] = "Bergamota-test";
++	static const uint8_t rates[] = { 1, 2, 5, 6, 9, 11, 12, 18, 24, 36, 48, 54 };
++	struct s8_scan_result *r;
++	int err;
++
++	if (s8.scan_next != 0) {
++		return EIO;
++	}
++	r = kalloc_data(sizeof(*r), Z_WAITOK | Z_ZERO);
++	if (r == NULL) {
++		return ENOMEM;
++	}
++	r->version = 1;
++	r->ch_version = 1;
++	r->ch_channel = 6;
++	r->ch_flags = C_FLAG_2GHZ | C_FLAG_20MHZ | C_FLAG_ACTIVE;
++	r->unk = 1;
++	r->noise = -92;
++	r->snr = 40;
++	r->rssi = -52;
++	r->beacon_int = 100;
++	r->cap = 0x0001;                /* ESS, open */
++	memcpy(r->bssid, (const uint8_t[]){ 0x02, 0x00, 0x5e, 0x77, 0xe0, 0xaa }, 6);
++	r->nrates = sizeof(rates);
++	for (unsigned i = 0; i < sizeof(rates); i++) {
++		r->rates[i] = rates[i];
++	}
++	r->ssid_len = sizeof(ssid) - 1;
++	memcpy(r->ssid, ssid, sizeof(ssid) - 1);
++	/* IEs: SSID, supported rates (500 kb/s units, basic bit on 1/2/5.5/11), DS parameter set */
++	uint8_t *ie = r->ie;
++	*ie++ = 0;
++	*ie++ = sizeof(ssid) - 1;
++	memcpy(ie, ssid, sizeof(ssid) - 1);
++	ie += sizeof(ssid) - 1;
++	static const uint8_t supp[] = { 1, 8, 0x82, 0x84, 0x8b, 0x96, 0x0c, 0x12, 0x18, 0x24 };
++	memcpy(ie, supp, sizeof(supp));
++	ie += sizeof(supp);
++	*ie++ = 3;
++	*ie++ = 1;
++	*ie++ = 6;
++	r->ie_len = (uint16_t)(ie - r->ie);
++	s8.scan_next++;
++	err = s8_reply(req, r, sizeof(*r));
++	kfree_data(r, sizeof(*r));
++	return err;
++}
++
+ static int
+ s8_get(struct sweet80211_req *req)
+ {
+@@ -274,6 +358,9 @@ s8_get(struct sweet80211_req *req)
+ 		return s8_reply(req, &d, sizeof(d));
+ 	}
+ 	case IOC_SCAN_RESULT:
++		if (s8.stage >= 2) {
++			return s8_fake_result(req);
++		}
+ 		return EIO;                                     /* no (more) results */
+ 	case IOC_SSID:
+ 	case IOC_BSSID:
+@@ -317,6 +404,7 @@ s8_set(struct sweet80211_req *req)
+ 		}
+ 	{
+ 		uint64_t deadline;
++		s8.scan_next = 0;
+ 		clock_interval_to_deadline(300, NSEC_PER_MSEC, &deadline);    /* "scan" takes 300 ms */
+ 		thread_call_enter_delayed(s8.scan_done, deadline);
+ 		return 0;

@@ -1,0 +1,50 @@
+--- a/bsd/kern/kern_sysctl.c
++++ b/bsd/kern/kern_sysctl.c
+@@ -5906,3 +5906,47 @@
+ SYSCTL_PROC(_kern, OID_AUTO, page_protection_type,
+     CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
+     0, 0, sysctl_page_protection_type, "I", "Type of page protection that the system supports");
++
++/*
++ * iOS 18 (xnu-11215) userland queries the Exclaves state with sysctlbyname().
++ * apfs_boot_util (mount-phase-2, graft_exclaveos) does
++ *     sysctlbyname("kern.exclaves_status") -> failure: "failed to get exclaves
++ *     status", returns errno, and the boot task aborts ("ExclaveOS graft");
++ *     == 0xFF (EXCLAVES_STATUS_NOT_SUPPORTED): skip the ExclaveOS graft, success;
++ *     == 1 (EXCLAVES_STATUS_AVAILABLE): graft the ExclaveOS cryptex;
++ *     anything else: EINVAL-like failure ("invalid exclaves status").
++ * This kernel has no exclaves, so answer what xnu-11215 answers when it is
++ * built without CONFIG_EXCLAVES (as for A12 and older): exclaves_get_status()
++ * == EXCLAVES_STATUS_NOT_SUPPORTED and exclaves_get_boot_stage() ==
++ * EXCLAVES_BOOT_STAGE_NONE.
++ *
++ * kern.exclaves_relaxed_requirements and kern.exclaves_inspection_status are
++ * only defined under CONFIG_EXCLAVES in xnu-11215; they stay absent (ENOENT),
++ * which callers treat as "no requirement relaxed".
++ */
++#define SWEET_EXCLAVES_STATUS_NOT_SUPPORTED     0xFF
++#define SWEET_EXCLAVES_BOOT_STAGE_NONE          (~0u)
++
++static int
++sysctl_exclaves_status SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = SWEET_EXCLAVES_STATUS_NOT_SUPPORTED;
++	return sysctl_io_number(req, value, sizeof(value), NULL, NULL);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, exclaves_status,
++    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_exclaves_status, "I", "Running status of Exclaves");
++
++static int
++sysctl_exclaves_boot_stage SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int value = (int)SWEET_EXCLAVES_BOOT_STAGE_NONE;
++	return sysctl_io_number(req, value, sizeof(value), NULL, NULL);
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, exclaves_boot_stage,
++    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, sysctl_exclaves_boot_stage, "I", "Boot stage of Exclaves");

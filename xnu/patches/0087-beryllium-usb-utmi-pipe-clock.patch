@@ -1,0 +1,41 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -21,6 +21,7 @@
+ #include <vm/pmap.h>
+ #include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
++#include "sweet_board.h"
+ #include <kern/locks.h>
+ #include <sys/kpi_mbuf.h>
+ #include <sys/kpi_socket.h>
+@@ -867,6 +868,30 @@
+ 	ud.dma_pa = ptoa_64(pn);
+ 	ud_if_create();
+ 
++	/*
++	 * SDM845: the DWC3 is USB3-capable and clocks its PIPE side (and RAM)
++	 * from the QMP SuperSpeed PHY, which nobody started. Run the PIPE side
++	 * from the QUSB2 UTMI clock instead, as Linux dwc3_qcom_select_utmi_clk()
++	 * does for "qcom,select-utmi-as-pipe-clk" (QSCRATCH_GENERAL_CFG).
++	 */
++	if (sweet_board_beryllium()) {
++		vm_offset_t qs = ml_io_map(QSCRATCH_PA, 0x100);
++		if (qs != 0) {
++			volatile uint32_t *cfg = (volatile uint32_t *)(qs + 0x08);
++			uint32_t before = *cfg;
++			*cfg = *cfg | (1u << 8);                        /* PIPE_UTMI_CLK_DIS */
++			__asm__ volatile ("dsb sy" ::: "memory");
++			delay(1000);
++			*cfg = *cfg | (1u << 0) | (1u << 3);            /* PIPE_UTMI_CLK_SEL | PIPE3_PHYSTATUS_SW */
++			__asm__ volatile ("dsb sy" ::: "memory");
++			delay(1000);
++			*cfg = *cfg & ~(1u << 8);
++			__asm__ volatile ("dsb sy" ::: "memory");
++			delay(1000);
++			printf("SWEET USB: UTMI clock as PIPE clock, GENERAL_CFG 0x%08x -> 0x%08x\n", before, *cfg);
++		}
++	}
++
+ 	/* Device controller soft reset (PHY and global setup stay as ABL left them). */
+ 	uint32_t gctl_abl = dwc_rd(GCTL);
+ 	dwc_wr(DCTL, DCTL_CSFTRST);

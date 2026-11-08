@@ -1,0 +1,155 @@
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+index 8e08360..1e1fe58 100644
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -825,6 +825,8 @@ SweetAdrenoUserClient::boSync(struct sweet_gpu_bo_sync *r)
+ 			ret = kIOReturnUnsupported;
+ 		} else if (r->offset > g->size || r->size > g->size - r->offset) {
+ 			ret = kIOReturnBadArgument;
++		} else if (g->surface != NULL && sweet_surface_gpu_wrote(g->surface)) {
++			ret = kIOReturnSuccess;         /* pool surface already on the panel path: GPU-only, no CPU cache involved (0212) */
+ 		} else {
+ 			uint64_t len = r->size ? r->size : g->size - r->offset;
+ 			sweet_gpu_cache_sync(g->kva + r->offset, (size_t)len);
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 179aec0..5ebf6d7 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -448,6 +448,12 @@ AppleCLCD::start(IOService *provider)
+ 		if (fDirect) {
+ 			zcReq = 1;
+ 		}
++		{
++			/* 0 never clean, 1 always (0127), 2 clean only frames the GPU did not write; direct defaults to 2 */
++			uint32_t cm = fDirect ? 2 : 1;
++			PE_parse_boot_argn("sweetfb_zcclean", &cm, sizeof(cm));
++			fZcCleanMode = cm > 2 ? 2 : cm;
++		}
+ 		if (zcReq && smmuLevel == 0) {
+ 			smmuLevel = 1;
+ 		}
+@@ -485,6 +491,12 @@ AppleCLCD::start(IOService *provider)
+ 				}
+ 			}
+ 		}
++		if (fZc && fZcOK) {
++			sweet_lowpool_gpu_nosync(fZcCleanMode != 1);
++			IOLog("SWEET FB: pool surface cache policy: clean at scan = %s, BO_SYNC of scanned GPU surfaces = %s\n",
++			    fZcCleanMode == 0 ? "never" : (fZcCleanMode == 1 ? "always" : "only CPU-drawn frames"),
++			    fZcCleanMode != 1 ? "skipped" : "clean+invalidate");
++		}
+ 		if (fDirect) {
+ 			fEarly = fZc && fZcOK;
+ 			if (!fEarly) {
+@@ -1514,15 +1526,23 @@ AppleCLCD::zcPresent(const uint8_t *rec, uint32_t mask)
+ 		return zcDecline(10, "no kernel mapping of the surface", id);
+ 	}
+ 	uint64_t tz0 = mach_absolute_time();
+-	if (sweet_lowpool_cacheable()) {
+-		/* CoreAnimation drew through the CPU cache (write-back mapping): the MDP reads DRAM */
++	uint32_t gpuBlits = __atomic_load_n(&s->gpuBlits, __ATOMIC_ACQUIRE);
++	bool gpuFrame = gpuBlits != s->gpuBlitsSeen;    /* the GPU wrote it since the last scan (BO_SYNC) */
++	s->gpuBlitsSeen = gpuBlits;
++	bool clean = sweet_lowpool_cacheable() && (fZcCleanMode == 1 || (fZcCleanMode == 2 && !gpuFrame));
++	if (clean) {
++		/* the CPU drew through its cache (write-back mapping): the MDP reads DRAM */
+ 		uint64_t tc0 = mach_absolute_time();
+ 		sweet_dcache_clean_va((const void *)(kva + s->offset), (size_t)(need - s->offset));
+ 		fSt.cleanAbs += mach_absolute_time() - tc0;
+ 		fSt.cleans++;
+ 	} else {
+-		__asm__ volatile ("dsb sy" ::: "memory");
++		if (sweet_lowpool_cacheable()) {
++			fSt.cleanSkips++;       /* GPU frame (or sweetfb_zcclean=0): no CPU lines to push */
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");       /* order our earlier stores, e.g. the swap record */
+ 	}
++	s->scanned = true;
+ 	sweet_hold(s, true);
+ 	fZcHeld[fZcCount++] = s;        /* keeps the reference sweet_surface_copy gave */
+ 	scanAddr((uint32_t)(s->poolPA + s->offset), s->bytesPerRow, true);
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index d14de29..4eb32dc 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -48,6 +48,7 @@
+ #include <kern/clock.h>
+ #include <pexpert/pexpert.h>
+ #include <pexpert/device_tree.h>
++#include "../../../bsd/dev/sweet_board.h"
+ 
+ enum {
+ 	kSweetSurfaceCreate             = 0,
+@@ -175,8 +176,22 @@ static struct {
+ 	uint64_t     cool;              /* cooling period, absolute time units */
+ 	uint64_t     allocs, fails;
+ 	uint32_t     minW, minH;
++	bool         noSync;            /* GPU-written scanned surfaces need no cache maintenance (patch 0212) */
+ } sweet_lowpool;
+ 
++void
++sweet_lowpool_gpu_nosync(bool on)
++{
++	sweet_lowpool.noSync = on;
++}
++
++bool
++sweet_surface_gpu_wrote(SweetSurface *s)
++{
++	__atomic_add_fetch(&s->gpuBlits, 1, __ATOMIC_RELEASE);
++	return s->pooled && s->scanned && sweet_lowpool.noSync;
++}
++
+ bool
+ sweet_lowpool_cacheable(void)
+ {
+@@ -532,6 +547,12 @@ sweet_surface_try_pool(SweetSurface *s)
+ 		uintptr_t kva = s->kernelAddress();
+ 		if (kva != 0) {
+ 			bzero((void *)kva, s->allocSize);
++			/*
++			 * The zero fill sits dirty in the CPU cache of this cacheable mapping. The GPU (non-cacheable
++			 * SMMU context) and the MDP read and write DRAM behind it: push the zeros out and drop the
++			 * lines once, so no later eviction can overwrite a rendered frame with them.
++			 */
++			sweet_dma_sync_va((const void *)kva, s->allocSize);
+ 			if (told++ < 4) {
+ 				uint32_t used, total;
+ 				uint64_t allocs, fails;
+diff --git a/iokit/Kernel/arm/SweetSurface.h b/iokit/Kernel/arm/SweetSurface.h
+index 89f2a26..c44020b 100644
+--- a/iokit/Kernel/arm/SweetSurface.h
++++ b/iokit/Kernel/arm/SweetSurface.h
+@@ -47,8 +47,11 @@ public:
+ 	bool                      pooled;       /* memory is a low-pool block (sweetfb_zc, patch 0127) */
+ 	uint32_t                  poolPages;    /* pooled: size of the block in kernel pages */
+ 	uint64_t                  poolPA;       /* pooled: physical address of the block (below 4 GiB) */
++	bool                      scanned;      /* pooled: the framebuffer has scanned this surface in place (patch 0212) */
++	uint32_t                  gpuBlits;     /* GPU writes announced through BO_SYNC (SweetAdreno), patch 0212 */
++	uint32_t                  gpuBlitsSeen; /* ... of which the framebuffer has already presented */
+ 
+-	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; pooled = false; poolPages = 0; poolPA = 0; return OSObject::init(); }
++	bool init() APPLE_KEXT_OVERRIDE { values = NULL; purgeable = 0; wrapDelta = 0; wrapped = false; pooled = false; poolPages = 0; poolPA = 0; scanned = false; gpuBlits = 0; gpuBlitsSeen = 0; return OSObject::init(); }
+ 	void free() APPLE_KEXT_OVERRIDE;
+ 
+ 	/* Kernel address of the pixels (mapped on first use; wrapped memory: of the first pixel), or 0. */
+@@ -85,6 +88,19 @@ bool sweet_lowpool_setup(uint64_t splashBase, uint64_t splashSize, uint32_t minW
+ /* The pool maps cacheable (write-back): the CPU must clean a frame before the MDP reads it. */
+ bool sweet_lowpool_cacheable(void);
+ 
++/*
++ * Cache policy of GPU-written pool surfaces (patch 0212, docs/DISPLAY_HW.md section 6). The GPU's SMMU
++ * context maps memory non-cacheable and the MDP fetches from DRAM, so a surface that only the GPU writes
++ * needs no CPU cache maintenance at all once its lines were cleaned+invalidated after the zero fill
++ * (done at allocation). With this on, a BO_SYNC of a pool surface that was already scanned in place is a no-op
++ * (it only counts the GPU write, sweet_surface_gpu_wrote) and the framebuffer skips its per-frame clean for
++ * frames the GPU produced. Off: BO_SYNC always does clean+invalidate (the 0182 behaviour).
++ */
++void sweet_lowpool_gpu_nosync(bool on);
++
++/* BO_SYNC on a surface BO: count the GPU write; true when the cache maintenance can be skipped. */
++bool sweet_surface_gpu_wrote(SweetSurface *s);
++
+ /* Pool statistics: pages in use / total, allocations, failed allocations (fell back to normal memory). */
+ void sweet_lowpool_stats(uint32_t *usedPages, uint32_t *totalPages, uint64_t *allocs, uint64_t *fails);
+ 

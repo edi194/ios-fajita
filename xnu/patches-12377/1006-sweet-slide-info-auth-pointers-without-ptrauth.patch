@@ -1,0 +1,32 @@
+diff --git a/osfmk/vm/vm_shared_region.c b/osfmk/vm/vm_shared_region.c
+index 225c0871d4ee1688045517f56784fa934b4c6935..fde8736844405650bc2d7ac9ebeec9df0378178a 100644
+--- a/osfmk/vm/vm_shared_region.c
++++ b/osfmk/vm/vm_shared_region.c
+@@ -3345,6 +3345,13 @@ vm_shared_region_slide_page_v3(
+ 			} else {
+ 				memcpy(rebaseLocation, &value, sizeof(value));
+ 			}
++#else /* __has_feature(ptrauth_calls) */
++			/*
++			 * sweet (no ptrauth in this kernel): store the slid pointer unsigned, as xnu-11215 did after both branches.
++			 * 12377 moved the store into the ptrauth-only code, which left every auth pointer of the shared cache as a
++			 * raw slide-info word (iOS 26 dyld4::prepare: vtable pointer 0x86be... -> SIGSEGV in launchd).
++			 */
++			memcpy(rebaseLocation, &value, sizeof(value));
+ #endif /* __has_feature(ptrauth_calls) */
+ 		} else {
+ 			// The new value for a rebase is the low 51-bits of the threaded value plus the slide.
+@@ -3564,6 +3571,13 @@ vm_shared_region_slide_page_v5(
+ 			} else {
+ 				memcpy(rebaseLocation, &value, sizeof(value));
+ 			}
++#else /* __has_feature(ptrauth_calls) */
++			/*
++			 * sweet (no ptrauth in this kernel): store the slid pointer unsigned, as xnu-11215 did after both branches.
++			 * 12377 moved the store into the ptrauth-only code, which left every auth pointer of the shared cache as a
++			 * raw slide-info word (iOS 26 dyld4::prepare: vtable pointer 0x86be... -> SIGSEGV in launchd).
++			 */
++			memcpy(rebaseLocation, &value, sizeof(value));
+ #endif /* __has_feature(ptrauth_calls) */
+ 		} else {
+ 			// the value already has the correct low bits, so just add in the high8 if it exists

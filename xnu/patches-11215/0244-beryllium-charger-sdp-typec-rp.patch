@@ -1,0 +1,33 @@
+diff --git a/bsd/dev/sweet_charger.c b/bsd/dev/sweet_charger.c
+--- a/bsd/dev/sweet_charger.c
++++ b/bsd/dev/sweet_charger.c
+@@ -94,6 +94,7 @@
+ #define SC_ICL_CDP_MA           1500u
+ #define SC_ICL_HVDCP_MA         1500u
+ #define SC_ICL_OCP_MA           1800u   /* OCP treated as DCP, Rp not 3.0 A (downstream DCP_CURRENT_UA) */
++#define SC_ICL_SDP_RP15_MA      1500u   /* 0244: SDP (a computer) with Type-C Rp 1.5 A */
+ #define SC_ICL_FLOAT_MA         1000u   /* downstream FLOAT_CHARGER_UA */
+ #define SC_ICL_NO_AICL_MA       1500u   /* AICL off: no automatic back-off from a weak adapter */
+ #define SC_FCC_MA               2000u
+@@ -348,6 +349,21 @@
+ 	if (res & APSD_FLOAT) {
+ 		return SC_ICL_FLOAT_MA;
+ 	}
++	if (res & APSD_SDP) {
++		/*
++		 * 0244: a computer's USB-C port is an SDP (it talks data) and also advertises Type-C current on CC. By the
++		 * Type-C spec a sink may draw what Rp promises regardless of the BC1.2 result, so a Mac's port (Rp 1.5 A or
++		 * 3.0 A) charges at that instead of USB 2.0's 500 mA. Rp default (USB-A cables, hubs) leaves the hardware's
++		 * 500/900 mA alone, as before.
++		 */
++		int rp = sc_typec_rp(s);
++		if (rp == 3) {
++			return SC_ICL_DCP_MA;
++		}
++		if (rp == 2) {
++			return SC_ICL_SDP_RP15_MA;
++		}
++	}
+ 	return 0;
+ }
+ 

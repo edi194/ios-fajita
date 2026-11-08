@@ -1,0 +1,43 @@
+#!/bin/bash
+# Renegade: the arm64e -> arm64 patcher and the iOS 18 root build around it (tools/renegade/README.md).
+#
+#   renegade strip [-v] [--sign] IN [OUT]     rewrite one arm64e Mach-O for a CPU without pointer authentication
+#   renegade scan FILE...                     count the PAC instructions, write nothing
+#   renegade cache CACHE_DIR [--scan] ...     the same over the dyld shared cache (main + sub-caches)
+#   renegade fips CACHE_DIR [--patch]         recompute corecrypto's FIPS HMAC after the cache rewrite
+#   renegade fetch                            download + decrypt the iOS 18.7.8 iPhone11,8 root dmgs
+#   renegade fetch-tools [--tag T] [--zip F]  download berga-tools.zip (prebuilt on-device binaries) from the GitHub release, verify, cache
+#   renegade root [--stages ...] ...          build the full root image (copy, macho, cache, tweaks, seal)
+#   renegade boot [KERNEL] [ADT] [OUT.img]    Enxerto boot image for the full root on userdata
+#   renegade update SIMG [--no-appreg|--no-posterboard|--no-bluetooth|--no-jb]   apply the root tweaks to a finished
+#                                             image in place (simg2img --consume, attach, tweaks, owners, fsck, img2simg --consume)
+#   renegade hfs SIMG ls|cat|get|getdir|stat|find|dsc ...   read the root image in place
+#   renegade jb fetch|stage|live|remove|status   optional jailbreak userland: Procursus rootless, Sileo, TrollStore (README)
+#   renegade sparse IN OUT [--consume]        raw <-> Android sparse image (direction from the IN suffix)
+#   renegade platform [--plan [macos|linux]]  platform layer: which backend, the commands an image build would run (dry)
+#   renegade test                             unit tests (command construction, dry run, feature gating)
+set -euo pipefail
+HERE=$(cd "$(dirname "$0")" && pwd)
+py() { exec python3 -I "$HERE/$1" "${@:2}"; }
+cmd=${1:-help}; [ $# -gt 0 ] && shift
+case $cmd in
+strip)	py pacstrip.py "$@" ;;
+scan)	py pacstrip.py --scan "$@" ;;
+cache)	py pacstrip_cache.py "$@" ;;
+fips)	py fips_rehmac.py "$@" ;;
+fetch)	exec "$HERE/fetch-root.sh" "$@" ;;
+fetch-tools)	py berga_tools.py "$@" ;;
+root)	exec "$HERE/mkroot-full.sh" "$@" ;;
+boot)	exec "$HERE/mkboot-full.sh" "$@" ;;
+update)	py update.py "$@" ;;
+jb)	py jailbreak.py "$@" ;;
+hfs)	py hfsx.py "$@" ;;
+sparse)	case ${1:-} in
+	*.simg) py simg2img.py "$@" ;;
+	*) py img2simg.py "$@" ;;
+	esac ;;
+platform)	py renegade_platform.py "$@" ;;
+test)	exec python3 -I -m unittest discover -s "$HERE/tests" "$@" ;;
+help|-h|--help) sed -n '2,/^set -/{/^set -/!s/^# \{0,1\}//p;}' "$0" ;;
+*)	echo "renegade: unknown command '$cmd' (renegade help)" >&2; exit 2 ;;
+esac

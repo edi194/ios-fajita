@@ -1,0 +1,211 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -304,6 +304,9 @@
+ static uint32_t a630_idle_ms;           /* sweetgpuidle=MS: slumber after this long without a submission (0 = never) */
+ static uint32_t a630_hwcg;              /* sweetgpuhwcg=1: hardware clock gating tables */
+ static uint32_t a630_ubwc;              /* sweetgpuubwc=1: program the UBWC/bank registers (hbb 15) */
++static uint32_t a630_stamps;           /* sweetgpustamps=1: CP timestamps around every submission (diagnostic; adds a WFI) */
++static uint64_t gov_boost_until;        /* mach time until which the interactive boost floor holds */
++static uint32_t a630_boost_level = 3;   /* sweetgpuboost=N: floor while a client submits frequently (0 = off) */
+ static uint32_t a630_hb_s;              /* sweetgpuhb=SECONDS: heartbeat line with GPU + USB clock state */
+ static uint32_t a630_recover_max = 3;   /* sweetgpurecover=N: resets after a fault/hang before "lost until reboot" */
+ static uint32_t a630_bw_linux;          /* sweetgpubw=linux: the fixed Linux a630 BCM addresses instead of cmd-db's */
+@@ -2901,7 +2904,7 @@
+ uint32_t
+ sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count)
+ {
+-	unsigned need = 32 + 4 * count, room = 0;
++	unsigned need = (a630_stamps ? 32 : 16) + 4 * count, room = 0;
+ 
+ 	if (!sweet_gpu_ready() || count == 0 || count > 128) {
+ 		return 0;
+@@ -2945,7 +2948,9 @@
+ 	if (++a630_dev.seqno == 0) {
+ 		a630_dev.seqno = 1;
+ 	}
+-	ring_time(a630_dev.seqno, 0);
++	if (a630_stamps) {
++		ring_time(a630_dev.seqno, 0);
++	}
+ 	ring_emit(pkt7(CP_EVENT_WRITE, 1));
+ 	ring_emit(PC_CCU_INVALIDATE_DEPTH);
+ 	ring_emit(pkt7(CP_EVENT_WRITE, 1));
+@@ -2956,8 +2961,10 @@
+ 		ring_emit((uint32_t)(ib_iova[i] >> 32));
+ 		ring_emit(ib_dwords[i]);
+ 	}
+-	ring_emit(pkt7(CP_WAIT_FOR_IDLE, 0));           /* the end stamp is the pipeline's, not the CP's (it runs ahead) */
+-	ring_time(a630_dev.seqno, 1);
++	if (a630_stamps) {
++		ring_emit(pkt7(CP_WAIT_FOR_IDLE, 0));   /* the end stamp is the pipeline's, not the CP's (it runs ahead) */
++		ring_time(a630_dev.seqno, 1);
++	}
+ 	ring_emit(pkt7(CP_EVENT_WRITE, 4));
+ 	ring_emit(CACHE_FLUSH_TS | CP_EVENT_WRITE_IRQ);
+ 	ring_emit((uint32_t)(SCRATCH_VA + SCRATCH_FENCE));
+@@ -3135,6 +3142,12 @@
+ {
+ 	bool ok = false;
+ 
++	if (a630_gov && a630_boost_level) {
++		uint64_t hold;
++		nanoseconds_to_absolutetime(400 * NSEC_PER_MSEC, &hold);
++		a630_level = MAX(a630_level, MIN(a630_boost_level, a630_level_max));
++		gov_boost_until = mach_absolute_time() + hold;
++	}
+ 	a630_quiet = a630_resumes >= 2;
+ 	if (a630_resumes < 2) {
+ 		printf("SWEET GPU: waking from slumber (resume %u)\n", a630_resumes + 1);
+@@ -3231,8 +3244,8 @@
+ 	return ok;
+ }
+ 
+-static uint64_t gov_win_start, gov_busy_pct, res_ns[8];
+-static unsigned gov_low_windows;
++static uint64_t gov_win_ns, gov_win_busy_ns, gov_busy_pct, res_ns[8];
++static unsigned gov_low_windows, gov_prev_submits, gov_rate;
+ 
+ /* Busy ticks (19.2 MHz) of the submissions completed since the last call, from the CP's own stamps. */
+ static uint64_t
+@@ -3258,25 +3271,54 @@
+ 	return busy;
+ }
+ 
++/*
++ * Utilisation by sampling: the PM thread wakes every 4 ms while the governor is on and counts the time during which the
++ * newest submission's fence is not yet written (the CP timestamps of sweetgpustamps=1 read as a frozen counter on this
++ * hardware, so they are not the default). Window 100 ms. Interactive boost: a window with >= 4 submissions (a client
++ * drawing frames) raises the floor to the boost level for 400 ms after the last such window; the load-based part
++ * (>= 80% up one level, >= 90% two, >= 95% to the cap; < 30% twice in a row one down) never goes below the floor.
++ */
+ static void
+-gpu_gov_tick(void)
++gpu_gov_tick(uint64_t dt)
+ {
+-	if (gov_win_start == 0) {
+-		gov_win_start = mach_absolute_time();
+-		(void)gpu_busy_collect();
++	if (!sweet_gpu_fence_done(a630_dev.seqno)) {
++		gov_win_busy_ns += dt;
++	}
++	gov_win_ns += dt;
++	if (gov_win_ns < 100 * NSEC_PER_MSEC) {
+ 		return;
+ 	}
+-	uint64_t ns = ns_since(gov_win_start);
+-	if (ns < 60 * NSEC_PER_MSEC) {
++	uint64_t pct;
++	if (a630_stamps) {
++		uint64_t ticks = gov_win_ns * 192 / 10000, busy = gpu_busy_collect();
++		pct = busy * 100 / (ticks ? ticks : 1);
++	} else {
++		pct = gov_win_busy_ns * 100 / gov_win_ns;
++	}
++	gov_busy_pct = MIN(100, pct);
++	gov_rate = a630_dev.submissions - gov_prev_submits;
++	gov_prev_submits = a630_dev.submissions;
++	gov_win_ns = gov_win_busy_ns = 0;
++	uint64_t now = mach_absolute_time(), hold;
++	nanoseconds_to_absolutetime(400 * NSEC_PER_MSEC, &hold);
++	unsigned cap = a630_level_max;
++	if (a630_boost_level && gov_rate >= 4) {
++		gov_boost_until = now + hold;
++	}
++	unsigned floor_lvl = (a630_boost_level && now < gov_boost_until) ? MIN(a630_boost_level, cap) : 1;
++	if (!a630_gov) {
+ 		return;
+ 	}
+-	uint64_t ticks = ns * 192 / 10000, busy = gpu_busy_collect();
+-	gov_busy_pct = MIN(100, busy * 100 / (ticks ? ticks : 1));
+-	gov_win_start = mach_absolute_time();
+ 	unsigned lvl = a630_level;
+-	if (gov_busy_pct >= 80) {
+-		lvl = gov_busy_pct >= 95 ? a630_level_max : MIN(a630_level + 1, a630_level_max);
++	if (gov_busy_pct >= 95) {
++		lvl = cap;
+ 		gov_low_windows = 0;
++	} else if (gov_busy_pct >= 90) {
++		lvl = MIN(a630_level + 2, cap);
++		gov_low_windows = 0;
++	} else if (gov_busy_pct >= 80) {
++		lvl = MIN(a630_level + 1, cap);
++		gov_low_windows = 0;
+ 	} else if (gov_busy_pct < 30) {
+ 		if (++gov_low_windows >= 2 && lvl > 1) {        /* hysteresis: two quiet windows per step down */
+ 			lvl--;
+@@ -3285,6 +3327,9 @@
+ 	} else {
+ 		gov_low_windows = 0;
+ 	}
++	if (lvl < floor_lvl) {
++		lvl = floor_lvl;
++	}
+ 	if (lvl != a630_level) {
+ 		(void)gpu_set_level(lvl);
+ 	}
+@@ -3315,10 +3360,10 @@
+ 	}
+ 	n = snprintf(buf, sizeof(buf),
+ 	    "state=%s level=%u mhz=%u max_level=%u freq=%s busy_pct=%llu clients=%u pids=%s submitted=%u completed=%u "
+-	    "suspends=%u resumes=%u recoveries=%u hangs=%u idle_ms=%u hwcg=%u total_ms=%llu res_ms=",
++	    "suspends=%u resumes=%u recoveries=%u hangs=%u idle_ms=%u hwcg=%u boost_level=%u boosted=%u submits_100ms=%u total_ms=%llu res_ms=",
+ 	    state, lvl, lvl ? gpu_levels[lvl].mhz : 0, a630_level_max, a630_gov ? "gov" : "fixed", gov_busy_pct, clients, pids,
+ 	    a630_dev.seqno, a630_dev.ready && cp_memory ? *(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) : 0,
+-	    a630_suspends, a630_resumes, a630_recoveries, a630_dev.hangs, a630_idle_ms, a630_hwcg, tot / NSEC_PER_MSEC);
++	    a630_suspends, a630_resumes, a630_recoveries, a630_dev.hangs, a630_idle_ms, a630_hwcg, a630_boost_level, (unsigned)(a630_boost_level && mach_absolute_time() < gov_boost_until), gov_rate, tot / NSEC_PER_MSEC);
+ 	(void)now_in;
+ 	for (unsigned i = 0; i < 8 && n > 0 && (size_t)n < sizeof(buf); i++) {
+ 		if (i) {
+@@ -3343,7 +3388,7 @@
+ 	(void)arg;
+ 	(void)wr;
+ 	for (;;) {
+-		sleep_ms(20);
++		sleep_ms(a630_gov ? 4 : 20);
+ 		sweet_gpu_lock();
+ 		uint64_t now = mach_absolute_time(), dt;
+ 		absolutetime_to_nanoseconds(now - last, &dt);
+@@ -3351,16 +3396,14 @@
+ 		if (a630_dev.ready && !a630_dev.lost) {
+ 			res_ns[a630_awake ? MIN(a630_level, 7u) : 0] += dt;
+ 			if (a630_awake) {
+-				if (a630_gov) {
+-					gpu_gov_tick();
+-				}
++				gpu_gov_tick(dt);                       /* measures always, acts only with sweetgpufreq=gov */
+ 				if (a630_idle_ms && ns_since(a630_last_active) >= (uint64_t)a630_idle_ms * NSEC_PER_MSEC && gpu_cp_idle_now()) {
+ 					bool first = a630_suspends == 0;
+ 					if (first) {
+ 						printf("SWEET GPU: idle for %u ms: slumber\n", a630_idle_ms);
+ 					}
+ 					(void)gpu_suspend(!first);
+-					gov_win_start = 0;
++					gov_win_ns = gov_win_busy_ns = 0;
+ 				}
+ 			}
+ 		}
+@@ -3370,8 +3413,8 @@
+ 				tot += res_ns[i];
+ 			}
+ 			summary = now;
+-			printf("SWEET GPU: pm: %s level %u busy %llu%% | time in level (%%): slumber %llu, 257 %llu, 342 %llu, 414 %llu, 520 %llu, 596 %llu, 675 %llu, 710 %llu | suspends %u resumes %u recoveries %u submits %u\n",
+-			    a630_awake ? "on" : "slumber", a630_level, gov_busy_pct, res_ns[0] * 100 / tot, res_ns[1] * 100 / tot, res_ns[2] * 100 / tot,
++			printf("SWEET GPU: pm: %s level %u busy %llu%% (%u submits/100ms) | time in level (%%): slumber %llu, 257 %llu, 342 %llu, 414 %llu, 520 %llu, 596 %llu, 675 %llu, 710 %llu | suspends %u resumes %u recoveries %u submits %u\n",
++			    a630_awake ? "on" : "slumber", a630_level, gov_busy_pct, gov_rate, res_ns[0] * 100 / tot, res_ns[1] * 100 / tot, res_ns[2] * 100 / tot,
+ 			    res_ns[3] * 100 / tot, res_ns[4] * 100 / tot, res_ns[5] * 100 / tot, res_ns[6] * 100 / tot, res_ns[7] * 100 / tot,
+ 			    a630_suspends, a630_resumes, a630_recoveries, a630_dev.submissions);
+ 		}
+@@ -3581,6 +3624,12 @@
+ 		}
+ 		if (PE_parse_boot_argn("sweetgpurecover", &v, sizeof(v)) && v >= 0) {
+ 			a630_recover_max = (uint32_t)MIN(v, 100);
++		}
++		if (PE_parse_boot_argn("sweetgpustamps", &v, sizeof(v))) {
++			a630_stamps = v != 0;
++		}
++		if (PE_parse_boot_argn("sweetgpuboost", &v, sizeof(v)) && v >= 0) {
++			a630_boost_level = (uint32_t)MIN(v, 7);
+ 		}
+ 		if (PE_parse_boot_argn("sweetgpubw", fb, sizeof(fb)) && fb[0] == 'l') {
+ 			a630_bw_linux = 1;

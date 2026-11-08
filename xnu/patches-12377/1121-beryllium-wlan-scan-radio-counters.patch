@@ -1,0 +1,133 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -4334,7 +4334,15 @@
+ #define SCAN_NCHAN              (sizeof(scan_chans) / sizeof(scan_chans[0]))
+ 
+ static struct {
+-	unsigned step, beacons, foreign, nbss, events;
++	unsigned step, beacons, foreign, nbss, events, chan_infos, chan_logged;
++	uint64_t rx_frames, tx_frames;
++	struct {
++		uint32_t mhz, rx_frames, nf, rx_clear, cycles;
++	} ch[SCAN_NCHAN];               /* the last COMPLETE CHAN_INFO per scanned channel */
++	struct {
++		uint32_t id, n;
++	} ev[24];                       /* every WMI event id seen while scanning, with counts */
++	unsigned nev, htt;
+ 	uint64_t step_ms;
+ 	bool htt_conf, started, completed, vdev;
+ 	uint8_t htt_major, htt_minor;
+@@ -4604,8 +4612,65 @@
+ 	}
+ 	printf("SWEET IPC: scan: bss %u %02x:%02x:%02x:%02x:%02x:%02x %u MHz %d dBm \"%s\"%s\n", k, bssid[0], bssid[1],
+ 	    bssid[2], bssid[3], bssid[4], bssid[5], mhz, rssi, scan.bss[k].ssid, scan.bss[k].ssid_len ? "" : " (hidden)");
++}
++
++/*
++ * CHAN_INFO (0x4002, tag 38: err_code, freq, cmd_flags (bit 0 COMPLETE, bit 1 PRE_COMPLETE), noise_floor,
++ * rx_clear_count, cycle_count, chan_tx_pwr_range, chan_tx_pwr_tp, rx_frame_count, my_bss_rx_cycle_count,
++ * rx_11b_mode_data_duration, tx_frame_cnt, mac_clk_mhz): the radio's own counters for each channel visit. A
++ * non-zero rx_frame_count with a sane noise floor means the RF hears frames that never reach the host.
++ */
++static void
++scan_chan_info(const uint8_t *t, uint32_t len)
++{
++	uint16_t tl, tag;
++	if (len < 4 + 52) {
++		return;
++	}
++	memcpy(&tl, t, 2);
++	memcpy(&tag, t + 2, 2);
++	if (tag != 38 || tl < 52) {
++		return;
++	}
++	uint32_t c[13];
++	memcpy(c, t + 4, 52);
++	scan.chan_infos++;
++	if (c[2] & 1) {                         /* COMPLETE: counters for the visit that just ended */
++		scan.rx_frames += c[8];
++		scan.tx_frames += c[11];
++		for (unsigned k = 0; k < SCAN_NCHAN; k++) {
++			if (scan_chans[k] == c[1]) {
++				scan.ch[k].mhz = c[1];
++				scan.ch[k].rx_frames = c[8];
++				scan.ch[k].nf = c[3];
++				scan.ch[k].rx_clear = c[4];
++				scan.ch[k].cycles = c[5];
++			}
++		}
++	}
++	if (scan.chan_logged < 64) {
++		scan.chan_logged++;
++		printf("SWEET IPC: scan: chan_info %u MHz flags %#x err %u nf %d rx_clear %u cycles %u rx_frames %u tx_frames %u "
++		    "my_bss_cycles %u mac_clk %u MHz\n", c[1], c[2], c[0], (int32_t)c[3], c[4], c[5], c[8], c[11], c[9], c[12]);
++	}
+ }
+ 
++static void
++scan_tally(uint32_t id)
++{
++	for (unsigned k = 0; k < scan.nev; k++) {
++		if (scan.ev[k].id == id) {
++			scan.ev[k].n++;
++			return;
++		}
++	}
++	if (scan.nev < 24) {
++		scan.ev[scan.nev].id = id;
++		scan.ev[scan.nev].n = 1;
++		scan.nev++;
++	}
++}
++
+ /* T2H HTT on CE1: VERSION_CONF = type 0, minor, major */
+ static void
+ scan_htt(const uint8_t *pl, uint32_t plen)
+@@ -4629,6 +4694,18 @@
+ 	printf("SWEET IPC: scan summary: htt %u.%u, %s, %u events, %u channel visits, %u beacons/probe responses, %u BSS\n",
+ 	    scan.htt_major, scan.htt_minor, scan.completed ? "completed" : (scan.started ? "started, not completed" :
+ 	    "not started"), scan.events, scan.foreign, scan.beacons, scan.nbss);
++	printf("SWEET IPC: scan summary radio: %u CHAN_INFO events, rx frames %llu, tx frames %llu, %u HTT messages\n",
++	    scan.chan_infos, scan.rx_frames, scan.tx_frames, scan.htt);
++	for (unsigned k = 0; k < SCAN_NCHAN; k++) {
++		if (scan.ch[k].mhz) {
++			printf("SWEET IPC: scan summary chan %u MHz: rx_frames %u nf %d rx_clear %u cycles %u\n", scan.ch[k].mhz,
++			    scan.ch[k].rx_frames, (int32_t)scan.ch[k].nf, scan.ch[k].rx_clear, scan.ch[k].cycles);
++		}
++	}
++	for (unsigned k = 0; k < scan.nev; k++) {
++		printf("SWEET IPC: scan summary event %#x x %u\n", scan.ev[k].id, scan.ev[k].n);
++	}
++	sweet_log_sync();
+ 	for (unsigned k = 0; k < scan.nbss; k++) {
+ 		printf("SWEET IPC: scan summary bss %u: %02x:%02x:%02x:%02x:%02x:%02x %u MHz %d dBm \"%s\"\n", k,
+ 		    scan.bss[k].bssid[0], scan.bss[k].bssid[1], scan.bss[k].bssid[2], scan.bss[k].bssid[3], scan.bss[k].bssid[4],
+@@ -4777,9 +4854,19 @@
+ 				wf.sent_ms = ms_now_ms();
+ 			}
+ 		} else if (ev == 0x3001 && ipc.scan) {
++			scan_tally(ev);
+ 			scan_event(pl + 4, plen - 4);
+ 		} else if (ev == 0x7001 && ipc.scan) {
++			scan_tally(ev);
+ 			scan_mgmt_rx(pl + 4, plen - 4);
++		} else if (ev == 0x4002 && ipc.scan) {
++			scan_tally(ev);
++			scan_chan_info(pl + 4, plen - 4);
++		} else if (ipc.scan && wf.state >= WS_SCAN_SETUP) {
++			scan_tally(ev);
++			if (wce.wmi_events <= 32) {
++				printf("SWEET IPC: wmi: event %#x (%u bytes) in state %s\n", ev, plen, wf_state_name[wf.state]);
++			}
+ 		} else if (wce.wmi_events <= 16) {
+ 			printf("SWEET IPC: wmi: event %#x (%u bytes) in state %s\n", ev, plen, wf_state_name[wf.state]);
+ 		}
+@@ -4787,6 +4874,7 @@
+ 	}
+ 	if (p[0] == wce.htt_eid && wce.htt_eid) {
+ 		if (ipc.scan) {
++			scan.htt++;
+ 			scan_htt(pl, plen);
+ 		}
+ 		if (wce.htt_msgs++ < 8) {

@@ -1,0 +1,40 @@
+diff --git a/osfmk/kern/exception.c b/osfmk/kern/exception.c
+index bff8a475397ec63827af906a4aca4921c7e50dd4..a7397000c656bb462bf4b08084fe703702a6213f 100644
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -89,6 +89,7 @@
+ 
+ #include <vm/vm_map_xnu.h>
+ #include <vm/vm_map.h>
++#include <vm/vm_map_lock_internal.h>
+ #include <sys/reason.h>
+ #include <security/mac_mach_internal.h>
+ #include <string.h>
+@@ -1013,6 +1014,27 @@ sweet_crash_log(const char *name, int pid, int sig, uint64_t code, uint64_t subc
+ 	}
+ 	printf("%s\n", line);
+ 
++	if (sig == 11 || sig == 10) {
++		/* Which mapping the faulting address is in, or which two it falls between. */
++		uint64_t far = (uint64_t)saved_state64(ss)->far;
++		vm_map_t map = current_map();
++		vm_map_entry_t entry;
++		/* xnu-12377: no vm_map_lock_read/vm_map_lookup_entry; the interlock guards the entry store and
++		 * vm_map_lookup_or_next returns the entry containing far, or the one after it. */
++		vm_map_ilk_lock_shared(map);
++		bool inside = vm_map_lookup_or_next(map, (vm_map_offset_t)far, &entry);
++		vm_map_entry_t show[2] = { inside ? entry : entry->vme_prev, inside ? vm_map_to_entry(map) : entry };
++		for (int i = 0; i < 2; i++) {
++			if (show[i] == vm_map_to_entry(map)) {
++				continue;
++			}
++			printf("CRASH %s map%s 0x%llx-0x%llx prot %d/%d tag %d\n", name,
++			    inside ? " (far inside)" : (i == 0 ? " before far" : " after far"),
++			    (uint64_t)show[i]->vme_start, (uint64_t)show[i]->vme_end, show[i]->protection,
++			    show[i]->max_protection, (int)VME_ALIAS(show[i]));
++		}
++		vm_map_ilk_unlock_shared(map);
++	}
+ 	if (sig == 6 || sig == 5) {
+ 		sweet_crash_strings(name);
+ 	}

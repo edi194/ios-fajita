@@ -1,0 +1,272 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -574,7 +574,11 @@
+ 	unsigned stage, delay_s;
+ 	int sleep_chan;
+ 	bool started;
++	bool service;                   /* sweetwlan=5: the WLAN service (every Wi-Fi gate on, no hold, no teardown) */
+ } wl;
++
++static int wl_gate(const char *name);
++static void svc_echo_event(const uint8_t *t, uint32_t len);
+ 
+ /* the GENI UART and the HCI state of the stage: held by the RX loop per poll and by every TX */
+ static LCK_GRP_DECLARE(wl_hw_grp, "sweet_bt_uart");
+@@ -3700,8 +3704,7 @@
+ 	 * sweetrfclk=1: then the reference clock, as ath10k_hw_power_on() enables cxo_ref_clk_pin (RPMH_RF_CLK2) right
+ 	 * after the regulators. Off by default to compare scans with and without it (boot 47 had none).
+ 	 */
+-	int rfclk = 0;
+-	(void)PE_parse_boot_argn("sweetrfclk", &rfclk, sizeof(rfclk));
++	int rfclk = wl_gate("sweetrfclk");
+ 	if (ok && rfclk == 1) {
+ 		int err = sweet_rpmh_rfclk_enable("rfclka2");
+ 		printf("SWEET IPC: wlfw: RF reference clock rfclka2 -> %d\n", err);
+@@ -4943,6 +4946,8 @@
+ 		} else if (ev == 0x7001 && ipc.scan) {
+ 			scan_tally(ev);
+ 			scan_mgmt_rx(pl + 4, plen - 4);
++		} else if (ev == 0x1d001) {
++			svc_echo_event(pl + 4, plen - 4);
+ 		} else if (ev == 0x4002 && ipc.scan) {
+ 			scan_tally(ev);
+ 			scan_chan_info(pl + 4, plen - 4);
+@@ -5461,23 +5466,17 @@
+ ms_ipc_setup(void)
+ {
+ 	memset(&ipc, 0, sizeof(ipc));
+-	int tftp = 0;
+-	(void)PE_parse_boot_argn("sweettftp", &tftp, sizeof(tftp));
+-	ipc.tftp = tftp == 1;
+-	int pdm = 0;
+-	(void)PE_parse_boot_argn("sweetpdm", &pdm, sizeof(pdm));
++	int tftp = wl_gate("sweettftp");
++	ipc.tftp = tftp == 1;
++	int pdm = wl_gate("sweetpdm");
+ 	ipc.pdm = pdm == 1;
+-	int wlfw = 0;
+-	(void)PE_parse_boot_argn("sweetwlfw", &wlfw, sizeof(wlfw));
++	int wlfw = wl_gate("sweetwlfw");
+ 	ipc.wlfw = wlfw == 1;
+-	int ce = 0;
+-	(void)PE_parse_boot_argn("sweetce", &ce, sizeof(ce));
++	int ce = wl_gate("sweetce");
+ 	ipc.ce = ipc.wlfw && ce == 1;
+-	int wmi = 0;
+-	(void)PE_parse_boot_argn("sweetwmi", &wmi, sizeof(wmi));
++	int wmi = wl_gate("sweetwmi");
+ 	ipc.wmi = ipc.ce && wmi == 1;
+-	int scn = 0;
+-	(void)PE_parse_boot_argn("sweetscan", &scn, sizeof(scn));
++	int scn = wl_gate("sweetscan");
+ 	ipc.scan = ipc.wmi && scn == 1;
+ 	memset(&wf, 0, sizeof(wf));
+ 	if (ipc.wlfw && !wf_rails()) {
+@@ -5518,12 +5517,112 @@
+ 	return v;
+ }
+ 
+-/* the service loop: GLINK every millisecond, the modem's SMP2P entry every 100 ms */
++/*
++ * ---- the long-lived service (sweetwlan=5, WL1): no hold time, adaptive polling (1 ms while anything moves,
++ * 20 ms when idle), a status line every 60 s with a WMI ECHO round trip (cmd 0x1d001 tag 149 -> event 0x1d001
++ * tag 54, ath10k_wmi_tlv_op_gen_echo) to show the firmware still answers.
++ */
++#define SVC_IDLE_MS             20u
++#define SVC_STATUS_MS           60000u
++static struct {
++	uint64_t loops, busy_loops, last_busy_ms, next_status_ms, echo_sent_ms;
++	uint32_t last_msgs, last_rx, last_tx, echo_val, echo_sent, echo_ok, echo_rtt_ms, echo_skipped;
++	bool summary_done;
++} svc;
++
+ static bool
+-ms_ipc_run(unsigned hold_s)
++svc_busy(void)
+ {
+-	uint64_t t0 = ms_now_ms(), next = t0, end = t0 + (uint64_t)hold_s * 1000;
++	bool moved = wce.msgs != svc.last_msgs || ipc.rx_pkts != svc.last_rx || ipc.tx_pkts != svc.last_tx;
++	svc.last_msgs = wce.msgs;
++	svc.last_rx = ipc.rx_pkts;
++	svc.last_tx = ipc.tx_pkts;
++	bool tftp_active = false;
++	for (unsigned k = 0; k < TFTP_CLIENTS; k++) {
++		tftp_active = tftp_active || tftp_cl[k].used;
++	}
++	bool settled = wf.state == WS_SCAN_DONE || wf.state == WS_FAILED || wf.state == WS_OFF ||
++	    (wf.state == WS_WMI_READY && !ipc.scan) || (wf.state == WS_READY && !ipc.ce);
++	if (moved || tftp_active || wf.pending || !settled || ipc.txq_n) {
++		svc.last_busy_ms = ms_now_ms();
++	}
++	return ms_now_ms() < svc.last_busy_ms + 200;
++}
++
++static void
++svc_echo(void)
++{
++	uint8_t c[16];
++	uint32_t id = 0x1d001, v = ++svc.echo_val;
++	uint16_t len = 4, tag = 149;
++	memcpy(c, &id, 4);
++	memcpy(c + 4, &len, 2);
++	memcpy(c + 6, &tag, 2);
++	memcpy(c + 8, &v, 4);
++	if (wce.rings && wce.wmi_eid && wce_send(1, wce.wmi_eid, c, 12)) {
++		svc.echo_sent++;
++		svc.echo_sent_ms = ms_now_ms();
++	} else {
++		svc.echo_skipped++;             /* no WMI credit (or no rings): shown in the status line */
++	}
++}
++
++/* WMI ECHO event: tag 54 {u32 value} */
++static void
++svc_echo_event(const uint8_t *t, uint32_t len)
++{
++	uint16_t tl, tag;
++	uint32_t v;
++	if (len < 8) {
++		return;
++	}
++	memcpy(&tl, t, 2);
++	memcpy(&tag, t + 2, 2);
++	memcpy(&v, t + 4, 4);
++	if (tag == 54 && tl >= 4 && v == svc.echo_val) {
++		svc.echo_ok++;
++		svc.echo_rtt_ms = (uint32_t)(ms_now_ms() - svc.echo_sent_ms);
++	}
++}
++
++static void
++svc_tick(uint64_t t0)
++{
++	uint64_t now = ms_now_ms();
++	if (!svc.summary_done && wf.state == WS_SCAN_DONE) {
++		svc.summary_done = true;
++		scan_summary();                 /* the startup scan's list, once */
++	}
++	if (now < svc.next_status_ms) {
++		return;
++	}
++	svc.next_status_ms = now + SVC_STATUS_MS;
++	if (svc.echo_sent > svc.echo_ok && !wce.wmi_credits) {
++		/* a lost reply alone costs nothing; a credit that never came back would block every WMI command */
++		printf("SWEET WLAN svc: ECHO %u unanswered and no WMI credit back: WMI commands are blocked\n", svc.echo_val);
++	}
++	printf("SWEET WLAN svc: up %llu s, state %s, loops %llu (busy %llu), glink %u in / %u out, wmi events %u, "
++	    "credit %u, echo %u/%u ok (last %u ms, %u skipped), rmtfs %u reads / %u writes, modem %s\n", (now - t0) / 1000,
++	    wf_state_name[wf.state], svc.loops, svc.busy_loops, ipc.rx_pkts, ipc.tx_pkts, wce.wmi_events, wce.wmi_credits,
++	    svc.echo_ok, svc.echo_sent, svc.echo_rtt_ms, svc.echo_skipped, ipc.reads, ipc.writes, mw.fatal ? "FATAL" : "up");
++	sweet_log_sync();
++	if (wf.state == WS_SCAN_DONE || wf.state == WS_WMI_READY) {
++		svc_echo();
++	}
++}
++
++/* the service loop: GLINK every millisecond (20 ms when the service is idle), the modem's SMP2P entry every 100 ms */
++static bool
++ms_ipc_run(unsigned hold_s)
++{
++	uint64_t t0 = ms_now_ms(), next = t0, end = hold_s ? t0 + (uint64_t)hold_s * 1000 : UINT64_MAX;
+ 	bool alive = true;
++	memset(&svc, 0, sizeof(svc));
++	svc.next_status_ms = t0 + SVC_STATUS_MS;
++	svc.last_busy_ms = t0;
++	if (!hold_s) {
++		printf("SWEET WLAN svc: long-lived service: no hold time, status every %u s\n", SVC_STATUS_MS / 1000);
++	}
+ 	while (ms_now_ms() < end) {
+ 		ipc_rx_poll();
+ 		ipc_flush();
+@@ -5534,14 +5633,25 @@
+ 			ipc_qrtr_announce();
+ 		}
+ 		if (ms_now_ms() >= next) {
+-			next += 100;
++			next = ms_now_ms() + 100;
+ 			ms_mpss_poll();
+ 			if (mw.fatal) {
+ 				alive = false;
+ 				break;
+ 			}
+ 		}
+-		wl_sleep(1);
++		svc.loops++;
++		if (hold_s) {
++			wl_sleep(1);            /* the test stages: unchanged */
++			continue;
++		}
++		svc_tick(t0);
++		if (svc_busy()) {
++			svc.busy_loops++;
++			wl_sleep(1);
++		} else {
++			wl_sleep(SVC_IDLE_MS);
++		}
+ 	}
+ 	printf("SWEET IPC: %u s: glink %s, IPCRTR %s, qrtr hello %s; %u packets in, %u out; rmtfs %u reads (%llu bytes), "
+ 	    "%u writes kept in RAM (%llu bytes); pd-mapper %u requests; WLFW %s\n", (unsigned)((ms_now_ms() - t0) / 1000),
+@@ -5670,6 +5780,18 @@
+ done:
+ 	sweet_log_sync();
+ 	return ready;
++}
++
++/*
++ * A Wi-Fi gate: off by default, on by default with sweetwlan=5 (the long-lived service, docs/WIFI_IOS26_PHASE2.md
++ * WL1); the boot-arg itself overrides either way (e.g. sweetscan=0 under sweetwlan=5).
++ */
++static int
++wl_gate(const char *name)
++{
++	int v = wl.service ? 1 : 0;
++	(void)PE_parse_boot_argn(name, &v, sizeof(v));
++	return v;
+ }
+ 
+ static void
+@@ -5680,10 +5802,10 @@
+ 	void *mba = NULL;
+ 	bool alive = false, running = false;
+ 
+-	(void)PE_parse_boot_argn("sweetmss", &gate, sizeof(gate));
+-	(void)PE_parse_boot_argn("sweetmsskeep", &keep, sizeof(keep));
++	gate = wl_gate("sweetmss");
++	keep = wl_gate("sweetmsskeep");
+ 	(void)PE_parse_boot_argn("sweetmssstep", &ms_step_max, sizeof(ms_step_max));
+-	(void)PE_parse_boot_argn("sweetmpss", &mpss, sizeof(mpss));
++	mpss = wl_gate("sweetmpss");
+ 	ms.mpss_perm = VMBIT(SCM_VMID_HLOS);
+ 	if (gate != 1) {
+ 		printf("SWEET MSS: stage 4 needs sweetmss=1 as well (first TrustZone/hypervisor step): not run\n");
+@@ -5867,9 +5989,9 @@
+ 	if (alive && mpss == 1) {
+ 		unsigned hold = 15;
+ 		(void)PE_parse_boot_argn("sweetmpsshold", &hold, sizeof(hold));
+-		int rmtfs = 0;
+-		(void)PE_parse_boot_argn("sweetrmtfs", &rmtfs, sizeof(rmtfs));
+-		running = ms_mpss(MIN(MAX(hold, 1u), 600u), rmtfs == 1);
++		int rmtfs = wl_gate("sweetrmtfs");
++		/* the service has no hold time (0 = run until the modem dies) */
++		running = ms_mpss(wl.service ? 0 : MIN(MAX(hold, 1u), 600u), rmtfs == 1);
+ 	} else if (alive) {
+ 		printf("SWEET MSS: MPSS not loaded (sweetmpss=1 loads and starts it)\n");
+ 	}
+@@ -7771,7 +7893,7 @@
+ 		wl_bt();
+ 	} else if (wl.stage == 3) {
+ 		wl_inventory();
+-	} else if (wl.stage == 4) {
++	} else if (wl.stage == 4 || wl.stage == 5) {
+ 		wl_mss();
+ 	}
+ out:
+@@ -7821,6 +7943,7 @@
+ 	(void)PE_parse_boot_argn("sweetbtnoflow", &wl.bt_noflow, sizeof(wl.bt_noflow)); /* 1: ignore CTS (no hw flow control) */
+ 	wl.started = true;
+ 	wl.stage = stage;
++	wl.service = stage == 5;
+ 	wl.delay_s = delay_s;
+ 	if (kernel_thread_start(wl_thread, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);

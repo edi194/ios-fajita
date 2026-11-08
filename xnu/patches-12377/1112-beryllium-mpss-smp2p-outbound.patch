@@ -1,0 +1,443 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -959,6 +959,12 @@
+ #define MSS_MDATA_MAX           0x10000u
+ #define MPSS_SMP2P_IN_ITEM      435u            /* smp2p-mpss qcom,smem = <435>, <428>: [0] inbound, [1] outbound (smp2p.c) */
+ #define MPSS_CRASH_REASON_ITEM  421u            /* qcom_q6v5_mss.c MPSS_CRASH_REASON_SMEM */
++#define MPSS_SMP2P_OUT_ITEM     428u
++#define MPSS_SMP2P_DOORBELL     14u             /* smp2p-mpss mboxes = <&apss_shared 14> */
++#define SMP2P_MAGIC             0x504d5324u     /* "$SMP" */
++#define SMP2P_MAX_ENTRY         16u
++#define SMP2P_ITEM_SIZE         (20u + SMP2P_MAX_ENTRY * 20u)
++#define SMP2P_FEATURE_SSR_ACK   1u
+ 
+ #define RMB_MBA_IMAGE           0x00
+ #define RMB_PBL_STATUS          0x04
+@@ -997,6 +1003,9 @@
+ 	bool qmp_open, arc[3], snoc, memnoc, reset_out, mba_assigned;
+ 	uint32_t mpss_perm;             /* VMBIT()s owning the MPSS carve-out (q6v5 mpss_perm) */
+ 	bool mpss_loading;              /* MPSS load started: like Linux, reclaim it only with an MBA running */
++	bool mpss_running;              /* ready seen: teardown asks the modem to stop first */
++	uint32_t smp2p_out;             /* SMEM offset of our outbound SMP2P item (428), 0 = none */
++	bool smp2p_nego, ssr_ack;       /* qcom_smp2p negotiation_done / ssr_ack */
+ 	uint32_t vote_set;              /* GCC 0x52004 bits we set (gpll0_mss 17, prng 13) */
+ 	bool mnoc_set;                  /* we set mfab_axis CBCR enable */
+ 	bool scm_dead;                  /* an SCM call did not complete: no further calls */
+@@ -1004,12 +1013,16 @@
+ 
+ static const char *const ms_arc_res[3] = { "cx.lvl", "mx.lvl", "mss.lvl" };
+ 
++static void ms_smp2p_kick(void);
++static bool ms_smp2p_in(const char *want, uint32_t *val);
++
+ /*
+  * Boot 32: the console stopped right after the stage-4 banner (USB console and persistent log are
+  * buffered, so the stop may be a few steps later). Every step now logs, flushes the persistent log
+  * and waits 1.5 s for the USB console; sweetmssstep=N stops after step N (then tears down).
+  * Steps: 1 map, 2 read mba.mbn, 3 copy MBA, 4 QMP, 5 ARC votes, 6 clocks + alt reset, 7 SCM assign,
+- * 8 QDSP6 boot.
++ * 8 QDSP6 boot; with sweetmpss=1: 9 SMP2P outbound item, 10 modem.mdt, 11 metadata auth, 12 segments,
++ * 13 AUTH_COMPLETE, 14 SMP2P watch.
+  */
+ static int ms_step_max = 99;
+ 
+@@ -1405,6 +1418,23 @@
+ {
+ 	/* q6v5_mba_reclaim() order: halt the AXI ports, hold the Q6 in reset, clocks off, then reclaim */
+ 	printf("SWEET MSS: teardown\n");
++	if (ms.mpss_running && ms.smp2p_out) {
++		/* qcom_q6v5_request_stop(): "stop" = bit 0 of master-kernel, wait stop-ack (slave-kernel bit 3), 5 s */
++		uint32_t v = ms.smp2p_out + 20 + 16, in = 0;
++		unsigned t;
++		wl_wr(wl.smem, v, smem_u32(v) | 1u);
++		ms_smp2p_kick();
++		for (t = 0; t < 5000; t += 10) {
++			if (ms_smp2p_in("slave-kernel", &in) && (in & (1u << 3))) {
++				break;
++			}
++			wl_sleep(10);
++		}
++		printf("SWEET MSS: stop request: %s after %u ms (slave-kernel %#x)\n", t < 5000 ? "stop-ack" : "timed out", t, in);
++		wl_wr(wl.smem, v, smem_u32(v) & ~1u);
++		ms_smp2p_kick();
++		sweet_log_sync();
++	}
+ 	if (ms.reset_out) {
+ 		ms_halt_axi("q6", 0x0000);
+ 		ms_halt_axi("modem", 0x2000);
+@@ -1446,6 +1476,10 @@
+ 	if (ms.qmp_open) {
+ 		(void)ms_qmp_send("{class: image, res: load_state, name: modem, val: off}");
+ 	}
++	if (ms.smp2p_out) {
++		/* smp2p unwind: out->valid_entries = 0 */
++		wl_wr(wl.smem, ms.smp2p_out + 12, SMP2P_MAX_ENTRY);
++	}
+ 	printf("SWEET MSS: teardown done\n");
+ 	sweet_log_sync();
+ }
+@@ -1737,43 +1771,220 @@
+ 	return ok;
+ }
+ 
+-/* the data of an SMEM item in the private partition of hosts a<->b (either order), 0 if absent */
+-static uint32_t
+-ms_smem_item(uint32_t a, uint32_t b, uint32_t item, uint32_t *size)
++/* the private SMEM partition of hosts a<->b (either order, Linux smem_ptable / smem_partition_header) */
++static bool
++ms_smem_part(uint32_t a, uint32_t b, uint32_t *off, uint32_t *psize)
+ {
+ 	uint32_t top = WL_SMEM_SIZE - 0x1000;
+ 	if (smem_u32(top) != 0x434f5424u) {
+-		return 0;
++		return false;
+ 	}
+ 	uint32_t n = MIN(smem_u32(top + 8), 32u);
+ 	for (uint32_t k = 0; k < n; k++) {
+ 		uint32_t e = top + 32 + k * 48;
+-		uint32_t offset = smem_u32(e), psize = smem_u32(e + 4), hosts = smem_u32(e + 12);
++		uint32_t offset = smem_u32(e), size = smem_u32(e + 4), hosts = smem_u32(e + 12);
+ 		uint32_t h0 = hosts & 0xffff, h1 = hosts >> 16;
+-		if (!offset || !psize || !((h0 == a && h1 == b) || (h0 == b && h1 == a))) {
++		if (!offset || !size || !((h0 == a && h1 == b) || (h0 == b && h1 == a))) {
+ 			continue;
+ 		}
+-		if ((uint64_t)offset + psize > WL_SMEM_SIZE || smem_u32(offset) != 0x54525024u) {
+-			return 0;
++		if ((uint64_t)offset + size > WL_SMEM_SIZE || smem_u32(offset) != 0x54525024u) {
++			return false;
+ 		}
+-		uint32_t free_u = MIN(smem_u32(offset + 12), psize), pos = offset + 32;
+-		for (unsigned guard = 0; pos + 16 <= offset + free_u && guard < 512; guard++) {
+-			uint32_t w0 = smem_u32(pos), sz = smem_u32(pos + 4), w2 = smem_u32(pos + 8);
+-			if ((w0 & 0xffff) != 0xa5a5 || sz > psize) {
+-				return 0;
+-			}
+-			if ((w0 >> 16) == item) {
+-				*size = sz - (w2 & 0xffff);
+-				return pos + 16 + (w2 >> 16);
+-			}
+-			pos += 16 + (w2 >> 16) + sz;
+-		}
++		*off = offset;
++		*psize = size;
++		return true;
++	}
++	return false;
++}
++
++/* the data of an SMEM item in the private partition of hosts a<->b, 0 if absent */
++static uint32_t
++ms_smem_item(uint32_t a, uint32_t b, uint32_t item, uint32_t *size)
++{
++	uint32_t offset, psize;
++	if (!ms_smem_part(a, b, &offset, &psize)) {
+ 		return 0;
++	}
++	uint32_t free_u = MIN(smem_u32(offset + 12), psize), pos = offset + 32;
++	for (unsigned guard = 0; pos + 16 <= offset + free_u && guard < 512; guard++) {
++		uint32_t w0 = smem_u32(pos), sz = smem_u32(pos + 4), w2 = smem_u32(pos + 8);
++		if ((w0 & 0xffff) != 0xa5a5 || sz > psize) {
++			return 0;
++		}
++		if ((w0 >> 16) == item) {
++			*size = sz - (w2 & 0xffff);
++			return pos + 16 + (w2 >> 16);
++		}
++		pos += 16 + (w2 >> 16) + sz;
+ 	}
+ 	return 0;
+ }
+ 
++/* SMEM hwspinlock: TCSR mutex 3 (qcom_hwspinlock.c, stride 0x1000, owner id 1 = apps), 1 s like Linux */
++static bool
++ms_smem_lock(void)
++{
++	const uint32_t r = WL_SMEM_HWLOCK * 0x1000;
++	for (unsigned i = 0; i < 1000; i++) {
++		wl_wr(wl.mutex, r, 1);
++		if (wl_rd(wl.mutex, r) == 1) {
++			return true;
++		}
++		delay(1000);
++	}
++	printf("SWEET MSS: SMEM hwlock %u busy (owner %#x)\n", WL_SMEM_HWLOCK, wl_rd(wl.mutex, r));
++	return false;
++}
++
+ static void
++ms_smem_unlock(void)
++{
++	const uint32_t r = WL_SMEM_HWLOCK * 0x1000;
++	if (wl_rd(wl.mutex, r) == 1) {
++		wl_wr(wl.mutex, r, 0);
++	} else {
++		printf("SWEET MSS: SMEM hwlock not owned by us (owner %#x)\n", wl_rd(wl.mutex, r));
++	}
++}
++
++/*
++ * qcom_smem_alloc() for the apps<->modem partition (qcom_smem_alloc_private): under the hwlock, walk the
++ * uncached list; an existing item is reused (-EEXIST), else a new entry {canary 0xa5a5, item, size
++ * aligned to 8, padding_data, padding_hdr 0} goes at offset_free_uncached, which then advances.
++ * Returns the data offset in SMEM, 0 on failure. This is the first write into shared SMEM.
++ */
++static uint32_t
++ms_smem_alloc(uint32_t item, uint32_t size)
++{
++	uint32_t off, psize, data = 0, free_u = 0, free_c = 0, pos = 0, have = 0;
++	enum { A_BAD, A_EXISTS, A_SMALL, A_NEW, A_FULL } res = A_BAD;
++	if (!ms_smem_part(0, 1, &off, &psize)) {
++		printf("SWEET MSS: no apps<->modem SMEM partition\n");
++		return 0;
++	}
++	if (!ms_smem_lock()) {
++		return 0;
++	}
++	/* nothing in here prints: the modem spins on the same hwlock while we hold it */
++	free_u = smem_u32(off + 12);
++	free_c = smem_u32(off + 16);
++	pos = off + 32;
++	if (free_u > psize || free_c > psize || free_u > free_c || free_u < 32) {
++		goto out;
++	}
++	while (pos < off + free_u) {
++		uint32_t w0 = smem_u32(pos), sz = smem_u32(pos + 4), w2 = smem_u32(pos + 8);
++		if ((w0 & 0xffff) != 0xa5a5 || sz > psize) {
++			goto out;
++		}
++		if ((w0 >> 16) == item) {
++			have = sz - (w2 & 0xffff);
++			if (have >= size) {
++				data = pos + 16 + (w2 >> 16);
++				res = A_EXISTS;
++			} else {
++				res = A_SMALL;
++			}
++			goto out;
++		}
++		pos += 16 + (w2 >> 16) + sz;
++	}
++	if (pos != off + free_u) {
++		goto out;               /* the list does not end at offset_free_uncached */
++	}
++	uint32_t asize = (size + 7u) & ~7u;
++	if (pos + 16 + asize > off + free_c) {
++		res = A_FULL;
++		goto out;
++	}
++	wl_wr(wl.smem, pos, 0xa5a5u | (item << 16));
++	wl_wr(wl.smem, pos + 4, asize);
++	wl_wr(wl.smem, pos + 8, asize - size);  /* padding_data, padding_hdr 0 */
++	wl_wr(wl.smem, pos + 12, 0);
++	wl_wr(wl.smem, off + 12, free_u + 16 + asize);  /* after the header (wl_wr: dmb before, dsb after) */
++	data = pos + 16;
++	res = A_NEW;
++out:
++	ms_smem_unlock();
++	switch (res) {
++	case A_NEW:
++		printf("SWEET MSS: SMEM item %u allocated at +%#x (%u bytes), free-uncached %#x -> %#x\n", item, data,
++		    size, free_u, free_u + 16 + ((size + 7u) & ~7u));
++		break;
++	case A_EXISTS:
++		printf("SWEET MSS: SMEM item %u exists at +%#x (%u bytes, reused)\n", item, data, have);
++		break;
++	case A_SMALL:
++		printf("SWEET MSS: SMEM item %u exists but has only %u bytes\n", item, have);
++		break;
++	case A_FULL:
++		printf("SWEET MSS: SMEM partition out of memory\n");
++		break;
++	case A_BAD:
++		printf("SWEET MSS: apps<->modem partition not sane (free %#x/%#x size %#x, walk ended at +%#x)\n",
++		    free_u, free_c, psize, pos - off);
++		break;
++	}
++	return data;
++}
++
++/* qcom_smp2p_kick(): apcs ipc doorbell, sdm845 apss_shared +12, channel 14 for the modem */
++static void
++ms_smp2p_kick(void)
++{
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wl_wr(ms.ipc, 12, 1u << MPSS_SMP2P_DOORBELL);
++}
++
++static void
++ms_smp2p_add_entry(uint32_t d, const char *name)
++{
++	uint32_t valid = smem_u32(d + 12) >> 16;
++	char buf[16];
++	memset(buf, 0, sizeof(buf));
++	strlcpy(buf, name, sizeof(buf));
++	for (uint32_t c = 0; c < 16; c += 4) {
++		uint32_t w;
++		memcpy(&w, buf + c, 4);
++		wl_wr(wl.smem, d + 20 + valid * 20 + c, w);
++	}
++	wl_wr(wl.smem, d + 20 + valid * 20 + 16, 0);
++	wl_wr(wl.smem, d + 12, SMP2P_MAX_ENTRY | ((valid + 1) << 16));
++}
++
++/*
++ * qcom_smp2p_alloc_outbound_item() + the outbound entries of the sdm845 smp2p-mpss node in DT order
++ * ("master-kernel": bit 0 = stop; "ipa"), with Linux's two kicks.
++ */
++static bool
++ms_smp2p_out_setup(void)
++{
++	if (!wl.mutex) {
++		wl.mutex = ml_io_map(WL_MUTEX_PA, 0x4000);
++	}
++	uint32_t d = ms_smem_alloc(MPSS_SMP2P_OUT_ITEM, SMP2P_ITEM_SIZE);
++	if (!d) {
++		return false;
++	}
++	for (uint32_t k = 0; k < SMP2P_ITEM_SIZE; k += 4) {
++		wl_wr(wl.smem, d + k, 0);
++	}
++	wl_wr(wl.smem, d + 0, SMP2P_MAGIC);
++	wl_wr(wl.smem, d + 4, SMP2P_FEATURE_SSR_ACK << 8);     /* version 0 until the header is complete */
++	wl_wr(wl.smem, d + 8, 0u | (1u << 16));                 /* local pid 0, remote pid 1 */
++	wl_wr(wl.smem, d + 12, SMP2P_MAX_ENTRY);                /* total 16, valid 0 */
++	wl_wr(wl.smem, d + 4, (SMP2P_FEATURE_SSR_ACK << 8) | 1u);
++	ms_smp2p_kick();
++	ms_smp2p_add_entry(d, "master-kernel");
++	ms_smp2p_add_entry(d, "ipa");
++	ms_smp2p_kick();
++	ms.smp2p_out = d;
++	printf("SWEET MSS: smp2p item %u ready at +%#x: version 1, pid 0->1, entries master-kernel + ipa, doorbell bit %u\n",
++	    MPSS_SMP2P_OUT_ITEM, d, MPSS_SMP2P_DOORBELL);
++	return true;
++}
++
++static void
+ ms_crash_reason(void)
+ {
+ 	/* qcom_smem_get(QCOM_SMEM_HOST_ANY, ...): the global partition */
+@@ -1792,11 +2003,60 @@
+ 	printf("SWEET MSS: modem crash reason: \"%s\"\n", msg);
+ }
+ 
+-/*
+- * step 13: watch the modem's SMP2P item for hold_s seconds (struct smp2p_smem_item: magic "$SMP",
++/* value of a named entry of the modem's SMP2P item (435) */
++static bool
++ms_smp2p_in(const char *want, uint32_t *val)
++{
++	uint32_t sz = 0, it = ms_smem_item(0, 1, MPSS_SMP2P_IN_ITEM, &sz);
++	if (!it || sz < 20 || smem_u32(it) != SMP2P_MAGIC) {
++		return false;
++	}
++	uint32_t valid = MIN(smem_u32(it + 12) >> 16, SMP2P_MAX_ENTRY);
++	for (uint32_t k = 0; k < valid && 20 + (k + 1) * 20 <= sz; k++) {
++		char name[17];
++		for (uint32_t c = 0; c < 16; c += 4) {
++			uint32_t w = smem_u32(it + 20 + k * 20 + c);
++			memcpy(name + c, &w, 4);
++		}
++		name[16] = 0;
++		if (strcmp(name, want) == 0) {
++			*val = smem_u32(it + 20 + k * 20 + 16);
++			return true;
++		}
++	}
++	return false;
++}
++
++/* qcom_smp2p_negotiate() and qcom_smp2p_check_ssr()/do_ssr_ack(), run on every poll instead of the interrupt */
++static void
++ms_smp2p_service(uint32_t it)
++{
++	if (!ms.smp2p_out) {
++		return;
++	}
++	uint32_t in1 = smem_u32(it + 4), out1 = smem_u32(ms.smp2p_out + 4);
++	if (!ms.smp2p_nego && (in1 & 0xff) == (out1 & 0xff)) {
++		uint32_t feat = (out1 >> 8) & (in1 >> 8);
++		wl_wr(wl.smem, ms.smp2p_out + 4, (feat << 8) | (out1 & 0xff));
++		ms.smp2p_nego = true;
++		printf("SWEET MSS: smp2p negotiated: version %u, features %#x\n", out1 & 0xff, feat);
++	}
++	if (ms.smp2p_nego && ((smem_u32(ms.smp2p_out + 4) >> 8) & SMP2P_FEATURE_SSR_ACK)) {
++		bool restart = (smem_u32(it + 16) & 1u) != 0;  /* SMP2P_FLAGS_RESTART_DONE_BIT */
++		if (restart != ms.ssr_ack) {
++			ms.ssr_ack = !ms.ssr_ack;
++			uint32_t f = smem_u32(ms.smp2p_out + 16) & ~2u;
++			wl_wr(wl.smem, ms.smp2p_out + 16, f | (ms.ssr_ack ? 2u : 0));
++			ms_smp2p_kick();
++			printf("SWEET MSS: smp2p restart-done %d acknowledged\n", restart);
++		}
++	}
++}
++
++/*
++ * step 14: watch the modem's SMP2P item for hold_s seconds (struct smp2p_smem_item: magic "$SMP",
+  * version, features, local/remote pid, total/valid entries, flags, then {char name[16]; u32 value}
+- * entries). Nothing here allocates the apps-side outbound item (428) or kicks the modem (Linux
+- * qcom_smp2p_alloc_outbound_item): if the modem waits for it, ready never shows. sdm845 mss: "fatal" = bit 0, "ready" = 1, "handover" = 2, "stop-ack" = 3 of "slave-kernel".
++ * entries); our outbound item (428) is set up in step 9 and negotiated here. sdm845 mss: "fatal" = bit 0, "ready" = 1, "handover" = 2, "stop-ack" = 3 of "slave-kernel".
+  */
+ static bool
+ ms_mpss_watch(unsigned hold_s)
+@@ -1815,6 +2075,7 @@
+ 				    ms_now_ms() - t0);
+ 				seen = true;
+ 			}
++			ms_smp2p_service(it);
+ 			uint32_t valid = MIN(ents >> 16, 8u);
+ 			for (uint32_t k = 0; k < valid && 20 + (k + 1) * 20 <= sz; k++) {
+ 				uint32_t e = it + 20 + k * 20;
+@@ -1854,7 +2115,7 @@
+ 	return ready;
+ }
+ 
+-/* steps 9-13 */
++/* steps 9-14 */
+ static bool
+ ms_mpss(unsigned hold_s)
+ {
+@@ -1862,20 +2123,23 @@
+ 	if (!wl.smem) {
+ 		wl.smem = ml_io_map(WL_SMEM_PA, WL_SMEM_SIZE);
+ 	}
+-	if (!ms_step(9, "read modem.mdt, build the metadata") || !ms_mdt_prepare()) {
++	if (!ms_step(9, "SMP2P outbound item 428 + modem doorbell (first SMEM write)") || !ms_smp2p_out_setup()) {
+ 		goto done;
+ 	}
+-	if (!ms_step(10, "metadata authentication (RMB META_DATA_READY)")) {
++	if (!ms_step(10, "read modem.mdt, build the metadata") || !ms_mdt_prepare()) {
+ 		goto done;
+ 	}
++	if (!ms_step(11, "metadata authentication (RMB META_DATA_READY)")) {
++		goto done;
++	}
+ 	wl_wr(ms.rmb, RMB_PMI_CODE_LENGTH, 0);  /* "Initialize the RMB validator" */
+ 	if (!ms_mdata_auth()) {
+ 		goto done;
+ 	}
+-	if (!ms_step(11, "load the MPSS segments (RMB LOAD_READY, code length)") || !ms_mpss_segments()) {
++	if (!ms_step(12, "load the MPSS segments (RMB LOAD_READY, code length)") || !ms_mpss_segments()) {
+ 		goto done;
+ 	}
+-	if (!ms_step(12, "MPSS to the modem, wait for AUTH_COMPLETE")) {
++	if (!ms_step(13, "MPSS to the modem, wait for AUTH_COMPLETE")) {
+ 		goto done;
+ 	}
+ 	if (!ms_xfer("mpss to modem", MSS_MPSS_PA, MSS_MPSS_SIZE, &ms.mpss_perm, false, true)) {
+@@ -1889,10 +2153,11 @@
+ 		goto done;
+ 	}
+ 	printf("SWEET MSS: MPSS AUTHENTICATED\n");
+-	if (!ms_step(13, "watch the modem's SMP2P entry for ready")) {
++	if (!ms_step(14, "watch the modem's SMP2P entry for ready")) {
+ 		goto done;
+ 	}
+ 	ready = ms_mpss_watch(hold_s);
++	ms.mpss_running = ready;
+ 	if (ready && ms.mba_assigned &&
+ 	    ms_assign("mba back", MSS_MBA_PA, MSS_MBA_SIZE, SCM_VMID_MSS_MSA, SCM_VMID_HLOS, SCM_PERM_RWX)) {
+ 		ms.mba_assigned = false;        /* q6v5_start() reclaims the MBA region once the modem is up */

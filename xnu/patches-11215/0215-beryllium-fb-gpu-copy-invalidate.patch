@@ -1,0 +1,32 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0714d60..d1f312a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -2124,6 +2124,27 @@ AppleCLCD::present(const uint8_t *rec)
+ 			continue;
+ 		}
+ 		uintptr_t src = s->kernelAddress();
++		if (src != 0 && s->pooled && sweet_lowpool_cacheable()) {
++			/*
++			 * 0215: this frame is copied by the CPU through the pool's write-back mapping. Since 0212 a BO_SYNC of a
++			 * pool surface that was already scanned in place is a no-op (the GPU writes DRAM, the MDP reads DRAM), so
++			 * the lines this CPU still holds from an earlier copy or draw are stale against what the GPU wrote.
++			 * gpuBlits counts those announced writes: when it moved since the surface was last looked at (zcPresent or
++			 * here) clean+invalidate the whole block once before reading it. civac, not ivac: a dirty line of a
++			 * CoreAnimation CPU draw is written back instead of lost.
++			 */
++			uint32_t gb = __atomic_load_n(&s->gpuBlits, __ATOMIC_ACQUIRE);
++			if (gb != s->gpuBlitsSeen) {
++				uint64_t block = (uint64_t)s->poolPages * PAGE_SIZE;
++				s->gpuBlitsSeen = gb;
++				if ((uint64_t)s->offset < block) {
++					uint64_t ti0 = mach_absolute_time();
++					sweet_dma_sync_va((const void *)(src + s->offset), (size_t)(block - s->offset));
++					fSt.cleanAbs += mach_absolute_time() - ti0;
++					fSt.cleans++;
++				}
++			}
++		}
+ 		uint32_t bpe = s->bytesPerElement ? s->bytesPerElement : 4;
+ 		if (w <= 0 || h <= 0) {
+ 			w = (int32_t)s->width;

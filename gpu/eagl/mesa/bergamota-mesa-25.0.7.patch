@@ -1,0 +1,995 @@
+diff --git a/meson.build b/meson.build
+index 095aec5..56e66e7 100644
+--- a/meson.build
++++ b/meson.build
+@@ -128,6 +128,10 @@ with_any_opengl = with_opengl or with_gles1 or with_gles2
+ with_shared_glapi = with_shared_glapi and with_any_opengl
+ 
+ system_has_kms_drm = ['openbsd', 'netbsd', 'freebsd', 'gnu/kfreebsd', 'dragonfly', 'linux', 'sunos', 'android', 'managarm'].contains(host_machine.system())
++# Bergamota: iOS has no DRM, but the freedreno msm backend runs over a libdrm stand-in (gpu/freedreno-sweet) with the same request set
++if host_machine.system() == 'darwin' and host_machine.subsystem() == 'ios' and get_option('gallium-drivers').contains('freedreno')
++  system_has_kms_drm = true
++endif
+ 
+ gallium_drivers = get_option('gallium-drivers')
+ if gallium_drivers.contains('auto')
+diff --git a/src/freedreno/drm/freedreno_bo.c b/src/freedreno/drm/freedreno_bo.c
+index 1f99f36..ca38562 100644
+--- a/src/freedreno/drm/freedreno_bo.c
++++ b/src/freedreno/drm/freedreno_bo.c
+@@ -473,8 +473,15 @@ fd_bo_fini_common(struct fd_bo *bo)
+ 
+    fd_bo_fini_fences(bo);
+ 
+-   if (bo->map)
++   if (bo->map) {
++#ifdef __APPLE__
++      /* Bergamota: BO maps are IOConnectMapMemory64 mappings (libdrm stand-in) */
++      extern int sweet_drm_munmap(void *addr, size_t len);
++      sweet_drm_munmap(bo->map, bo->size);
++#else
+       os_munmap(bo->map, bo->size);
++#endif
++   }
+ 
+    if (handle) {
+       simple_mtx_lock(&table_lock);
+@@ -618,8 +625,14 @@ fd_bo_map_os_mmap(struct fd_bo *bo)
+    if (ret) {
+       return NULL;
+    }
++#ifdef __APPLE__
++   /* Bergamota: offset = BO handle; mapped through IOConnectMapMemory64 by the libdrm stand-in */
++   extern void *sweet_drm_mmap(int fd, size_t len, uint64_t offset);
++   return sweet_drm_mmap(bo->dev->fd, bo->size, offset);
++#else
+    return os_mmap(0, bo->size, PROT_READ | PROT_WRITE, MAP_SHARED,
+                   bo->dev->fd, offset);
++#endif
+ }
+ 
+ /* For internal use only, does not check FD_BO_NOMAP: */
+diff --git a/src/freedreno/ir3/ir3_disk_cache.c b/src/freedreno/ir3/ir3_disk_cache.c
+index 1d35b43..59a7120 100644
+--- a/src/freedreno/ir3/ir3_disk_cache.c
++++ b/src/freedreno/ir3/ir3_disk_cache.c
+@@ -3,6 +3,10 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#ifdef __APPLE__
++#include <dlfcn.h>
++#include <mach-o/loader.h>
++#endif
+ #include "nir_serialize.h"
+ 
+ #include "ir3_compiler.h"
+@@ -34,6 +38,28 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+       return;
+ 
+    const char *renderer = fd_dev_name(compiler->dev_id);
++   char timestamp[41];
++#ifdef __APPLE__
++   /* Bergamota: no ELF build-id on Mach-O. The cache key is the LC_UUID of the image holding this code (changes with every
++    * build of libOSMesa), so a new Mesa never reads shaders compiled by an old one. */
++   {
++      Dl_info info;
++      const uint8_t *uuid = NULL;
++      if (dladdr((const void *)ir3_disk_cache_init, &info) && info.dli_fbase) {
++         const struct mach_header_64 *mh = info.dli_fbase;
++         const struct load_command *lc = (const struct load_command *)(mh + 1);
++         for (uint32_t i = 0; i < mh->ncmds; i++) {
++            if (lc->cmd == LC_UUID) { uuid = ((const struct uuid_command *)lc)->uuid; break; }
++            lc = (const struct load_command *)((const char *)lc + lc->cmdsize);
++         }
++      }
++      if (!uuid)
++         return;
++      uint8_t sha1[20];
++      _mesa_sha1_compute(uuid, 16, sha1);
++      _mesa_sha1_format(timestamp, sha1);
++   }
++#else
+    const struct build_id_note *note =
+       build_id_find_nhdr_for_addr(ir3_disk_cache_init);
+    assert(note && build_id_length(note) == 20); /* sha1 */
+@@ -41,8 +67,8 @@ ir3_disk_cache_init(struct ir3_compiler *compiler)
+    const uint8_t *id_sha1 = build_id_data(note);
+    assert(id_sha1);
+ 
+-   char timestamp[41];
+    _mesa_sha1_format(timestamp, id_sha1);
++#endif
+ 
+    uint64_t driver_flags = ir3_shader_debug_hash_key();
+    compiler->disk_cache = disk_cache_create(renderer, timestamp, driver_flags);
+diff --git a/src/freedreno/meson.build b/src/freedreno/meson.build
+index 29e1bc4..e3d4279 100644
+--- a/src/freedreno/meson.build
++++ b/src/freedreno/meson.build
+@@ -8,7 +8,7 @@ rnn_src_path = dir_source_root + '/src/freedreno/registers'
+ rnn_install_path = get_option('datadir') + '/freedreno/registers'
+ rnn_path = rnn_src_path + ':' + get_option('prefix') + '/' + rnn_install_path
+ 
+-dep_libarchive = dependency('libarchive', allow_fallback: true, required: false)
++dep_libarchive = dependency('libarchive', allow_fallback: false, required: false)
+ dep_libxml2 = dependency('libxml-2.0', allow_fallback: true, required: false)
+ prog_gzip = find_program('gzip', required: false)
+ 
+@@ -28,7 +28,7 @@ endif
+ 
+ subdir('perfcntrs')
+ 
+-if system_has_kms_drm
++if system_has_kms_drm and host_machine.system() != 'darwin'   # Bergamota: a test tool, needs libarchive
+   subdir('computerator')
+ endif
+ 
+diff --git a/src/gallium/drivers/freedreno/freedreno_screen.c b/src/gallium/drivers/freedreno/freedreno_screen.c
+index e41699a..bc326aa 100644
+--- a/src/gallium/drivers/freedreno/freedreno_screen.c
++++ b/src/gallium/drivers/freedreno/freedreno_screen.c
+@@ -25,7 +25,11 @@
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include "drm-uapi/drm_fourcc.h"
++#ifdef __APPLE__
++#include <sys/sysctl.h>
++#else
+ #include <sys/sysinfo.h>
++#endif
+ 
+ #include "freedreno_fence.h"
+ #include "freedreno_perfetto.h"
+@@ -838,7 +842,7 @@ fd_screen_bo_from_handle(struct pipe_screen *pscreen,
+    if (whandle->type == WINSYS_HANDLE_TYPE_SHARED) {
+       bo = fd_bo_from_name(screen->dev, whandle->handle);
+    } else if (whandle->type == WINSYS_HANDLE_TYPE_KMS) {
+-      bo = fd_bo_from_handle(screen->dev, whandle->handle, 0);
++      bo = fd_bo_from_handle(screen->dev, whandle->handle, whandle->size);   /* Bergamota: size is known for IOSurface BOs */
+    } else if (whandle->type == WINSYS_HANDLE_TYPE_FD) {
+       bo = fd_bo_from_dmabuf(screen->dev, whandle->handle);
+    } else {
+@@ -1004,9 +1008,18 @@ fd_screen_create(int fd,
+    screen->driconf.dual_color_blend_by_location =
+          driQueryOptionb(config->options, "dual_color_blend_by_location");
+ 
++#ifdef __APPLE__
++   {
++      uint64_t memsize = 0;
++      size_t len = sizeof(memsize);
++      sysctlbyname("hw.memsize", &memsize, &len, NULL, 0);
++      screen->ram_size = memsize;
++   }
++#else
+    struct sysinfo si;
+    sysinfo(&si);
+    screen->ram_size = si.totalram;
++#endif
+ 
+    DBG("Pipe Info:");
+    DBG(" GPU-id:          %s", fd_dev_name(screen->dev_id));
+diff --git a/src/gallium/frontends/osmesa/osmesa.c b/src/gallium/frontends/osmesa/osmesa.c
+index 6d61677..dd676b3 100644
+--- a/src/gallium/frontends/osmesa/osmesa.c
++++ b/src/gallium/frontends/osmesa/osmesa.c
+@@ -59,11 +59,19 @@
+ #include "GL/osmesa.h"
+ 
+ #include <stdio.h>
++#include "util/os_time.h"
+ #include <c11/threads.h>
+ 
+ #include "state_tracker/st_context.h"
+ 
+ #include "glapi/glapi.h"  /* for OSMesaGetProcAddress below */
++#include "main/context.h"
++#include "main/fbobject.h"
++#include "main/texobj.h"
++#include "state_tracker/st_cb_flush.h"
++#include "state_tracker/st_cb_eglimage.h"
++#include "state_tracker/st_cb_texture.h"
++#include "main/teximage.h"
+ 
+ #include "pipe/p_context.h"
+ #include "pipe/p_screen.h"
+@@ -615,7 +623,8 @@ OSMesaCreateContextAttribs(const int *attribList, OSMesaContext sharelist)
+       case OSMESA_PROFILE:
+          profile = attribList[i+1];
+          if (profile != OSMESA_CORE_PROFILE &&
+-             profile != OSMESA_COMPAT_PROFILE)
++             profile != OSMESA_COMPAT_PROFILE &&
++             profile != 0x36 /* Bergamota: OpenGL ES profile */)
+             return NULL;
+          break;
+       case OSMESA_CONTEXT_MAJOR_VERSION:
+@@ -664,6 +673,8 @@ OSMesaCreateContextAttribs(const int *attribList, OSMesaContext sharelist)
+    memset(&attribs, 0, sizeof(attribs));
+    attribs.profile = (profile == OSMESA_CORE_PROFILE)
+       ? API_OPENGL_CORE : API_OPENGL_COMPAT;
++   if (profile == 0x36) /* Bergamota: GLES context (major 1 = ES1, else ES2/ES3) */
++      attribs.profile = (version_major == 1) ? API_OPENGLES : API_OPENGLES2;
+    attribs.major = version_major;
+    attribs.minor = version_minor;
+    attribs.flags = 0;  /* ST_CONTEXT_FLAG_x */
+@@ -1027,3 +1038,277 @@ OSMesaPostprocess(OSMesaContext osmesa, const char *filter,
+       debug_warning("Calling OSMesaPostprocess() after OSMesaMakeCurrent()\n");
+    }
+ }
++
++
++/* ---- Bergamota: GPU blit of a GL renderbuffer/texture into an IOSurface (targets/osmesa/sweet_hw.c) ---- */
++extern struct pipe_resource *sweet_hw_surface_resource(uint32_t surface_id, int opaque, unsigned *w, unsigned *h);
++extern void sweet_hw_surface_sync(uint32_t surface_id);
++extern int sweet_hw_active(void);
++extern struct pipe_resource *sweet_hw_wrapped_resource(uint32_t surface_id, enum pipe_format fmt, unsigned w, unsigned h);
++extern void sweet_hw_wrapped_sync(uint32_t surface_id);
++extern void sweet_hw_surface_forget(uint32_t surface_id);
++int sweet_hw_surface_alias(uint32_t surface_id, void **base, unsigned *bpr, unsigned *w, unsigned *h);
++void sweet_hw_surface_alias_sync(uint32_t surface_id);
++
++GLAPI int GLAPIENTRY OSMesaSweetActive(void);
++GLAPI void GLAPIENTRY OSMesaSweetForgetSurface(uint32_t surface_id);
++GLAPI int GLAPIENTRY OSMesaSweetBlit(GLuint name, int is_texture, uint32_t surface_id, int flip, int opaque);
++GLAPI void GLAPIENTRY OSMesaSweetStats(double *out, int n);
++GLAPI int GLAPIENTRY OSMesaSweetAttachDirect(GLuint name, uint32_t surface_id);
++GLAPI void GLAPIENTRY OSMesaSweetDirectSync(uint32_t surface_id);
++GLAPI void GLAPIENTRY OSMesaSweetZeroTexture(void);
++GLAPI int GLAPIENTRY OSMesaSweetWrapTexture(GLuint name, uint32_t surface_id, int kind, unsigned w, unsigned h);
++GLAPI void GLAPIENTRY OSMesaSweetWrapSync(uint32_t surface_id);
++GLAPI int GLAPIENTRY OSMesaSweetSurfaceAlias(uint32_t surface_id, void **base, unsigned *bpr, unsigned *w, unsigned *h);
++GLAPI void GLAPIENTRY OSMesaSweetAliasSync(uint32_t surface_id);
++
++/* Frame pipeline statistics (EAGL_SHIM_DEBUG / SWEET_GPU_STATS set): cumulative milliseconds per phase of OSMesaSweetBlit.
++ * 0 blits, 1 render-wait (st_finish before the blit: GPU time of everything the client drew), 2 blit enqueue (CPU),
++ * 3 blit wait (st_finish after it: GPU time of the copy), 4 BO_SYNC (cache clean+invalidate), 5 surface lookup / first-use setup, 6 refused blits */
++static double g_sweet_stats[8];
++static int
++sweet_stats_on(void)
++{
++   static int v = -1;
++   if (v < 0)
++      v = getenv("EAGL_SHIM_DEBUG") != NULL || getenv("SWEET_GPU_STATS") != NULL;
++   return v;
++}
++static double
++sweet_ms(void)
++{
++   return (double)os_time_get_nano() / 1e6;
++}
++
++GLAPI void GLAPIENTRY
++OSMesaSweetStats(double *out, int n)
++{
++   for (int i = 0; i < n && i < 8; i++)
++      out[i] = g_sweet_stats[i];
++}
++
++/** 1 when the contexts run on the GPU (freedreno), 0 for softpipe. */
++GLAPI int GLAPIENTRY
++OSMesaSweetActive(void)
++{
++   return sweet_hw_active();
++}
++
++GLAPI void GLAPIENTRY
++OSMesaSweetForgetSurface(uint32_t surface_id)
++{
++   sweet_hw_surface_forget(surface_id);
++}
++
++/**
++ * Copy a renderbuffer (is_texture = 0) or level 0 of a texture of the current context into the memory of
++ * IOSurface `surface_id` with the GPU: no CPU readback. `flip` mirrors vertically (GL rows are bottom-up),
++ * `opaque` writes alpha = 1. Returns 1 on success, 0 when the caller must use the CPU path.
++ */
++GLAPI int GLAPIENTRY
++OSMesaSweetBlit(GLuint name, int is_texture, uint32_t surface_id, int flip, int opaque)
++{
++   OSMesaContext osmesa = OSMesaGetCurrentContext();
++   struct pipe_resource *src = NULL, *dst;
++   unsigned dw = 0, dh = 0;
++
++   if (!osmesa || !sweet_hw_active())
++      return 0;
++   struct st_context *st = osmesa->st;
++   struct gl_context *ctx = st->ctx;
++   struct pipe_context *pipe = st->pipe;
++
++   const int stats = sweet_stats_on();
++   double t0 = stats ? sweet_ms() : 0, t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
++   FLUSH_VERTICES(ctx, 0, 0);
++   if (stats) {
++      st_finish(st);   /* debug only: separates the GPU time of the client's drawing from the time of the copy */
++      t1 = sweet_ms();
++   }
++   if (is_texture) {
++      struct gl_texture_object *t = _mesa_lookup_texture(ctx, name);
++      if (t)
++         src = t->pt;
++   } else {
++      struct gl_renderbuffer *rb = _mesa_lookup_renderbuffer(ctx, name);
++      if (rb)
++         src = rb->texture;
++   }
++   if (!src)
++      return 0;
++   if (stats)
++      t2 = sweet_ms();
++   dst = sweet_hw_surface_resource(surface_id, opaque, &dw, &dh);
++   if (!dst) {
++      if (stats)
++         g_sweet_stats[6] += 1;
++      return 0;
++   }
++   if (stats)
++      t3 = sweet_ms();
++
++   unsigned w = MIN2(src->width0, dw), h = MIN2(src->height0, dh);
++   struct pipe_blit_info b;
++   memset(&b, 0, sizeof(b));
++   b.src.resource = src;
++   b.src.level = 0;
++   b.src.format = src->format;
++   u_box_2d(0, 0, w, h, &b.src.box);
++   b.dst.resource = dst;
++   b.dst.level = 0;
++   b.dst.format = dst->format;
++   u_box_2d(0, flip ? (int)h : 0, w, flip ? -(int)h : (int)h, &b.dst.box);
++   b.mask = PIPE_MASK_RGBA;
++   b.filter = PIPE_TEX_FILTER_NEAREST;
++   pipe->blit(pipe, &b);
++   if (stats)
++      t4 = sweet_ms();
++   st_finish(st);
++   if (stats)
++      t5 = sweet_ms();
++   sweet_hw_surface_sync(surface_id);
++   if (stats) {
++      double t6 = sweet_ms();
++      g_sweet_stats[0] += 1;
++      g_sweet_stats[1] += t1 - t0;
++      g_sweet_stats[2] += t4 - t3;
++      g_sweet_stats[3] += t5 - t4;
++      g_sweet_stats[4] += t6 - t5;
++      g_sweet_stats[5] += t3 - t2;
++   }
++   return 1;
++}
++
++/**
++ * Zero-copy display buffer: make level 0 of texture `name` of the current context BE the memory of IOSurface `surface_id` (a linear BGRA kernel-allocated
++ * surface, via SURFACE_BO and resource_from_handle), like glEGLImageTargetTexture2DOES. CoreAnimation then renders into the surface directly: no blit,
++ * and the damage-only redraw keeps the pixels already in it. Wrapped (client-memory) surfaces are GPU read-only and are refused here (returns 0).
++ */
++GLAPI int GLAPIENTRY
++OSMesaSweetAttachDirect(GLuint name, uint32_t surface_id)
++{
++   OSMesaContext osmesa = OSMesaGetCurrentContext();
++   unsigned dw = 0, dh = 0;
++
++   if (!osmesa || !sweet_hw_active())
++      return 0;
++   struct st_context *st = osmesa->st;
++   struct gl_context *ctx = st->ctx;
++   struct gl_texture_object *t = _mesa_lookup_texture(ctx, name);
++   const int dbg = getenv("EAGL_SHIM_DEBUG") != NULL;
++   if (!t || t->Target != GL_TEXTURE_2D) {
++      if (dbg) fprintf(stderr, "OSMesa/sweet: direct attach of surface %u: texture %u missing or not 2D\n", surface_id, name);
++      return 0;
++   }
++   struct pipe_resource *res = sweet_hw_surface_resource(surface_id, 0, &dw, &dh);
++   if (!res) {
++      if (dbg) fprintf(stderr, "OSMesa/sweet: direct attach of surface %u: no writable GPU resource (refused: wrapped/read-only, bad geometry or SURFACE_BO failed)\n", surface_id);
++      return 0;
++   }
++   struct gl_texture_image *img = _mesa_get_tex_image(ctx, t, GL_TEXTURE_2D, 0);
++   if (!img) {
++      if (dbg) fprintf(stderr, "OSMesa/sweet: direct attach of surface %u: texture %u has no level 0 image\n", surface_id, name);
++      return 0;
++   }
++   struct st_egl_image stimg;
++   memset(&stimg, 0, sizeof(stimg));
++   stimg.texture = res;
++   stimg.format = res->format;
++   stimg.internalformat = GL_RGBA;
++   st_bind_egl_image(ctx, t, img, &stimg, false, true);
++   int ok = t->surface_based && t->pt == res;
++   if (dbg)
++      fprintf(stderr, "OSMesa/sweet: direct attach of surface %u (%ux%u) to texture %u: %s\n", surface_id, dw, dh, name, ok ? "ok" : "st_bind_egl_image did not take the resource");
++   return ok;
++}
++
++/** Finish the GPU work and make it visible to the CPU / display (clean+invalidate the surface alias). */
++GLAPI void GLAPIENTRY
++OSMesaSweetDirectSync(uint32_t surface_id)
++{
++   OSMesaContext osmesa = OSMesaGetCurrentContext();
++
++   if (!osmesa || !sweet_hw_active())
++      return;
++   FLUSH_VERTICES(osmesa->st->ctx, 0, 0);
++   st_finish(osmesa->st);
++   sweet_hw_surface_sync(surface_id);
++}
++
++/** Writable CPU pixels of a client-memory IOSurface through the kernel alias (abi_minor 2); 0 when unavailable. */
++GLAPI int GLAPIENTRY
++OSMesaSweetSurfaceAlias(uint32_t surface_id, void **base, unsigned *bpr, unsigned *w, unsigned *h)
++{
++   return sweet_hw_surface_alias(surface_id, base, bpr, w, h);
++}
++
++GLAPI void GLAPIENTRY
++OSMesaSweetAliasSync(uint32_t surface_id)
++{
++   sweet_hw_surface_alias_sync(surface_id);
++}
++
++/**
++ * glTexImage2D(NULL) leaves the texture undefined; on iOS the GPU memory behind such a texture is cleared, here the recycled memory still holds
++ * pixels of earlier textures (noisy blocks in Control Center). Zero level 0 of the texture bound to the current unit's GL_TEXTURE_2D.
++ */
++GLAPI void GLAPIENTRY
++OSMesaSweetZeroTexture(void)
++{
++   OSMesaContext osmesa = OSMesaGetCurrentContext();
++
++   if (!osmesa || !sweet_hw_active())
++      return;
++   struct st_context *st = osmesa->st;
++   struct gl_context *ctx = st->ctx;
++   struct gl_texture_object *t = ctx->Texture.Unit[ctx->Texture.CurrentUnit].CurrentTex[TEXTURE_2D_INDEX];
++   if (!t || t->Target != GL_TEXTURE_2D || t->surface_based)
++      return;
++   if (!st_finalize_texture(ctx, st->pipe, t, 0) || !t->pt)
++      return;
++   struct pipe_box box;
++   u_box_2d(0, 0, t->pt->width0, t->pt->height0, &box);
++   if (st->pipe->clear_texture)
++      st->pipe->clear_texture(st->pipe, t->pt, 0, &box, NULL);
++}
++
++/**
++ * Make level 0 of texture `name` of the current context sample the memory of IOSurface `surface_id` directly (read-only GPU import, no copy). `kind`:
++ * 1 A8, 2 L8, 3 L8A8, 4 R8G8B8A8, 5 B8G8R8A8, 6 R16G16B16A16F. Returns 1 when the texture now IS the surface, 0 (nothing changed) when the caller must copy.
++ * The texture must never become a render target or the target of glTexSubImage2D (the shim detaches it on such calls).
++ */
++GLAPI int GLAPIENTRY
++OSMesaSweetWrapTexture(GLuint name, uint32_t surface_id, int kind, unsigned w, unsigned h)
++{
++   static const enum pipe_format map[] = { PIPE_FORMAT_NONE, PIPE_FORMAT_A8_UNORM, PIPE_FORMAT_L8_UNORM, PIPE_FORMAT_L8A8_UNORM,
++                                           PIPE_FORMAT_R8G8B8A8_UNORM, PIPE_FORMAT_B8G8R8A8_UNORM, PIPE_FORMAT_R16G16B16A16_FLOAT };
++   OSMesaContext osmesa = OSMesaGetCurrentContext();
++
++   if (!osmesa || !sweet_hw_active() || kind < 1 || kind > 6)
++      return 0;
++   struct st_context *st = osmesa->st;
++   struct gl_context *ctx = st->ctx;
++   struct gl_texture_object *t = _mesa_lookup_texture(ctx, name);
++   if (!t || t->Target != GL_TEXTURE_2D)
++      return 0;
++   struct pipe_resource *res = sweet_hw_wrapped_resource(surface_id, map[kind], w, h);
++   if (!res)
++      return 0;
++   struct gl_texture_image *img = _mesa_get_tex_image(ctx, t, GL_TEXTURE_2D, 0);
++   if (!img)
++      return 0;
++   struct st_egl_image stimg;
++   memset(&stimg, 0, sizeof(stimg));
++   stimg.texture = res;
++   stimg.format = res->format;
++   stimg.internalformat = kind == 1 ? GL_ALPHA : kind == 2 ? GL_LUMINANCE : kind == 3 ? GL_LUMINANCE_ALPHA : GL_RGBA;
++   st_bind_egl_image(ctx, t, img, &stimg, false, true);
++   return t->surface_based && t->pt == res;
++}
++
++/** The producer changed a wrapped surface: make its CPU writes visible to the GPU. */
++GLAPI void GLAPIENTRY
++OSMesaSweetWrapSync(uint32_t surface_id)
++{
++   sweet_hw_wrapped_sync(surface_id);
++}
+diff --git a/src/gallium/targets/osmesa/meson.build b/src/gallium/targets/osmesa/meson.build
+index 3c37161..1fce590 100644
+--- a/src/gallium/targets/osmesa/meson.build
++++ b/src/gallium/targets/osmesa/meson.build
+@@ -22,9 +22,16 @@ osmesa_def = custom_target(
+   command : gen_vs_module_defs_normal_command,
+ )
+ 
++osmesa_sweet_files = []
++osmesa_sweet_deps = []
++if with_gallium_freedreno and host_machine.system() == 'darwin'
++  osmesa_sweet_files += 'sweet_hw.c'
++  osmesa_sweet_deps += [driver_freedreno, dep_libdrm]
++endif
++
+ libosmesa = shared_library(
+   osmesa_lib_name,
+-  'osmesa_target.c',
++  ['osmesa_target.c', osmesa_sweet_files],
+   gnu_symbol_visibility : 'hidden',
+   link_args : [ld_args_gc_sections, osmesa_link_args],
+   vs_module_defs : osmesa_def,
+@@ -38,7 +45,7 @@ libosmesa = shared_library(
+     libmesa, libgallium, libws_null, osmesa_link_with,
+   ],
+   dependencies : [
+-    dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil,
++    dep_ws2_32, dep_thread, dep_clock, dep_unwind, driver_swrast, idep_mesautil, osmesa_sweet_deps,
+   ],
+   name_prefix : host_machine.system() == 'windows' ? '' : [],  # otherwise mingw will create libosmesa.dll
+   soversion : host_machine.system() == 'windows' ? '' : '8',
+diff --git a/src/gallium/targets/osmesa/osmesa_target.c b/src/gallium/targets/osmesa/osmesa_target.c
+index 25985dd..f7d01b1 100644
+--- a/src/gallium/targets/osmesa/osmesa_target.c
++++ b/src/gallium/targets/osmesa/osmesa_target.c
+@@ -30,6 +30,9 @@
+ struct pipe_screen *
+ osmesa_create_screen(void);
+ 
++/* Bergamota: hardware path (targets/osmesa/sweet_hw.c) */
++struct pipe_screen *sweet_hw_create_screen(void) __attribute__((weak));
++
+ 
+ struct pipe_screen *
+ osmesa_create_screen(void)
+@@ -37,6 +40,11 @@ osmesa_create_screen(void)
+    struct sw_winsys *winsys;
+    struct pipe_screen *screen;
+ 
++   /* Bergamota: freedreno on the Adreno 630 when SweetAdreno630 is present and SWEET_GPU is not 0 */
++   screen = sweet_hw_create_screen ? sweet_hw_create_screen() : NULL;
++   if (screen)
++      return debug_screen_wrap(screen);
++
+    /* We use a null software winsys since we always just render to ordinary
+     * driver resources.
+     */
+diff --git a/src/gallium/targets/osmesa/sweet_hw.c b/src/gallium/targets/osmesa/sweet_hw.c
+new file mode 100644
+index 0000000..276b496
+--- /dev/null
++++ b/src/gallium/targets/osmesa/sweet_hw.c
+@@ -0,0 +1,440 @@
++/*
++ * SPDX-License-Identifier: MIT
++ * Bergamota: hardware (freedreno / Adreno 630) pipe_screen for the OSMesa target, over the libdrm stand-in
++ * (gpu/freedreno-sweet) and the SweetAdreno630 IOKit service, plus IOSurface-backed render targets.
++ *
++ *   SWEET_GPU=0       force softpipe          SWEET_GPU=1 (default)  freedreno when SweetAdreno630 is there, else softpipe
++ */
++#include <stdlib.h>
++#include <string.h>
++#include <stdio.h>
++#include <stdint.h>
++#include <pthread.h>
++
++#include "pipe/p_defines.h"
++#include "pipe/p_screen.h"
++#include "pipe/p_state.h"
++#include "frontend/winsys_handle.h"
++#include "util/u_inlines.h"
++#include "util/xmlconfig.h"
++#include "util/driconf.h"
++#include "freedreno/drm/freedreno_drm_public.h"
++
++/* libdrm stand-in extras (gpu/freedreno-sweet/sweet_drm.c) */
++extern int drmOpenWithType(const char *name, const char *busid, int type);
++struct sweet_gpu_surface_plane { uint32_t offset, stride, width, height; };
++struct sweet_gpu_surface_bo {   /* xnu/gpu-abi/sweet_adreno_abi.h; the stand-in sends only the first 48 bytes to a minor-0 kernel */
++   uint32_t surface_id, handle;
++   uint64_t size, iova;
++   uint32_t offset, bytes_per_row, width, height, pixel_format, planes;
++   uint32_t flags, tiling, ubwc, reserved;      /* minor 1 */
++   struct sweet_gpu_surface_plane plane[3];
++   uint64_t alias_addr, alias_size;             /* minor 2 (abi_minor >= 2, INFO.flags & CAP_SBO_ALIAS): writable CPU alias of byte 0 of the BO */
++};
++#define SWEET_SBO_READONLY 0x1   /* out flags (minor 1): GPU mapping is read-only (client-memory surface): usable as a texture source ONLY */
++#define SWEET_SBO_WRAPPED  0x4
++#define SWEET_SBO_IN_SYNC  0x1
++#define SWEET_SBO_IN_WRITABLE_ALIAS 0x2
++#define SWEET_SBO_ALIAS    0x10   /* out: alias_addr/alias_size valid */
++#define SWEET_INFO_CAP_SBO_ALIAS 0x10   /* INFO.flags */
++extern int sweet_drm_surface_bo(int fd, struct sweet_gpu_surface_bo *io);
++extern int sweet_drm_gem_close(int fd, uint32_t handle);
++extern int sweet_drm_bo_sync(int fd, uint32_t handle, uint64_t offset, uint64_t size);
++struct sweet_gpu_info_abi {   /* xnu/gpu-abi/sweet_adreno_abi.h struct sweet_gpu_info */
++   uint32_t abi_version, flags, gpu_id, chip_id;
++   uint64_t va_start, va_size;
++   uint32_t last_fence, abi_minor;
++};
++extern int sweet_drm_info(int fd, struct sweet_gpu_info_abi *out);
++
++struct pipe_screen *sweet_hw_create_screen(void);
++int sweet_hw_active(void);
++struct pipe_resource *sweet_hw_surface_resource(uint32_t surface_id, int opaque, unsigned *w, unsigned *h);
++void sweet_hw_surface_sync(uint32_t surface_id);
++void sweet_hw_surface_forget(uint32_t surface_id);
++struct pipe_resource *sweet_hw_wrapped_resource(uint32_t surface_id, enum pipe_format fmt, unsigned w, unsigned h);
++void sweet_hw_wrapped_sync(uint32_t surface_id);
++int sweet_hw_surface_alias(uint32_t surface_id, void **base, unsigned *bpr, unsigned *w, unsigned *h);
++void sweet_hw_surface_alias_sync(uint32_t surface_id);
++
++static const driOptionDescription sweet_driconf[] = {
++#include "pipe-loader/driinfo_gallium.h"
++#include "freedreno/driinfo_freedreno.h"
++};
++
++static int g_fd = -1;
++static struct pipe_screen *g_hw_screen;
++static int g_alias_cap;    /* INFO.flags CAP_SBO_ALIAS: SURFACE_BO can give a writable CPU alias of client-memory surfaces (BGL_ALIAS=0 disables) */
++static int g_zc_wrapped;   /* INFO.abi_minor >= 1: SURFACE_BO imports wrapped (client-memory) IOSurfaces, READ-ONLY for the GPU. SURFACE_BO is always tried first for every surface, so such surfaces are used
++                              zero-copy automatically (no CPU fallback) once the kernel accepts them; this only drives the log line. BGL_ZEROCOPY overrides it. */
++
++static struct pipe_screen *
++sweet_hw_try_create(void)
++{
++   static struct driOptionCache cache;
++   static struct driOptionCache info;
++   static struct pipe_screen_config config;
++   struct pipe_screen *screen;
++   const char *e = getenv("SWEET_GPU");
++
++   if (e && e[0] == '0')
++      return NULL;
++   g_fd = drmOpenWithType("msm", NULL, 0);
++   if (g_fd < 0) {
++      fprintf(stderr, "OSMesa/sweet: no SweetAdreno630 (drmOpen failed), using softpipe\n");
++      return NULL;
++   }
++   driParseOptionInfo(&info, sweet_driconf, ARRAY_SIZE(sweet_driconf));
++   driParseConfigFiles(&cache, &info, 0, "msm", NULL, NULL, NULL, 0, NULL, 0);
++   config.options = &cache;
++   config.options_info = &info;
++   screen = fd_drm_screen_create_renderonly(g_fd, NULL, &config);
++   if (!screen) {
++      fprintf(stderr, "OSMesa/sweet: freedreno screen creation failed, using softpipe\n");
++      return NULL;
++   }
++   {
++      struct sweet_gpu_info_abi inf;
++      memset(&inf, 0, sizeof(inf));
++      const char *z = getenv("BGL_ZEROCOPY");
++      if (sweet_drm_info(g_fd, &inf) == 0)
++         g_zc_wrapped = inf.abi_minor >= 1;
++      g_alias_cap = inf.abi_minor >= 2 && (inf.flags & SWEET_INFO_CAP_SBO_ALIAS) != 0;
++      if (getenv("BGL_ALIAS") && getenv("BGL_ALIAS")[0] == '0')
++         g_alias_cap = 0;
++      if (z)
++         g_zc_wrapped = z[0] != '0';
++      if (getenv("SWEET_GPU_DEBUG") || getenv("EAGL_SHIM_DEBUG"))
++         fprintf(stderr, "OSMesa/sweet: kernel info abi %u.%u flags 0x%x, zero-copy of wrapped IOSurfaces: %s, writable CPU alias: %s\n", inf.abi_version, inf.abi_minor, inf.flags, g_zc_wrapped ? "yes" : "no (CPU copy for those)", g_alias_cap ? "yes" : "no");
++   }
++   if (getenv("SWEET_GPU_DEBUG"))
++      fprintf(stderr, "OSMesa/sweet: freedreno screen: %s / %s\n", screen->get_name(screen), screen->get_vendor(screen));
++   g_hw_screen = screen;
++   return screen;
++}
++
++struct pipe_screen *
++sweet_hw_create_screen(void)
++{
++   return sweet_hw_try_create();
++}
++
++int
++sweet_hw_active(void)
++{
++   return g_hw_screen != NULL;
++}
++
++/* ---- IOSurface as a render target ---- */
++
++#define MAX_SURF 64
++static struct {
++   uint32_t id;
++   int opaque;
++   uint32_t handle;
++   unsigned w, h;
++   struct pipe_resource *res;
++} g_surf[MAX_SURF];
++static pthread_mutex_t g_surf_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* Surfaces the kernel/GPU path refused (wrapped client memory on an older kernel, odd geometry): remembered so the blit does not repeat the
++ * SURFACE_BO call on every flush; the caller takes the CPU copy. Cleared when the surface is forgotten. */
++#define MAX_REFUSED 256
++static uint32_t g_refused[MAX_REFUSED];
++static int g_nrefused;
++static int
++refused_has(uint32_t id)
++{
++   for (int i = 0; i < g_nrefused; i++)
++      if (g_refused[i] == id)
++         return 1;
++   return 0;
++}
++static void
++refused_add(uint32_t id)
++{
++   if (g_nrefused < MAX_REFUSED)
++      g_refused[g_nrefused++] = id;
++}
++
++/* Resource for the memory of IOSurface `surface_id` (BGRA, linear), or NULL (geometry the GPU path cannot use). */
++struct pipe_resource *
++sweet_hw_surface_resource(uint32_t surface_id, int opaque, unsigned *w, unsigned *h)
++{
++   struct pipe_resource *res = NULL;
++   int free_slot = -1;
++
++   if (!g_hw_screen)
++      return NULL;
++   pthread_mutex_lock(&g_surf_lock);
++   for (int i = 0; i < MAX_SURF; i++) {
++      if (g_surf[i].res && g_surf[i].id == surface_id && g_surf[i].opaque == opaque) {
++         res = g_surf[i].res;
++         *w = g_surf[i].w; *h = g_surf[i].h;
++         goto out;
++      }
++      if (!g_surf[i].res && free_slot < 0)
++         free_slot = i;
++   }
++   if (free_slot < 0 || refused_has(surface_id))
++      goto out;
++   {
++      struct sweet_gpu_surface_bo sb = { .surface_id = surface_id, .handle = 0 };
++      int src;
++      if (g_zc_wrapped) {
++         /* minor-1 kernel imports ANY surface, client-memory ones READ-ONLY and pinned until GEM_CLOSE: describe first (no BO is made) and keep
++          * those on the CPU copy path (a GPU write into them is an SMMU fault + GPU recovery). They are texture sources only. */
++         sb.handle = 0xffffffffu;
++         src = sweet_drm_surface_bo(g_fd, &sb);
++         if (src == 0 && (sb.flags & (SWEET_SBO_READONLY | SWEET_SBO_WRAPPED))) {
++            refused_add(surface_id);
++            goto out;
++         }
++         sb.handle = 0;
++      }
++      /* BGRA, or no pixel format at all (CoreAnimation's offscreen/backdrop surfaces are created without one) with 4 bytes per pixel */
++      src = sweet_drm_surface_bo(g_fd, &sb);
++      if (src != 0 && getenv("SWEET_GPU_DEBUG"))
++         fprintf(stderr, "OSMesa/sweet: SURFACE_BO(%u) failed: %d\n", surface_id, src);
++      if (src != 0 || sb.planes > 1 ||
++          !((sb.pixel_format == 0x42475241 /* BGRA */) || (sb.pixel_format == 0 && sb.bytes_per_row >= sb.width * 4 && sb.bytes_per_row < sb.width * 8))) {
++         refused_add(surface_id);
++         if (getenv("SWEET_GPU_DEBUG"))
++            fprintf(stderr, "OSMesa/sweet: surface %u not usable (planes %u fmt %08x, %ux%u bpr %u)\n", surface_id, sb.planes, sb.pixel_format, sb.width, sb.height, sb.bytes_per_row);
++         goto out;
++      }
++      struct pipe_resource templ;
++      memset(&templ, 0, sizeof(templ));
++      templ.target = PIPE_TEXTURE_2D;
++      templ.format = opaque ? PIPE_FORMAT_B8G8R8X8_UNORM : PIPE_FORMAT_B8G8R8A8_UNORM;
++      templ.width0 = sb.width;
++      templ.height0 = sb.height;
++      templ.depth0 = 1;
++      templ.array_size = 1;
++      templ.usage = PIPE_USAGE_DEFAULT;
++      templ.bind = PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW;
++      struct winsys_handle wh;
++      memset(&wh, 0, sizeof(wh));
++      wh.type = WINSYS_HANDLE_TYPE_KMS;
++      wh.handle = sb.handle;
++      wh.stride = sb.bytes_per_row;
++      wh.offset = sb.offset;
++      wh.size = sb.size;
++      wh.modifier = 0;   /* DRM_FORMAT_MOD_LINEAR: no UBWC */
++      res = g_hw_screen->resource_from_handle(g_hw_screen, &templ, &wh, PIPE_HANDLE_USAGE_FRAMEBUFFER_WRITE);
++      if (!res) {
++         if (getenv("SWEET_GPU_DEBUG"))
++            fprintf(stderr, "OSMesa/sweet: resource_from_handle failed for surface %u (%ux%u stride %u)\n", surface_id, sb.width, sb.height, sb.bytes_per_row);
++         refused_add(surface_id);
++         goto out;
++      }
++      /* Clean dirty CPU cache lines of the surface BEFORE the GPU first writes it (the CPU zeroed/painted it): the post-blit BO_SYNC is a
++       * clean+invalidate, which would otherwise write those stale lines back over the GPU's pixels (rows/blocks of black seen in a test). */
++      sweet_drm_bo_sync(g_fd, sb.handle, 0, 0);
++      g_surf[free_slot].id = surface_id; g_surf[free_slot].opaque = opaque; g_surf[free_slot].handle = sb.handle;
++      g_surf[free_slot].w = sb.width; g_surf[free_slot].h = sb.height; g_surf[free_slot].res = res;
++      *w = sb.width; *h = sb.height;
++   }
++out:
++   pthread_mutex_unlock(&g_surf_lock);
++   return res;
++}
++
++/* Make GPU writes into the surface visible to the CPU (and to the display): clean+invalidate the kernel alias. */
++void
++sweet_hw_surface_sync(uint32_t surface_id)
++{
++   pthread_mutex_lock(&g_surf_lock);
++   for (int i = 0; i < MAX_SURF; i++)
++      if (g_surf[i].res && g_surf[i].id == surface_id) {
++         sweet_drm_bo_sync(g_fd, g_surf[i].handle, 0, 0);
++         break;
++      }
++   pthread_mutex_unlock(&g_surf_lock);
++}
++
++/* ---- writable CPU alias of client-memory (read-only for the GPU) surfaces: the Control Center platters, live icons ... ---- */
++#define MAX_ALIAS 128
++static struct { uint32_t id, handle, bpr, w, h; uint8_t *base; } g_alias[MAX_ALIAS];
++
++/* CPU-writable pixels of IOSurface `surface_id` through the kernel alias (SURFACE_BO + SBO_IN_WRITABLE_ALIAS), or 0 (no cap, refused, table full). */
++int
++sweet_hw_surface_alias(uint32_t surface_id, void **base, unsigned *bpr, unsigned *w, unsigned *h)
++{
++   int ok = 0, free_slot = -1;
++
++   if (!g_hw_screen || !g_alias_cap)
++      return 0;
++   pthread_mutex_lock(&g_surf_lock);
++   for (int i = 0; i < MAX_ALIAS; i++) {
++      if (g_alias[i].base && g_alias[i].id == surface_id) {
++         *base = g_alias[i].base; *bpr = g_alias[i].bpr; *w = g_alias[i].w; *h = g_alias[i].h;
++         ok = 1;
++         goto out;
++      }
++      if (!g_alias[i].base && free_slot < 0)
++         free_slot = i;
++   }
++   if (free_slot < 0 || refused_has(surface_id | 0x80000000u))
++      goto out;
++   {
++      struct sweet_gpu_surface_bo sb;
++      memset(&sb, 0, sizeof(sb));
++      sb.surface_id = surface_id;
++      sb.flags = SWEET_SBO_IN_WRITABLE_ALIAS | SWEET_SBO_IN_SYNC;
++      struct sweet_gpu_surface_bo dsc;   /* describe first, only to log the geometry the kernel refuses */
++      memset(&dsc, 0, sizeof(dsc));
++      dsc.surface_id = surface_id; dsc.handle = 0xffffffffu;
++      int dr = sweet_drm_surface_bo(g_fd, &dsc);
++      int r = sweet_drm_surface_bo(g_fd, &sb);
++      if (r != 0 && getenv("SWEET_GPU_DEBUG"))
++         fprintf(stderr, "OSMesa/sweet: alias request for surface %u failed %d; describe %d: %ux%u bpr %u size %llu offset %u fmt %08x flags %x\n", surface_id, r, dr, dsc.width, dsc.height, dsc.bytes_per_row, (unsigned long long)dsc.size, dsc.offset, dsc.pixel_format, dsc.flags);
++      if (r != 0 || !(sb.flags & SWEET_SBO_ALIAS) || !sb.alias_addr || sb.planes > 1 || sb.bytes_per_row < sb.width * 4) {
++         if (getenv("SWEET_GPU_DEBUG"))
++            fprintf(stderr, "OSMesa/sweet: no writable alias for surface %u (r %d flags %x planes %u bpr %u w %u)\n", surface_id, r, sb.flags, sb.planes, sb.bytes_per_row, sb.width);
++         if (r == 0 && sb.handle)
++            sweet_drm_gem_close(g_fd, sb.handle);
++         refused_add(surface_id | 0x80000000u);   /* alias refusals are kept apart from blit refusals (same table, high bit) */
++         goto out;
++      }
++      g_alias[free_slot].id = surface_id; g_alias[free_slot].handle = sb.handle; g_alias[free_slot].bpr = sb.bytes_per_row;
++      g_alias[free_slot].w = sb.width; g_alias[free_slot].h = sb.height; g_alias[free_slot].base = (uint8_t *)(uintptr_t)sb.alias_addr + sb.offset;
++      *base = g_alias[free_slot].base; *bpr = sb.bytes_per_row; *w = sb.width; *h = sb.height;
++      ok = 1;
++      if (getenv("SWEET_GPU_DEBUG"))
++         fprintf(stderr, "OSMesa/sweet: writable alias for surface %u: %ux%u bpr %u at %p\n", surface_id, sb.width, sb.height, sb.bytes_per_row, (void *)g_alias[free_slot].base);
++   }
++out:
++   pthread_mutex_unlock(&g_surf_lock);
++   return ok;
++}
++
++/* After CPU writes through the alias: clean the caches so the GPU / the display see the pixels. */
++void
++sweet_hw_surface_alias_sync(uint32_t surface_id)
++{
++   pthread_mutex_lock(&g_surf_lock);
++   for (int i = 0; i < MAX_ALIAS; i++)
++      if (g_alias[i].base && g_alias[i].id == surface_id) {
++         sweet_drm_bo_sync(g_fd, g_alias[i].handle, 0, 0);
++         break;
++      }
++   pthread_mutex_unlock(&g_surf_lock);
++}
++
++/* ---- GPU SAMPLING of client-memory surfaces (read-only import, never a render target) ---- */
++#define MAX_WRAP 192
++static struct { uint32_t id, handle; enum pipe_format fmt; unsigned w, h; struct pipe_resource *res; } g_wrap[MAX_WRAP];
++
++/* Texture-only resource of the memory of IOSurface `surface_id` in format `fmt` (w x h pixels from pixel (0,0), the surface's own row pitch), or NULL
++ * (kernel refused, format or pitch not supported by the GPU: the caller copies instead). The GPU only READS it: the kernel maps client memory read-only. */
++struct pipe_resource *
++sweet_hw_wrapped_resource(uint32_t surface_id, enum pipe_format fmt, unsigned w, unsigned h)
++{
++   struct pipe_resource *res = NULL;
++   int free_slot = -1;
++
++   if (!g_hw_screen || !g_zc_wrapped)
++      return NULL;
++   pthread_mutex_lock(&g_surf_lock);
++   for (int i = 0; i < MAX_WRAP; i++) {
++      if (g_wrap[i].res && g_wrap[i].id == surface_id && g_wrap[i].fmt == fmt && g_wrap[i].w == w && g_wrap[i].h == h) {
++         res = g_wrap[i].res;
++         goto out;
++      }
++      if (!g_wrap[i].res && free_slot < 0)
++         free_slot = i;
++   }
++   if (free_slot < 0 || refused_has(surface_id | 0x40000000u))
++      goto out;
++   if (!g_hw_screen->is_format_supported(g_hw_screen, fmt, PIPE_TEXTURE_2D, 0, 0, PIPE_BIND_SAMPLER_VIEW)) {
++      refused_add(surface_id | 0x40000000u);
++      goto out;
++   }
++   {
++      struct sweet_gpu_surface_bo sb;
++      memset(&sb, 0, sizeof(sb));
++      sb.surface_id = surface_id;
++      sb.flags = SWEET_SBO_IN_SYNC;   /* clean the producer's CPU writes before the GPU reads */
++      int r = sweet_drm_surface_bo(g_fd, &sb);
++      unsigned bpp = util_format_get_blocksize(fmt);
++      if (r != 0 || sb.planes > 1 || sb.bytes_per_row < w * bpp || (sb.bytes_per_row & 63) || !(w && h)) {
++         if (getenv("SWEET_GPU_DEBUG"))
++            fprintf(stderr, "OSMesa/sweet: no GPU sampling of surface %u (r %d planes %u bpr %u need %u, 64-byte pitch)\n", surface_id, r, sb.planes, sb.bytes_per_row, w * bpp);
++         if (r == 0 && sb.handle)
++            sweet_drm_gem_close(g_fd, sb.handle);
++         refused_add(surface_id | 0x40000000u);
++         goto out;
++      }
++      struct pipe_resource templ;
++      memset(&templ, 0, sizeof(templ));
++      templ.target = PIPE_TEXTURE_2D;
++      templ.format = fmt;
++      templ.width0 = w;
++      templ.height0 = h;
++      templ.depth0 = 1;
++      templ.array_size = 1;
++      templ.usage = PIPE_USAGE_DEFAULT;
++      templ.bind = PIPE_BIND_SAMPLER_VIEW;   /* never a render target: wrapped memory is read-only for the GPU */
++      struct winsys_handle wh;
++      memset(&wh, 0, sizeof(wh));
++      wh.type = WINSYS_HANDLE_TYPE_KMS;
++      wh.handle = sb.handle;
++      wh.stride = sb.bytes_per_row;
++      wh.offset = sb.offset;
++      wh.size = sb.size;
++      wh.modifier = 0;
++      res = g_hw_screen->resource_from_handle(g_hw_screen, &templ, &wh, 0);   /* no write usage: sampling only */
++      if (!res) {
++         if (getenv("SWEET_GPU_DEBUG"))
++            fprintf(stderr, "OSMesa/sweet: resource_from_handle failed for sampling surface %u (%ux%u fmt %d bpr %u)\n", surface_id, w, h, (int)fmt, sb.bytes_per_row);
++         sweet_drm_gem_close(g_fd, sb.handle);
++         refused_add(surface_id | 0x40000000u);
++         goto out;
++      }
++      g_wrap[free_slot].id = surface_id; g_wrap[free_slot].handle = sb.handle; g_wrap[free_slot].fmt = fmt;
++      g_wrap[free_slot].w = w; g_wrap[free_slot].h = h; g_wrap[free_slot].res = res;
++   }
++out:
++   pthread_mutex_unlock(&g_surf_lock);
++   return res;
++}
++
++/* The producer changed the surface (seed): clean its CPU writes so the GPU samples them. */
++void
++sweet_hw_wrapped_sync(uint32_t surface_id)
++{
++   pthread_mutex_lock(&g_surf_lock);
++   for (int i = 0; i < MAX_WRAP; i++)
++      if (g_wrap[i].res && g_wrap[i].id == surface_id)
++         sweet_drm_bo_sync(g_fd, g_wrap[i].handle, 0, 0);
++   pthread_mutex_unlock(&g_surf_lock);
++}
++
++/* Forget a surface (the client released it). */
++void
++sweet_hw_surface_forget(uint32_t surface_id)
++{
++   pthread_mutex_lock(&g_surf_lock);
++   for (int i = 0; i < g_nrefused; i++)
++      if (g_refused[i] == surface_id || g_refused[i] == (surface_id | 0x80000000u) || g_refused[i] == (surface_id | 0x40000000u)) {
++         g_refused[i] = g_refused[--g_nrefused];
++         i--;
++      }
++   for (int i = 0; i < MAX_WRAP; i++)
++      if (g_wrap[i].res && g_wrap[i].id == surface_id) {
++         pipe_resource_reference(&g_wrap[i].res, NULL);   /* textures still bound to it keep their own reference */
++         memset(&g_wrap[i], 0, sizeof(g_wrap[i]));
++      }
++   for (int i = 0; i < MAX_ALIAS; i++)
++      if (g_alias[i].base && g_alias[i].id == surface_id) {
++         sweet_drm_gem_close(g_fd, g_alias[i].handle);   /* the kernel unmaps the alias here */
++         memset(&g_alias[i], 0, sizeof(g_alias[i]));
++      }
++   for (int i = 0; i < MAX_SURF; i++)
++      if (g_surf[i].res && g_surf[i].id == surface_id) {
++         pipe_resource_reference(&g_surf[i].res, NULL);
++         memset(&g_surf[i], 0, sizeof(g_surf[i]));
++      }
++   pthread_mutex_unlock(&g_surf_lock);
++}

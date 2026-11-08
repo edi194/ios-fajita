@@ -1,0 +1,700 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -2160,7 +2160,8 @@
+ #define IPC_INTENT_SIZE         1024u
+ #define IPC_MAX_INTENTS         16u             /* ours */
+ #define IPC_MAX_RINTENTS        64u             /* the modem's */
+-#define IPC_TXQ                 16u
++#define IPC_TXQ                 32u
++#define IPC_PKT_MAX             (32u + 4u + 65464u + 4u)  /* QRTR header + one TFTP block at MAX_BLKSIZE */
+ #define RMTFS_SECTOR            512u
+ 
+ enum { G_VERSION = 0, G_VERSION_ACK = 1, G_OPEN = 2, G_CLOSE = 3, G_OPEN_ACK = 4, G_INTENT = 5, G_RX_DONE = 6,
+@@ -2193,13 +2194,13 @@
+ 	struct ipc_rintent ri[IPC_MAX_RINTENTS];
+ 	struct {
+ 		uint32_t len;
+-		uint8_t data[32 + 1024];
+-	} txq[IPC_TXQ];                 /* QRTR packets waiting for a modem intent */
++		uint8_t *data;
++	} txq[IPC_TXQ];                 /* QRTR packets waiting for a modem intent (kalloc'd copies) */
+ 	unsigned txq_n;
+ 	bool intent_asked;
+ 	uint32_t next_liid;
+ 	uint32_t node;                  /* the modem's QRTR node, learned from its packets */
+-	bool hello_seen, announced;
++	bool hello_seen, announced, tftp;
+ 	uint64_t open_ms;
+ 	vm_offset_t win;                /* kernel window over the rmtfs buffer */
+ 	uint64_t win_base, win_len;
+@@ -2568,13 +2569,24 @@
+ 	if (!best) {
+ 		return false;
+ 	}
+-	struct {
+-		uint16_t cmd, lcid;
+-		uint32_t iid, chunk, left;
+-	} __attribute__((packed)) h = { G_TX_DATA, GLINK_LCID, best->id, len, 0 };
+ 	best->used = true;
+ 	ipc.tx_pkts++;
+-	(void)ipc_tx(&h, (uint32_t)sizeof(h), data, len);
++	/* chunks of at most SZ_8K: TX_DATA, then TX_DATA_CONT, left_size counting down */
++	for (uint32_t off = 0; off < len;) {
++		uint32_t chunk = MIN(len - off, GLINK_TX_MAX);
++		struct {
++			uint16_t cmd, lcid;
++			uint32_t iid, chunk, left;
++		} __attribute__((packed)) h = { off == 0 ? G_TX_DATA : G_TX_DATA_CONT, GLINK_LCID, best->id, chunk,
++		    len - off - chunk };
++		if (!ipc_tx(&h, (uint32_t)sizeof(h), (const uint8_t *)data + off, chunk)) {
++			/* __qcom_glink_send(): the intent is free again and the send fails */
++			best->used = false;
++			printf("SWEET IPC: glink send of %u bytes failed at %u%s\n", len, off, off ? " (partial message on the ring)" : "");
++			return false;
++		}
++		off += chunk;
++	}
+ 	return true;
+ }
+ 
+@@ -2582,7 +2594,7 @@
+ static bool
+ ipc_send(const void *data, uint32_t len)
+ {
+-	if (!ipc.open_acked || ipc.closed || len > sizeof(ipc.txq[0].data)) {
++	if (!ipc.open_acked || ipc.closed || len > IPC_PKT_MAX) {
+ 		return false;
+ 	}
+ 	if (ipc.txq_n == 0 && ipc_send_now(data, len)) {
+@@ -2592,8 +2604,13 @@
+ 		printf("SWEET IPC: glink TX queue full: %u-byte packet dropped\n", len);
+ 		return false;
+ 	}
++	uint8_t *copy = kalloc_data(len, Z_WAITOK);
++	if (!copy) {
++		return false;
++	}
++	memcpy(copy, data, len);
+ 	ipc.txq[ipc.txq_n].len = len;
+-	memcpy(ipc.txq[ipc.txq_n].data, data, len);
++	ipc.txq[ipc.txq_n].data = copy;
+ 	ipc.txq_n++;
+ 	if (!ipc.intent_asked) {
+ 		struct {
+@@ -2610,6 +2627,7 @@
+ ipc_flush(void)
+ {
+ 	while (ipc.txq_n && ipc_send_now(ipc.txq[0].data, ipc.txq[0].len)) {
++		kfree_data(ipc.txq[0].data, ipc.txq[0].len);
+ 		ipc.txq_n--;
+ 		memmove(&ipc.txq[0], &ipc.txq[1], ipc.txq_n * sizeof(ipc.txq[0]));
+ 		ipc.intent_asked = false;
+@@ -2628,10 +2646,13 @@
+ static bool
+ ipc_qrtr_send(uint32_t type, uint32_t src_port, uint32_t dst_node, uint32_t dst_port, const void *pl, uint32_t size)
+ {
+-	static uint8_t pkt[32 + 1024];
++	static uint8_t *pkt;
+ 	uint32_t h[8] = { 1, type, QRTR_NODE_LOCAL, src_port, 0, size, dst_node, dst_port };
+ 	uint32_t padded = (size + 3u) & ~3u;
+-	if (padded > sizeof(pkt) - 32) {
++	if (!pkt && !(pkt = kalloc_data(IPC_PKT_MAX, Z_WAITOK))) {
++		return false;
++	}
++	if (padded > IPC_PKT_MAX - 32) {
+ 		return false;
+ 	}
+ 	memcpy(pkt, h, 32);
+@@ -2649,6 +2670,12 @@
+ 	bool a = ipc_qrtr_send(Q_HELLO, QRTR_PORT_CTRL, ipc.node, QRTR_PORT_CTRL, hello, sizeof(hello));
+ 	bool b = ipc_qrtr_send(Q_NEW_SERVER, QRTR_PORT_CTRL, ipc.node, QRTR_PORT_CTRL, srv, sizeof(srv));
+ 	ipc.announced = true;
++	if (ipc.tftp) {
++		uint32_t tsrv[5] = { Q_NEW_SERVER, 4096u, 1u, QRTR_NODE_LOCAL, 0x4001u };   /* TFTP_SERVICE/INSTANCE/PORT */
++		bool c = ipc_qrtr_send(Q_NEW_SERVER, QRTR_PORT_CTRL, ipc.node, QRTR_PORT_CTRL, tsrv, sizeof(tsrv));
++		printf("SWEET IPC: qrtr: tftp announced as service 4096 instance 1 at %u:0x4001 %s\n", QRTR_NODE_LOCAL,
++		    c ? "" : "(FAILED)");
++	}
+ 	printf("SWEET IPC: qrtr: hello %s, rmtfs announced as service %u instance %u at %u:%#x %s\n", a ? "sent" : "FAILED",
+ 	    RMTFS_SERVICE, RMTFS_INSTANCE, QRTR_NODE_LOCAL, QRTR_RMTFS_PORT, b ? "" : "(FAILED)");
+ }
+@@ -2863,9 +2890,521 @@
+ 		break;
+ 	}
+ 	sweet_log_sync();
++}
++
++/*
++ * ---- TFTP over QRTR (sweettftp=1), linux-msm/tqftpserv: service 4096 version 1, RFC 1350 + options
++ * (blksize, timeoutms, tsize, wsize, rsize, seek) in network byte order. A request arrives at the server
++ * port; every transfer then runs on its own port (tqftpserv: qrtr_open(0) + connect()). Read-only: the
++ * firmware paths map to the phone's modem partition, /readwrite/ files live in RAM only.
++ */
++#define TFTP_SERVICE            4096u
++#define TFTP_INSTANCE           1u              /* qrtr_publish(fd, 4096, 1, 0) */
++#define QRTR_TFTP_PORT          0x4001u
++#define TFTP_CLIENTS            8u
++#define TFTP_RW_FILES           8u
++#define TFTP_RW_MAX             0x40000u
++enum { T_RRQ = 1, T_WRQ = 2, T_DATA = 3, T_ACK = 4, T_ERROR = 5, T_OACK = 6 };
++
++struct tftp_client {
++	bool used, writer, seek_set;
++	uint32_t port, node, rport;     /* our transfer port; the modem's address */
++	uint32_t blksize, wsize, rsize, seek, timeoutms;
++	uint32_t win_next, win_end;     /* blocks of the current window still to send (tftp_pump) */
++	uint64_t seq;                   /* age, for eviction */
++	uint16_t blk_expected;
++	uint32_t cl, size;              /* reader source in the modem partition */
++	int rw;                         /* /readwrite/ RAM file, -1 = partition file */
++	uint64_t sent;
++	char path[96];
++};
++static struct tftp_client tftp_cl[TFTP_CLIENTS];
++static struct {
++	char name[64];
++	uint8_t *data;
++	uint32_t len;
++} tftp_rw[TFTP_RW_FILES];
++static uint32_t tftp_next_port = QRTR_TFTP_PORT + 1;
++static uint64_t tftp_seq;
++static uint8_t *tftp_blk;               /* one block + 4 */
++
++static void
++tftp_send(struct tftp_client *c, const void *b, uint32_t n)
++{
++	(void)ipc_qrtr_send(Q_DATA, c->port, c->node, c->rport, b, n);
+ }
+ 
+ static void
++tftp_error(uint32_t port, uint32_t node, uint32_t rport, uint16_t code, const char *msg)
++{
++	uint8_t b[80];
++	uint32_t n = 4 + (uint32_t)strlen(msg) + 1;
++	b[0] = 0;
++	b[1] = T_ERROR;
++	b[2] = (uint8_t)(code >> 8);
++	b[3] = (uint8_t)code;
++	strlcpy((char *)b + 4, msg, sizeof(b) - 4);
++	(void)ipc_qrtr_send(Q_DATA, port, node, rport, b, MIN(n, (uint32_t)sizeof(b)));
++}
++
++/* translate_open(): the firmware paths -> modem:image/..., /readwrite/ -> RAM; NULL = no such path */
++static const char *
++tftp_translate(const char *path, bool *rw)
++{
++	static const char *const ro[] = { "/readonly/firmware/image/", "/readonly/vendor/firmware_mnt/image/",
++		                          "/readonly/vendor/firmware/" };
++	static const char modem_pr[] = "/readonly/firmware/modem_pr";
++	*rw = false;
++	if (path[0] != '/') {
++		return NULL;
++	}
++	/* sanitize_path(): no empty component, no ".." component */
++	for (const char *q = path + 1; *q;) {
++		const char *e = q;
++		while (*e && *e != '/') {
++			e++;
++		}
++		if (e == q || (e - q == 2 && q[0] == '.' && q[1] == '.')) {
++			return NULL;
++		}
++		q = *e ? e + 1 : e;
++	}
++	for (unsigned k = 0; k < 3; k++) {
++		if (strncmp(path, ro[k], strlen(ro[k])) == 0) {
++			return path + strlen(ro[k]);
++		}
++	}
++	if (strncmp(path, modem_pr, sizeof(modem_pr) - 1) == 0) {
++		return path + strlen("/readonly/firmware/");   /* READONLY_MODEM_PATH: relative to the firmware dir */
++	}
++	if (strncmp(path, "/readwrite/", 11) == 0) {
++		*rw = true;
++		return path + 11;
++	}
++	return NULL;
++}
++
++/* every component of a relative path fits 8.3: base 1-8 characters, at most one dot, extension 0-3 */
++static bool
++tftp_83(const char *rel)
++{
++	for (const char *q = rel; *q;) {
++		size_t base = 0, ext = 0;
++		unsigned dots = 0;
++		for (; *q && *q != '/'; q++) {
++			if (*q == '.') {
++				dots++;
++			} else if (dots) {
++				ext++;
++			} else {
++				base++;
++			}
++		}
++		if (dots > 1 || base == 0 || base > 8 || ext > 3) {
++			return false;
++		}
++		if (*q == '/') {
++			q++;
++		}
++	}
++	return true;
++}
++
++static int
++tftp_rw_find(const char *name, bool create)
++{
++	for (unsigned k = 0; k < TFTP_RW_FILES; k++) {
++		if (tftp_rw[k].data && strcmp(tftp_rw[k].name, name) == 0) {
++			return (int)k;
++		}
++	}
++	for (unsigned k = 0; create && k < TFTP_RW_FILES; k++) {
++		if (!tftp_rw[k].data && (tftp_rw[k].data = kalloc_data(TFTP_RW_MAX, Z_WAITOK | Z_ZERO))) {
++			strlcpy(tftp_rw[k].name, name, sizeof(tftp_rw[k].name));
++			tftp_rw[k].len = 0;
++			return (int)k;
++		}
++	}
++	return -1;
++}
++
++/* parse_options() in tqftpserv's ranges; false = "Option negotiation failed" */
++static bool
++tftp_options(const char *p, const char *end, struct tftp_client *c, int64_t *tsize, bool *any)
++{
++	*any = p < end;
++	while (p < end) {
++		const char *opt = p, *val;
++		size_t ol = strnlen(opt, (size_t)(end - p));
++		if (ol == (size_t)(end - p)) {
++			return false;
++		}
++		val = opt + ol + 1;
++		if (val >= end) {
++			return false;
++		}
++		size_t vl = strnlen(val, (size_t)(end - val));
++		if (vl == (size_t)(end - val)) {
++			return false;
++		}
++		p = val + vl + 1;
++		uint64_t v = 0;
++		for (const char *q = val; *q; q++) {
++			if (*q < '0' || *q > '9') {
++				return false;
++			}
++			v = v * 10 + (uint64_t)(*q - '0');
++			if (v > 0xffffffffull) {
++				return false;
++			}
++		}
++		if (vl == 0) {
++			return false;
++		}
++		if (strcmp(opt, "blksize") == 0) {
++			if (v < 8 || v > 65464) {
++				return false;
++			}
++			c->blksize = (uint32_t)v;
++		} else if (strcmp(opt, "timeoutms") == 0) {
++			if (v < 1 || v > 255000) {
++				return false;
++			}
++			c->timeoutms = (uint32_t)v;
++		} else if (strcmp(opt, "tsize") == 0) {
++			*tsize = (int64_t)v;
++		} else if (strcmp(opt, "rsize") == 0) {
++			if (v < 1 || v > 100 * 1024 * 1024) {
++				return false;
++			}
++			c->rsize = (uint32_t)v;
++		} else if (strcmp(opt, "wsize") == 0) {
++			if (v < 1 || v > 65535) {
++				return false;
++			}
++			c->wsize = (uint32_t)v;
++		} else if (strcmp(opt, "seek") == 0) {
++			c->seek = (uint32_t)v;
++			c->seek_set = true;
++		}
++	}
++	return true;
++}
++
++/* tftp_send_oack(): blksize, timeoutms (1000), tsize if asked, wsize, rsize and seek if set */
++static void
++tftp_oack(struct tftp_client *c, int64_t tsize)
++{
++	char b[160];
++	uint32_t n = 2;
++	b[0] = 0;
++	b[1] = T_OACK;
++#define TFTP_OPT(name, fmt, val) \
++	n += (uint32_t)snprintf(b + n, sizeof(b) - n, "%s", name) + 1; \
++	n += (uint32_t)snprintf(b + n, sizeof(b) - n, fmt, val) + 1
++	TFTP_OPT("blksize", "%u", c->blksize);
++	TFTP_OPT("timeoutms", "%u", c->timeoutms);
++	if (tsize != -1) {
++		TFTP_OPT("tsize", "%llu", (unsigned long long)tsize);
++	}
++	TFTP_OPT("wsize", "%u", c->wsize);
++	if (c->rsize) {
++		TFTP_OPT("rsize", "%u", c->rsize);
++	}
++	if (c->seek_set) {
++		TFTP_OPT("seek", "%u", c->seek);
++	}
++#undef TFTP_OPT
++	tftp_send(c, b, MIN(n, (uint32_t)sizeof(b)));
++}
++
++/* tftp_send_data(): pread blksize bytes at offset; with rsize the last block is cut to rsize % blksize */
++static bool
++tftp_data(struct tftp_client *c, uint32_t block, uint64_t offset, uint32_t response_size)
++{
++	uint8_t *b = tftp_blk;
++	uint32_t len = 0;
++	b[0] = 0;
++	b[1] = T_DATA;
++	b[2] = (uint8_t)(block >> 8);
++	b[3] = (uint8_t)block;
++	if (c->rw >= 0) {
++		uint32_t flen = tftp_rw[c->rw].len;
++		len = offset < flen ? MIN(c->blksize, flen - (uint32_t)offset) : 0;
++		memcpy(b + 4, tftp_rw[c->rw].data + offset, len);
++	} else {
++		len = offset < c->size ? (uint32_t)MIN((uint64_t)c->blksize, c->size - offset) : 0;
++		if (len && fat_read_chain(&ms_fat, c->cl, offset, b + 4, len)) {
++			tftp_error(c->port, c->node, c->rport, 0, "Read error");
++			return false;
++		}
++	}
++	uint32_t send_len = 4 + len;
++	if (response_size) {
++		if (4 + response_size > send_len) {
++			return false;
++		}
++		send_len = 4 + response_size;
++	}
++	c->sent += send_len - 4;
++	tftp_send(c, b, send_len);
++	return true;
++}
++
++static void
++tftp_close(struct tftp_client *c, const char *why)
++{
++	printf("SWEET IPC: tftp %s %s: %s, %llu bytes\n", c->writer ? "write" : "read", c->path, why, c->sent);
++	c->used = false;
++}
++
++static void
++tftp_request(uint32_t node, uint32_t rport, const uint8_t *buf, uint32_t len)
++{
++	uint16_t op = (uint16_t)(buf[0] << 8 | buf[1]);
++	const char *end = (const char *)buf + len, *file = (const char *)buf + 2;
++	size_t fl = strnlen(file, (size_t)(end - file));
++	if (fl == (size_t)(end - file) || file + fl + 1 >= end) {
++		return;
++	}
++	const char *mode = file + fl + 1;
++	size_t ml = strnlen(mode, (size_t)(end - mode));
++	if (ml == (size_t)(end - mode)) {
++		return;
++	}
++	struct tftp_client *c = NULL;
++	for (unsigned k = 0; k < TFTP_CLIENTS; k++) {
++		if (!tftp_cl[k].used) {
++			c = &tftp_cl[k];
++			break;
++		}
++		if (!c || tftp_cl[k].seq < c->seq) {
++			c = &tftp_cl[k];        /* all busy: the oldest one goes */
++		}
++	}
++	if (c->used) {
++		tftp_close(c, "evicted (all slots busy)");
++	}
++	memset(c, 0, sizeof(*c));
++	c->node = node;
++	c->rport = rport;
++	c->blksize = 512;
++	c->wsize = 1;
++	c->timeoutms = 1000;
++	c->seq = ++tftp_seq;
++	c->rw = -1;
++	c->writer = op == T_WRQ;
++	strlcpy(c->path, file, sizeof(c->path));
++	int64_t tsize = -1;
++	bool any = false;
++	const char *opts = mode + ml + 1;
++	bool octet = ml == 5;
++	for (unsigned k = 0; octet && k < 5; k++) {
++		octet = (mode[k] | 0x20) == "octet"[k];
++	}
++	if (!octet) {
++		printf("SWEET IPC: tftp %s: mode \"%s\" refused\n", file, mode);
++		tftp_error(tftp_next_port++, node, rport, 4, "Only octet mode supported");
++		return;
++	}
++	if (!tftp_options(opts, end, c, &tsize, &any)) {
++		printf("SWEET IPC: tftp %s: options refused\n", file);
++		tftp_error(tftp_next_port++, node, rport, 8, "Option negotiation failed");
++		return;
++	}
++	bool rw;
++	const char *rel = tftp_translate(file, &rw);
++	char fat_path[128];
++	if (rel && rw && strlen(rel) >= sizeof(tftp_rw[0].name)) {
++		rel = NULL;                     /* a RAM name we could not match again */
++	}
++	if (rel && !rw) {
++		/* the FAT reader matches 8.3 names: anything longer would match the wrong file */
++		if (!tftp_83(rel)) {
++			rel = NULL;
++		}
++		if (rel && (size_t)snprintf(fat_path, sizeof(fat_path), "image/%s", rel) >= sizeof(fat_path)) {
++			rel = NULL;
++		}
++	}
++	if (c->writer) {
++		c->rw = rel && rw ? tftp_rw_find(rel, true) : -1;
++		if (c->rw < 0) {
++			printf("SWEET IPC: tftp write %s refused (not /readwrite/ or no room)\n", file);
++			tftp_error(tftp_next_port++, node, rport, 2, "Access violation");
++			return;
++		}
++		tftp_rw[c->rw].len = 0;
++		c->blk_expected = 1;
++	} else if (rel && rw) {
++		c->rw = tftp_rw_find(rel, false);
++		c->size = c->rw >= 0 ? tftp_rw[c->rw].len : 0;
++	} else if (!rel || fat_open(&ms_fat, fat_path, &c->cl, &c->size)) {
++		c->port = tftp_next_port++;
++		c->used = false;
++		printf("SWEET IPC: tftp read %s (opts %s): not found\n", file, any ? "yes" : "no");
++		tftp_error(c->port, node, rport, 1, "file not found");
++		return;
++	}
++	if (!c->writer && rw && c->rw < 0) {
++		c->port = tftp_next_port++;
++		printf("SWEET IPC: tftp read %s: not found (RAM)\n", file);
++		tftp_error(c->port, node, rport, 1, "file not found");
++		return;
++	}
++	if (tsize != -1 && !c->writer) {
++		tsize = c->rw >= 0 ? tftp_rw[c->rw].len : c->size;   /* readers only: a WRQ echoes the asked value */
++	}
++	c->port = tftp_next_port++;
++	c->used = true;
++	printf("SWEET IPC: tftp %s %s (%u bytes) blksize %u wsize %u rsize %u seek %u%s from %u:%#x on port %#x\n",
++	    c->writer ? "write" : "read", file, c->writer ? 0 : c->size, c->blksize, c->wsize, c->rsize, c->seek,
++	    any ? "" : " (no options)", node, rport, c->port);
++	if (any) {
++		tftp_oack(c, tsize);
++	} else if (c->writer) {
++		uint8_t ack[4] = { 0, T_ACK, 0, 0 };
++		tftp_send(c, ack, 4);
++	} else {
++		(void)tftp_data(c, 1, 0, 0);
++	}
++}
++
++/* handle_reader() / handle_writer() for a packet at a transfer port */
++static bool
++tftp_transfer(uint32_t dport, uint32_t node, uint32_t rport, const uint8_t *buf, uint32_t len)
++{
++	struct tftp_client *c = NULL;
++	for (unsigned k = 0; k < TFTP_CLIENTS; k++) {
++		if (tftp_cl[k].used && tftp_cl[k].port == dport) {
++			c = &tftp_cl[k];
++		}
++	}
++	if (!c) {
++		return false;
++	}
++	if (node != c->node || rport != c->rport || len < 4) {
++		return true;            /* spoofed or short: dropped */
++	}
++	uint16_t op = (uint16_t)(buf[0] << 8 | buf[1]), arg = (uint16_t)(buf[2] << 8 | buf[3]);
++	if (op == T_ERROR) {
++		tftp_close(c, arg == 9 ? "end of transfer" : "error from the modem");
++		return true;
++	}
++	if (c->writer) {
++		if (op != T_DATA || arg != c->blk_expected) {
++			tftp_error(c->port, c->node, c->rport, 4, "Block number out of sequence");
++			tftp_close(c, "bad block");
++			return true;
++		}
++		uint32_t payload = len - 4;
++		if (tftp_rw[c->rw].len + payload > TFTP_RW_MAX) {
++			tftp_error(c->port, c->node, c->rport, 3, "Disk full or write error");
++			tftp_close(c, "RAM file full");
++			return true;
++		}
++		memcpy(tftp_rw[c->rw].data + tftp_rw[c->rw].len, buf + 4, payload);
++		tftp_rw[c->rw].len += payload;
++		c->sent += payload;
++		c->blk_expected++;
++		if (arg % c->wsize == 0 || payload < c->blksize) {
++			uint8_t ack[4] = { 0, T_ACK, buf[2], buf[3] };
++			tftp_send(c, ack, 4);
++		}
++		if (payload < c->blksize) {
++			tftp_close(c, "done (kept in RAM)");
++		}
++		return true;
++	}
++	if (op != T_ACK) {
++		tftp_error(c->port, c->node, c->rport, 4, "Expected ACK opcode");
++		tftp_close(c, "not an ACK");
++		return true;
++	}
++	/* tqftpserv's arithmetic, quirks included (rsize 0: one block per request); tftp_pump() sends */
++	uint32_t last = arg;
++	if ((uint64_t)last * c->blksize > c->rsize) {
++		tftp_close(c, "done");
++		return true;
++	}
++	c->win_next = last;
++	c->win_end = last + c->wsize;
++	return true;
++}
++
++/* the window of every reader, as far as the GLINK TX queue has room (instead of a blocking send()) */
++static void
++tftp_pump(void)
++{
++	for (unsigned k = 0; k < TFTP_CLIENTS; k++) {
++		struct tftp_client *c = &tftp_cl[k];
++		while (c->used && !c->writer && c->win_next < c->win_end && ipc.txq_n < IPC_TXQ / 2) {
++			uint32_t block = c->win_next++;
++			uint64_t offset = (uint64_t)c->seek + (uint64_t)block * c->blksize;
++			uint32_t response_size = 0;
++			bool last = (uint64_t)(block + 1) * c->blksize > c->rsize;
++			if (last) {
++				response_size = c->rsize % c->blksize;
++			}
++			if (!tftp_data(c, (block + 1) & 0xffff, offset, response_size)) {
++				tftp_close(c, "send failed");
++				break;
++			}
++			if (last) {
++				c->win_end = c->win_next;
++			}
++		}
++	}
++}
++
++/* QRTR DATA for the TFTP server or one of its transfers; false = not a TFTP port */
++static bool
++tftp_rx(uint32_t dport, uint32_t node, uint32_t rport, const uint8_t *buf, uint32_t len)
++{
++	if (!ipc.tftp) {
++		return false;
++	}
++	if (!tftp_blk && !(tftp_blk = kalloc_data(65464 + 4, Z_WAITOK))) {
++		return false;
++	}
++	if (dport == QRTR_TFTP_PORT) {
++		uint16_t op = len >= 2 ? (uint16_t)(buf[0] << 8 | buf[1]) : 0;
++		if (op == T_RRQ || op == T_WRQ) {
++			tftp_request(node, rport, buf, len);
++		} else {
++			printf("SWEET IPC: tftp: opcode %u at the server port from %u:%#x\n", op, node, rport);
++		}
++		return true;
++	}
++	return tftp_transfer(dport, node, rport, buf, len);
++}
++
++/* DEL_CLIENT / BYE from the modem ends its writers (tqftpserv) and, here, its readers too */
++static void
++tftp_client_gone(uint32_t node, uint32_t port, bool whole_node)
++{
++	for (unsigned k = 0; k < TFTP_CLIENTS; k++) {
++		struct tftp_client *c = &tftp_cl[k];
++		if (c->used && c->node == node && (whole_node || c->rport == port)) {
++			tftp_close(c, "client gone");
++		}
++	}
++}
++
++static void
++tftp_teardown(void)
++{
++	for (unsigned k = 0; k < TFTP_RW_FILES; k++) {
++		if (tftp_rw[k].data) {
++			printf("SWEET IPC: tftp RAM file /readwrite/%s: %u bytes (dropped)\n", tftp_rw[k].name, tftp_rw[k].len);
++			kfree_data(tftp_rw[k].data, TFTP_RW_MAX);
++			tftp_rw[k].data = NULL;
++		}
++	}
++	memset(tftp_cl, 0, sizeof(tftp_cl));
++}
++
++static void
+ ipc_qrtr_rx(const uint8_t *p, uint32_t len)
+ {
+ 	uint32_t h[8], type, snode, sport, confirm, size, dnode, dport, hdrlen;
+@@ -2923,6 +3462,8 @@
+ 	case Q_DATA:
+ 		if (dport == QRTR_RMTFS_PORT) {
+ 			rmtfs_rx(snode, sport, pl, size);
++		} else if (tftp_rx(dport, snode, sport, pl, size)) {
++			/* TFTP server or one of its transfers */
+ 		} else {
+ 			printf("SWEET IPC: qrtr: %u bytes from %u:%#x to port %#x (no server)\n", size, snode, sport, dport);
+ 		}
+@@ -2934,6 +3475,17 @@
+ 		break;
+ 	case Q_RESUME_TX:
+ 		break;
++	case Q_DEL_CLIENT:
++		if (size >= 12) {
++			uint32_t d[3];
++			memcpy(d, pl, 12);
++			tftp_client_gone(d[1], d[2], false);
++		}
++		break;
++	case Q_BYE:
++		printf("SWEET IPC: qrtr: bye from node %u\n", snode);
++		tftp_client_gone(snode, 0, true);
++		break;
+ 	default:
+ 		printf("SWEET IPC: qrtr: control %u from %u:%#x (%u bytes)\n", type, snode, sport, size);
+ 		break;
+@@ -2945,6 +3497,9 @@
+ ms_ipc_setup(void)
+ {
+ 	memset(&ipc, 0, sizeof(ipc));
++	int tftp = 0;
++	(void)PE_parse_boot_argn("sweettftp", &tftp, sizeof(tftp));
++	ipc.tftp = tftp == 1;
+ 	ipc.features = GLINK_FEATURE_REUSE;
+ 	ipc.node = 0;
+ 	ipc.rmtfs_perm = VMBIT(SCM_VMID_HLOS);
+@@ -2989,6 +3544,7 @@
+ 	while (ms_now_ms() < end) {
+ 		ipc_rx_poll();
+ 		ipc_flush();
++		tftp_pump();
+ 		if (ipc.open_acked && !ipc.announced && ms_now_ms() > ipc.open_ms + 3000) {
+ 			printf("SWEET IPC: qrtr: no hello from the modem 3 s after IPCRTR opened: sending ours\n");
+ 			ipc_qrtr_announce();
+@@ -3015,6 +3571,11 @@
+ static void
+ ms_ipc_teardown(void)
+ {
++	tftp_teardown();
++	while (ipc.txq_n) {
++		ipc.txq_n--;
++		kfree_data(ipc.txq[ipc.txq_n].data, ipc.txq[ipc.txq_n].len);
++	}
+ 	if (ipc.rmtfs_perm & VMBIT(SCM_VMID_MSS_MSA)) {
+ 		uint32_t src[2] = { SCM_VMID_HLOS, SCM_VMID_MSS_MSA }, dst = SCM_VMID_HLOS, perm = SCM_PERM_RW;
+ 		if (ms_assign_list("rmtfs back", RMTFS_MEM_PA, RMTFS_MEM_SIZE, src, 2, &dst, &perm, 1)) {

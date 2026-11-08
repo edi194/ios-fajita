@@ -1,0 +1,42 @@
+From: Bergamota
+Subject: [PATCH] sweet: boot-arg sweetdenypath hides a path from lookups (recovery)
+
+---
+--- a/bsd/vfs/vfs_lookup.c
++++ b/bsd/vfs/vfs_lookup.c
+@@ -73,6 +73,7 @@
+  */
+ 
+ #include <sys/param.h>
++#include <pexpert/pexpert.h>
+ #include <sys/systm.h>
+ #include <sys/syslimits.h>
+ #include <sys/time.h>
+@@ -398,6 +399,27 @@
+ 	assert(bytes_copied <= cnp->cn_pnlen);
+ 	ndp->ni_pathlen = (u_int)bytes_copied;
+ 	bytes_copied = 0;
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	{
++		/*
++		 * boot-arg sweetdenypath=SUFFIX: any lookup of a path ending in SUFFIX fails with ENOENT. Recovery tool: a
++		 * debug dylib weakly linked into a system daemon that crash-loops before SSH is up can be switched off
++		 * from the boot image without touching the root filesystem.
++		 */
++		static char deny[128];
++		static int deny_state;          /* 0 unread, 1 none, 2 set */
++		if (deny_state == 0) {
++			deny_state = PE_parse_boot_argn("sweetdenypath", deny, sizeof(deny)) && deny[0] ? 2 : 1;
++		}
++		if (deny_state == 2) {
++			size_t pl = strnlen(cnp->cn_pnbuf, cnp->cn_pnlen), dl = strlen(deny);
++			if (pl >= dl && strcmp(cnp->cn_pnbuf + pl - dl, deny) == 0) {
++				error = ENOENT;
++				goto error_out;
++			}
++		}
++	}
++#endif
+ 
+ 	if (!(resolve_flags & RESOLVE_CHECKED)) {
+ 		assert(!(cnp->cn_flags & HASBUF) && (cnp->cn_pnlen == PATHBUFLEN));

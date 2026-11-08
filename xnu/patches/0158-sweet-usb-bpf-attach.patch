@@ -1,0 +1,25 @@
+--- a/bsd/dev/sweet_usb.c
++++ b/bsd/dev/sweet_usb.c
+@@ -36,6 +36,7 @@
+ #include <netinet/in.h>
+ #include <net/if_media.h>
+ #include <net/dlil.h>
++#include <net/bpf.h>
+ #include <sys/kern_event.h>
+ #include <net/route.h>
+ #include <libkern/OSAtomic.h>
+@@ -819,6 +820,14 @@
+ 		return;
+ 	}
+ 	ifnet_set_lladdr(ud.ifp, ud_phone_mac, ETHER_ADDR_LEN);
++	/*
++	 * 0158: the legacy ifnet has no BPF tap. IPConfiguration (iOS 18 configd) probes a MANUAL address with ARP over
++	 * BPF (arp_client_open_fd: bpf_setif(ue0) failed -> "MANUAL ue0: arp probe failed" every 1.5 s), flushes the
++	 * kernel's static 192.168.7.2 and never re-adds it, so IPv4 died ~3 min after boot. Attach BPF as ether_ifattach
++	 * would (DLT_EN10MB).
++	 */
++	errno_t berr = bpf_attach(ud.ifp, DLT_EN10MB, sizeof(struct ether_header), NULL, NULL);
++	printf("SWEET USB: bpf_attach ue0 -> %d\n", (int)berr);
+ 
+ 	errno_t err = proto_plumb(PF_INET, ud.ifp);
+ 	socket_t so = NULL;

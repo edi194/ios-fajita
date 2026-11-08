@@ -1,0 +1,2023 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -57,6 +57,9 @@
+ #include <vm/vm_kern_xnu.h>
+ #include "sweet_board.h"
+ #include "sweet_wlan.h"
++#include "sweet_wlan_frames.h"
++#include "sweet_wpa.h"
++#include <sys/random.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern kern_return_t thread_terminate(thread_t);
+@@ -581,6 +584,10 @@
+ static int wl_gate(const char *name);
+ static void svc_echo_event(const uint8_t *t, uint32_t len);
+ static void scan_flush_notify(const char *why);
++static bool sta_wmi_event(uint32_t ev, const uint8_t *t, uint32_t len);
++static bool sta_htt(const uint8_t *pl, uint32_t plen);
++static void sta_mgmt_rx(const uint8_t *t, uint32_t len);
++static void sta_init(void);
+ 
+ /* the GENI UART and the HCI state of the stage: held by the RX loop per poll and by every TX */
+ static LCK_GRP_DECLARE(wl_hw_grp, "sweet_bt_uart");
+@@ -3886,7 +3893,7 @@
+ } wce_ring[5] = {
+ 	{ 0, 16, true, 0x1000, 0x40000, 2048 }, { 3, 32, true, 0x2000, 0x48000, 2048 },
+ 	{ 1, 32, false, 0x3000, 0x10000, 0 }, { 2, 64, false, 0x4000, 0x20000, 0 },
+-	{ 4, 16, true, 0x5000, 0x58000, 256 },  /* HTT host->target, sweetscan=1 only (CE4 dmax 256) */
++	{ 4, 64, true, 0x5000, 0x58000, 256 },  /* HTT host->target, sweetscan=1 only (CE4 dmax 256); TX_FRM: 2 each */
+ };
+ #define WCE_NRINGS              (ipc.scan ? 5u : 4u)
+ 
+@@ -4983,6 +4990,7 @@
+ 			ipc_note(" wmi READY st %u mac %02x:%02x:%02x:%02x:%02x:%02x;", st, wce.mac[0], wce.mac[1], wce.mac[2],
+ 			    wce.mac[3], wce.mac[4], wce.mac[5]);
+ 			wf.state = WS_WMI_READY;
++			sta_init();
+ 			if (ipc.scan) {
+ 				memset(&scan, 0, sizeof(scan));
+ 				wf.state = WS_SCAN_SETUP;
+@@ -4993,12 +5001,15 @@
+ 			scan_event(pl + 4, plen - 4);
+ 		} else if (ev == 0x7001 && ipc.scan) {
+ 			scan_tally(ev);
++			sta_mgmt_rx(pl + 4, plen - 4);
+ 			scan_mgmt_rx(pl + 4, plen - 4);
+ 		} else if (ev == 0x1d001) {
+ 			svc_echo_event(pl + 4, plen - 4);
+ 		} else if (ev == 0x4002 && ipc.scan) {
+ 			scan_tally(ev);
+ 			scan_chan_info(pl + 4, plen - 4);
++		} else if (ipc.scan && sta_wmi_event(ev, pl + 4, plen - 4)) {
++			scan_tally(ev);
+ 		} else if (ipc.scan && wf.state >= WS_SCAN_SETUP) {
+ 			scan_tally(ev);
+ 			if (wce.wmi_events <= 32) {
+@@ -5012,6 +5023,9 @@
+ 	if (p[0] == wce.htt_eid && wce.htt_eid) {
+ 		if (ipc.scan) {
+ 			scan.htt++;
++			if (sta_htt(pl, plen)) {
++				return;
++			}
+ 			scan_htt(pl, plen);
+ 		}
+ 		if (wce.htt_msgs++ < 8) {
+@@ -5566,6 +5580,1379 @@
+ }
+ 
+ /*
++ * ---- WL3/WL4: the station (sweet80211=3 joins). What ath10k + mac80211 + wpa_supplicant do for a client, in the
++ * service thread (docs/WIFI_IOS26.md 6.3, the order of ath10k mac.c): STOP_SCAN if one runs, VDEV_START on the AP's
++ * channel (VDEV_START_RESP), STA_POWERSAVE_MODE off, beacon interval and management rate, PEER_CREATE (HTT PEER_MAP),
++ * open-system authentication and the association request through WMI MGMT_TX_SEND by reference (HTT TX_FRM type
++ * MGMT when the firmware lacks service 76), PEER_ASSOC (+ SMPS), VDEV_UP; then for WPA2-PSK the 4-way handshake
++ * (sweet_wpa.c) over the data path and VDEV_INSTALL_KEY pairwise (HTT SEC_IND), PEER_SET_PARAM authorize, group.
++ * Data: HTT TX_FRM native wifi (ext descriptor in the frag bank, two CE4 gather descriptors), TX_COMPL_IND frees the
++ * msdu id; RX_IN_ORD_PADDR_IND hands back RX ring buffers (payload at +360), which are posted again at once.
++ */
++#define STA_MGMT_OFF            0x430000u       /* 8 management frame buffers of 1 KiB */
++#define STA_MGMT_N              8u
++#define STA_TXBUF_OFF           0x438000u       /* per msdu id: HTC header + HTT TX_FRM descriptor (64 bytes) */
++#define STA_TXFR_OFF            0x440000u       /* per msdu id: the native-wifi frame (2 KiB) */
++#define STA_NTX                 256u            /* msdu ids in use (of HTT_FRAG_DESCS) */
++#define STA_TXQ                 64u             /* Ethernet frames queued by en0 for the service thread */
++#define STA_TXQ_MAX             1600u
++#define STA_WMIQ                16u
++#define STA_WMI_MAX             320u
++#define STA_RXDESC              360u            /* sizeof(struct htt_rx_desc_v2): the payload offset */
++
++enum { ST_IDLE, ST_STOPSCAN, ST_START, ST_PEER, ST_AUTH, ST_ASSOC, ST_UP, ST_4WAY, ST_KEYS, ST_CONNECTED, ST_DOWN };
++static const char *const st_name[] = { "idle", "stop-scan", "vdev-start", "peer", "auth", "assoc", "up", "4-way",
++	                               "keys", "CONNECTED", "teardown" };
++
++static struct {
++	int state;
++	struct sweet_wlan_join req;     /* the join being done (service thread only) */
++	struct sweet_wlan_join pend;    /* the next join, written by the ioctl under sta_lock */
++	volatile bool req_pending, leave_pending;
++	volatile int result;            /* SWEET_WLAN_JOIN_* */
++	uint64_t t_ms, join_ms;         /* state entered, join started */
++	unsigned tries;
++	/* the BSS */
++	int bss;                        /* scan cache index */
++	uint8_t bssid[6];
++	uint16_t mhz, beacon_int, ap_cap, aid;
++	uint8_t dtim, mgmt_rate;
++	bool rsn, ht, wmm, svc_mgmt_wmi;
++	uint32_t group_cipher;
++	struct swf_assoc_resp ar;
++	/* firmware state */
++	bool vdev_started, vdev_up, peer, peer_mapped, start_resp, stopped, sec_ind, ptk_installed, connected, by_ap;
++	unsigned down_step;
++	bool had_peer;
++	uint8_t eapol_hold[256];        /* message 1 that arrived before PEER_ASSOC / VDEV_UP were through */
++	uint16_t eapol_hold_len;
++	uint16_t peer_id, seq;
++	uint32_t start_status;
++	unsigned keys_step;
++	bool key_pending[2];            /* pairwise, group */
++	uint8_t ptk[16], gtk[16];
++	unsigned gtk_idx;
++	int eapol_msdu;                 /* msdu id of the last EAPOL frame sent, -1 = none in flight */
++	uint64_t keys_ms;
++	struct sweet_wpa wpa;
++	/* management TX: one frame in flight, 8 buffers / desc ids in turn */
++	bool mgmt_busy;
++	unsigned mgmt_slot;
++	int mgmt_status;                /* completion status, -1 = not yet */
++	/* data path */
++	uint8_t txfree[STA_NTX];        /* 1 = msdu id free */
++	unsigned tx_inflight, rx_idx;
++	uint64_t tx_frames, tx_bytes, tx_fail, tx_drop, rx_frames, rx_bytes, rx_drop, rx_eapol, tx_eapol, rx_ind;
++	int8_t rssi;
++	/* the frames en0 hands over */
++	uint8_t *txq;
++	uint16_t txq_len[STA_TXQ];
++	unsigned txq_head, txq_n;
++	/* WMI commands, one in flight */
++	uint8_t wq[STA_WMIQ][STA_WMI_MAX];
++	uint16_t wq_len[STA_WMIQ];
++	unsigned wq_head, wq_n;
++	uint64_t last_status_ms;
++	uint32_t kickouts, bmiss, deauths;
++} sta;
++static LCK_GRP_DECLARE(sta_grp, "sweet_wlan_sta");
++static LCK_MTX_DECLARE(sta_lock, &sta_grp);
++
++static void sta_set_state(int s);
++static void sta_fail(int result, const char *why);
++
++/* ---- WMI command queue ---- */
++static bool
++sta_wmi(const uint8_t *c, uint32_t n, const char *what)
++{
++	if (n > STA_WMI_MAX || sta.wq_n >= STA_WMIQ) {
++		printf("SWEET WLAN sta: WMI queue full, %s dropped\n", what);
++		return false;
++	}
++	unsigned k = (sta.wq_head + sta.wq_n) % STA_WMIQ;
++	memcpy(sta.wq[k], c, n);
++	sta.wq_len[k] = (uint16_t)n;
++	sta.wq_n++;
++	return true;
++}
++
++static void
++sta_wmi_pump(void)
++{
++	while (sta.wq_n && wce.wmi_credits) {
++		if (!wce_send(1, wce.wmi_eid, sta.wq[sta.wq_head], sta.wq_len[sta.wq_head])) {
++			return;
++		}
++		sta.wq_head = (sta.wq_head + 1) % STA_WMIQ;
++		sta.wq_n--;
++	}
++}
++
++static void
++sta_vdev_param(uint32_t param, uint32_t value, const char *what)
++{
++	uint8_t c[32];
++	uint32_t v[3] = { 0, param, value };
++	sta_wmi(c, scan_cmd(c, 0x5008, 95, v, 12), what);
++}
++
++static void
++sta_peer_param(uint32_t param, uint32_t value, const char *what)
++{
++	uint8_t c[32];
++	uint32_t v[5] = { 0, 0, 0, param, value };
++	memcpy(&v[1], sta.bssid, 6);
++	sta_wmi(c, scan_cmd(c, 0x6004, 100, v, 20), what);
++}
++
++/* ---- CE4: two gather descriptors (ath10k_snoc_hif_tx_sg + ath10k_ce_send_nolock_64) ---- */
++static bool
++sta_ce4_send2(uint64_t pa0, uint16_t len0, uint64_t pa1, uint16_t len1)
++{
++	unsigned r = 4;                         /* wce_ring[4] = CE4 */
++	uint32_t b = WCE_BASE(wce_ring[r].ce), mask = wce_ring[r].n - 1, wr = wce.wr[r];
++	uint32_t srri = wl_rd(wce.regs, b + CE_CURRENT_SRRI) & mask;
++	if (((srri - 1 - wr) & mask) < 2) {
++		return false;
++	}
++	uint16_t meta = 0;                      /* transfer id 0, as ath10k_htt_tx_64 */
++	struct wce_desc *d = wce_desc(r, wr);
++	/* CE_SEND_FLAG_GATHER (0x10000) lands in the address high word with CE_WCN3990_DESC_FLAGS_GATHER (bit 31) */
++	d->addr = (pa0 & 0x7ffffffffull) | (0x10000ull << 32) | (1ull << 63);
++	d->nbytes = len0;
++	d->flags = (uint16_t)(meta | 1);        /* CE_DESC_FLAGS_GATHER */
++	d->hash = 0;
++	wr = (wr + 1) & mask;
++	d = wce_desc(r, wr);
++	d->addr = pa1 & 0x7ffffffffull;
++	d->nbytes = len1;
++	d->flags = meta;
++	d->hash = 0;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	wr = (wr + 1) & mask;
++	wce.wr[r] = wr;
++	wl_wr(wce.regs, 0x32010u, wr);          /* CE4 shadow source write index */
++	return true;
++}
++
++/* HTT TX_FRM for msdu id `id` whose frame is already in its buffer: data (ext desc) or management */
++static bool
++sta_htt_tx(unsigned id, uint16_t len, bool mgmt, bool no_encrypt, unsigned tid)
++{
++	uint64_t frame_pa = WCE_POOL_PA + STA_TXFR_OFF + (uint64_t)id * 2048;
++	uint64_t txbuf_pa = WCE_POOL_PA + STA_TXBUF_OFF + (uint64_t)id * 64;
++	uint8_t *tb = (uint8_t *)(wce.pool + STA_TXBUF_OFF + (uint64_t)id * 64);
++	uint64_t frags = frame_pa;
++	if (!mgmt) {
++		uint8_t *ext = (uint8_t *)(wce.pool + HTT_FRAG_OFF + (uint64_t)id * HTT_FRAG_DESC_SIZE);
++		memset(ext, 0, HTT_FRAG_DESC_SIZE);
++		uint32_t lo = (uint32_t)frame_pa;
++		uint16_t hi = (uint16_t)(frame_pa >> 32);
++		memcpy(ext + 24, &lo, 4);
++		memcpy(ext + 28, &hi, 2);
++		memcpy(ext + 30, &len, 2);
++		frags = WCE_POOL_PA + HTT_FRAG_OFF + (uint64_t)id * HTT_FRAG_DESC_SIZE;
++	}
++	uint16_t prefetch = (uint16_t)((MIN(len, (uint16_t)50) + 3) & ~3u);
++	memset(tb, 0, 28);
++	tb[0] = wce.htt_eid;                    /* HTC header: eid, flags 0, len = 20 + prefetch */
++	uint16_t hl = (uint16_t)(20 + prefetch);
++	memcpy(tb + 2, &hl, 2);
++	tb[8] = 1;                              /* HTT_H2T_MSG_TYPE_TX_FRM */
++	tb[9] = (uint8_t)(1u | (no_encrypt ? 4u : 0u) | ((mgmt ? 3u : 1u) << 5));   /* MAC_HDR_PRESENT, pkt type */
++	uint16_t f1 = (uint16_t)(0u | ((tid & 0x1f) << 6) | 0x800u);                /* vdev 0, ext tid, POSTPONED */
++	memcpy(tb + 10, &f1, 2);
++	memcpy(tb + 12, &len, 2);
++	uint16_t id16 = (uint16_t)id, peer = 0xffff;
++	memcpy(tb + 14, &id16, 2);
++	memcpy(tb + 16, &frags, 8);
++	memcpy(tb + 24, &peer, 2);              /* peerid invalid, freq 0 */
++	__asm__ volatile ("dsb sy" ::: "memory");
++	return sta_ce4_send2(txbuf_pa + 0, 28, frame_pa, prefetch);
++}
++
++static int
++sta_txid_alloc(void)
++{
++	for (unsigned k = 0; k < STA_NTX; k++) {
++		if (sta.txfree[k]) {
++			sta.txfree[k] = 0;
++			sta.tx_inflight++;
++			return (int)k;
++		}
++	}
++	return -1;
++}
++
++static void
++sta_txid_free(unsigned id)
++{
++	if (id < STA_NTX && !sta.txfree[id]) {
++		sta.txfree[id] = 1;
++		sta.tx_inflight--;
++	}
++}
++
++/* one Ethernet II frame out as native wifi; protected once the pairwise key is in */
++static int
++sta_tx_eth(const uint8_t *eth, size_t len, bool eapol)
++{
++	int id = sta_txid_alloc();
++	if (id < 0) {
++		sta.tx_drop++;
++		return ENOBUFS;
++	}
++	uint8_t *fr = (uint8_t *)(wce.pool + STA_TXFR_OFF + (uint64_t)id * 2048);
++	size_t n = swf_eth_to_nwifi(eth, len, sta.bssid, fr, 2048);
++	if (n == 0) {
++		sta_txid_free((unsigned)id);
++		sta.tx_drop++;
++		return EINVAL;
++	}
++	bool prot = sta.ptk_installed;
++	if (prot) {
++		fr[1] |= 0x40;                  /* Protected: the firmware encrypts with the pairwise key */
++	}
++	uint16_t sc = (uint16_t)(sta.seq++ << 4);
++	memcpy(fr + 22, &sc, 2);
++	if (!sta_htt_tx((unsigned)id, (uint16_t)n, false, !prot, 16)) {   /* ext tid 16: non-QoS */
++		sta_txid_free((unsigned)id);
++		sta.tx_drop++;
++		return ENOBUFS;
++	}
++	if (eapol) {
++		sta.eapol_msdu = id;
++		sta.tx_eapol++;
++	}
++	sta.tx_frames++;
++	sta.tx_bytes += len;
++	return 0;
++}
++
++/* ---- management frames ---- */
++static bool
++sta_mgmt_tx(const uint8_t *f, size_t len, const char *what)
++{
++	if (len > 1024 || sta.mgmt_busy) {
++		return false;
++	}
++	uint16_t sc = (uint16_t)(sta.seq++ << 4);
++	if (sta.svc_mgmt_wmi) {
++		unsigned slot = sta.mgmt_slot++ % STA_MGMT_N;
++		uint8_t *buf = (uint8_t *)(wce.pool + STA_MGMT_OFF + slot * 1024u);
++		memcpy(buf, f, len);
++		memcpy(buf + 22, &sc, 2);
++		__asm__ volatile ("dsb sy" ::: "memory");
++		uint64_t pa = WCE_POOL_PA + STA_MGMT_OFF + slot * 1024u;
++		uint32_t blen = (uint32_t)((MIN(len, (size_t)64) + 3) & ~3u);
++		uint32_t m[7] = { 0, slot, 0, (uint32_t)pa, (uint32_t)(pa >> 32), (uint32_t)len, blen };
++		uint8_t c[8 + 28 + 4 + 64];
++		uint32_t n = scan_cmd(c, 0x7008, 422, m, 28);
++		scan_tlv(c, &n, 17, buf, (uint16_t)blen);
++		if (!sta_wmi(c, n, what)) {
++			return false;
++		}
++	} else {
++		int id = sta_txid_alloc();
++		if (id < 0) {
++			return false;
++		}
++		uint8_t *fr = (uint8_t *)(wce.pool + STA_TXFR_OFF + (uint64_t)id * 2048);
++		memcpy(fr, f, len);
++		memcpy(fr + 22, &sc, 2);
++		if (!sta_htt_tx((unsigned)id, (uint16_t)len, true, true, 17)) {
++			sta_txid_free((unsigned)id);
++			return false;
++		}
++	}
++	sta.mgmt_busy = true;
++	sta.mgmt_status = -1;
++	printf("SWEET WLAN sta: %s sent (%zu bytes, %s)\n", what, len, sta.svc_mgmt_wmi ? "WMI by reference" : "HTT");
++	return true;
++}
++
++static void
++sta_send_auth(void)
++{
++	uint8_t f[64];
++	size_t n = swf_auth_req(f, sizeof(f), sta.bssid, scan_mac);
++	if (sta_mgmt_tx(f, n, "authentication")) {
++		sta.tries++;
++		sta.t_ms = ms_now_ms();
++	}
++}
++
++static void
++sta_send_assoc(void)
++{
++	struct sweet_wlan_bss *b = kalloc_data(sizeof(*b), Z_WAITOK | Z_ZERO);
++	uint8_t *f = kalloc_data(512, Z_WAITOK | Z_ZERO);
++	if (b && f && sweet_wlan_bss_get((unsigned)sta.bss, b) == 0) {
++		struct swf_assoc_params p;
++		memset(&p, 0, sizeof(p));
++		memcpy(p.bssid, sta.bssid, 6);
++		memcpy(p.sa, scan_mac, 6);
++		p.ap_cap = sta.ap_cap;
++		p.listen_interval = 1;
++		p.mhz = sta.mhz;
++		p.ap_ies = b->ie;
++		p.ap_ies_len = b->ie_len;
++		p.rsn_ie = sta.rsn ? sta.req.rsn_ie : NULL;
++		p.rsn_ie_len = sta.rsn ? sta.req.rsn_ie_len : 0;
++		p.ht = sta.ht;
++		size_t n = swf_assoc_req(f, 512, &p);
++		if (n == 0) {
++			kfree_data(b, sizeof(*b));
++			kfree_data(f, 512);
++			sta_fail(SWEET_WLAN_JOIN_UNSUPPORTED, "no common rates / no SSID element for the association request");
++			return;
++		}
++		if (sta_mgmt_tx(f, n, "association request")) {
++			sta.tries++;
++			sta.t_ms = ms_now_ms();
++		}
++	}
++	if (b) {
++		kfree_data(b, sizeof(*b));
++	}
++	if (f) {
++		kfree_data(f, 512);
++	}
++}
++
++/* ---- the 4-way handshake glue (sweet_wpa.c ops, service thread) ---- */
++static void
++sta_wpa_tx(void *arg __unused, const uint8_t *frame, size_t len)
++{
++	uint8_t eth[14 + 256];
++	if (len > 256) {
++		return;
++	}
++	memcpy(eth, sta.bssid, 6);
++	memcpy(eth + 6, scan_mac, 6);
++	eth[12] = 0x88;
++	eth[13] = 0x8e;
++	memcpy(eth + 14, frame, len);
++	(void)sta_tx_eth(eth, 14 + len, true);
++}
++
++static int
++sta_wpa_key(void *arg __unused, int pairwise, unsigned idx, uint32_t cipher, const uint8_t *key, size_t key_len,
++    const uint8_t rsc[8] __unused)
++{
++	if (cipher != SWEET_WPA_CIPHER_CCMP || key_len != 16) {
++		return ENOTSUP;
++	}
++	if (pairwise) {
++		memcpy(sta.ptk, key, 16);
++		sta.key_pending[0] = true;
++	} else {
++		memcpy(sta.gtk, key, 16);
++		sta.gtk_idx = idx;
++		sta.key_pending[1] = true;
++	}
++	return 0;
++}
++
++static void
++sta_wpa_done(void *arg __unused, int status)
++{
++	printf("SWEET WLAN sta: 4-way handshake %s (%d)\n", status ? "FAILED" : "done", status);
++	if (status) {
++		sta_fail(SWEET_WLAN_JOIN_EAPOL, "4-way handshake failed");
++	} else {
++		sta.keys_ms = ms_now_ms();
++		sta_set_state(ST_KEYS);
++	}
++}
++
++static void
++sta_random(uint8_t *buf, size_t len)
++{
++	read_random(buf, (u_int)len);
++}
++
++static const struct sweet_wpa_ops sta_wpa_ops = { sta_wpa_tx, sta_wpa_key, sta_wpa_done, sta_random };
++
++static void
++sta_install_key(bool pairwise)
++{
++	uint8_t c[8 + 92 + 4 + 16];
++	uint32_t k[23];
++	memset(k, 0, sizeof(k));
++	k[0] = 0;                               /* vdev */
++	memcpy(&k[1], sta.bssid, 6);            /* the AP for both keys */
++	k[3] = pairwise ? 0 : sta.gtk_idx;
++	k[4] = pairwise ? 0 : 1;                /* PAIRWISE / GROUP */
++	k[5] = 4;                               /* WMI_TLV_CIPHER_AES_CCM */
++	k[20] = 16;                             /* key_len; RSCs 0 as ath10k */
++	uint32_t n = scan_cmd(c, 0x5009, 96, k, 92);
++	scan_tlv(c, &n, 17, pairwise ? sta.ptk : sta.gtk, 16);
++	sta.sec_ind = false;
++	sta_wmi(c, n, pairwise ? "install pairwise key" : "install group key");
++	printf("SWEET WLAN sta: installing the %s key (CCMP%s)\n", pairwise ? "pairwise" : "group",
++	    pairwise ? "" : (sta.gtk_idx == 2 ? ", index 2" : ", index 1"));
++}
++
++/* ---- state machine ---- */
++static void
++sta_set_state(int s)
++{
++	if (s != sta.state) {
++		printf("SWEET WLAN sta: %s -> %s (%llu ms into the join)\n", st_name[sta.state], st_name[s],
++		    sta.join_ms ? ms_now_ms() - sta.join_ms : 0);
++	}
++	sta.state = s;
++	sta.t_ms = ms_now_ms();
++	sta.tries = 0;
++}
++
++/* tear down whatever was set up (ST_DOWN does it in steps); the result stays (a failed join reports it) */
++static void
++sta_teardown_start(uint16_t reason)
++{
++	bool was_connected = sta.connected;
++	sta.connected = false;
++	sta.ptk_installed = false;
++	sweet_wpa_stop(&sta.wpa);
++	bzero(sta.ptk, sizeof(sta.ptk));
++	bzero(sta.gtk, sizeof(sta.gtk));
++	bzero(sta.req.pmk, sizeof(sta.req.pmk));
++	sta.key_pending[0] = sta.key_pending[1] = false;
++	sta.eapol_hold_len = 0;
++	if (was_connected) {
++		sweet80211_link(0, reason, sta.by_ap);
++	}
++	sta.mgmt_busy = false;
++	if (!sta.by_ap && (sta.vdev_up || sta.state == ST_ASSOC || sta.state == ST_UP || sta.state == ST_4WAY ||
++	    sta.state == ST_KEYS || was_connected)) {
++		uint8_t f[32];
++		size_t n = swf_deauth(f, sizeof(f), sta.bssid, scan_mac, 3);   /* leaving */
++		(void)sta_mgmt_tx(f, n, "deauthentication");
++	}
++	sta.down_step = 0;
++	sta_set_state(ST_DOWN);
++}
++
++/* the service left the scan states (WLFW failure, modem down, service stopping): forget the station */
++static void
++sta_abort(const char *why)
++{
++	if (sta.state == ST_IDLE && !sta.req_pending && !sta.leave_pending) {
++		return;
++	}
++	printf("SWEET WLAN sta: abort in %s: %s\n", st_name[sta.state], why);
++	if (sta.connected) {
++		sta.connected = false;
++		sweet80211_link(0, 1, false);
++	}
++	lck_mtx_lock(&sta_lock);
++	sta.req_pending = sta.leave_pending = false;
++	if (sta.result == SWEET_WLAN_JOIN_RUNNING) {
++		sta.result = SWEET_WLAN_JOIN_FAILED;
++	}
++	lck_mtx_unlock(&sta_lock);
++	sweet_wpa_stop(&sta.wpa);
++	sta.ptk_installed = sta.vdev_up = sta.peer = sta.vdev_started = false;
++	sta.wq_n = 0;
++	sta.state = ST_IDLE;
++}
++
++static void
++sta_fail(int result, const char *why)
++{
++	printf("SWEET WLAN sta: join FAILED in %s: %s (result %d)\n", st_name[sta.state], why, result);
++	ipc_note(" sta FAIL %s/%d;", st_name[sta.state], result);
++	lck_mtx_lock(&sta_lock);
++	if (!sta.req_pending) {
++		sta.result = result;            /* not when a newer join is already waiting */
++	}
++	lck_mtx_unlock(&sta_lock);
++	sta_teardown_start(1);
++}
++
++/* pick the BSS: the requested BSSID, else the strongest with this SSID and the matching security */
++static bool
++sta_pick_bss(void)
++{
++	struct sweet_wlan_bss *b = kalloc_data(sizeof(*b), Z_WAITOK | Z_ZERO);
++	int best = -1, best_rssi = -1000;
++	static const uint8_t zero[6];
++	bool any = memcmp(sta.req.bssid, zero, 6) == 0;
++	if (!b) {
++		return false;
++	}
++	for (unsigned i = 0; sweet_wlan_bss_get(i, b) == 0; i++) {
++		if (b->ssid_len != sta.req.ssid_len || memcmp(b->ssid, sta.req.ssid, b->ssid_len) ||
++		    (!any && memcmp(b->bssid, sta.req.bssid, 6))) {
++			continue;
++		}
++		bool has_rsn = swf_ie_find(b->ie, b->ie_len, 48) != NULL;
++		if (has_rsn != (sta.req.rsn_ie_len != 0)) {
++			continue;
++		}
++		if (b->rssi > best_rssi) {
++			best = (int)i;
++			best_rssi = b->rssi;
++		}
++	}
++	if (best >= 0 && sweet_wlan_bss_get((unsigned)best, b) == 0) {
++		sta.bss = best;
++		memcpy(sta.bssid, b->bssid, 6);
++		sta.mhz = b->mhz;
++		sta.beacon_int = b->beacon_int;
++		sta.ap_cap = b->cap;
++		sta.rssi = b->rssi;
++		sta.rsn = sta.req.rsn_ie_len != 0;
++		sta.ht = swf_ie_find(b->ie, b->ie_len, 45) != NULL;
++		const uint8_t *tim = swf_ie_find(b->ie, b->ie_len, 5);
++		sta.dtim = tim && tim[1] >= 2 && tim[3] ? tim[3] : 1;
++		/* management rate: the lowest basic rate (ath10k_recalculate_mgmt_rate), hw code | preamble << 6 */
++		static const uint8_t rate_val[12] = { 2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108 };
++		static const uint8_t rate_hw[12] = { 0x43, 0x42, 0x41, 0x40, 0x03, 0x07, 0x02, 0x06, 0x01, 0x05, 0x00, 0x04 };
++		int lo = -1;
++		for (uint8_t id = 1; id != 0; id = id == 1 ? 50 : 0) {
++			const uint8_t *e = swf_ie_find(b->ie, b->ie_len, id);
++			for (unsigned k = 0; e && k < e[1]; k++) {
++				for (int r = 0; r < 12; r++) {
++					if ((e[2 + k] & 0x80) && (e[2 + k] & 0x7f) == rate_val[r] && (lo < 0 || rate_val[r] < rate_val[lo])) {
++						lo = r;
++					}
++				}
++			}
++		}
++		sta.mgmt_rate = lo >= 0 ? rate_hw[lo] : (sta.mhz > 4900 ? 0x03 : 0x43);
++		/* the AP's RSN element (byte-compared with message 3) and the group cipher */
++		const uint8_t *rsn = swf_ie_find(b->ie, b->ie_len, 48);
++		sweet_wpa_stop(&sta.wpa);
++		sta.group_cipher = 0;
++		if (sta.rsn && sta.req.rsn_ie_len >= 8) {
++			sta.group_cipher = ((uint32_t)sta.req.rsn_ie[4] << 24) | ((uint32_t)sta.req.rsn_ie[5] << 16) |
++			    ((uint32_t)sta.req.rsn_ie[6] << 8) | sta.req.rsn_ie[7];
++			sweet_wpa_start(&sta.wpa, &sta_wpa_ops, NULL, sta.req.pmk, sta.bssid, scan_mac, sta.req.rsn_ie,
++			    sta.req.rsn_ie_len, rsn, rsn ? (size_t)rsn[1] + 2 : 0, sta.group_cipher);
++		}
++		printf("SWEET WLAN sta: BSS %u %02x:%02x:%02x:%02x:%02x:%02x %u MHz %d dBm, beacon %u TU, dtim %u, cap %#x, %s%s, "
++		    "mgmt rate %#x\n", best, sta.bssid[0], sta.bssid[1], sta.bssid[2], sta.bssid[3], sta.bssid[4], sta.bssid[5],
++		    sta.mhz, sta.rssi, sta.beacon_int, sta.dtim, sta.ap_cap, sta.rsn ? "WPA2-PSK" : "open", sta.ht ? ", HT" : "",
++		    sta.mgmt_rate);
++	}
++	kfree_data(b, sizeof(*b));
++	return best >= 0;
++}
++
++static void
++sta_begin(void)
++{
++	lck_mtx_lock(&sta_lock);
++	sta.req = sta.pend;
++	bzero(sta.pend.pmk, sizeof(sta.pend.pmk));
++	sta.req_pending = false;
++	lck_mtx_unlock(&sta_lock);
++	sta.join_ms = ms_now_ms();
++	sta.vdev_started = sta.vdev_up = sta.peer = sta.peer_mapped = sta.connected = sta.ptk_installed = false;
++	sta.start_resp = sta.stopped = sta.sec_ind = sta.by_ap = false;
++	sta.key_pending[0] = sta.key_pending[1] = false;
++	sta.keys_step = 0;
++	sta.mgmt_busy = false;
++	sta.eapol_msdu = -1;
++	sta.eapol_hold_len = 0;
++	sta.aid = 0;
++	sta.svc_mgmt_wmi = wmi_svc_on(76);      /* WMI_TLV_SERVICE_MGMT_TX_WMI */
++	printf("SWEET WLAN sta: join \"%.*s\" (%s), management TX %s, rx reorder offload %s\n", sta.req.ssid_len,
++	    sta.req.ssid, sta.req.rsn_ie_len ? "WPA2-PSK" : "open", sta.svc_mgmt_wmi ? "WMI by reference" : "HTT",
++	    wmi_svc_on(65) ? "on" : "OFF");
++	if (sta.req.rsn_ie_len) {
++		uint32_t gc = 0;
++		uint8_t ie[64];
++		/* wifid built this element; the station supports CCMP pairwise + PSK, and a CCMP group key */
++		if (sweet_wpa_build_ie(sta.req.rsn_ie, sta.req.rsn_ie_len, ie, sizeof(ie), &gc) == 0 ||
++		    gc != SWEET_WPA_CIPHER_CCMP) {
++			sta.state = ST_IDLE;
++			sta.result = SWEET_WLAN_JOIN_UNSUPPORTED;
++			printf("SWEET WLAN sta: RSN element not CCMP/CCMP/PSK: refused\n");
++			return;
++		}
++	}
++	if (!sta_pick_bss()) {
++		sta.state = ST_IDLE;
++		sta.result = SWEET_WLAN_JOIN_NO_BSS;
++		printf("SWEET WLAN sta: no BSS with that SSID and security in the last scan\n");
++		return;
++	}
++	sta_set_state(ST_STOPSCAN);
++}
++
++static void
++sta_vdev_start(void)
++{
++	uint8_t c[128];
++	uint32_t v[18];
++	memset(v, 0, sizeof(v));                /* vdev 0; beacon interval / dtim 0 as ath10k on a fresh STA vdev */
++	uint32_t n = scan_cmd(c, 0x5003, 88, v, 72);
++	bool g5 = sta.mhz > 4900, dfs = sta.mhz >= 5260 && sta.mhz <= 5720;
++	bool ht = sta.ht;
++	uint32_t mode = g5 ? (ht ? 4u : 0u) : (ht ? 5u : 1u);   /* 11NA_HT20 / 11A, 11NG_HT20 / 11G */
++	uint32_t ch[6] = { sta.mhz, sta.mhz, 0, mode | (dfs ? (1u << 10) : 0), 0u | (40u << 8) | (40u << 16), 0u | (40u << 8) };
++	scan_tlv(c, &n, 80, ch, 24);
++	scan_tlv(c, &n, 18, NULL, 0);
++	sta.start_resp = false;
++	sta.vdev_started = true;                /* from here a teardown sends VDEV_STOP (even for a late response) */
++	sta_wmi(c, n, "vdev start");
++}
++
++/* PEER_ASSOC (ath10k_peer_assoc_prepare + gen_peer_assoc) from the association response */
++static void
++sta_peer_assoc(void)
++{
++	static const uint8_t ours[12] = { 2, 4, 11, 22, 12, 18, 24, 36, 48, 72, 96, 108 };
++	uint8_t legacy[12], htr[16];
++	unsigned nl = 0, nh = 0;
++	bool g5 = sta.mhz > 4900;
++	for (unsigned r = 0; r < 12; r++) {
++		if (g5 && r < 4) {
++			continue;
++		}
++		for (unsigned k = 0; k < sta.ar.nrates; k++) {
++			if ((sta.ar.rates[k] & 0x7f) == ours[r]) {
++				legacy[nl++] = (uint8_t)(ours[r] | (r < 4 ? 0x80 : 0));
++				break;
++			}
++		}
++	}
++	bool ht = sta.ht && sta.ar.ht;
++	uint32_t a[19];
++	memset(a, 0, sizeof(a));
++	memcpy(&a[0], sta.bssid, 6);
++	a[2] = 0;                               /* vdev */
++	a[3] = 1;                               /* new_assoc */
++	a[4] = sta.aid;
++	a[5] = 0x1 | (sta.ar.wmm ? 0x2 : 0) | (sta.rsn ? 0x4 : 0) | (ht ? 0x1000 : 0);
++	a[6] = sta.ar.cap;
++	a[7] = 1;                               /* listen interval (forced 1 for a STA) */
++	a[12] = 1;                              /* nss */
++	if (ht) {
++		uint16_t hc = (uint16_t)(sta.ar.ht_cap[0] | (sta.ar.ht_cap[1] << 8));
++		uint8_t ampdu = sta.ar.ht_cap[2];
++		static const uint8_t dens[8] = { 0, 1, 1, 1, 2, 4, 8, 16 };
++		a[8] = hc;
++		a[9] = (1u << (13 + (ampdu & 3))) - 1;
++		a[10] = dens[(ampdu >> 2) & 7];
++		a[11] = 0x08 | ((hc & 0x20) ? 0x04 : 0) | ((sta.ar.ht_cap[4] != 0) ? 0x01 : 0) | (((hc & 0x300) >> 8) << 6);
++		for (unsigned i = 0; i < 16; i++) {
++			if (sta.ar.ht_cap[3 + i / 8] & (1u << (i % 8))) {
++				htr[nh++] = (uint8_t)i;
++			}
++		}
++		if (nh == 0) {                  /* the firmware asserts on an HT peer without HT rates (mac.c) */
++			for (unsigned i = 0; i < 8; i++) {
++				htr[nh++] = (uint8_t)i;
++			}
++		}
++		a[12] = sta.ar.ht_cap[4] ? 2 : 1;
++		a[14] = g5 ? 4 : 5;             /* MODE_11NA_HT20 / MODE_11NG_HT20 */
++	} else {
++		a[14] = g5 ? 0 : (nl > 4 || (nl && !(legacy[0] & 0x80)) ? 1 : 2);   /* 11A / 11G / 11B */
++	}
++	a[17] = nl;
++	a[18] = nh;
++	uint8_t c[8 + 76 + 4 + 12 + 4 + 16 + 4 + 16];
++	uint32_t n = scan_cmd(c, 0x6005, 101, a, 76);
++	uint8_t pad[16];
++	memset(pad, 0, sizeof(pad));
++	memcpy(pad, legacy, nl);
++	scan_tlv(c, &n, 17, pad, (uint16_t)((nl + 3) & ~3u));
++	memset(pad, 0, sizeof(pad));
++	memcpy(pad, htr, nh);
++	scan_tlv(c, &n, 17, pad, (uint16_t)((nh + 3) & ~3u));
++	uint32_t vht[4] = { 0, 0, 0, 0 };
++	scan_tlv(c, &n, 102, vht, 16);
++	sta_wmi(c, n, "peer assoc");
++	printf("SWEET WLAN sta: peer assoc aid %u flags %#x caps %#x phy mode %u, %u legacy + %u HT rates, nss %u, rate caps %#x\n",
++	    sta.aid, a[5], a[6], a[14], nl, nh, a[12], a[11]);
++	if (ht) {
++		static const uint8_t smps[4] = { 1, 2, 0, 0 };   /* SM PS static / dynamic / invalid / disabled */
++		uint16_t hc = (uint16_t)(sta.ar.ht_cap[0] | (sta.ar.ht_cap[1] << 8));
++		sta_peer_param(1, smps[(hc >> 2) & 3], "peer smps");
++	}
++}
++
++static void
++sta_connected(void)
++{
++	sta.connected = true;
++	sta_set_state(ST_CONNECTED);
++	printf("SWEET WLAN sta: CONNECTED to %02x:%02x:%02x:%02x:%02x:%02x (aid %u, %s) in %llu ms\n", sta.bssid[0],
++	    sta.bssid[1], sta.bssid[2], sta.bssid[3], sta.bssid[4], sta.bssid[5], sta.aid, sta.rsn ? "WPA2-PSK" : "open",
++	    ms_now_ms() - sta.join_ms);
++	ipc_note(" sta CONNECTED %llu ms;", ms_now_ms() - sta.join_ms);
++	sweet80211_link(1, 0, false);           /* link state and events first: wifid reads them once GET 21 says 1 */
++	lck_mtx_lock(&sta_lock);
++	if (!sta.req_pending) {
++		sta.result = SWEET_WLAN_JOIN_OK;
++	}
++	lck_mtx_unlock(&sta_lock);
++}
++
++/* the service thread, every loop */
++static void
++sta_step(void)
++{
++	uint64_t now = ms_now_ms(), in = now - sta.t_ms;
++	if (sta.leave_pending) {
++		lck_mtx_lock(&sta_lock);
++		sta.leave_pending = false;
++		lck_mtx_unlock(&sta_lock);
++		if (sta.state != ST_IDLE && sta.state != ST_DOWN) {
++			printf("SWEET WLAN sta: leave requested in %s\n", st_name[sta.state]);
++			sta.by_ap = false;
++			sta_teardown_start(3);
++		}
++	}
++	/* wall clock: wifid gives a join 8 s (400 GET 21 polls) */
++	if (sta.state != ST_IDLE && sta.state != ST_DOWN && sta.state != ST_CONNECTED && now > sta.join_ms + 7500) {
++		sta_fail(sta.state == ST_4WAY || sta.state == ST_KEYS ? SWEET_WLAN_JOIN_SUPP_TIMEOUT : SWEET_WLAN_JOIN_TIMEOUT,
++		    "join watchdog (7.5 s)");
++	}
++	if (sta.req_pending && sta.state == ST_IDLE) {
++		sta_begin();
++	}
++	switch (sta.state) {
++	case ST_STOPSCAN:
++		if (wf.state == WS_SCAN_DONE) {
++			sta_vdev_start();
++			sta_set_state(ST_START);
++		} else if (wf.state == WS_SCANNING && sta.tries == 0) {
++			uint8_t c[32];
++			uint32_t s[4] = { 0xa001, 0xa000 | ((scan.count - 1) & 0xfff), 0, 0 };   /* req, scan id, STOP_ONE, vdev */
++			sta_wmi(c, scan_cmd(c, 0x3002, 78, s, 16), "stop scan");
++			sta.tries++;
++		} else if (wf.state != WS_SCANNING && wf.state != WS_SCAN_SETUP) {
++			sta_fail(SWEET_WLAN_JOIN_FAILED, "WLAN service not idle");
++		} else if (in > 3000) {
++			sta_fail(SWEET_WLAN_JOIN_TIMEOUT, "the running scan did not stop");
++		}
++		break;
++	case ST_START:
++		if (sta.start_resp) {
++			if (sta.start_status) {
++				sta_fail(SWEET_WLAN_JOIN_FAILED, "VDEV_START refused");
++				break;
++			}
++			uint8_t c[32];
++			uint32_t v[2] = { 0, 0 };
++			sta_wmi(c, scan_cmd(c, 0x9001, 108, v, 8), "power save off");
++			sta_vdev_param(0x03, sta.beacon_int, "beacon interval");
++			sta_vdev_param(0x19, sta.mgmt_rate, "management rate");
++			uint32_t p[4] = { 0, 0, 0, 0 };
++			memcpy(&p[1], sta.bssid, 6);
++			sta.peer_mapped = false;
++			sta_wmi(c, scan_cmd(c, 0x6001, 97, p, 16), "peer create");
++			sta.peer = true;
++			sta_set_state(ST_PEER);
++		} else if (in > 5000) {
++			sta_fail(SWEET_WLAN_JOIN_TIMEOUT, "no VDEV_START_RESP");
++		}
++		break;
++	case ST_PEER:
++		if (sta.peer_mapped) {
++			sta_set_state(ST_AUTH);
++			sta_send_auth();
++		} else if (in > 3000) {
++			sta_fail(SWEET_WLAN_JOIN_TIMEOUT, "no HTT PEER_MAP");
++		}
++		break;
++	case ST_AUTH:
++	case ST_ASSOC:
++		if (sta.tries == 0 && !sta.mgmt_busy) {
++			sta.state == ST_AUTH ? sta_send_auth() : sta_send_assoc();
++		} else if (in > 200 + 100 * (sta.svc_mgmt_wmi ? 0 : 1)) {
++			if (sta.tries >= 3) {
++				bool acked = sta.mgmt_status == 0;
++				sta_fail(sta.state == ST_AUTH ? (acked ? SWEET_WLAN_JOIN_AUTH_NO_RESP : SWEET_WLAN_JOIN_AUTH_NO_ACK) :
++				    (acked ? SWEET_WLAN_JOIN_ASSOC_NO_RESP : SWEET_WLAN_JOIN_ASSOC_NO_ACK), "no response from the AP");
++			} else {
++				sta.mgmt_busy = false;  /* a lost completion must not block the retry */
++				sta.state == ST_AUTH ? sta_send_auth() : sta_send_assoc();
++			}
++		}
++		break;
++	case ST_UP:
++		/* PEER_ASSOC, SMPS, VDEV_UP through (queue empty, credit back): only then data / EAPOL */
++		if (sta.wq_n == 0 && wce.wmi_credits) {
++			if (sta.rsn) {
++				sta_set_state(ST_4WAY);
++				if (sta.eapol_hold_len) {
++					uint16_t hl = sta.eapol_hold_len;
++					sta.eapol_hold_len = 0;
++					int e = sweet_wpa_rx(&sta.wpa, sta.eapol_hold, hl);
++					printf("SWEET WLAN sta: held EAPOL frame %u bytes -> %d\n", hl, e);
++				}
++			} else {
++				sta_connected();
++			}
++		} else if (in > 2000) {
++			sta_fail(SWEET_WLAN_JOIN_TIMEOUT, "PEER_ASSOC / VDEV_UP not through in 2 s");
++		}
++		break;
++	case ST_4WAY:
++		if (in > 6000) {
++			sta_fail(sta.wpa.rx ? SWEET_WLAN_JOIN_EAPOL : SWEET_WLAN_JOIN_SUPP_TIMEOUT, "4-way handshake timeout");
++		}
++		break;
++	case ST_KEYS:
++		/* message 4 out first (it goes unencrypted either way), then pairwise -> authorize -> group */
++		if (sta.keys_step == 0 && (sta.eapol_msdu < 0 || in > 200)) {
++			if (sta.key_pending[0]) {
++				sta_install_key(true);
++				sta.keys_step = 1;
++			} else {
++				sta_fail(SWEET_WLAN_JOIN_EAPOL, "no pairwise key");
++			}
++		} else if (sta.keys_step == 1 && sta.sec_ind) {
++			sta.ptk_installed = true;
++			sta.key_pending[0] = false;
++			sta_peer_param(3, 1, "peer authorize");
++			if (sta.key_pending[1]) {
++				sta_install_key(false);
++				sta.keys_step = 2;
++			} else {
++				sta_connected();
++			}
++		} else if (sta.keys_step == 2 && sta.sec_ind) {
++			sta.key_pending[1] = false;
++			sta_connected();
++		} else if (in > 3000 + 200) {
++			sta_fail(SWEET_WLAN_JOIN_EAPOL, "no HTT SEC_IND for a key");
++		}
++		break;
++	case ST_CONNECTED:
++		if (sta.key_pending[1] && sta.keys_step != 3) {
++			sta_install_key(false);         /* group rekey */
++			sta.keys_step = 3;
++		} else if (sta.keys_step == 3 && sta.sec_ind) {
++			sta.key_pending[1] = false;
++			sta.keys_step = 2;
++			printf("SWEET WLAN sta: group key %u installed (rekey %u)\n", sta.gtk_idx, sta.wpa.rekeys);
++		}
++		break;
++	case ST_DOWN: {
++		uint8_t c[32];
++		uint32_t v[3] = { 0, 0, 0 };
++		if (sta.down_step == 0 && (!sta.mgmt_busy || in > 300)) {
++			/* the deauthentication out (or given up), then VDEV_DOWN and PEER_DELETE */
++			if (sta.vdev_up) {
++				sta_wmi(c, scan_cmd(c, 0x5007, 94, v, 4), "vdev down");
++				sta.vdev_up = false;
++			}
++			sta.had_peer = sta.peer;
++			if (sta.peer) {
++				memcpy(&v[1], sta.bssid, 6);
++				sta.peer_mapped = true;         /* PEER_UNMAP clears it */
++				sta_wmi(c, scan_cmd(c, 0x6002, 98, v, 12), "peer delete");
++				sta.peer = false;
++			}
++			sta.down_step = 1;
++			sta.t_ms = now;
++		} else if (sta.down_step == 1 && ((sta.wq_n == 0 && (!sta.had_peer || !sta.peer_mapped)) || in > 1000)) {
++			if (sta.vdev_started) {
++				sta.stopped = false;
++				v[1] = v[2] = 0;
++				sta_wmi(c, scan_cmd(c, 0x5006, 93, v, 4), "vdev stop");
++			}
++			sta.down_step = 2;
++			sta.t_ms = now;
++		} else if (sta.down_step == 2 && ((sta.wq_n == 0 && (sta.stopped || !sta.vdev_started)) || in > 2000)) {
++			if (sta.vdev_started && !sta.stopped) {
++				printf("SWEET WLAN sta: no VDEV_STOPPED in 2 s (%u WMI commands still queued: dropped)\n", sta.wq_n);
++			}
++			sta.wq_n = 0;
++			sta.vdev_started = false;
++			sta.peer_mapped = false;
++			sta.mgmt_busy = false;
++			/* everything sent before the stop is gone with the vdev: every msdu id free again */
++			memset(sta.txfree, 1, sizeof(sta.txfree));
++			sta.tx_inflight = 0;
++			sta.eapol_msdu = -1;
++			sta_set_state(ST_IDLE);
++			lck_mtx_lock(&sta_lock);
++			if (sta.result == SWEET_WLAN_JOIN_RUNNING && !sta.req_pending) {
++				sta.result = SWEET_WLAN_JOIN_FAILED;
++			}
++			lck_mtx_unlock(&sta_lock);
++		}
++		break;
++	}
++	default:
++		break;
++	}
++	sta_wmi_pump();
++	/* the frames en0 queued */
++	while (sta.state == ST_CONNECTED && sta.txq_n) {
++		lck_mtx_lock(&sta_lock);
++		unsigned k = sta.txq_head;
++		uint16_t l = sta.txq_len[k];
++		lck_mtx_unlock(&sta_lock);
++		if (sta_tx_eth(sta.txq + (size_t)k * STA_TXQ_MAX, l, false) == ENOBUFS && sta.tx_inflight) {
++			sta.tx_drop--;
++			break;                  /* ring or ids full: retry on the next loop */
++		}
++		lck_mtx_lock(&sta_lock);
++		sta.txq_head = (sta.txq_head + 1) % STA_TXQ;
++		sta.txq_n--;
++		lck_mtx_unlock(&sta_lock);
++	}
++	if (sta.state != ST_CONNECTED && sta.txq_n) {
++		lck_mtx_lock(&sta_lock);
++		sta.tx_drop += sta.txq_n;
++		sta.txq_n = 0;
++		lck_mtx_unlock(&sta_lock);
++	}
++	if (sta.state == ST_CONNECTED && now > sta.last_status_ms + 30000) {
++		sta.last_status_ms = now;
++		printf("SWEET WLAN sta: up %llu s: tx %llu frames %llu bytes (%llu failed, %llu dropped, %u in flight), rx %llu "
++		    "frames %llu bytes (%llu dropped, %llu indications), eapol %llu/%llu, rssi %d, rekeys %u, kickouts %u, bmiss %u\n",
++		    (now - sta.join_ms) / 1000, sta.tx_frames, sta.tx_bytes, sta.tx_fail, sta.tx_drop, sta.tx_inflight,
++		    sta.rx_frames, sta.rx_bytes, sta.rx_drop, sta.rx_ind, sta.rx_eapol, sta.tx_eapol, sta.rssi, sta.wpa.rekeys,
++		    sta.kickouts, sta.bmiss);
++	}
++}
++
++/* ---- events from the firmware ---- */
++static void
++sta_mgmt_rx(const uint8_t *t, uint32_t len)
++{
++	const uint8_t *h = NULL, *fr = NULL;
++	uint32_t frl = 0;
++	if (sta.state == ST_IDLE) {
++		return;
++	}
++	for (uint32_t o = 0; o + 4 <= len;) {
++		uint16_t l, tag;
++		memcpy(&l, t + o, 2);
++		memcpy(&tag, t + o + 2, 2);
++		if (o + 4 + l > len) {
++			break;
++		}
++		if (tag == 44 && l >= 40) {
++			h = t + o + 4;
++		} else if (tag == 17) {
++			fr = t + o + 4;
++			frl = l;
++		}
++		o += 4u + l;
++	}
++	if (!h || !fr) {
++		return;
++	}
++	uint32_t hd[6];
++	memcpy(hd, h, 24);
++	frl = MIN(frl, hd[4]);
++	if (hd[5] & 0x29) {
++		return;
++	}
++	uint16_t st = 0;
++	if (sta.state == ST_AUTH && swf_auth_resp(fr, frl, sta.bssid, scan_mac, &st) == 0) {
++		printf("SWEET WLAN sta: authentication response status %u\n", st);
++		if (st) {
++			sta_fail(SWEET_WLAN_JOIN_FAILED, "authentication refused");
++		} else {
++			sta.mgmt_busy = false;
++			sta_set_state(ST_ASSOC);
++			sta_send_assoc();
++		}
++	} else if (sta.state == ST_ASSOC && swf_assoc_resp(fr, frl, sta.bssid, scan_mac, &sta.ar) == 0) {
++		printf("SWEET WLAN sta: association response status %u aid %u cap %#x, %u rates, HT %s, WMM %s\n", sta.ar.status,
++		    sta.ar.aid, sta.ar.cap, sta.ar.nrates, sta.ar.ht ? "yes" : "no", sta.ar.wmm ? "yes" : "no");
++		if (sta.ar.status) {
++			sta_fail(SWEET_WLAN_JOIN_FAILED, "association refused");
++			return;
++		}
++		sta.mgmt_busy = false;
++		sta.aid = sta.ar.aid;
++		sta_vdev_param(0x0d, sta.dtim, "dtim period");
++		sta_peer_assoc();
++		uint8_t c[32];
++		uint32_t u[4] = { 0, sta.aid, 0, 0 };
++		memcpy(&u[2], sta.bssid, 6);
++		sta_wmi(c, scan_cmd(c, 0x5005, 92, u, 16), "vdev up");
++		sta.vdev_up = true;
++		if (sta.aid == 0 || sta.aid > 2007) {
++			printf("SWEET WLAN sta: the AP gave aid %u (out of 1..2007)\n", sta.aid);
++		}
++		sta_set_state(ST_UP);
++	} else if (swf_kicked(fr, frl, sta.bssid, scan_mac, &st) == 0) {
++		sta.deauths++;
++		printf("SWEET WLAN sta: %s from the AP, reason %u, in %s\n", fr[0] == SWF_FC_DEAUTH ? "deauthentication" :
++		    "disassociation", st, st_name[sta.state]);
++		sta.by_ap = true;
++		if (sta.state == ST_CONNECTED) {
++			sta_teardown_start(st);
++		} else if (sta.state != ST_DOWN) {
++			sta_fail(sta.state == ST_4WAY ? SWEET_WLAN_JOIN_EAPOL : SWEET_WLAN_JOIN_FAILED, "kicked by the AP");
++		}
++	}
++}
++
++/* WMI events of the station; true = consumed */
++static bool
++sta_wmi_event(uint32_t ev, const uint8_t *t, uint32_t len)
++{
++	uint32_t v[5];
++	memset(v, 0, sizeof(v));
++	if (len >= 4) {
++		memcpy(v, t + 4, MIN(len - 4, (uint32_t)sizeof(v)));
++	}
++	switch (ev) {
++	case 0x5001:                            /* VDEV_START_RESP {vdev, req, type, status} */
++		sta.start_status = v[3];
++		sta.start_resp = true;
++		printf("SWEET WLAN sta: VDEV_START_RESP status %u\n", v[3]);
++		return true;
++	case 0x5002:                            /* VDEV_STOPPED */
++		sta.stopped = true;
++		return true;
++	case 0x5003:                            /* INSTALL_KEY_COMPLETE (ath10k only logs it; SEC_IND is the signal) */
++		printf("SWEET WLAN sta: WMI install key complete\n");
++		return true;
++	case 0x7006: {                          /* MGMT_TX_COMPLETION {desc, status, pdev, ppdu, ack rssi} */
++		sta.mgmt_status = (int)v[1];
++		sta.mgmt_busy = false;
++		printf("SWEET WLAN sta: management TX done: %s (status %u)\n", v[1] ? "NOT acked" : "acked", v[1]);
++		return true;
++	}
++	case 0x7007: {                          /* MGMT_TX_BUNDLE_COMPLETION: TLV {num}, then desc_ids[], status[], ... */
++		uint32_t o = 8, nrep = v[0];
++		uint16_t l;
++		if (o + 4 <= len) {
++			memcpy(&l, t + o, 2);           /* skip the desc id array */
++			o += 4u + l;
++			if (nrep && o + 8 <= len) {
++				uint32_t st;
++				memcpy(&st, t + o + 4, 4);   /* status[0] */
++				sta.mgmt_status = (int)st;
++			}
++		}
++		sta.mgmt_busy = false;
++		printf("SWEET WLAN sta: management TX done (bundle of %u): status %d\n", nrep, sta.mgmt_status);
++		return true;
++	}
++	case 0x6001:                            /* PEER_STA_KICKOUT: the firmware lost the AP */
++		sta.kickouts++;
++		printf("SWEET WLAN sta: firmware kickout of the AP in %s\n", st_name[sta.state]);
++		if (sta.state == ST_CONNECTED) {
++			sta.by_ap = true;
++			sta_teardown_start(4);  /* inactivity */
++		}
++		return true;
++	case 0xb001:                            /* ROAM {vdev, reason, rssi} */
++		sta.bmiss++;
++		printf("SWEET WLAN sta: roam event reason %u rssi %d\n", v[1], (int)v[2]);
++		return true;
++	case 0x4005:                            /* TX_PAUSE */
++	case 0x6006:                            /* PEER_ASSOC_CONF */
++		printf("SWEET WLAN sta: event %#x (%u bytes)\n", ev, len);
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* RX ring: post the buffer at pa again (ath10k __ath10k_htt_rx_ring_fill_n) */
++static void
++sta_rx_repost(uint64_t pa)
++{
++	uint64_t *ring = (uint64_t *)(wce.pool + HTT_RXRING_OFF);
++	*(volatile uint32_t *)(wce.pool + (pa - WCE_POOL_PA) + 4) = 0;  /* rx_attention */
++	ring[sta.rx_idx] = pa;
++	sta.rx_idx = (sta.rx_idx + 1) & (HTT_RX_RING_SIZE - 1);
++}
++
++static void
++sta_rx_frame(const uint8_t *buf, uint16_t mlen)
++{
++	uint8_t eth[1600];
++	uint32_t att, mpdu0;
++	memcpy(&att, buf + 4, 4);
++	memcpy(&mpdu0, buf + 16, 4);
++	if (!(att & (1u << 31)) || (att & ((1u << 30) | (1u << 29) | (1u << 3) | (1u << 27) | (1u << 17) | (1u << 16))) ||
++	    mlen > HTT_RX_BUF_SIZE - STA_RXDESC) {
++		sta.rx_drop++;
++		return;
++	}
++	if ((att & 1) && buf[108 + 16]) {       /* first MPDU of the PPDU: rx_ppdu_start.rssi_comb over the noise floor */
++		sta.rssi = (int8_t)((int)buf[108 + 16] - 95);
++	}
++	size_t n = swf_nwifi_to_eth(buf + STA_RXDESC, mlen, eth, sizeof(eth));
++	if (n < 14) {
++		sta.rx_drop++;
++		return;
++	}
++	if (memcmp(eth + 6, scan_mac, 6) == 0) {
++		sta.rx_drop++;                  /* our own broadcast / multicast reflected by the AP */
++		return;
++	}
++	if (eth[12] == 0x88 && eth[13] == 0x8e) {
++		sta.rx_eapol++;
++		if (sta.state == ST_UP || sta.state == ST_ASSOC) {
++			/* message 1 before PEER_ASSOC / VDEV_UP are through: keep it for ST_UP's exit */
++			if (n - 14 <= sizeof(sta.eapol_hold)) {
++				memcpy(sta.eapol_hold, eth + 14, n - 14);
++				sta.eapol_hold_len = (uint16_t)(n - 14);
++			}
++			return;
++		}
++		bool enc = (mpdu0 >> 28) != 7;
++		int e = sweet_wpa_rx(&sta.wpa, eth + 14, n - 14);
++		printf("SWEET WLAN sta: EAPOL frame %zu bytes (%s) -> %d, supplicant %u\n", n - 14, enc ? "encrypted" : "clear",
++		    e, sta.wpa.state);
++		return;
++	}
++	if (sta.state != ST_CONNECTED) {
++		sta.rx_drop++;
++		return;
++	}
++	sta.rx_frames++;
++	sta.rx_bytes += n;
++	sweet80211_input(eth, n);
++}
++
++/* HTT T2H messages of the station; true = consumed */
++static bool
++sta_htt(const uint8_t *pl, uint32_t plen)
++{
++	if (plen < 4) {
++		return false;
++	}
++	switch (pl[0]) {
++	case 0x03:                              /* PEER_MAP: vdev, peer id, MAC */
++		if (plen >= 10 && memcmp(pl + 4, sta.bssid, 6) == 0) {
++			memcpy(&sta.peer_id, pl + 2, 2);
++			sta.peer_mapped = true;
++			printf("SWEET WLAN sta: peer mapped: id %u vdev %u\n", sta.peer_id, pl[1]);
++		}
++		return true;
++	case 0x04:                              /* PEER_UNMAP: peer id */
++		if (sta.state == ST_DOWN && plen >= 4 && (uint16_t)(pl[2] | (pl[3] << 8)) == sta.peer_id) {
++			sta.peer_mapped = false;
++		}
++		return true;
++	case 0x0b:                              /* SEC_IND: a key is in */
++		sta.sec_ind = true;
++		printf("SWEET WLAN sta: SEC_IND type %u %s peer %u\n", pl[1] & 0x7f, (pl[1] & 0x80) ? "unicast" : "group",
++		    pl[2] | (pl[3] << 8));
++		return true;
++	case 0x07: {                            /* TX_COMPL_IND: status, count, flags2, msdu ids */
++		unsigned st = pl[1] & 7, num = pl[2];
++		for (unsigned k = 0; k < num && 4 + 2 * k + 2 <= plen; k++) {
++			uint16_t id;
++			memcpy(&id, pl + 4 + 2 * k, 2);
++			if (id == 0xffff) {
++				continue;
++			}
++			if (st != 0) {
++				sta.tx_fail++;
++			}
++			if ((int)id == sta.eapol_msdu) {
++				sta.eapol_msdu = -1;
++			}
++			if (sta.mgmt_busy && !sta.svc_mgmt_wmi) {
++				sta.mgmt_busy = false;
++				sta.mgmt_status = (int)st;
++			}
++			sta_txid_free(id);
++		}
++		return true;
++	}
++	case 0x0e:                              /* MGMT_TX_COMPL_IND (HTT management path) */
++		if (plen >= 12) {
++			uint32_t id, st;
++			memcpy(&id, pl + 4, 4);
++			memcpy(&st, pl + 8, 4);
++			sta.mgmt_busy = false;
++			sta.mgmt_status = (int)st;
++			sta_txid_free(id);
++			printf("SWEET WLAN sta: management TX (HTT) done: status %u\n", st);
++		}
++		return true;
++	case 0x12: {                            /* RX_IN_ORD_PADDR_IND: info, peer, vdev, rsvd, count, 12-byte descs */
++		uint16_t cnt;
++		memcpy(&cnt, pl + 6, 2);
++		sta.rx_ind++;
++		if (8u + 12u * cnt > plen) {
++			printf("SWEET WLAN sta: short in-order indication (%u msdus, %u bytes)\n", cnt, plen);
++			return true;
++		}
++		if (pl[1] & 0x20) {
++			printf("SWEET WLAN sta: offloaded in-order indication not handled (%u msdus)\n", cnt);
++		}
++		for (unsigned k = 0; k < cnt; k++) {
++			uint64_t pa;
++			uint16_t ml;
++			memcpy(&pa, pl + 8 + 12 * k, 8);
++			memcpy(&ml, pl + 8 + 12 * k + 8, 2);
++			pa &= 0x7ffffffffull;
++			if (pa < WCE_POOL_PA + HTT_RXBUF_OFF || pa >= WCE_POOL_PA + WCE_POOL_LEN ||
++			    ((pa - WCE_POOL_PA - HTT_RXBUF_OFF) % HTT_RX_BUF_SIZE) != 0) {
++				printf("SWEET WLAN sta: in-order indication with an unknown buffer %#llx: RX stops\n", pa);
++				return true;
++			}
++			const uint8_t *buf = (const uint8_t *)(wce.pool + (pa - WCE_POOL_PA));
++			if (!(pl[1] & 0x20)) {
++				sta_rx_frame(buf, ml);
++			}
++			sta_rx_repost(pa);
++		}
++		__asm__ volatile ("dsb sy" ::: "memory");
++		*(volatile uint32_t *)(wce.pool + HTT_ALLOC_IDX_OFF) = sta.rx_idx;
++		return true;
++	}
++	default:
++		return false;
++	}
++}
++
++/* ---- the interface sweet_80211.c calls (ioctl and if_output context) ---- */
++int
++sweet_wlan_join(const struct sweet_wlan_join *j)
++{
++	if (j->ssid_len == 0 || j->ssid_len > 32 || j->rsn_ie_len > sizeof(j->rsn_ie)) {
++		return EINVAL;
++	}
++	int err = ENXIO;
++	lck_mtx_lock(&scan_lock);
++	bool up = wl.service && ipc.scan && wce.rings && !mw.fatal && scan.vdev && (wf.state == WS_SCAN_DONE ||
++	    wf.state == WS_SCANNING || wf.state == WS_SCAN_SETUP);
++	lck_mtx_unlock(&scan_lock);
++	uint8_t *q = NULL;
++	if (up && !sta.txq) {
++		q = kalloc_data(STA_TXQ * STA_TXQ_MAX, Z_WAITOK | Z_ZERO);
++	}
++	if (up) {
++		lck_mtx_lock(&sta_lock);
++		if (!sta.txq) {
++			sta.txq = q;
++			q = NULL;
++		}
++		sta.pend = *j;
++		sta.result = SWEET_WLAN_JOIN_RUNNING;
++		if (sta.state != ST_IDLE) {
++			sta.leave_pending = true;       /* a join replaces the current association; it starts once idle */
++		}
++		sta.req_pending = true;
++		lck_mtx_unlock(&sta_lock);
++		thread_wakeup(&wl.sleep_chan);
++		err = 0;
++	}
++	if (q) {
++		kfree_data(q, STA_TXQ * STA_TXQ_MAX);
++	}
++	return err;
++}
++
++int
++sweet_wlan_join_result(void)
++{
++	return sta.result;
++}
++
++/* DISASSOCIATE: cancels a join not started yet, tears down the current one */
++int
++sweet_wlan_leave(void)
++{
++	lck_mtx_lock(&sta_lock);
++	if (sta.req_pending) {
++		sta.req_pending = false;
++		bzero(sta.pend.pmk, sizeof(sta.pend.pmk));
++		if (sta.result == SWEET_WLAN_JOIN_RUNNING) {
++			sta.result = SWEET_WLAN_JOIN_FAILED;
++		}
++	}
++	if (sta.state != ST_IDLE) {
++		sta.leave_pending = true;
++		if (sta.result == SWEET_WLAN_JOIN_RUNNING) {
++			sta.result = SWEET_WLAN_JOIN_FAILED;
++		}
++	}
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup(&wl.sleep_chan);
++	return 0;
++}
++
++int
++sweet_wlan_link_get(struct sweet_wlan_link *out)
++{
++	if (!sta.connected) {
++		return ENXIO;
++	}
++	memset(out, 0, sizeof(*out));
++	memcpy(out->bssid, sta.bssid, 6);
++	out->ssid_len = sta.req.ssid_len;
++	memcpy(out->ssid, sta.req.ssid, sta.req.ssid_len);
++	out->mhz = sta.mhz;
++	out->rssi = sta.rssi;
++	out->noise = -95;
++	out->aid = sta.aid;
++	out->ht = sta.ht && sta.ar.ht;
++	out->rate = out->ht ? (sta.ar.ht_cap[4] ? 144 : 72) : 54;
++	out->rsn = sta.rsn;
++	return sta.connected ? 0 : ENXIO;
++}
++
++int
++sweet_wlan_current_bss(struct sweet_wlan_bss *out)
++{
++	if (!sta.connected) {
++		return ENXIO;
++	}
++	int err = sweet_wlan_bss_get((unsigned)sta.bss, out);
++	if (err == 0 && memcmp(out->bssid, sta.bssid, 6)) {
++		err = ENXIO;                    /* the cache was refreshed since the join */
++	}
++	if (err == 0) {
++		out->rssi = sta.rssi;
++	}
++	return err;
++}
++
++int
++sweet_wlan_output(const uint8_t *eth, size_t len)
++{
++	int err = 0;
++	if (len < 14 || len > STA_TXQ_MAX) {
++		return EINVAL;
++	}
++	lck_mtx_lock(&sta_lock);
++	if (!sta.connected || !sta.txq) {
++		err = ENXIO;
++	} else if (sta.txq_n >= STA_TXQ) {
++		err = ENOBUFS;
++		sta.tx_drop++;
++	} else {
++		unsigned k = (sta.txq_head + sta.txq_n) % STA_TXQ;
++		memcpy(sta.txq + (size_t)k * STA_TXQ_MAX, eth, len);
++		sta.txq_len[k] = (uint16_t)len;
++		sta.txq_n++;
++	}
++	lck_mtx_unlock(&sta_lock);
++	if (err == 0) {
++		thread_wakeup(&wl.sleep_chan);
++	}
++	return err;
++}
++
++/* at WMI READY: every msdu id free, the RX ring index where scan_htt_setup left it */
++static void
++sta_init(void)
++{
++	memset(sta.txfree, 1, sizeof(sta.txfree));
++	sta.tx_inflight = 0;
++	sta.rx_idx = HTT_RX_RING_SIZE - 1;
++	sta.state = ST_IDLE;
++	sta.eapol_msdu = -1;
++}
++
++/*
+  * ---- WL2: scans on request from sweet_80211 (sweet80211=3) and the BSS cache of the last scan. Only the
+  * service thread touches the chip; a request sets a flag the service picks up when the previous scan is done.
+  */
+@@ -5574,8 +6961,9 @@
+ {
+ 	int err = ENXIO;
+ 	lck_mtx_lock(&scan_lock);
+-	if (wl.service && ipc.scan && wce.rings && !mw.fatal && (wf.state == WS_SCAN_DONE ||
+-	    wf.state == WS_SCAN_SETUP || wf.state == WS_SCANNING)) {
++	/* while a join runs or the station is associated the cached list answers (sweet_80211's 300 ms path) */
++	if (wl.service && ipc.scan && wce.rings && !mw.fatal && sta.state == ST_IDLE && !sta.req_pending &&
++	    (wf.state == WS_SCAN_DONE || wf.state == WS_SCAN_SETUP || wf.state == WS_SCANNING)) {
+ 		scan_notify = true;
+ 		if (wf.state == WS_SCAN_DONE) {
+ 			scan_req = true;        /* a new scan; a running one just reports when it ends */
+@@ -5628,7 +7016,8 @@
+ static void
+ svc_scan(void)
+ {
+-	if (!scan_req || wf.state != WS_SCAN_DONE || !wce.wmi_credits) {
++	if (!scan_req || wf.state != WS_SCAN_DONE || !wce.wmi_credits || sta.state != ST_IDLE || sta.req_pending) {
++		scan_req = scan_req && sta.state == ST_IDLE;
+ 		return;
+ 	}
+ 	lck_mtx_lock(&scan_lock);
+@@ -5670,7 +7059,9 @@
+ 	}
+ 	bool settled = wf.state == WS_SCAN_DONE || wf.state == WS_FAILED || wf.state == WS_OFF ||
+ 	    (wf.state == WS_WMI_READY && !ipc.scan) || (wf.state == WS_READY && !ipc.ce);
+-	if (moved || tftp_active || wf.pending || !settled || ipc.txq_n) {
++	bool joining = sta.state != ST_IDLE && sta.state != ST_CONNECTED;
++	if (moved || tftp_active || wf.pending || !settled || ipc.txq_n || joining || sta.req_pending || sta.txq_n ||
++	    sta.wq_n) {
+ 		svc.last_busy_ms = ms_now_ms();
+ 	}
+ 	return ms_now_ms() < svc.last_busy_ms + 200;
+@@ -5774,11 +7165,16 @@
+ 		}
+ 		svc_tick(t0);
+ 		svc_scan();
++		if (wf.state == WS_SCAN_DONE || wf.state == WS_SCANNING || wf.state == WS_SCAN_SETUP) {
++			sta_step();
++		} else {
++			sta_abort(wf_state_name[wf.state]);
++		}
+ 		if (svc_busy()) {
+ 			svc.busy_loops++;
+ 			wl_sleep(1);
+ 		} else {
+-			wl_sleep(SVC_IDLE_MS);
++			wl_sleep(sta.state == ST_CONNECTED ? 5 : SVC_IDLE_MS);   /* en0 output wakes the thread at once */
+ 		}
+ 	}
+ 	printf("SWEET IPC: %u s: glink %s, IPCRTR %s, qrtr hello %s; %u packets in, %u out; rmtfs %u reads (%llu bytes), "
+@@ -5796,6 +7192,7 @@
+ 		    wce.mac[4], wce.mac[5]);
+ 	}
+ 	scan_summary();
++	sta_abort(alive ? "service stopping" : "modem down");
+ 	scan_flush_notify(alive ? "service stopping" : "modem down");
+ 	if (alive) {
+ 		wf_shutdown();
+diff --git a/bsd/dev/sweet_80211.c b/bsd/dev/sweet_80211.c
+--- a/bsd/dev/sweet_80211.c
++++ b/bsd/dev/sweet_80211.c
+@@ -89,8 +89,11 @@
+ #define IOC_RSSI                16
+ #define IOC_NOISE               17
+ #define IOC_POWER               19
++#define IOC_AUTH_TYPE           2
+ #define IOC_ASSOCIATE           20
++#define IOC_ASSOCIATE_RESULT    21
+ #define IOC_DISASSOCIATE        22
++#define IOC_CURRENT_NETWORK     103
+ #define IOC_SUPPORTED_CHANNELS  27
+ #define IOC_LOCALE              28
+ #define IOC_DRIVER_VERSION      43
+@@ -102,7 +105,13 @@
+ 
+ /* APPLE80211_M_* event codes */
+ #define M_POWER_CHANGED         1
++#define M_SSID_CHANGED          2
++#define M_BSSID_CHANGED         3
++#define M_LINK_CHANGED          4
++#define M_ASSOC_DONE            9
+ #define M_SCAN_DONE             10
++#define M_RSN_HANDSHAKE_DONE    20
++#define M_DEAUTH_RECEIVED       34
+ #define KEV_APPLE80211_EVENT_SUBCLASS   1
+ 
+ /* channel flags and modes (apple80211_var.h) */
+@@ -132,6 +141,9 @@
+ 	volatile SInt32 logged;         /* log lines used (budget 512) */
+ 	uint8_t         seen_get[IOC_MAX / 8];
+ 	uint8_t         seen_set[IOC_MAX / 8];
++	volatile int    link;           /* sweet80211=3: associated (sweet80211_link) */
++	uint32_t        auth_upper;     /* of the last ASSOCIATE */
++	uint64_t        tx_frames, tx_drops, rx_frames, rx_drops;
+ } s8;
+ 
+ static void
+@@ -304,20 +316,10 @@
+ 	return err;
+ }
+ 
+-/* sweet80211=3: network s8.scan_next of the WLAN service's last scan, in the same layout as the fake one */
+-static int
+-s8_real_result(struct sweet80211_req *req)
++/* one BSS of the WLAN service's cache in the scan-result layout (SCAN_RESULT, CURRENT_NETWORK) */
++static void
++s8_fill_result(const struct sweet_wlan_bss *b, struct s8_scan_result *r)
+ {
+-	struct sweet_wlan_bss *b = kalloc_data(sizeof(*b), Z_WAITOK | Z_ZERO);
+-	struct s8_scan_result *r = kalloc_data(sizeof(struct s8_scan_result), Z_WAITOK | Z_ZERO);
+-	int err = ENOMEM;
+-	if (b == NULL || r == NULL) {
+-		goto out;
+-	}
+-	if (sweet_wlan_bss_get(s8.scan_next, b) != 0) {
+-		err = EIO;                              /* no more results: the framework stops here */
+-		goto out;
+-	}
+ 	bool g5 = b->mhz > 4900;
+ 	r->version = 1;
+ 	r->ch_version = 1;
+@@ -349,7 +351,31 @@
+ 	}
+ 	r->ie_len = MIN(b->ie_len, (uint16_t)sizeof(r->ie));
+ 	memcpy(r->ie, b->ie, r->ie_len);
+-	s8.scan_next++;
++}
++
++/* sweet80211=3: network s8.scan_next of the WLAN service's last scan, or the current one (CURRENT_NETWORK) */
++static int
++s8_real_result(struct sweet80211_req *req, bool current)
++{
++	struct sweet_wlan_bss *b = kalloc_data(sizeof(*b), Z_WAITOK | Z_ZERO);
++	struct s8_scan_result *r = kalloc_data(sizeof(struct s8_scan_result), Z_WAITOK | Z_ZERO);
++	int err = ENOMEM;
++	if (b == NULL || r == NULL) {
++		goto out;
++	}
++	if (current) {
++		if (sweet_wlan_current_bss(b) != 0) {
++			err = ENXIO;                    /* not associated */
++			goto out;
++		}
++	} else if (sweet_wlan_bss_get(s8.scan_next, b) != 0) {
++		err = EIO;                              /* no more results: the framework stops here */
++		goto out;
++	}
++	s8_fill_result(b, r);
++	if (!current) {
++		s8.scan_next++;
++	}
+ 	err = s8_reply(req, r, sizeof(*r));
+ out:
+ 	if (b) {
+@@ -370,17 +396,151 @@
+ 	}
+ }
+ 
++/* the GETs that only answer while associated (IO80211 GetWithIOCTL layouts); ENXIO otherwise */
+ static int
++s8_get_link(struct sweet80211_req *req)
++{
++	struct sweet_wlan_link l;
++	if (s8.stage != 3 || !s8.link || sweet_wlan_link_get(&l) != 0) {
++		return ENXIO;
++	}
++	switch (req->type) {
++	case IOC_SSID: {
++		uint8_t d[32] = { 0 };                  /* raw, NUL padded */
++		memcpy(d, l.ssid, MIN(l.ssid_len, 32));
++		req->val = l.ssid_len;
++		return s8_reply(req, d, sizeof(d));
++	}
++	case IOC_BSSID:
++		return s8_reply(req, l.bssid, 6);
++	case IOC_CHANNEL: {
++		bool g5 = l.mhz > 4900;
++		uint32_t d[4] = { 1, l.mhz == 2484 ? 14u : g5 ? (l.mhz - 5000u) / 5 : (l.mhz - 2407u) / 5,
++			          (g5 ? C_FLAG_5GHZ : C_FLAG_2GHZ) | C_FLAG_20MHZ | C_FLAG_ACTIVE, 0 };
++		return s8_reply(req, d, sizeof(d));
++	}
++	case IOC_RSSI:
++	case IOC_NOISE: {
++		int32_t d[13] = { 0 };                  /* version, num_chains, unit, value[4], aggregate, ext[4], agg_ext */
++		int32_t v = req->type == IOC_RSSI ? l.rssi : l.noise;
++		d[0] = 1;
++		d[1] = 1;
++		d[3] = v;
++		d[7] = v;
++		req->val = v;
++		return s8_reply(req, d, sizeof(d));
++	}
++	case IOC_RATE:
++		req->val = l.rate;
++		return s8_reply_u32(req, l.rate);
++	case IOC_TXPOWER: {
++		uint32_t d[3] = { 1, 0, 20 };           /* version, unit (dBm), 20 */
++		return s8_reply(req, d, sizeof(d));
++	}
++	case IOC_AUTH_TYPE: {
++		uint32_t d[4] = { 1, 1, s8.auth_upper, 0 };   /* version, lower OPEN, upper (8 = WPA2-PSK), upper ext */
++		return s8_reply(req, d, sizeof(d));
++	}
++	default:
++		return ENXIO;
++	}
++}
++
++/*
++ * ASSOCIATE (type 20, 908 bytes, IO80211 1565.3 _performAssociation): version @0, mode @4, auth lower @8 / upper
++ * @0xc (8 = WPA2-PSK), ssid len @0x10 + ssid @0x14, bssid @0x34, key {version @0x3c, len @0x40, cipher @0x44
++ * (6 = PMK)} with the PMK @0x4c, RSN element len @0xd0 (u16) + bytes @0xd2, flags2 @0x1fc. Logged without the key.
++ */
++static int
++s8_associate(struct sweet80211_req *req)
++{
++	uint8_t *d;
++	struct sweet_wlan_join j;
++	uint32_t ver, mode, al, au, sl, kl, kc, f2;
++	uint16_t rl;
++	int err;
++
++	if (s8.stage != 3) {
++		return ENXIO;                           /* nothing to join with a null backend */
++	}
++	if (req->data == 0 || req->len < 0x200 || req->len > 4096) {
++		printf("SWEET 80211: ASSOCIATE with %u bytes: refused\n", req->len);
++		return EINVAL;
++	}
++	d = kalloc_data(req->len, Z_WAITOK | Z_ZERO);
++	if (d == NULL) {
++		return ENOMEM;
++	}
++	err = copyin((user_addr_t)req->data, d, req->len);
++	if (err) {
++		kfree_data(d, req->len);
++		return err;
++	}
++	memcpy(&ver, d + 0x00, 4);
++	memcpy(&mode, d + 0x04, 4);
++	memcpy(&al, d + 0x08, 4);
++	memcpy(&au, d + 0x0c, 4);
++	memcpy(&sl, d + 0x10, 4);
++	memcpy(&kl, d + 0x40, 4);
++	memcpy(&kc, d + 0x44, 4);
++	memcpy(&rl, d + 0xd0, 2);
++	memcpy(&f2, d + 0x1fc, 4);
++	bzero(&j, sizeof(j));
++	j.ssid_len = (uint8_t)MIN(sl, 32u);
++	memcpy(j.ssid, d + 0x14, j.ssid_len);
++	memcpy(j.bssid, d + 0x34, 6);
++	char hex[3 * 64 + 1];
++	unsigned hl = 0;
++	for (unsigned i = 0; i < MIN((unsigned)rl, 64u); i++) {
++		hl += (unsigned)snprintf(hex + hl, sizeof(hex) - hl, "%02x", d[0xd2 + i]);
++	}
++	hex[hl] = 0;
++	printf("SWEET 80211: ASSOCIATE len %u: version %u mode %u auth %u/%#x ssid %u bytes, bssid %02x:%02x:%02x:%02x:%02x:%02x, "
++	    "key len %u cipher %u, rsn ie %u bytes %s, flags %02x %02x %02x, flags2 %#x\n", req->len, ver, mode & 0xffff, al, au,
++	    sl, j.bssid[0], j.bssid[1], j.bssid[2], j.bssid[3], j.bssid[4], j.bssid[5], kl, kc, rl, hex, d[0x1d3], d[0x1d4],
++	    d[0x1d5], f2);
++	err = 0;
++	if (ver != 1 || sl == 0 || sl > 32 || (mode & 0xffff) != 2) {
++		err = EINVAL;
++	} else if (au == 0 && rl == 0) {
++		j.rsn_ie_len = 0;                       /* open network */
++	} else if (au == 8 && kc == 6 && kl == 32 && rl >= 8 && rl <= sizeof(j.rsn_ie) && d[0xd2] == 0x30) {
++		memcpy(j.pmk, d + 0x4c, 32);
++		j.rsn_ie_len = (uint8_t)rl;
++		memcpy(j.rsn_ie, d + 0xd2, rl);
++	} else {
++		err = EOPNOTSUPP;                       /* WEP, WPA1, SAE, enterprise, passphrase mode */
++	}
++	bzero(d, req->len);                             /* the PMK */
++	kfree_data(d, req->len);
++	if (err == 0) {
++		s8.auth_upper = au;
++		err = sweet_wlan_join(&j);
++	}
++	bzero(&j, sizeof(j));
++	printf("SWEET 80211: ASSOCIATE -> %d\n", err);
++	return err;
++}
++
++static int
+ s8_get(struct sweet80211_req *req)
+ {
+ 	switch (req->type) {
+ 	case IOC_CARD_CAPABILITIES: {
+-		/* {u32 version; u8 capabilities[]}: no optional capabilities yet */
+-		uint32_t v = 1;
+-		return s8_reply(req, &v, sizeof(v));
++		/*
++		 * IO80211 1565.3 reads a bare 21-byte bit map (no version word). Joins need AES-CCM (byte 0 bit 3) and
++		 * WPA2 (byte 1 bit 6); SAE (byte 9 bit 3) stays clear so a WPA2-PSK join carries the PMK, and so do the
++		 * async-join (byte 5 bit 6), MFP (byte 6 bit 4) and OWE (byte 12 bit 0) bits.
++		 */
++		uint8_t caps[21] = { 0 };
++		if (s8.stage == 3) {
++			caps[0] = 0x08;
++			caps[1] = 0x40;
++		}
++		return s8_reply(req, caps, sizeof(caps));
+ 	}
+ 	case IOC_DRIVER_VERSION:
+-		return s8_reply_string(req, s8.stage == 3 ? "Bergamota sweet80211 2 (WCN3990 scan backend)" :
++		return s8_reply_string(req, s8.stage == 3 ? "Bergamota sweet80211 3 (WCN3990, WPA2-PSK station)" :
+ 		    "Bergamota sweet80211 1 (null backend)");
+ 	case IOC_HARDWARE_VERSION:
+ 		return s8_reply_string(req, "Qualcomm WCN3990");
+@@ -390,7 +550,13 @@
+ 		return s8_reply(req, d, sizeof(d));
+ 	}
+ 	case IOC_STATE:
+-		return s8_reply_u32(req, 0);                    /* APPLE80211_S_INIT */
++		return s8_reply_u32(req, s8.link ? 4 : 0);      /* APPLE80211_S_RUN / S_INIT */
++	case IOC_ASSOCIATE_RESULT:
++		/* polled every 20 ms while a join runs (value in req_val): 0 running, 1 success, else a failure code */
++		req->val = s8.stage == 3 ? sweet_wlan_join_result() : 2;
++		return 0;
++	case IOC_CURRENT_NETWORK:
++		return s8.stage == 3 ? s8_real_result(req, true) : ENXIO;
+ 	case IOC_OP_MODE:
+ 		return s8_reply_u32(req, OPMODE_STA);
+ 	case IOC_PHY_MODE: {
+@@ -439,7 +605,7 @@
+ 	}
+ 	case IOC_SCAN_RESULT:
+ 		if (s8.stage == 3) {
+-			return s8_real_result(req);
++			return s8_real_result(req, false);
+ 		}
+ 		if (s8.stage >= 2) {
+ 			return s8_fake_result(req);
+@@ -452,7 +618,8 @@
+ 	case IOC_NOISE:
+ 	case IOC_RATE:
+ 	case IOC_TXPOWER:
+-		return ENXIO;                                   /* not associated */
++	case IOC_AUTH_TYPE:
++		return s8_get_link(req);
+ 	default:
+ 		return EOPNOTSUPP;
+ 	}
+@@ -475,7 +642,7 @@
+ 		}
+ 		if (on != s8.power) {
+ 			s8.power = on;
+-			printf("SWEET 80211: radio %s (null backend)\n", on ? "on" : "off");
++			printf("SWEET 80211: radio %s\n", on ? "on" : "off");
+ 			s8_post_event(M_POWER_CHANGED, NULL, 0);
+ 		}
+ 		return 0;
+@@ -506,9 +673,12 @@
+ 		return 0;
+ 	}
+ 	case IOC_DISASSOCIATE:
++		if (s8.stage == 3) {
++			(void)sweet_wlan_leave();
++		}
+ 		return 0;
+ 	case IOC_ASSOCIATE:
+-		return ENXIO;                                   /* nothing to join with a null backend */
++		return s8_associate(req);
+ 	default:
+ 		/*
+ 		 * boot 23: after power-on wifid pushes ~15 optional settings (battery powersave,
+@@ -541,7 +711,7 @@
+ 		ifmr->ifm_current = media;
+ 		ifmr->ifm_active = media;
+ 		ifmr->ifm_mask = 0;
+-		ifmr->ifm_status = IFM_AVALID;          /* never associated with the null backend */
++		ifmr->ifm_status = IFM_AVALID | (s8.link ? IFM_ACTIVE : 0);
+ 		if (list != USER_ADDR_NULL && ifmr->ifm_count > 0) {
+ 			ifmr->ifm_count = 1;
+ 			return copyout(&media, list, sizeof(media));
+@@ -575,12 +745,121 @@
+ static errno_t
+ sweet80211_if_output(ifnet_t ifp, mbuf_t m)
+ {
++	uint8_t buf[1600];
++	size_t len = mbuf_pkthdr_len(m);
++	int err = ENXIO;
++	if (s8.stage == 3 && s8.link && len >= ETHER_HDR_LEN && len <= sizeof(buf) &&
++	    mbuf_copydata(m, 0, len, buf) == 0) {
++		bpf_tap_out(ifp, DLT_EN10MB, m, NULL, 0);
++		err = sweet_wlan_output(buf, len);
++	}
+ 	mbuf_freem(m);
+-	ifnet_stat_increment_out(ifp, 0, 0, 1);
++	if (err == 0) {
++		s8.tx_frames++;
++		ifnet_stat_increment_out(ifp, 1, (u_int32_t)len, 0);
++	} else {
++		s8.tx_drops++;
++		ifnet_stat_increment_out(ifp, 0, 0, 1);
++	}
+ 	return 0;
+ }
+ 
++/* the WLAN service thread: one received Ethernet II frame */
++void
++sweet80211_input(const uint8_t *eth, size_t len)
++{
++	mbuf_t m = NULL;
++	unsigned int one = 1;
++	if (s8.ifp == NULL || len < ETHER_HDR_LEN || mbuf_allocpacket(MBUF_DONTWAIT, len, &one, &m) != 0) {
++		s8.rx_drops++;
++		return;
++	}
++	if (mbuf_copyback(m, 0, len, eth, MBUF_DONTWAIT) != 0) {
++		mbuf_freem(m);
++		s8.rx_drops++;
++		return;
++	}
++	mbuf_pkthdr_setrcvif(m, s8.ifp);
++	mbuf_pkthdr_setlen(m, len);
++	bpf_tap_in(s8.ifp, DLT_EN10MB, m, NULL, 0);
++	mbuf_pkthdr_setheader(m, mbuf_data(m));
++	mbuf_pkthdr_adjustlen(m, -ETHER_HDR_LEN);
++	mbuf_setdata(m, (char *)mbuf_data(m) + ETHER_HDR_LEN, mbuf_len(m) - ETHER_HDR_LEN);
++	struct ifnet_stat_increment_param st = { .packets_in = 1, .bytes_in = (u_int32_t)len };
++	s8.rx_frames++;
++	(void)ifnet_input(s8.ifp, m, &st);
++}
++
++/* KEV_DL_LINK_ON / OFF as bsd/net/if_fake.c interface_link_event does: configd starts / stops DHCP on these */
+ static void
++s8_link_event(u_int32_t code)
++{
++	struct ev {
++		u_int32_t family, unit;
++		char      name[IFNAMSIZ];
++	};
++	_Alignas(struct kern_event_msg) char msg[offsetof(struct kern_event_msg, event_data) + sizeof(struct ev)] = { 0 };
++	struct kern_event_msg *h = (struct kern_event_msg *)msg;
++	struct ev *e = (struct ev *)(void *)(msg + offsetof(struct kern_event_msg, event_data));   /* as if_fake.c */
++	h->total_size = sizeof(msg);
++	h->vendor_code = KEV_VENDOR_APPLE;
++	h->kev_class = KEV_NETWORK_CLASS;
++	h->kev_subclass = KEV_DL_SUBCLASS;
++	h->event_code = code;
++	e->family = ifnet_family(s8.ifp);
++	e->unit = (u_int32_t)ifnet_unit(s8.ifp);
++	strlcpy(e->name, ifnet_name(s8.ifp), IFNAMSIZ);
++	ifnet_event(s8.ifp, h);
++}
++
++/* the WLAN service thread: joined (keys in) or the association ended */
++void
++sweet80211_link(int up, uint16_t reason, int by_ap)
++{
++	struct sweet_wlan_link l;
++	uint8_t lc[32] = { 0 };                 /* LINK_CHANGED: link_down @0, rssi @4, snr @8, noise @10, reason @20 */
++	if (s8.ifp == NULL || s8.stage != 3) {
++		return;
++	}
++	if (up) {
++		if (sweet_wlan_link_get(&l) == 0) {
++			int32_t rssi = l.rssi;
++			int16_t snr = (int16_t)(l.rssi - l.noise), noise = l.noise;
++			memcpy(lc + 4, &rssi, 4);
++			memcpy(lc + 8, &snr, 2);
++			memcpy(lc + 10, &noise, 2);
++		}
++		s8.link = 1;
++		uint32_t ok = 0;
++		ifnet_set_flags(s8.ifp, IFF_UP | IFF_RUNNING, IFF_UP | IFF_RUNNING);
++		s8_post_event(M_SSID_CHANGED, NULL, 0);
++		s8_post_event(M_BSSID_CHANGED, NULL, 0);
++		s8_post_event(M_ASSOC_DONE, &ok, sizeof(ok));
++		if (s8.auth_upper) {
++			s8_post_event(M_RSN_HANDSHAKE_DONE, NULL, 0);
++		}
++		s8_post_event(M_LINK_CHANGED, lc, sizeof(lc));
++		s8_link_event(KEV_DL_LINK_ON);
++		printf("SWEET 80211: link up\n");
++	} else {
++		uint32_t why = reason, dr[2] = { 0, reason };
++		s8.link = 0;
++		lc[0] = 1;
++		memcpy(lc + 20, &why, 4);
++		s8_post_event(M_LINK_CHANGED, lc, sizeof(lc));
++		s8_post_event(M_BSSID_CHANGED, NULL, 0);
++		s8_post_event(M_SSID_CHANGED, NULL, 0);
++		if (by_ap) {
++			s8_post_event(M_DEAUTH_RECEIVED, dr, sizeof(dr));
++		}
++		s8_link_event(KEV_DL_LINK_OFF);
++		ifnet_set_flags(s8.ifp, 0, IFF_RUNNING);
++		printf("SWEET 80211: link down (reason %u): %llu frames out (%llu dropped), %llu in (%llu dropped)\n", reason,
++		    s8.tx_frames, s8.tx_drops, s8.rx_frames, s8.rx_drops);
++	}
++}
++
++static void
+ sweet80211_if_detach(ifnet_t ifp __unused)
+ {
+ }
+diff --git a/bsd/dev/sweet_wlan.h b/bsd/dev/sweet_wlan.h
+--- a/bsd/dev/sweet_wlan.h
++++ b/bsd/dev/sweet_wlan.h
+@@ -6,6 +6,7 @@
+ #define _SWEET_WLAN_H_
+ 
+ #include <stdint.h>
++#include <stddef.h>
+ 
+ #define SWEET_WLAN_IE_MAX       1024u
+ 
+@@ -30,4 +31,64 @@
+ /* sweet_80211.c: called by the WLAN service when a requested scan has completed */
+ void sweet80211_scan_done(void);
+ 
++/*
++ * WL3/WL4: join, link, data (docs/WIFI_IOS26_PHASE2.md). wifid's ASSOCIATE carries the SSID, the PMK (IO80211 derives
++ * it from the passphrase) and the RSN element for the association request; the BSSID is usually zero and the
++ * service picks the strongest BSS with that SSID from the last scan. The 4-way handshake runs in the service.
++ */
++struct sweet_wlan_join {
++	uint8_t  ssid[32];
++	uint8_t  ssid_len;
++	uint8_t  bssid[6];              /* all zero: any BSS of this SSID */
++	uint8_t  rsn_ie_len;            /* 0: open network */
++	uint8_t  rsn_ie[64];
++	uint8_t  pmk[32];
++};
++
++/* the current association, for wifid's GETs while associated */
++struct sweet_wlan_link {
++	uint8_t  bssid[6];
++	uint8_t  ssid_len;
++	uint8_t  ssid[32];
++	uint16_t mhz;
++	int8_t   rssi;
++	int8_t   noise;
++	uint16_t aid;
++	uint16_t rate;                  /* Mb/s */
++	uint8_t  ht;
++	uint8_t  rsn;
++};
++
++/* Apple80211 ASSOCIATE_RESULT codes (IO80211 _errorForAssociateResult) */
++#define SWEET_WLAN_JOIN_RUNNING         0
++#define SWEET_WLAN_JOIN_OK              1
++#define SWEET_WLAN_JOIN_FAILED          2       /* unspecified */
++#define SWEET_WLAN_JOIN_UNSUPPORTED     3       /* unsupported capabilities */
++#define SWEET_WLAN_JOIN_TIMEOUT         9
++#define SWEET_WLAN_JOIN_SUPP_TIMEOUT    22      /* supplicant timeout */
++#define SWEET_WLAN_JOIN_NO_BSS          25      /* BSS not found */
++#define SWEET_WLAN_JOIN_AUTH_NO_ACK     26
++#define SWEET_WLAN_JOIN_AUTH_NO_RESP    27
++#define SWEET_WLAN_JOIN_ASSOC_NO_ACK    28
++#define SWEET_WLAN_JOIN_ASSOC_NO_RESP   29
++#define SWEET_WLAN_JOIN_EAPOL           30      /* EAPOL M1-M4 failure */
++
++/* beryllium_wlan.c: 0 = join started, ENXIO = service not up, EINVAL = bad request */
++int sweet_wlan_join(const struct sweet_wlan_join *j);
++/* beryllium_wlan.c: SWEET_WLAN_JOIN_* of the last join (RUNNING while it runs) */
++int sweet_wlan_join_result(void);
++/* beryllium_wlan.c: leave the network (or cancel a join); 0 */
++int sweet_wlan_leave(void);
++/* beryllium_wlan.c: 0 and the link while associated, ENXIO otherwise */
++int sweet_wlan_link_get(struct sweet_wlan_link *out);
++/* beryllium_wlan.c: the scan-cache entry of the current BSS (CURRENT_NETWORK); ENXIO when not associated */
++int sweet_wlan_current_bss(struct sweet_wlan_bss *out);
++/* beryllium_wlan.c: queue one Ethernet II frame for transmission; 0, ENXIO (no link), ENOBUFS (queue full) */
++int sweet_wlan_output(const uint8_t *eth, size_t len);
++/* sweet_80211.c, from the service thread: the link came up (joined), or went down (802.11 reason; by_ap = the AP
++ * deauthenticated / disassociated us or the firmware lost it, else we left) */
++void sweet80211_link(int up, uint16_t reason, int by_ap);
++/* sweet_80211.c, from the service thread: one received Ethernet II frame for en0 */
++void sweet80211_input(const uint8_t *eth, size_t len);
++
+ #endif /* _SWEET_WLAN_H_ */

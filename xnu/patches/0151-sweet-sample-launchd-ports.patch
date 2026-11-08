@@ -1,0 +1,60 @@
+--- a/osfmk/kern/exception.c
++++ b/osfmk/kern/exception.c
+@@ -1050,8 +1050,9 @@
+ 		struct {
+ 			mach_port_name_t name;
+ 			uint32_t msgs, seqno, srights, mscount, sorights;
+-			uint8_t knote, nsreq, kot;
+-		} rr[40];
++			uint8_t knote, nsreq, kot, pset, sls;
++			uint32_t mid, msz;
++		} rr[64];
+ 		int nr = 0;
+ 		uint32_t nrecv = 0;
+ 
+@@ -1068,10 +1069,15 @@
+ 					}
+ 					nrecv++;
+ 					ipc_object_t obj = entry->ie_object;
+-					if (io_otype(obj) != IOT_PORT || nr >= 40) {
++					if (io_otype(obj) != IOT_PORT || nr >= 64) {
+ 						continue;
+ 					}
+ 					ipc_port_t port = ip_object_to_port(obj);
++					/* launchd owns hundreds of rights: only list those with queued messages or in a pset */
++					if (strncmp(name, "launchd", 7) == 0 && port->ip_messages.imq_msgcount == 0 &&
++					    !ip_in_pset(port)) {
++						continue;
++					}
+ 					rr[nr].name = MACH_PORT_MAKE(index, IE_BITS_GEN(bits));
+ 					rr[nr].msgs = port->ip_messages.imq_msgcount;
+ 					rr[nr].seqno = port->ip_messages.imq_seqno;
+@@ -1081,6 +1087,16 @@
+ 					rr[nr].knote = SLIST_FIRST(&port->ip_klist) != NULL;
+ 					rr[nr].nsreq = port->ip_nsrequest != IP_NULL;
+ 					rr[nr].kot = (uint8_t)ip_kotype(port);
++					rr[nr].pset = ip_in_pset(port);
++					rr[nr].sls = (uint8_t)port->ip_sync_link_state;
++					rr[nr].mid = rr[nr].msz = 0;
++					if (port->ip_messages.imq_msgcount != 0 &&
++					    !circle_queue_empty(&port->ip_messages.imq_messages)) {
++						ipc_kmsg_t km = ipc_kmsg_queue_first(&port->ip_messages.imq_messages);
++						mach_msg_header_t *mh = ikm_header(km);
++						rr[nr].mid = mh->msgh_id;
++						rr[nr].msz = mh->msgh_size;
++					}
+ 					nr++;
+ 				}
+ 			}
+@@ -1088,8 +1104,9 @@
+ 		}
+ 		printf("SMP %s PORTS recv %u listed %d\n", name, nrecv, nr);
+ 		for (int i = 0; i < nr; i++) {
+-			printf("SMP %s R 0x%x %u/%u %u/%u/%u %u/%u/%u\n", name, rr[i].name, rr[i].msgs, rr[i].seqno,
+-			    rr[i].srights, rr[i].mscount, rr[i].sorights, rr[i].knote, rr[i].nsreq, rr[i].kot);
++			printf("SMP %s R 0x%x %u/%u %u/%u/%u %u/%u/%u pset%u sls%u m0 id 0x%x sz %u\n", name, rr[i].name,
++			    rr[i].msgs, rr[i].seqno, rr[i].srights, rr[i].mscount, rr[i].sorights, rr[i].knote,
++			    rr[i].nsreq, rr[i].kot, rr[i].pset, rr[i].sls, rr[i].mid, rr[i].msz);
+ 		}
+ 
+ 		/*

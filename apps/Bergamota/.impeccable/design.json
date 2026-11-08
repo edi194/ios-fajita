@@ -1,0 +1,620 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-26T16:29:27Z",
+  "title": "Design System: Bergamota",
+  "extensions": {
+    "colorMeta": {
+      "lime": {
+        "role": "primary",
+        "displayName": "Stage Lime",
+        "canonical": "#d7e98a",
+        "tonalRamp": [
+          "#36400c",
+          "#5e7015",
+          "#869f1e",
+          "#aece27",
+          "#c4df53",
+          "#d6e887",
+          "#e8f2ba",
+          "#f8fbea"
+        ]
+      },
+      "lime-dot": {
+        "role": "primary",
+        "displayName": "Stage Dot Lime",
+        "canonical": "#c6dc72",
+        "tonalRamp": [
+          "#343d0f",
+          "#5a6a1a",
+          "#809726",
+          "#a6c431",
+          "#bdd65c",
+          "#d1e38d",
+          "#e5efbe",
+          "#f7faeb"
+        ]
+      },
+      "leaf": {
+        "role": "primary",
+        "displayName": "Leaf Green",
+        "canonical": "#1a5933",
+        "tonalRamp": [
+          "#113b22",
+          "#1e673b",
+          "#2b9254",
+          "#37bd6d",
+          "#61d18d",
+          "#90dfb0",
+          "#c0edd2",
+          "#ebf9f1"
+        ]
+      },
+      "amber": {
+        "role": "secondary",
+        "displayName": "Fastboot Amber",
+        "canonical": "#e8a33a",
+        "tonalRamp": [
+          "#452d08",
+          "#774d0e",
+          "#a96e14",
+          "#db8e1a",
+          "#eaaa48",
+          "#f0c37f",
+          "#f6ddb6",
+          "#fcf4e8"
+        ]
+      },
+      "alert": {
+        "role": "secondary",
+        "displayName": "Alert Red",
+        "canonical": "#b3261e",
+        "tonalRamp": [
+          "#420e0b",
+          "#721813",
+          "#a2221b",
+          "#d22d23",
+          "#e25850",
+          "#eb8a85",
+          "#f3bcb9",
+          "#fbeae9"
+        ]
+      },
+      "alert-on-ink": {
+        "role": "secondary",
+        "displayName": "Alert On Ink",
+        "canonical": "#ff6a5a",
+        "tonalRamp": [
+          "#4c0700",
+          "#850d00",
+          "#bd1200",
+          "#f51800",
+          "#ff4733",
+          "#ff7e70",
+          "#ffb5ad",
+          "#ffe8e5"
+        ]
+      },
+      "ink": {
+        "role": "neutral",
+        "displayName": "Ink",
+        "canonical": "#161616",
+        "tonalRamp": [
+          "#262626",
+          "#424242",
+          "#5e5e5e",
+          "#7a7a7a",
+          "#999999",
+          "#b8b8b8",
+          "#d6d6d6",
+          "#f2f2f2"
+        ]
+      },
+      "paper": {
+        "role": "neutral",
+        "displayName": "Paper",
+        "canonical": "#f4f3ec",
+        "tonalRamp": [
+          "#302e1c",
+          "#545031",
+          "#787145",
+          "#9b935a",
+          "#b4ad7e",
+          "#cbc6a5",
+          "#e1decb",
+          "#f6f5ef"
+        ]
+      },
+      "console-line": {
+        "role": "neutral",
+        "displayName": "Console Line",
+        "canonical": "#2c2c29",
+        "tonalRamp": [
+          "#282825",
+          "#454540",
+          "#62625b",
+          "#7f7f76",
+          "#9d9d95",
+          "#babab5",
+          "#d8d8d5",
+          "#f3f3f2"
+        ]
+      },
+      "console-muted": {
+        "role": "neutral",
+        "displayName": "Console Muted",
+        "canonical": "#9a9992",
+        "tonalRamp": [
+          "#282725",
+          "#454440",
+          "#62615b",
+          "#7f7e76",
+          "#9d9c95",
+          "#babab5",
+          "#d8d7d5",
+          "#f3f3f2"
+        ]
+      },
+      "tile-ink": {
+        "role": "neutral",
+        "displayName": "Control Plane Tile",
+        "canonical": "#1d1d1b",
+        "tonalRamp": [
+          "#282825",
+          "#454540",
+          "#62625b",
+          "#7f7f76",
+          "#9d9d95",
+          "#babab5",
+          "#d8d8d5",
+          "#f3f3f2"
+        ]
+      },
+      "quiet": {
+        "role": "neutral",
+        "displayName": "Quiet Grey",
+        "canonical": "#8d8c85",
+        "tonalRamp": [
+          "#282725",
+          "#454440",
+          "#62615b",
+          "#7f7e76",
+          "#9c9c96",
+          "#bab9b5",
+          "#d8d7d5",
+          "#f3f3f2"
+        ]
+      },
+      "ground-light": {
+        "role": "neutral",
+        "displayName": "Paper Ground",
+        "canonical": "#f4f3ec",
+        "tonalRamp": [
+          "#302e1c",
+          "#545031",
+          "#787145",
+          "#9b935a",
+          "#b4ad7e",
+          "#cbc6a5",
+          "#e1decb",
+          "#f6f5ef"
+        ]
+      },
+      "ground-dark": {
+        "role": "neutral",
+        "displayName": "Ink Ground",
+        "canonical": "#141413",
+        "tonalRamp": [
+          "#272725",
+          "#444441",
+          "#61615c",
+          "#7e7e77",
+          "#9c9c96",
+          "#b9b9b6",
+          "#d7d7d5",
+          "#f3f3f2"
+        ]
+      },
+      "surface-light": {
+        "role": "neutral",
+        "displayName": "Paper Surface",
+        "canonical": "#fbfaf5",
+        "tonalRamp": [
+          "#373116",
+          "#5f5526",
+          "#877936",
+          "#af9d46",
+          "#c5b66d",
+          "#d6cc99",
+          "#e8e2c5",
+          "#f8f6ed"
+        ]
+      },
+      "surface-dark": {
+        "role": "neutral",
+        "displayName": "Ink Surface",
+        "canonical": "#1e1e1c",
+        "tonalRamp": [
+          "#282825",
+          "#454540",
+          "#62625b",
+          "#7f7f76",
+          "#9d9d95",
+          "#babab5",
+          "#d8d8d5",
+          "#f3f3f2"
+        ]
+      },
+      "rule-light": {
+        "role": "neutral",
+        "displayName": "Paper Rule",
+        "canonical": "#e2e0d6",
+        "tonalRamp": [
+          "#2d2b20",
+          "#4e4a37",
+          "#6f694e",
+          "#8f8865",
+          "#aaa588",
+          "#c4c0ab",
+          "#dddbcf",
+          "#f4f4f0"
+        ]
+      },
+      "rule-dark": {
+        "role": "neutral",
+        "displayName": "Ink Rule",
+        "canonical": "#2e2e2b",
+        "tonalRamp": [
+          "#282825",
+          "#454540",
+          "#62625b",
+          "#7f7f76",
+          "#9c9c96",
+          "#babab5",
+          "#d8d8d5",
+          "#f3f3f2"
+        ]
+      },
+      "text-light": {
+        "role": "neutral",
+        "displayName": "Text on Paper",
+        "canonical": "#161616",
+        "tonalRamp": [
+          "#262626",
+          "#424242",
+          "#5e5e5e",
+          "#7a7a7a",
+          "#999999",
+          "#b8b8b8",
+          "#d6d6d6",
+          "#f2f2f2"
+        ]
+      },
+      "text-dark": {
+        "role": "neutral",
+        "displayName": "Text on Ink",
+        "canonical": "#f4f3ec",
+        "tonalRamp": [
+          "#302e1c",
+          "#545031",
+          "#787145",
+          "#9b935a",
+          "#b4ad7e",
+          "#cbc6a5",
+          "#e1decb",
+          "#f6f5ef"
+        ]
+      },
+      "muted-light": {
+        "role": "neutral",
+        "displayName": "Muted on Paper",
+        "canonical": "#66655f",
+        "tonalRamp": [
+          "#282725",
+          "#454440",
+          "#62615b",
+          "#7f7e76",
+          "#9d9c95",
+          "#bab9b5",
+          "#d8d7d5",
+          "#f3f3f2"
+        ]
+      },
+      "muted-dark": {
+        "role": "neutral",
+        "displayName": "Muted on Ink",
+        "canonical": "#a3a29b",
+        "tonalRamp": [
+          "#282725",
+          "#454440",
+          "#62615a",
+          "#807e75",
+          "#9d9c95",
+          "#bbbab5",
+          "#d8d7d4",
+          "#f3f3f2"
+        ]
+      },
+      "leaf-text-light": {
+        "role": "neutral",
+        "displayName": "Leaf Text on Paper",
+        "canonical": "#1a5933",
+        "tonalRamp": [
+          "#113b22",
+          "#1e673b",
+          "#2b9254",
+          "#37bd6d",
+          "#61d18d",
+          "#90dfb0",
+          "#c0edd2",
+          "#ebf9f1"
+        ]
+      },
+      "leaf-text-dark": {
+        "role": "neutral",
+        "displayName": "Leaf Text on Ink",
+        "canonical": "#9ccf86",
+        "tonalRamp": [
+          "#203716",
+          "#375f26",
+          "#4e8736",
+          "#65af46",
+          "#87c56d",
+          "#abd699",
+          "#cfe8c5",
+          "#f0f8ed"
+        ]
+      },
+      "alert-text-light": {
+        "role": "neutral",
+        "displayName": "Alert Text on Paper",
+        "canonical": "#b3261e",
+        "tonalRamp": [
+          "#420e0b",
+          "#721813",
+          "#a2221b",
+          "#d22d23",
+          "#e25850",
+          "#eb8a85",
+          "#f3bcb9",
+          "#fbeae9"
+        ]
+      },
+      "alert-text-dark": {
+        "role": "neutral",
+        "displayName": "Alert Text on Ink",
+        "canonical": "#ff7b6b",
+        "tonalRamp": [
+          "#4c0800",
+          "#850e00",
+          "#bd1400",
+          "#f51a00",
+          "#ff4933",
+          "#ff8070",
+          "#ffb6ad",
+          "#ffe8e5"
+        ]
+      },
+      "amber-text-light": {
+        "role": "neutral",
+        "displayName": "Amber Text on Paper",
+        "canonical": "#8a4d00",
+        "tonalRamp": [
+          "#4c2b00",
+          "#854a00",
+          "#bd6900",
+          "#f58900",
+          "#ffa533",
+          "#ffc070",
+          "#ffdbad",
+          "#fff4e5"
+        ]
+      },
+      "amber-text-dark": {
+        "role": "neutral",
+        "displayName": "Amber Text on Ink",
+        "canonical": "#f0b860",
+        "tonalRamp": [
+          "#462d07",
+          "#794e0b",
+          "#ac7010",
+          "#e09115",
+          "#edac45",
+          "#f3c57d",
+          "#f8deb4",
+          "#fdf5e8"
+        ]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Page title",
+        "purpose": "Archivo 900 at 112% width, 30 pt: PageHeader."
+      },
+      "display-state": {
+        "displayName": "State word",
+        "purpose": "Archivo 900/112, 52 pt: the rail's state or activity title."
+      },
+      "display-empty": {
+        "displayName": "Empty title",
+        "purpose": "Archivo 22 pt on the lime stage."
+      },
+      "body": {
+        "displayName": "Body",
+        "purpose": "SF Pro callout for labels, controls, notices."
+      },
+      "data": {
+        "displayName": "Data",
+        "purpose": "JetBrains Mono 12 pt for Row values, paths, commands."
+      },
+      "data-console": {
+        "displayName": "Console data",
+        "purpose": "JetBrains Mono 11.5 pt on ink for logs and queue items."
+      },
+      "label": {
+        "displayName": "Section label",
+        "purpose": "Mono caps 11 pt/800 tracked 1.3 for in-panel headings."
+      },
+      "pill": {
+        "displayName": "Pill",
+        "purpose": "Mono caps 10.5 pt/800 tracked 0.6 for state capsules."
+      }
+    },
+    "shadows": [],
+    "motion": [
+      {
+        "name": "state-step",
+        "value": "opacity 1 -> 0.18 for 90 ms, animations disabled, then back; 64x4 pt ink underline 7 pt below the word held until hover or next window-key + 1.5 s",
+        "purpose": "The signature move on a state or activity title change; never eased."
+      },
+      {
+        "name": "button-press",
+        "value": "fill opacity 0.8 while pressed, 0.35 when disabled",
+        "purpose": "CPButtonStyle feedback."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sidebar",
+        "value": "170-196 pt"
+      },
+      {
+        "name": "rail",
+        "value": "290-420 pt (330 ideal)"
+      },
+      {
+        "name": "empty-stage-max",
+        "value": "440 pt"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "State Rail",
+      "kind": "custom",
+      "refersTo": "state-rail",
+      "description": "The lime stage with the state word, ink progress and the ink console at its foot; the system's signature.",
+      "html": "<div class=\"ds-rail\"><div class=\"ds-rail-top\"><span class=\"ds-pill\">ABL FASTBOOT</span><div class=\"ds-rail-word\">Waiting for a boot</div><div class=\"ds-rail-detail\">since 14:37 . 1a2b3c4d</div></div><div class=\"ds-rail-console\"><div class=\"ds-rail-label\">QUEUE <span class=\"ds-pill ds-pill-armed\">ARMED</span></div><div class=\"ds-rail-item\">ios26-boot.img</div><button class=\"ds-btn-send\">Send now</button></div></div>",
+      "css": ".ds-rail{width:300px;background-color:#d7e98a;background-image:radial-gradient(#c6dc72 1.6px,transparent 1.7px);background-size:14px 14px;color:#161616;display:flex;flex-direction:column;min-height:360px}.ds-rail-top{padding:18px 22px 8px;flex:1}.ds-rail-word{font-family:'Archivo','Arial Black',system-ui,sans-serif;font-weight:900;font-stretch:112%;font-size:44px;line-height:1;margin:10px 0}.ds-rail-detail{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:11.5px;font-weight:500}.ds-pill{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;background:#161616;color:#d7e98a;font-size:10.5px;font-weight:800;letter-spacing:.6px;padding:3px 9px;border-radius:999px}.ds-rail-console{background:#161616;color:#f4f3ec;padding:16px 20px;display:flex;flex-direction:column;gap:10px}.ds-rail-label{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:11px;font-weight:800;letter-spacing:1.3px;color:#9a9992}.ds-pill-armed{background:#e8a33a;color:#161616;font-size:9.5px}.ds-rail-item{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:11.5px;font-weight:600}.ds-btn-send{background:#e8a33a;color:#161616;border:0;border-radius:9px;padding:8px 14px;font:600 14px system-ui}.ds-btn-send:hover{opacity:.8}.ds-btn-send:focus-visible{outline:2px solid #f4f3ec;outline-offset:2px}"
+    },
+    {
+      "name": "Primary Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Leaf green prominent action on the work area.",
+      "html": "<button class=\"ds-btn-primary\">Choose IPA...</button>",
+      "css": ".ds-btn-primary{background:#1a5933;color:#f4f3ec;border:0;border-radius:7px;padding:6px 14px;font:500 13px system-ui}.ds-btn-primary:hover{background:#216b3d}.ds-btn-primary:active{opacity:.8}.ds-btn-primary:focus-visible{outline:2px solid #1a5933;outline-offset:2px}.ds-btn-primary:disabled{opacity:.35}"
+    },
+    {
+      "name": "Danger Button",
+      "kind": "button",
+      "refersTo": "button-danger",
+      "description": "Alert red action for anything that writes the phone; always behind a confirmation.",
+      "html": "<button class=\"ds-btn-danger\">Flash userdata</button>",
+      "css": ".ds-btn-danger{background:#b3261e;color:#f4f3ec;border:0;border-radius:9px;padding:8px 14px;font:600 14px system-ui}.ds-btn-danger:hover{opacity:.9}.ds-btn-danger:active{opacity:.8}.ds-btn-danger:focus-visible{outline:2px solid #b3261e;outline-offset:2px}.ds-btn-danger:disabled{opacity:.35}"
+    },
+    {
+      "name": "Stage Button",
+      "kind": "button",
+      "refersTo": "button-stage",
+      "description": "Lime fill with ink type, used on ink surfaces (enter Bergamota fastboot, Start).",
+      "html": "<div class=\"ds-on-ink\"><button class=\"ds-btn-stage\">Enter Bergamota fastboot</button></div>",
+      "css": ".ds-on-ink{background:#161616;padding:16px}.ds-btn-stage{background:#d7e98a;color:#161616;border:0;border-radius:9px;padding:8px 14px;font:600 14px system-ui}.ds-btn-stage:hover{opacity:.9}.ds-btn-stage:active{opacity:.8}.ds-btn-stage:focus-visible{outline:2px solid #f4f3ec;outline-offset:2px}"
+    },
+    {
+      "name": "Panel with Rows",
+      "kind": "card",
+      "refersTo": "panel",
+      "description": "The work area's one container: surface, hairline, 12 pt corners, mono values.",
+      "html": "<div class=\"ds-panel\"><div class=\"ds-label\">DETECTION</div><div class=\"ds-row\"><span>State</span><span class=\"ds-val\">ios up</span></div><div class=\"ds-row\"><span>Serial</span><span class=\"ds-val\">1a2b3c4d</span></div></div>",
+      "css": ".ds-panel{background:#fbfaf5;border:1px solid #e2e0d6;border-radius:12px;padding:16px;width:320px;color:#161616;font:13px system-ui}.ds-label{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:11px;font-weight:800;letter-spacing:1.3px;color:#66655f;margin-bottom:10px}.ds-row{display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #e2e0d6;color:#66655f}.ds-val{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:12px;color:#161616}"
+    },
+    {
+      "name": "State Pills",
+      "kind": "chip",
+      "refersTo": "pill",
+      "description": "Phone state as a capsule in its Tone; caps mono.",
+      "html": "<span class=\"ds-p ds-p-leaf\">IOS</span> <span class=\"ds-p ds-p-amber\">FASTBOOT</span> <span class=\"ds-p ds-p-ink\">BERGAMOTA FASTBOOT</span> <span class=\"ds-p ds-p-alert\">FAILED</span> <span class=\"ds-p ds-p-quiet\">OFFLINE</span>",
+      "css": ".ds-p{font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:10.5px;font-weight:800;letter-spacing:.6px;padding:3px 9px;border-radius:999px}.ds-p-leaf{background:#1a5933;color:#f4f3ec}.ds-p-amber{background:#e8a33a;color:#161616}.ds-p-ink{background:#161616;color:#d7e98a}.ds-p-alert{background:#b3261e;color:#f4f3ec}.ds-p-quiet{background:#8d8c85;color:#f4f3ec}"
+    },
+    {
+      "name": "Console Pane",
+      "kind": "custom",
+      "refersTo": "console",
+      "description": "Ink log surface with paper mono text.",
+      "html": "<pre class=\"ds-console\">[ 12.402] sdhci: link up\n[ 12.455] ufs: ready\n</pre>",
+      "css": ".ds-console{background:#161616;color:#f4f3ec;font-family:'JetBrains Mono',ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.35;padding:12px;margin:0;width:320px;border-radius:0}"
+    },
+    {
+      "name": "Empty Stage",
+      "kind": "custom",
+      "refersTo": "empty-stage",
+      "description": "Empty state on the lime halftone: what is missing and how to get it.",
+      "html": "<div class=\"ds-empty\"><div class=\"ds-empty-title\">No IPA yet</div><div>Drop an .ipa here or choose one.</div></div>",
+      "css": ".ds-empty{background-color:#d7e98a;background-image:radial-gradient(#c6dc72 1.6px,transparent 1.7px);background-size:14px 14px;color:#161616;border-radius:12px;padding:22px;max-width:360px;font:13px system-ui}.ds-empty-title{font-family:'Archivo','Arial Black',system-ui,sans-serif;font-weight:900;font-stretch:112%;font-size:22px;margin-bottom:8px}"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Phone Never Leaves the Window",
+    "overview": "Bergamota is a native macOS SwiftUI app whose look is the Bergamota identity carried from the phone's boot screens onto the Mac: a paper work area, ink type, and a lime rail with the identity's 14 pt halftone dots standing beside every section. The rail holds the phone's state in Archivo 900, what the app is doing, Newton in halftone rising from its foot, and an ink console panel with the next boots. The work area does the section's job on quiet paper panels.\n\nDensity is that of a working instrument watched for hours: mono values, hairline-ruled rows, few colours, each with a job (leaf = iOS up and primary action, amber = ABL fastboot and waiting, alert red = anything that writes the phone or fails, lime = the stage). In the dark appearance paper and ink swap; the lime stage and the ink console do not change. The system refuses a dashboard of cards where the phone's state is one card among many.",
+    "keyCharacteristics": [
+      "One lime state rail (inspector column, 290-420 pt, 330 ideal) beside every page; hidden, its state falls back to a pill in the sidebar foot.",
+      "Paper/ink work area with flat hairline panels; no shadows anywhere.",
+      "Archivo 900 at 112% width for state words, page titles and big numbers; JetBrains Mono for every value; SF Pro for labels and controls.",
+      "Halftone as the only decoration: the lime dot ground and the ink dissolve.",
+      "Colour carries meaning (state, danger), never ornament.",
+      "Native chrome stays native (sidebar List, toolbar, confirmation dialogs, .borderedProminent)."
+    ],
+    "rules": [
+      {
+        "name": "The Colour-Is-State Rule",
+        "body": "A colour on screen names a phone state or a consequence. Decorative use of leaf, amber, alert or lime is a defect.",
+        "section": "colors"
+      },
+      {
+        "name": "The Red-Writes Rule",
+        "body": "Alert red marks exactly what writes the phone (flash userdata, boot, logo) and failures; it also always asks first (typed or dialog confirmation).",
+        "section": "colors"
+      },
+      {
+        "name": "The Ink-Under-Lime Rule",
+        "body": "On the lime stage every mark (type, rules, underline, progress) is ink; lime on lime vanishes.",
+        "section": "colors"
+      },
+      {
+        "name": "The Three Voices Rule",
+        "body": "Archivo says what state; mono says what value; SF Pro says what to do. Never set a value in SF Pro or a label in Archivo.",
+        "section": "typography"
+      },
+      {
+        "name": "The Monospaced Digits Rule",
+        "body": "Live numbers use .monospacedDigit() so they do not shimmer while metrics refresh.",
+        "section": "typography"
+      },
+      {
+        "name": "The Flat-Hairline Rule",
+        "body": "Separation comes from fill and a 1 pt rule stroke, never a shadow.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do keep the State Rail visible beside every page; when hidden, show the state pill in the sidebar foot.",
+      "Do set page titles, state words and big numbers in Archivo 900 at 112% width through BFont.display; values, paths, logs and commands in BFont.mono.",
+      "Do use the paired colours (text, muted, leafText, alertText, amberText, ground, surface, rule) on the work area so both appearances stay legible; use fixed colours only for the stage, console and Tones.",
+      "Do give every state change the two-frame step and the unseen ink underline; never an eased fade.",
+      "Do make anything that writes the phone alert red and gate it with a confirmation.",
+      "Do put an empty state on the lime stage with what is missing and how to get it.",
+      "Do keep Panels flat: surface fill, 1 pt rule, 12 pt corners.",
+      "Do scale the Control Plane with s; its colours are the ink set, not the paired set."
+    ],
+    "donts": [
+      "Don't put the phone's state in a card among cards, or hide it behind a section.",
+      "Don't add shadows, blurs or gradients; depth is tone and hairline.",
+      "Don't put lime marks on the lime rail; use ink.",
+      "Don't use leaf, amber, alert or lime decoratively; they are state.",
+      "Don't set display type in the system face or numbers in SF Pro.",
+      "Don't nest Panels or wrap a Panel in a second container.",
+      "Don't fade, slide or spring state changes; no eased animation on the state word.",
+      "Don't hard-code light-only colours on the work area; they break the dark appearance."
+    ]
+  }
+}

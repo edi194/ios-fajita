@@ -1,0 +1,289 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -31,6 +31,7 @@
+ #include <sys/mount.h>
+ #include <sys/priv.h>
+ #include <sys/proc.h>
++#include <sys/persona.h>
+ #include <sys/systm.h>
+ #include <sys/ubc_internal.h>
+ #include <sys/vnode.h>
+@@ -581,9 +582,9 @@
+ #define SWEET_SYSERR_MAX        900
+ #define SWEET_SYSERR_DEFAULT    "containermanagerd,containermanagerd_system,usermanagerd,backboardd," \
+ 	"lsd,mobileactivationd,replicatord,passd,appprotectiond,findmydeviced,cryptexd,dropbear," \
+-	"financed,spaceattributiond,fairplayd.H2,PerfPowerServices,webinspectord"
++	"financed,spaceattributiond,fairplayd.H2,PerfPowerServices,webinspectord,launchd,xpcproxy"
+ 
+-static char sweet_syserr_names[256];
++static char sweet_syserr_names[320];
+ static int sweet_syserr_state;                  /* 0 = not parsed, 1 = off, 2 = on */
+ static uint64_t sweet_syserr_keys[SWEET_SYSERR_MAX];
+ static int _Atomic sweet_syserr_count;
+@@ -605,7 +606,7 @@
+ 	case 5: case 9: case 10: case 12: case 15: case 16: case 33: case 58: case 61:
+ 	case 128: case 136: case 137: case 138: case 157: case 200: case 191: case 216:
+ 	case 220: case 221: case 227: case 234: case 236: case 242: case 277: case 292:
+-	case 338: case 340: case 345: case 398:
++	case 338: case 340: case 345: case 398: case 266: case 268:
+ 		return 0;
+ 	case 463: case 464: case 466: case 467: case 468: case 469: case 470: case 472:
+ 	case 473: case 475:
+@@ -626,8 +627,10 @@
+ 	case 15: return "chmod";
+ 	case 16: return "chown";
+ 	case 33: return "access";
++	case 38: return "crossarch_trap";
+ 	case 58: return "readlink";
+ 	case 92: return "fcntl";
++	case 98: return "connect";
+ 	case 128: return "rename";
+ 	case 136: return "mkdir";
+ 	case 137: return "rmdir";
+@@ -636,6 +639,7 @@
+ 	case 170: return "csops_audittoken";
+ 	case 191: return "pathconf";
+ 	case 200: return "truncate";
++	case 202: return "sysctl";
+ 	case 216: return "open_dprotected_np";
+ 	case 220: return "getattrlist";
+ 	case 221: return "setattrlist";
+@@ -643,7 +647,10 @@
+ 	case 234: return "getxattr";
+ 	case 236: return "setxattr";
+ 	case 242: return "fsctl";
++	case 266: return "shm_open";
++	case 268: return "sem_open";
+ 	case 277: return "open_extended";
++	case 286: return "gettid";
+ 	case 292: return "mkdir_extended";
+ 	case 336: return "proc_info";
+ 	case 338: return "stat64";
+@@ -658,6 +665,7 @@
+ 	case 470: return "fstatat64";
+ 	case 472: return "unlinkat";
+ 	case 475: return "mkdirat";
++	case 488: return "renameatx_np";
+ 	case 494: return "persona";
+ 	default: return "";
+ 	}
+@@ -685,9 +693,87 @@
+ 	return false;
+ }
+ 
++void sweet_exec_env_trace(const char *name, int pid, const char *strings, const char *end);
+ void sweet_syserr_trace(struct proc *p, unsigned short code, int error, const uint64_t *arg);
++void sweet_machtrap_trace(struct proc *p, int call, int kr);
+ 
++/*
++ * At exec of a traced process print the launchd-provided XPC environment: XPC_FLAGS bit 0x4000 makes
++ * xpc_is_system_session() true (libxpc init, `tbz w20, #0xe` -> byte 0xd0 of the libxpc state), and
++ * ContainerManagerCommon's "Personas are supported (static)" is false when it is true.
++ */
+ void
++sweet_exec_env_trace(const char *name, int pid, const char *strings, const char *end)
++{
++	if (strings == NULL || end == NULL || end <= strings || (size_t)(end - strings) > (1U << 20)) {
++		return;
++	}
++	if (sweet_syserr_state == 0) {
++		if (!PE_parse_boot_argn("sweetsyserr", sweet_syserr_names, sizeof(sweet_syserr_names))) {
++			strlcpy(sweet_syserr_names, SWEET_SYSERR_DEFAULT, sizeof(sweet_syserr_names));
++		}
++		sweet_syserr_state = (sweet_syserr_names[0] == '-') ? 1 : 2;
++	}
++	if (sweet_syserr_state != 2 || !sweet_syserr_match(name)) {
++		return;
++	}
++	for (const char *s = strings; s < end;) {
++		size_t l = strnlen(s, (size_t)(end - s));
++		if (strncmp(s, "XPC_FLAGS=", 10) == 0 || strncmp(s, "XPC_SERVICE_NAME=", 17) == 0) {
++			printf("SWEET EXEC: %s[%d] %.60s\n", name, pid, s);
++		}
++		s += l + 1;
++	}
++}
++
++/*
++ * Failed Mach traps of the same processes (mach_msg/mach_msg2 results, port operations, invalid trap numbers
++ * (call >= 1000: the number is 1000 + the raw one)). Once per distinct (process, trap, kr).
++ * MACH_RCV_TIMED_OUT / MACH_SEND_TIMED_OUT / MACH_RCV_INTERRUPTED / MACH_RCV_TOO_LARGE are normal and skipped.
++ */
++void
++sweet_machtrap_trace(struct proc *p, int call, int kr)
++{
++	if (kr == 0 || (uint32_t)kr == 0x10004003 || (uint32_t)kr == 0x10000004 || (uint32_t)kr == 0x10004005 ||
++	    (uint32_t)kr == 0x10004004 || (uint32_t)kr == 0x10000003) {
++		return;
++	}
++	if (sweet_syserr_state == 0) {
++		if (!PE_parse_boot_argn("sweetsyserr", sweet_syserr_names, sizeof(sweet_syserr_names))) {
++			strlcpy(sweet_syserr_names, SWEET_SYSERR_DEFAULT, sizeof(sweet_syserr_names));
++		}
++		sweet_syserr_state = (sweet_syserr_names[0] == '-') ? 1 : 2;
++	}
++	if (sweet_syserr_state != 2 || os_atomic_load(&sweet_syserr_count, relaxed) >= SWEET_SYSERR_MAX) {
++		return;
++	}
++	char name[32];
++	proc_selfname(name, sizeof(name));
++	if (!sweet_syserr_match(name)) {
++		return;
++	}
++	uint64_t key = sweet_syserr_hash(0x84222325cbf29ce4ULL, name);
++	key = (key ^ (uint32_t)call) * 0x100000001b3ULL;
++	key = (key ^ (uint32_t)kr) * 0x100000001b3ULL;
++	int seen = os_atomic_load(&sweet_syserr_count, relaxed);
++	if (seen > SWEET_SYSERR_MAX) {
++		seen = SWEET_SYSERR_MAX;
++	}
++	for (int i = 0; i < seen; i++) {
++		if (sweet_syserr_keys[i] == key) {
++			return;
++		}
++	}
++	int slot = os_atomic_inc_orig(&sweet_syserr_count, relaxed);
++	if (slot >= SWEET_SYSERR_MAX) {
++		return;
++	}
++	sweet_syserr_keys[slot] = key;
++	printf("SWEET ERR: %s[%d/p%u u%u] MACH trap %d kr=0x%x\n", name, proc_pid(p), current_persona_get_id(),
++	    kauth_getuid(), call, (uint32_t)kr);
++}
++
++void
+ sweet_syserr_trace(struct proc *p, unsigned short code, int error, const uint64_t *arg)
+ {
+ 	if (error == EINTR || error == EAGAIN || error == ERESTART || error == EJUSTRETURN ||
+@@ -730,8 +816,52 @@
+ 		snprintf(detail, sizeof(detail), " op=%llu flags=0x%llx", arg[0], arg[1]);
+ 		key = (key ^ (uint32_t)arg[0]) * 0x100000001b3ULL;
+ 	} else if (code == 169 || code == 170) {
+-		snprintf(detail, sizeof(detail), " op=%llu", code == 169 ? arg[1] : arg[0]);
+-		key = (key ^ (uint32_t)(code == 169 ? arg[1] : arg[0])) * 0x100000001b3ULL;
++		/* csops(pid, op, ...) and csops_audittoken(pid, op, ...): op 16 = DER entitlements, ERANGE is its size probe */
++		snprintf(detail, sizeof(detail), " op=%llu", arg[1]);
++		key = (key ^ (uint32_t)arg[1]) * 0x100000001b3ULL;
++	} else if (code == 202) {
++		/* sysctl(name, namelen, ...): {0,3} is the name -> MIB lookup of sysctlbyname(): show the name */
++		int mib[2] = { -1, -1 };
++		char nm[80];
++		size_t done = 0;
++		nm[0] = '\0';
++		if (arg[1] == 2 && copyin((user_addr_t)arg[0], mib, sizeof(mib)) == 0 && mib[0] == 0 && mib[1] == 3 &&
++		    arg[4] != 0 && copyinstr((user_addr_t)arg[4], nm, sizeof(nm), &done) == 0) {
++			nm[sizeof(nm) - 1] = '\0';
++			snprintf(detail, sizeof(detail), " name \"%s\"", nm);
++			key = sweet_syserr_hash(key, nm);
++		} else {
++			snprintf(detail, sizeof(detail), " mib=%d.%d len=%llu", mib[0], mib[1], arg[1]);
++			key = (key ^ (uint32_t)mib[0]) * 0x100000001b3ULL;
++			key = (key ^ (uint32_t)mib[1]) * 0x100000001b3ULL;
++		}
++	} else if (code == 98) {
++		/* connect(s, addr, len): AF_UNIX path */
++		struct { uint8_t len; uint8_t fam; char path[104]; } sa;
++		memset(&sa, 0, sizeof(sa));
++		size_t n = arg[2] < sizeof(sa) ? (size_t)arg[2] : sizeof(sa);
++		if (arg[1] != 0 && copyin((user_addr_t)arg[1], &sa, n) == 0 && sa.fam == 1) {
++			sa.path[sizeof(sa.path) - 1] = '\0';
++			snprintf(detail, sizeof(detail), " unix \"%.90s\"", sa.path);
++			key = sweet_syserr_hash(key, sa.path);
++		} else {
++			snprintf(detail, sizeof(detail), " family=%d", sa.fam);
++			key = (key ^ sa.fam) * 0x100000001b3ULL;
++		}
++	} else if (code == 488) {
++		/* renameatx_np(fromfd, from, tofd, to, flags): 2 = RENAME_SWAP, 4 = RENAME_EXCL, 0x10 = NOFOLLOW_ANY */
++		char from[56], to[56];
++		size_t done = 0;
++		from[0] = to[0] = '\0';
++		if (arg[1] != 0) {
++			(void)copyinstr((user_addr_t)arg[1], from, sizeof(from), &done);
++		}
++		if (arg[3] != 0) {
++			(void)copyinstr((user_addr_t)arg[3], to, sizeof(to), &done);
++		}
++		from[sizeof(from) - 1] = to[sizeof(to) - 1] = '\0';
++		snprintf(detail, sizeof(detail), " \"%s\" -> \"%s\" flags=0x%llx", from, to, arg[4]);
++		key = sweet_syserr_hash(sweet_syserr_hash(key, from), to);
+ 	} else if (code == 92) {
+ 		snprintf(detail, sizeof(detail), " cmd=%llu", arg[1]);
+ 		key = (key ^ (uint32_t)arg[1]) * 0x100000001b3ULL;
+@@ -765,7 +895,8 @@
+ 		return;
+ 	}
+ 	sweet_syserr_keys[slot] = key;
+-	printf("SWEET ERR: %s[%d] %s(%d) e=%d%s\n", name, proc_pid(p), sweet_syserr_name(code), code, error, detail);
++	printf("SWEET ERR: %s[%d/p%u u%u] %s(%d) e=%d%s\n", name, proc_pid(p), current_persona_get_id(),
++	    kauth_getuid(), sweet_syserr_name(code), code, error, detail);
+ }
+ 
+ #endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/osfmk/arm64/bsd_arm64.c
++++ b/osfmk/arm64/bsd_arm64.c
+@@ -173,6 +173,11 @@
+ extern bool debug_syscall_rejection_handle(int syscall_mach_trap_number);
+ #endif /* CONFIG_DEBUG_SYSCALL_REJECTION */
+ 
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* bsd/kern/sweet_amfi.c: boot-arg sweetsyserr */
++void sweet_machtrap_trace(struct proc *p, int call, int kr);
++#endif
++
+ void
+ mach_syscall(struct arm_saved_state *state)
+ {
+@@ -200,6 +205,9 @@
+ 	call_number = -call_number;
+ 
+ 	if (call_number >= MACH_TRAP_TABLE_COUNT) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_machtrap_trace(current_proc(), 1000 + call_number, 1);
++#endif
+ 		goto bad;
+ 	}
+ 
+@@ -215,6 +223,9 @@
+ 	mach_call = (mach_call_t)mach_trap_table[call_number].mach_trap_function;
+ 
+ 	if (mach_call == (mach_call_t)kern_invalid) {
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++		sweet_machtrap_trace(current_proc(), 1000 + call_number, 2);
++#endif
+ 		DEBUG_KPRINT_SYSCALL_MACH(
+ 			"mach_syscall: kern_invalid 0x%x\n", call_number);
+ 		goto bad;
+@@ -281,6 +292,11 @@
+ 	retval = mach_call(&args);
+ 
+ skip_machcall:
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++	if (__improbable(retval != KERN_SUCCESS) && !mach_trap_table[call_number].mach_trap_returns_port) {
++		sweet_machtrap_trace(current_proc(), call_number, retval);
++	}
++#endif
+ 
+ 	DEBUG_KPRINT_SYSCALL_MACH("mach_syscall: retval=0x%x (pid %d, tid %lld)\n", retval,
+ 	    proc_pid(current_proc()), thread_tid(current_thread()));
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -105,6 +105,10 @@
+ #include <sys/sysproto.h>
+ #include <sys/sysctl.h>
+ #include <sys/persona.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++/* bsd/kern/sweet_amfi.c: boot-arg sweetsyserr */
++void sweet_exec_env_trace(const char *name, int pid, const char *strings, const char *end);
++#endif
+ #include <sys/reason.h>
+ #if SYSV_SHM
+ #include <sys/shm_internal.h>           /* shmexec() */
+@@ -7458,6 +7462,7 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 			/* SWEET runs every iOS binary this way: one short line per exec. */
+ 			printf("exec %s\n", p->p_name);
++			sweet_exec_env_trace(p->p_name, proc_getpid(p), imgp->ip_strings, imgp->ip_strendp);
+ #else
+ 			printf("Allowing spawn of iOS binary %s since it has "
+ 			    "com.apple.private.security.no-sandbox entitlement or unentitled_ios_sim_launch "

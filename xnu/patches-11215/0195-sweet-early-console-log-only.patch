@@ -1,0 +1,181 @@
+diff --git a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+index c89fc24..4fc4fbe 100644
+--- a/osfmk/arm/arm_init.c
++++ b/osfmk/arm/arm_init.c
+@@ -361,6 +361,7 @@ arm_init(
+ 	DTEntry chosen = NULL;
+ 	unsigned int dt_entry_size = 0;
+ 
++	sweet_early_set_cmdline(args->CommandLine);
+ 	sweet_early_set_video(args->Video.v_baseAddr, args->Video.v_width,
+ 	    args->Video.v_height, args->Video.v_rowBytes);
+ 	sweet_early_mark(1, "arm_init entered (MMU on)");
+@@ -594,6 +595,7 @@ arm_init(
+ 	kernel_startup_initialize_upto(STARTUP_SUB_KPRINTF);
+ 	kprintf("kprintf initialized\n");
+ 	sweet_early_mark(20, "kprintf startup complete");
++	sweet_early_flush_log();
+ 	if (serial_exists) {
+ 		sweet_early_disable();
+ 	}
+diff --git a/osfmk/arm64/sweet_early.c b/osfmk/arm64/sweet_early.c
+index ec4affd..7dcca46 100644
+--- a/osfmk/arm64/sweet_early.c
++++ b/osfmk/arm64/sweet_early.c
+@@ -10,6 +10,7 @@
+ #if defined(SWEET)
+ #include <stdint.h>
+ #include <kern/misc_protos.h>
++#include <pexpert/pexpert.h>
+ 
+ /*
+  * start.s and arm_vm_init map one 32MB block at 0x9c000000. It holds the
+@@ -37,6 +38,15 @@ extern unsigned char iso_font[256 * 16];
+ static unsigned int early_row, early_col;
+ static unsigned int early_started, early_disabled, early_panicking;
+ 
++/*
++ * The early console is log-only by default: lines go into a small ring that sweet_early_flush_log()
++ * hands to kprintf (serial + persistent log) once that works. They are drawn on the panel only with
++ * boot-arg sweetearlyfb=1 (found by sweet_early_set_cmdline, before any other mark) or on a panic.
++ */
++#define EARLY_RING 1536u
++static char early_ring[EARLY_RING];
++static unsigned int early_ring_len, early_screen, early_flushed;
++
+ static void
+ sweet_early_clear_row(void)
+ {
+@@ -48,12 +58,9 @@ sweet_early_clear_row(void)
+ 	}
+ }
+ 
+-void
+-sweet_early_putc(char c)
++static void
++sweet_early_draw(char c)
+ {
+-	if (early_disabled) {
+-		return;
+-	}
+ 	if (!early_started) {
+ 		early_started = 1;
+ 		sweet_early_clear_row();
+@@ -87,6 +94,20 @@ sweet_early_putc(char c)
+ 	early_col++;
+ }
+ 
++void
++sweet_early_putc(char c)
++{
++	if (early_disabled) {
++		return;
++	}
++	if (!early_flushed && early_ring_len < EARLY_RING) {
++		early_ring[early_ring_len++] = c;
++	}
++	if (early_screen) {
++		sweet_early_draw(c);
++	}
++}
++
+ static void
+ sweet_early_string(const char *s)
+ {
+@@ -101,13 +122,15 @@ sweet_early_mark(unsigned int stage, const char *label)
+ 	if (early_disabled || stage > 20) {
+ 		return;
+ 	}
+-	uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
+-	for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
+-		for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
+-			EARLY_FB[y * EARLY_STRIDE + x] = color;
++	if (early_screen) {
++		uint32_t color = 0xff00ff00u | ((stage & 7u) * 32u << 16);
++		for (unsigned int y = EARLY_HEIGHT - 32; y < EARLY_HEIGHT; y++) {
++			for (unsigned int x = stage * 48; x < (stage + 1) * 48; x++) {
++				EARLY_FB[y * EARLY_STRIDE + x] = color;
++			}
+ 		}
++		__asm__ volatile("dsb sy" ::: "memory");
+ 	}
+-	__asm__ volatile("dsb sy" ::: "memory");
+ 	sweet_early_string("SWEET EARLY ");
+ 	if (stage >= 10) {
+ 		sweet_early_putc((char)('0' + stage / 10));
+@@ -125,6 +148,13 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 		return;
+ 	}
+ 	early_panicking = 1;
++	if (!early_screen) {
++		/* a panic always shows: replay what was only logged so far, then the panic text */
++		early_screen = 1;
++		for (unsigned int i = 0; i < early_ring_len; i++) {
++			sweet_early_draw(early_ring[i]);
++		}
++	}
+ 	sweet_early_string("\nSWEET EARLY PANIC: ");
+ 	va_list copy;
+ 	va_copy(copy, *args);
+@@ -134,6 +164,39 @@ sweet_early_panic(const char *fmt, va_list *args)
+ 	__asm__ volatile("dsb sy" ::: "memory");
+ }
+ 
++void
++sweet_early_set_cmdline(const char *cmdline)
++{
++	static const char key[] = "sweetearlyfb=1";
++
++	for (unsigned int i = 0; cmdline[i] != '\0' && i < 256; i++) {
++		unsigned int k = 0;
++		while (key[k] != '\0' && cmdline[i + k] == key[k]) {
++			k++;
++		}
++		if (key[k] == '\0' && (i == 0 || cmdline[i - 1] == ' ')) {
++			early_screen = 1;
++			return;
++		}
++	}
++}
++
++/* kprintf (serial and the persistent log) is up: pass the recorded lines on, once. */
++void
++sweet_early_flush_log(void)
++{
++	if (early_flushed) {
++		return;
++	}
++	early_flushed = 1;
++	if (early_ring_len < EARLY_RING) {
++		early_ring[early_ring_len] = '\0';
++	} else {
++		early_ring[EARLY_RING - 1] = '\0';
++	}
++	kprintf("%s", early_ring);
++}
++
+ void
+ sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
+ {
+diff --git a/osfmk/arm64/sweet_early.h b/osfmk/arm64/sweet_early.h
+index 01dac4e..3ba05e4 100644
+--- a/osfmk/arm64/sweet_early.h
++++ b/osfmk/arm64/sweet_early.h
+@@ -13,6 +13,8 @@ void sweet_early_panic(const char *fmt, va_list *args);
+ void sweet_early_relocate(uint64_t base);
+ void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes);
+ void sweet_early_disable(void);
++void sweet_early_set_cmdline(const char *cmdline);
++void sweet_early_flush_log(void);
+ #else
+ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ {
+@@ -20,6 +22,8 @@ static inline void sweet_early_mark(unsigned int stage, const char *label)
+ 	(void)label;
+ }
+ static inline void sweet_early_disable(void) {}
++static inline void sweet_early_set_cmdline(const char *cmdline) { (void)cmdline; }
++static inline void sweet_early_flush_log(void) {}
+ static inline void sweet_early_set_video(uint64_t pa, uint64_t width, uint64_t height, uint64_t rowbytes)
+ {
+ 	(void)pa;

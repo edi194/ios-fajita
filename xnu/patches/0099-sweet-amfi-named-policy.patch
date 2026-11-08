@@ -1,0 +1,61 @@
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -366,7 +366,48 @@
+ };
+ 
+ static mac_policy_handle_t sweet_amfi_mac_handle;
++
++/*
++ * A policy named exactly "AMFI" for userland's __mac_syscall("AMFI", ...)
++ * (our signature policy is "SWEET AMFI", so those calls failed with "Policy
++ * not found"). lsd asks op 0x60 (amfi_interface_query_bootarg_state) whether
++ * the signed /System/Library/xpc/extensions.plist (the extension point
++ * catalog) must be verified: enforced unless (state & 0x86) != 0. With no
++ * real AMFI the signed read fails ("Unable to find AMFI"), the catalog stays
++ * empty, pkd finds 0 plugins and PosterBoard crashes (no wallpaper).
++ * docs/EXTENSION_CACHE.md. Every other op keeps the old answer, ENOPOLICY.
++ */
++#define SWEET_AMFI_OP_BOOTARG_STATE     0x60
++static uint64_t sweet_amfi_ops_seen[4];
++
++static int
++sweet_amfi_name_syscall(struct proc *p, int call, user_addr_t arg)
++{
++	if (call >= 0 && call < 256 && !(sweet_amfi_ops_seen[call / 64] & (1ULL << (call % 64)))) {
++		sweet_amfi_ops_seen[call / 64] |= 1ULL << (call % 64);
++		char name[32];
++		proc_name(proc_pid(p), name, sizeof(name));
++		printf("SWEET AMFI: %s __mac_syscall(\"AMFI\", 0x%x)\n", name, call);
++	}
++	if (call == SWEET_AMFI_OP_BOOTARG_STATE) {
++		uint64_t state = 0x86;
++		return copyout(&state, arg, sizeof(state));
++	}
++	return ENOPOLICY;
++}
+ 
++static const struct mac_policy_ops sweet_amfi_name_mac_ops = {
++	.mpo_policy_syscall = sweet_amfi_name_syscall,
++};
++
++static struct mac_policy_conf sweet_amfi_name_mac_conf = {
++	.mpc_name = "AMFI",
++	.mpc_fullname = "SWEET AMFI userland interface stand-in",
++	.mpc_ops = &sweet_amfi_name_mac_ops,
++};
++
++static mac_policy_handle_t sweet_amfi_name_mac_handle;
++
+ /* Called from bsd_init once MAC policies can register, before any exec. */
+ void sweet_amfi_policy_register(void);
+ 
+@@ -376,6 +417,9 @@
+ 	int error = mac_policy_register(&sweet_amfi_mac_conf, &sweet_amfi_mac_handle, NULL);
+ 	printf("SWEET AMFI: platform binary policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);
++	error = mac_policy_register(&sweet_amfi_name_mac_conf, &sweet_amfi_name_mac_handle, NULL);
++	printf("SWEET AMFI: \"AMFI\" syscall policy %s (%d)\n",
++	    error ? "NOT registered" : "registered", error);
+ 	error = mac_policy_register(&sweet_sandbox_mac_conf, &sweet_sandbox_mac_handle, NULL);
+ 	printf("SWEET Sandbox: permissive policy %s (%d)\n",
+ 	    error ? "NOT registered" : "registered", error);

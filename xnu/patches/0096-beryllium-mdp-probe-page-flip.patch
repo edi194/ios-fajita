@@ -1,0 +1,307 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -37,6 +37,9 @@
+ #include "SweetSurface.h"
+ 
+ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
++extern "C" void (*sweet_fb_panic_hook)(void);   /* osfmk/console/serial_console.c */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++#include "../../../bsd/dev/sweet_board.h"
+ 
+ #if defined(SWEET)
+ #include <IOKit/IOService.h>
+@@ -114,6 +117,27 @@
+ 	int32_t       fPadX, fPadY;
+ 	uint32_t     *fXMap;
+ 	bool          fBarsCleared;
++	/*
++	 * Poco F1 MDP (SDM845 DPU) page flipping, after ios-topaz 0092/0100/0102:
++	 * present() draws into a back buffer inside ABL's continuous-splash
++	 * carve-out, then points ABL's source pipe at it (SRC0_ADDR + CTL0
++	 * flush, latched at the panel's next vsync). Frame 0 is ABL's own
++	 * framebuffer (console, panics, power-off fade).
++	 */
++	uintptr_t     fDraw;            /* where present() draws */
++	uint32_t      fDrawIdx;
++	uint8_t       fBarsMask;        /* frames whose scaling bars are black */
++	vm_offset_t   fMdp;
++	int           fPipe;            /* index into sweet_mdp_pipes, -1 = unknown */
++	uint32_t      fBootSrc, fBootStride;
++	bool          fFlip;
++	uint32_t      fFront;
++	uint64_t      fBufPA[3];
++	uintptr_t     fBufVA[3];
++	IOMemoryMap  *fBufMap[3];
++	void          mdpProbe(void);
++	bool          flipSetup(void);
++	void          scanTo(uint32_t idx);
+ 	uintptr_t     fPixels;          /* kernel mapping of the panel memory */
+ 	IOMemoryMap  *fMap;
+ 	SweetSurface *fSurface;         /* the panel memory as an IOSurface */
+@@ -228,6 +252,17 @@
+ 		OSSafeReleaseNULL(fWorkLoop);
+ 		return false;
+ 	}
++	fDraw = fPixels;
++	fDrawIdx = 0;
++	fPipe = -1;
++	if (sweet_board_beryllium()) {
++		mdpProbe();
++		int flip = 0;
++		PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
++		if (flip && fPipe >= 0 && !flipSetup()) {
++			IOLog("SWEET FB: flip setup failed; drawing into the boot framebuffer\n");
++		}
++	}
+ 	fVsync = IOTimerEventSource::timerEventSource(this, &AppleCLCD::vsyncFired);
+ 	if (fVsync == NULL || fWorkLoop->addEventSource(fVsync) != kIOReturnSuccess) {
+ 		IOLog("SWEET FB: no vsync timer\n");
+@@ -284,6 +319,11 @@
+ 		if (step <= 6) {
+ 			fb->fFadeStep = step + 1;
+ 		}
++		if (step == 0 && fb->fFlip && fb->fFront != 0) {
++			memcpy((void *)fb->fPixels, (const void *)fb->fBufVA[fb->fFront],
++			    (size_t)fb->fRowBytes * fb->fHeight);
++			fb->scanTo(0);
++		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+@@ -359,7 +399,157 @@
+ 	IOLockUnlock(fLock);
+ 	if ((++sweet_fb_swap_count % 1000) == 0) {
+ 		IOLog("SWEET FB: %llu swaps\n", sweet_fb_swap_count);
++	}
++}
++
++/*
++ * SDM845 DPU source pipes (Linux dpu_hw_catalog sdm845, our live DT
++ * mdp_phys 0xae00000): offset from 0x0ae00000 and CTL_FLUSH bit.
++ */
++static const struct {
++	const char *name;
++	uint32_t off, flush;
++	bool vig;
++} sweet_mdp_pipes[] = {
++	{ "VIG0", 0x05000, 1u << 0, true },
++	{ "VIG1", 0x07000, 1u << 1, true },
++	{ "VIG2", 0x09000, 1u << 2, true },
++	{ "VIG3", 0x0b000, 1u << 18, true },
++	{ "DMA0", 0x25000, 1u << 11, false },
++	{ "DMA1", 0x27000, 1u << 12, false },
++	{ "DMA2", 0x29000, 1u << 24, false },
++	{ "DMA3", 0x2b000, 1u << 25, false },
++};
++#define SWEET_MDP_PA            0x0ae00000u
++#define SWEET_MDP_SIZE          0x82000u
++#define SWEET_MDP_CTL0          0x02000u
++#define SWEET_MDP_CTL_FLUSH     0x18u
++#define SWEET_MDP_CTL_BIT       (1u << 17)
++#define SWEET_MDP_LM0           0x45000u
++#define SWEET_MDP_INTF1         0x6b800u
++#define SSPP_SRC_SIZE           0x00u
++#define SSPP_OUT_SIZE           0x0cu
++#define SSPP_SRC0_ADDR          0x14u
++#define SSPP_YSTRIDE0           0x24u
++#define SSPP_SRC_FORMAT         0x30u
++#define SSPP_OP_MODE            0x38u
++
++/* panic: show ABL's framebuffer again, where the console draws */
++static vm_offset_t sweet_mdp_panic_base;
++static uint32_t sweet_mdp_panic_off, sweet_mdp_panic_flush, sweet_mdp_panic_src, sweet_mdp_panic_stride;
++static void
++sweet_fb_restore_boot_scanout(void)
++{
++	if (sweet_mdp_panic_base == 0) {
++		return;
++	}
++	volatile uint32_t *p = (volatile uint32_t *)(sweet_mdp_panic_base + sweet_mdp_panic_off);
++	p[SSPP_SRC0_ADDR / 4] = sweet_mdp_panic_src;
++	p[SSPP_YSTRIDE0 / 4] = sweet_mdp_panic_stride;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(sweet_mdp_panic_base + SWEET_MDP_CTL0 + SWEET_MDP_CTL_FLUSH) =
++	    sweet_mdp_panic_flush | SWEET_MDP_CTL_BIT;
++	__asm__ volatile ("dsb sy" ::: "memory");
++}
++
++static inline uint32_t
++mdp_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++/* Read-only: which pipe scans ABL's framebuffer, and the display path state. */
++void
++AppleCLCD::mdpProbe(void)
++{
++	fMdp = ml_io_map(SWEET_MDP_PA, SWEET_MDP_SIZE);
++	if (fMdp == 0) {
++		IOLog("SWEET MDP: map failed\n");
++		return;
++	}
++	for (uint32_t i = 0; i < sizeof(sweet_mdp_pipes) / sizeof(sweet_mdp_pipes[0]); i++) {
++		vm_offset_t p = fMdp + sweet_mdp_pipes[i].off;
++		uint32_t src = mdp_rd(p, SSPP_SRC0_ADDR), stride = mdp_rd(p, SSPP_YSTRIDE0);
++		IOLog("SWEET MDP: %s src0 0x%08x stride 0x%x size 0x%08x out 0x%08x fmt 0x%08x op 0x%08x%s\n",
++		    sweet_mdp_pipes[i].name, src, stride, mdp_rd(p, SSPP_SRC_SIZE), mdp_rd(p, SSPP_OUT_SIZE),
++		    mdp_rd(p, SSPP_SRC_FORMAT), mdp_rd(p, SSPP_OP_MODE),
++		    src == (uint32_t)fPhys ? "  <- boot framebuffer" : "");
++		if (sweet_mdp_pipes[i].vig) {
++			IOLog("SWEET MDP: %s qseed3 ver 0x%08x op 0x%08x\n", sweet_mdp_pipes[i].name,
++			    mdp_rd(p, 0xa00), mdp_rd(p, 0xa04));
++		}
++		if (src == (uint32_t)fPhys && fPipe < 0) {
++			fPipe = (int)i;
++			fBootSrc = src;
++			fBootStride = stride;
++		}
++	}
++	vm_offset_t ctl = fMdp + SWEET_MDP_CTL0;
++	IOLog("SWEET MDP: CTL0 layer0 0x%08x 0x%08x 0x%08x 0x%08x top 0x%08x flush 0x%08x; LM0 out 0x%08x\n",
++	    mdp_rd(ctl, 0x00), mdp_rd(ctl, 0x04), mdp_rd(ctl, 0x08), mdp_rd(ctl, 0x0c), mdp_rd(ctl, 0x14),
++	    mdp_rd(ctl, SWEET_MDP_CTL_FLUSH), mdp_rd(fMdp + SWEET_MDP_LM0, 0x04));
++	uint32_t f0 = mdp_rd(fMdp + SWEET_MDP_INTF1, 0xac);
++	IODelay(100000);
++	uint32_t f1 = mdp_rd(fMdp + SWEET_MDP_INTF1, 0xac);
++	IOLog("SWEET MDP: INTF1 frame count %u -> %u in 100 ms (line count en 0x%x); pipe %s\n",
++	    f0, f1, mdp_rd(fMdp + SWEET_MDP_INTF1, 0xa8),
++	    fPipe >= 0 ? sweet_mdp_pipes[fPipe].name : "NOT FOUND");
++}
++
++/* Two back buffers after ABL's framebuffer, inside cont_splash_region (36 MiB). */
++bool
++AppleCLCD::flipSetup(void)
++{
++	const uint64_t region_end = (uint64_t)fPhys + 0x2400000u;
++	uint64_t frame = ((uint64_t)fRowBytes * fHeight + 0xfffffu) & ~0xfffffull;
++	fBufPA[0] = fPhys;
++	fBufVA[0] = fPixels;
++	for (uint32_t i = 1; i < 3; i++) {
++		fBufPA[i] = (uint64_t)fPhys + frame * i;
++		if (fBufPA[i] + (uint64_t)fRowBytes * fHeight > region_end || (fBufPA[i] >> 32)) {
++			return false;
++		}
++		IOMemoryDescriptor *md = IOMemoryDescriptor::withPhysicalAddress(fBufPA[i],
++		    (IOByteCount)((uint64_t)fRowBytes * fHeight), kIODirectionInOut);
++		if (md == NULL) {
++			return false;
++		}
++		fBufMap[i] = md->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache);
++		md->release();
++		if (fBufMap[i] == NULL) {
++			return false;
++		}
++		fBufVA[i] = (uintptr_t)fBufMap[i]->getVirtualAddress();
++		memcpy((void *)fBufVA[i], (const void *)fPixels, (size_t)fRowBytes * fHeight);
+ 	}
++	sweet_mdp_panic_off = sweet_mdp_pipes[fPipe].off;
++	sweet_mdp_panic_flush = sweet_mdp_pipes[fPipe].flush;
++	sweet_mdp_panic_src = fBootSrc;
++	sweet_mdp_panic_stride = fBootStride;
++	sweet_mdp_panic_base = fMdp;
++	sweet_fb_panic_hook = sweet_fb_restore_boot_scanout;
++	fFront = 0;
++	fFlip = true;
++	IOLog("SWEET FB: page flipping on %s: frames 0x%llx 0x%llx 0x%llx\n",
++	    sweet_mdp_pipes[fPipe].name, fBufPA[0], fBufPA[1], fBufPA[2]);
++	return true;
++}
++
++/* Show frame idx: latched by the MDP at the next panel vsync. */
++void
++AppleCLCD::scanTo(uint32_t idx)
++{
++	volatile uint32_t *p = (volatile uint32_t *)(fMdp + sweet_mdp_pipes[fPipe].off);
++	__asm__ volatile ("dsb sy" ::: "memory");      /* WC writes of the frame land first */
++	p[SSPP_SRC0_ADDR / 4] = (uint32_t)fBufPA[idx];
++	p[SSPP_YSTRIDE0 / 4] = (fBootStride & 0xffff0000u) | fRowBytes;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	*(volatile uint32_t *)(fMdp + SWEET_MDP_CTL0 + SWEET_MDP_CTL_FLUSH) =
++	    sweet_mdp_pipes[fPipe].flush | SWEET_MDP_CTL_BIT;
++	__asm__ volatile ("dsb sy" ::: "memory");
++	fFront = idx;
+ }
+ 
+ /*
+@@ -395,11 +585,11 @@
+ 	if (last > s->memory->getLength()) {
+ 		return;
+ 	}
+-	if (!fBarsCleared && (fPadX > 0 || fPadY > 0)) {
++	if (!(fBarsMask & (1u << fDrawIdx)) && (fPadX > 0 || fPadY > 0)) {
+ 		for (uint32_t y = 0; y < fHeight; y++) {
+-			memset((void *)(fPixels + (uint64_t)y * fRowBytes), 0, (size_t)fWidth * 4);
++			memset((void *)(fDraw + (uint64_t)y * fRowBytes), 0, (size_t)fWidth * 4);
+ 		}
+-		fBarsCleared = true;
++		fBarsMask |= (uint8_t)(1u << fDrawIdx);
+ 	}
+ 	int32_t px0 = fPadX + (int32_t)((uint64_t)dx * fScaleXNum / fScaleXDen);
+ 	int32_t px1 = fPadX + (int32_t)((uint64_t)(dx + w) * fScaleXNum / fScaleXDen);
+@@ -424,7 +614,7 @@
+ 		int32_t ly = (int32_t)((uint64_t)(py - fPadY) * fScaleYDen / fScaleYNum) - dy;
+ 		ly = ly < 0 ? 0 : (ly >= h ? h - 1 : ly);
+ 		const uint32_t *srow = (const uint32_t *)(base + (uint64_t)(sy + ly) * s->bytesPerRow);
+-		volatile uint32_t *drow = (volatile uint32_t *)(fPixels + (uint64_t)py * fRowBytes) + px0;
++		volatile uint32_t *drow = (volatile uint32_t *)(fDraw + (uint64_t)py * fRowBytes) + px0;
+ 		int32_t n = px1 - px0;
+ 		for (int32_t i = 0; i < n; i++) {
+ 			drow[i] = srow[fXMap[i]];
+@@ -448,6 +638,13 @@
+ 		}
+ 	}
+ 
++	uint32_t back = 0;
++	if (fFlip) {
++		back = fFront == 1 ? 2 : 1;
++	}
++	fDrawIdx = back;
++	fDraw = fFlip ? fBufVA[back] : fPixels;
++
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -521,13 +718,16 @@
+ 		}
+ 		if (src != 0 && bpe == 4) {
+ 			for (int32_t y = 0; y < h; y++) {
+-				memcpy((void *)(fPixels + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
++				memcpy((void *)(fDraw + (uint64_t)(dy + y) * fRowBytes + (uint64_t)dx * 4),
+ 				    (const void *)(src + s->offset + (uint64_t)(sy + y) * s->bytesPerRow + (uint64_t)sx * 4),
+ 				    (size_t)w * 4);
+ 			}
+ 		}
+ 		s->release();
+ 	}
++	if (fFlip) {
++		scanTo(back);
++	}
+ }
+ 
+ bool
+--- a/osfmk/console/serial_console.c
++++ b/osfmk/console/serial_console.c
+@@ -274,6 +274,8 @@
+  * the GUI. A panic draws again.
+  */
+ int sweet_console_muted;
++/* Set by AppleCLCD when it page-flips the panel away from ABL's framebuffer. */
++void (*sweet_fb_panic_hook)(void);
+ #endif
+ 
+ static inline void
+@@ -283,6 +285,11 @@
+ 
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ 	sweet_log_append(c, size);
++	if (sweet_fb_panic_hook != NULL && panic_active()) {
++		void (*hook)(void) = sweet_fb_panic_hook;
++		sweet_fb_panic_hook = NULL;
++		hook();         /* the console draws into ABL's framebuffer */
++	}
+ 	if (sweet_console_muted && !panic_active()) {
+ 		return;
+ 	}

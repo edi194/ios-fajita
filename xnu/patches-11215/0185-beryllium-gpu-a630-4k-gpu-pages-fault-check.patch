@@ -1,0 +1,197 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -2236,6 +2236,7 @@
+ #define GVM_END                 0x100000000ull
+ #define GVM_GUARD               0x1000ull       /* unmapped page after every kernel-placed buffer */
+ #define GVM_MAXFREE             512
++#define PTP_TABLE               0x1000ull       /* a GPU table is 4 KiB; xnu's PAGE_SIZE is 16 KiB: never use PAGE_SIZE for GPU pages */
+ #define PTP_PAGES               256             /* 1 MiB of tables: 2 L2 + up to 254 L3 (2 MiB each) */
+ 
+ static struct {
+@@ -2256,6 +2257,7 @@
+ static unsigned gvm_nfree;
+ 
+ extern void SweetAdrenoPublish(void);   /* iokit/Kernel/arm/SweetAdreno.cpp */
++void sweet_gpu_report(const char *why);
+ 
+ static bool
+ gvm_init(void)
+@@ -2263,7 +2265,7 @@
+ 	if (ptp) {
+ 		return true;
+ 	}
+-	if (!dma_alloc((vm_size_t)PTP_PAGES * PAGE_SIZE, &ptp, &ptp_pa)) {
++	if (!dma_alloc((vm_size_t)PTP_PAGES * PTP_TABLE, &ptp, &ptp_pa)) {
+ 		ptp = 0;
+ 		return false;
+ 	}
+@@ -2280,13 +2282,13 @@
+ 	if (ptp_used >= PTP_PAGES) {
+ 		return 0;
+ 	}
+-	return ptp_pa + (uint64_t)(ptp_used++) * PAGE_SIZE;
++	return ptp_pa + (uint64_t)(ptp_used++) * PTP_TABLE;
+ }
+ 
+ static volatile uint64_t *
+ gvm_table_va(uint64_t pa)
+ {
+-	if (pa < ptp_pa || pa - ptp_pa >= (uint64_t)PTP_PAGES * PAGE_SIZE || (pa & 0xfff)) {
++	if (pa < ptp_pa || pa - ptp_pa >= (uint64_t)PTP_PAGES * PTP_TABLE || (pa & 0xfff)) {
+ 		return NULL;
+ 	}
+ 	return (volatile uint64_t *)(ptp + (pa - ptp_pa));
+@@ -2440,10 +2442,49 @@
+ 		return false;
+ 	}
+ 	pte_wr((vm_offset_t)slot, 0, pa | PTE_PAGE_NC | (readonly ? PTE_RDONLY : 0));
+-	a630_dev.bytes_mapped += PAGE_SIZE;
++	a630_dev.bytes_mapped += 0x1000;
+ 	return true;
+ }
+ 
++/* Invalidate the context's TLB after a batch of map calls (walks may be cached for tables that were still empty). */
++void
++sweet_gpu_vm_flush(void)
++{
++	if (a630_dev.ready) {
++		gvm_tlb_flush();
++	}
++}
++
++/*
++ * A translation fault of the CP's context bank 1 (FSR fault bits; bit 10 is a status bit that read 0x400 from
++ * boot on hardware and is ignored). Logs it, clears it, and declares the GPU lost: the CP is wedged on the faulting
++ * access (the context terminates instead of stalling, but the CP does not recover) and nothing is reset here.
++ */
++bool
++sweet_gpu_check_fault(void)
++{
++	vm_offset_t b;
++	uint32_t fsr;
++
++	if (!a630_dev.ready || !smmu_base) {
++		return false;
++	}
++	b = smmu_base + SMMU_CB(CP_CB);
++	fsr = gpu_rd(b, SMMU_CB_FSR);
++	if (!(fsr & 0xc00001feu)) {
++		return false;
++	}
++	printf("SWEET GPU: SMMU CB%u FAULT: FSR %#x FAR %#x%08x FSYNR0 %#x\n", CP_CB, fsr,
++	    gpu_rd(b, SMMU_CB_FAR + 4), gpu_rd(b, SMMU_CB_FAR), gpu_rd(b, SMMU_CB_FSYNR0));
++	gpu_wr(b, SMMU_CB_FSR, fsr);
++	if (!a630_dev.lost) {
++		a630_dev.lost = true;
++		a630_dev.hangs++;
++		sweet_gpu_report("GPU LOST (SMMU fault)");
++	}
++	return true;
++}
++
+ /* Clear the pages of [iova, iova+size) and invalidate the context's TLB. */
+ void
+ sweet_gpu_vm_unmap(uint64_t iova, uint64_t size)
+@@ -2452,7 +2493,7 @@
+ 		volatile uint64_t *slot = gvm_slot(iova + d, false);
+ 		if (slot && *slot) {
+ 			pte_wr((vm_offset_t)slot, 0, 0);
+-			a630_dev.bytes_mapped -= PAGE_SIZE;
++			a630_dev.bytes_mapped -= 0x1000;
+ 		}
+ 	}
+ 	gvm_tlb_flush();
+@@ -2626,6 +2667,17 @@
+ 	if (!(gpu_rd(cc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) || (gpu_rd(cc, gpucc_cbcr[CC_GX_GFX3D].off) & CBCR_CLK_OFF)) {
+ 		sweet_gpu_report("submit refused: GX is off");
+ 		return 0;
++	}
++	{
++		vm_offset_t b = smmu_base + SMMU_CB(CP_CB);
++		uint32_t fsr = gpu_rd(b, SMMU_CB_FSR);
++		if (fsr & 0xc00001feu) {
++			(void)sweet_gpu_check_fault();
++			return 0;
++		}
++		if (fsr) {
++			gpu_wr(b, SMMU_CB_FSR, fsr);    /* stale status bits (0x400 from boot) */
++		}
+ 	}
+ 	if (gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL) != 0) {
+ 		printf("SWEET GPU: submit: AHB fence was %#x (not ALLOW); set to ALLOW\n", gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL));
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -47,6 +47,8 @@
+ void sweet_gpu_iova_free(uint64_t iova, uint64_t size);
+ bool sweet_gpu_vm_map(uint64_t iova, uint64_t pa, bool readonly);
+ void sweet_gpu_vm_unmap(uint64_t iova, uint64_t size);
++void sweet_gpu_vm_flush(void);
++bool sweet_gpu_check_fault(void);
+ void sweet_gpu_cache_sync(void *va, size_t len);
+ uint32_t sweet_gpu_submit(const uint64_t *ib_iova, const uint32_t *ib_dwords, unsigned count);
+ bool sweet_gpu_fence_done(uint32_t fence);
+@@ -66,6 +68,7 @@
+ #define WAIT_PATIENCE_MS        5000    /* a wait that asks for more than this is cut here and the GPU declared lost */
+ #define CLOSE_PATIENCE_MS       2000
+ #define IOVA_UNSET              0
++#define GPU_PAGE                0x1000ull       /* SMMU granule; never PAGE_SIZE (16 KiB) */
+ 
+ static IOLock *gAdrenoLock;
+ static uint32_t gAdrenoClients;
+@@ -273,8 +276,8 @@
+ 		if (sweet_gpu_fence_done(fence)) {
+ 			return true;
+ 		}
+-		if (!sweet_gpu_ready()) {
+-			return false;
++		if (sweet_gpu_check_fault() || !sweet_gpu_ready()) {
++			return false;                   /* the CP faulted: fail now instead of waiting for the timeout */
+ 		}
+ 		if (waited >= limit || waited >= cap) {
+ 			static uint32_t reported;
+@@ -352,15 +355,17 @@
+ 	}
+ 	bool ok = true;
+ 	uint64_t mapped = 0;
+-	for (; mapped < size && ok; mapped += PAGE_SIZE) {
++	/* The GPU's pages are 4 KiB, xnu's are 16 KiB: one PTE per 4 KiB, each from its own physical address. */
++	for (; mapped < size && ok; mapped += GPU_PAGE) {
+ 		IOByteCount length = 0;
+ 		addr64_t pa = slot->md->getPhysicalSegment(mapped, &length, kIOMemoryMapperNone);
+-		ok = pa != 0 && (pa & (PAGE_SIZE - 1)) == 0 && sweet_gpu_vm_map(iova + mapped, pa, ro);
++		ok = pa != 0 && (pa & (GPU_PAGE - 1)) == 0 && sweet_gpu_vm_map(iova + mapped, pa, ro);
+ 	}
++	sweet_gpu_vm_flush();
+ 	if (!ok) {
+ 		sweet_gpu_vm_unmap(iova, mapped);
+ 		sweet_gpu_iova_free(iova, taken);
+-		IOLog("SWEET GPU: cannot map %llu bytes into the GPU address space (page %llu)\n", size, mapped / PAGE_SIZE);
++		IOLog("SWEET GPU: cannot map %llu bytes into the GPU address space (page %llu)\n", size, mapped / GPU_PAGE);
+ 		return kIOReturnNoMemory;
+ 	}
+ 	slot->iova = iova;
+@@ -454,11 +459,12 @@
+ 				uint64_t old = g->iova, oldLen = g->vaLen, newIova = r->value;
+ 				bool ok = true;
+ 				uint64_t mapped = 0;
+-				for (; mapped < g->size && ok; mapped += PAGE_SIZE) {
++				for (; mapped < g->size && ok; mapped += GPU_PAGE) {
+ 					IOByteCount length = 0;
+ 					addr64_t pa = g->md->getPhysicalSegment(mapped, &length, kIOMemoryMapperNone);
+ 					ok = pa != 0 && sweet_gpu_vm_map(newIova + mapped, pa, (g->flags & SWEET_MSM_BO_GPU_READONLY) != 0);
+ 				}
++				sweet_gpu_vm_flush();
+ 				if (!ok) {
+ 					sweet_gpu_vm_unmap(newIova, mapped);
+ 					sweet_gpu_iova_free(newIova, g->size);
+@@ -668,7 +674,7 @@
+ 	} else {
+ 		uint64_t ns = (r->timeout.tv_sec < 0 || r->timeout.tv_nsec < 0) ? 0 :
+ 		    (uint64_t)r->timeout.tv_sec * NSEC_PER_SEC + (uint64_t)r->timeout.tv_nsec;
+-		ret = waitFence(r->fence, ns) ? kIOReturnSuccess : (sweet_gpu_ready() ? kIOReturnTimeout : kIOReturnNotReady);
++		ret = waitFence(r->fence, ns) ? kIOReturnSuccess : (sweet_gpu_ready() ? kIOReturnTimeout : kIOReturnIOError);
+ 	}
+ 	IOLockUnlock(gAdrenoLock);
+ 	return ret;

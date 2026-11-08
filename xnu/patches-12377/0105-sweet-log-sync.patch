@@ -1,0 +1,51 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 5c4086fd50003669bbe02a1f159c80fbed22571e..94f541dc2d93a6700b013df360666556396ea7d6 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -871,6 +871,8 @@ static char sweet_log_ring[SWEET_LOG_SIZE];
+ static uint64_t _Atomic sweet_log_total;
+ static int sweet_log_chan;
+ static uint32_t sweet_log_secs = SWEET_LOG_SECS;
++static uint64_t _Atomic sweet_log_flushed;
++static bool _Atomic sweet_log_running;
+ 
+ /* Called for all console output, any context: never blocks. */
+ void sweet_log_append(const char *c, int size);
+@@ -970,6 +972,29 @@ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ 			return;
+ 		}
+ 		flushed = total;
++		os_atomic_store(&sweet_log_flushed, total, release);
++	}
++}
++
++/*
++ * Flush the console ring to the partition now and wait (bounded, 500 ms)
++ * for it, so the lines before a step that may hang the SoC survive the
++ * reset (sweet_a630.c). Returns at once if the log thread is not running
++ * or the caller cannot block.
++ */
++void sweet_log_sync(void);
++
++void
++sweet_log_sync(void)
++{
++	if (!os_atomic_load(&sweet_log_running, acquire) || ml_at_interrupt_context() ||
++	    !ml_get_interrupts_enabled()) {
++		return;
++	}
++	uint64_t target = os_atomic_load(&sweet_log_total, relaxed);
++	wakeup(&sweet_log_chan);
++	for (int i = 0; i < 50 && os_atomic_load(&sweet_log_flushed, acquire) < target; i++) {
++		delay(10000);
+ 	}
+ }
+ 
+@@ -988,6 +1013,7 @@ sweet_log_start(void)
+ 		sweet_log_secs = SWEET_LOG_SECS;
+ 	}
+ 	if (kernel_thread_start(sweet_log_thread, NULL, &thread) == KERN_SUCCESS) {
++		os_atomic_store(&sweet_log_running, true, release);
+ 		thread_deallocate(thread);
+ 	}
+ }

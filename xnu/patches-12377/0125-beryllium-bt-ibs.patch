@@ -1,0 +1,182 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index ddb09b4ad134e943a76dffa29c128b42a9442afa..1f3ab7d90e13f74ab749c2923bf318ce60387298 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -532,6 +532,8 @@ static struct {
+ 	unsigned rxn;
+ 	unsigned baud;                  /* UART baud currently programmed by wl_baud() */
+ 	unsigned tx_extra_us;           /* extra TX completion slack (flow control held by the controller) */
++	bool ibs_asleep, ibs_ack_pending;       /* hci_qca in-band sleep: controller asleep / WAKE_ACK owed */
++	unsigned ibs_logged, rx_st, rx_left;    /* IBS log budget; H4 event parser state at the RX side */
+ 	unsigned ev_cc, ev_other;       /* events seen while downloading firmware */
+ 	unsigned bt_fw, bt_baud, bt_fast, bt_ibs, bt_poweroff;   /* sweetbt* boot-args */
+ 	unsigned stage, delay_s;
+@@ -1329,6 +1331,7 @@ wl_uart_open(void)
+ static void
+ wl_rx_start(void)
+ {
++	wl.rx_st = 0;
+ 	wl_wr(wl.se, SE_S_IRQ_CLEAR, 0xffffffffu);
+ 	wl_wr(wl.se, SE_S_CMD0, UART_START_READ << 27);
+ }
+@@ -1351,6 +1354,57 @@ wl_rx_stop(void)
+ 	wl_wr(wl.se, SE_S_IRQ_CLEAR, 0xffffffffu);
+ }
+ 
++/*
++ * hci_qca.c in-band sleep (IBS): single bytes between H4 packets, 0xfe SLEEP_IND, 0xfd
++ * WAKE_IND, 0xfc WAKE_ACK. They are recognised only at a packet boundary (an event is
++ * 0x04, code, length, payload), acted on and kept out of wl.rxq. The ACK for a
++ * controller wake-up is sent later by wl_ibs_service(), never in the middle of a TX packet.
++ */
++#define IBS_SLEEP_IND   0xfeu
++#define IBS_WAKE_IND    0xfdu
++#define IBS_WAKE_ACK    0xfcu
++
++static void
++wl_rx_feed(uint8_t b)
++{
++	if (wl.rx_st == 0 && b >= IBS_WAKE_ACK && b <= IBS_SLEEP_IND) {
++		const char *n = b == IBS_WAKE_ACK ? "WAKE_ACK" : b == IBS_WAKE_IND ? "WAKE_IND" : "SLEEP_IND";
++		if (b == IBS_SLEEP_IND) {
++			wl.ibs_asleep = true;
++		} else {
++			wl.ibs_asleep = false;
++			if (b == IBS_WAKE_IND) {
++				wl.ibs_ack_pending = true;
++			}
++		}
++		if (wl.ibs_logged < 16) {
++			wl.ibs_logged++;
++			printf("SWEET WLAN: BT IBS: RX %s (%#04x)\n", n, b);
++		}
++		return;
++	}
++	if (wl.rxn < sizeof(wl.rxq)) {
++		wl.rxq[wl.rxn++] = b;
++	}
++	switch (wl.rx_st) {
++	case 0:
++		wl.rx_st = (b == 0x04) ? 1 : 0;         /* anything else: resync, like the event parsers do */
++		break;
++	case 1:
++		wl.rx_st = 2;
++		break;
++	case 2:
++		wl.rx_left = b;
++		wl.rx_st = b ? 3 : 0;
++		break;
++	default:
++		if (--wl.rx_left == 0) {
++			wl.rx_st = 0;
++		}
++		break;
++	}
++}
++
+ /* drain the RX FIFO into wl.rxq */
+ static void
+ wl_rx_poll(void)
+@@ -1377,9 +1431,7 @@ wl_rx_poll(void)
+ 	for (uint32_t w = 0; w < words; w++) {
+ 		uint32_t v = wl_rd(wl.se, SE_RX_FIFO);
+ 		for (unsigned k = 0; k < 4 && bytes; k++, bytes--) {
+-			if (wl.rxn < sizeof(wl.rxq)) {
+-				wl.rxq[wl.rxn++] = (uint8_t)(v >> (8 * k));
+-			}
++			wl_rx_feed((uint8_t)(v >> (8 * k)));
+ 		}
+ 	}
+ }
+@@ -1469,6 +1521,45 @@ wl_rxq_drop(unsigned n)
+ 	wl.rxn -= n;
+ }
+ 
++/* the controller woke up on its own (0xfd): acknowledge it with 0xfc, between packets only */
++static void
++wl_ibs_service(void)
++{
++	if (wl.ibs_ack_pending) {
++		uint8_t b = IBS_WAKE_ACK;
++		wl.ibs_ack_pending = false;
++		(void)wl_tx(&b, 1, wl.baud ? wl.baud : 115200);
++		if (wl.ibs_logged < 16) {
++			wl.ibs_logged++;
++			printf("SWEET WLAN: BT IBS: TX WAKE_ACK (0xfc)\n");
++		}
++	}
++}
++
++/* host side: before a packet, wake a sleeping controller with 0xfd and wait (bounded) for 0xfc */
++static void
++wl_ibs_wake(void)
++{
++	if (!wl.ibs_asleep) {
++		return;
++	}
++	uint8_t b = IBS_WAKE_IND;
++	(void)wl_tx(&b, 1, wl.baud ? wl.baud : 115200);
++	for (unsigned t = 0; t < 500 && wl.ibs_asleep; t++) {
++		wl_rx_poll();
++		if (wl.ibs_asleep) {
++			delay(1000);
++		}
++	}
++	if (wl.ibs_logged < 16) {
++		wl.ibs_logged++;
++		printf("SWEET WLAN: BT IBS: TX WAKE_IND (0xfd), %s\n", wl.ibs_asleep ? "no WAKE_ACK within 500 ms, sending anyway" :
++		    "WAKE_ACK (or WAKE_IND) received");
++	}
++	wl.ibs_asleep = false;
++	wl_ibs_service();
++}
++
+ /* TX of any length: split into pieces the FIFO accepts, keep the RX FIFO drained in between */
+ static bool
+ wl_tx_buf(const uint8_t *buf, unsigned len)
+@@ -1493,6 +1584,8 @@ wl_hci_send(uint16_t opcode, const uint8_t *params, unsigned plen)
+ 	if (plen > 255) {
+ 		return false;
+ 	}
++	wl_ibs_service();
++	wl_ibs_wake();
+ 	wl_pkt[0] = 0x01;
+ 	wl_pkt[1] = (uint8_t)opcode;
+ 	wl_pkt[2] = (uint8_t)(opcode >> 8);
+@@ -1513,6 +1606,7 @@ wl_hci_wait(uint16_t opcode, unsigned want, uint8_t *rsp, unsigned *rlen, unsign
+ {
+ 	for (unsigned t = 0; t < timeout_ms; t++) {
+ 		wl_rx_poll();
++		wl_ibs_service();
+ 		unsigned pos = 0;
+ 		while (pos < wl.rxn) {
+ 			if (wl.rxq[pos] != 0x04) {
+@@ -1570,6 +1664,7 @@ wl_evt_drain(const char *ctx)
+ 	bool ok = true;
+ 	unsigned pos = 0;
+ 	wl_rx_poll();
++	wl_ibs_service();
+ 	while (pos < wl.rxn) {
+ 		if (wl.rxq[pos] != 0x04) {
+ 			pos++;
+@@ -2014,7 +2109,19 @@ wl_bt_fw(const struct wl_qca_ver *v)
+ 		goto out;
+ 	}
+ 	wl_sleep(10);
+-	err = wl_hci_cmd(0x0c03, NULL, 0, rsp, &rlen, 3000);        /* qca_send_reset */
++	/*
++	 * qca_send_reset(): plain HCI Reset, HCI_INIT_TIMEOUT (10 s). Linux has no further delay after the NVM
++	 * (only the 10 ms before it). The controller restarts with the patch and may announce itself with an
++	 * IBS WAKE_IND first (boot 0124: "00 fd"), which has to be acknowledged before it sends anything.
++	 */
++	{
++		for (unsigned i = 0; i < 20; i++) {     /* up to 200 ms: let a pending WAKE_IND in and answer it */
++			wl_rx_poll();
++			wl_ibs_service();
++			wl_sleep(10);
++		}
++	}
++	err = wl_hci_cmd(0x0c03, NULL, 0, rsp, &rlen, 10000);      /* qca_send_reset */
+ 	if (err) {
+ 		printf("SWEET WLAN: BT fw: HCI Reset after download: no event (%d)\n", err);
+ 		goto out;

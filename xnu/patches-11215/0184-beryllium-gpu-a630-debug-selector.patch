@@ -1,0 +1,238 @@
+diff --git a/bsd/dev/sweet_a630.c b/bsd/dev/sweet_a630.c
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -168,6 +168,8 @@
+ #define GMU_GMU2HOST_INTR_INFO  R(0x5192)
+ #define GMU_HOST2GMU_INTR_SET   R(0x5194)
+ #define GMU_GENERAL_7           R(0x51cc)
++#define GMU_AO_COUNTER_L        R(0x5088)       /* a6xx_gmu.xml GMU_ALWAYS_ON_COUNTER_L/H, 19.2 MHz */
++#define GMU_AO_COUNTER_H        R(0x5089)
+ #define GMU_PWR_COL_KEEPALIVE   R(0x50c3)       /* a6xx_gmu.xml: 1 = the GMU does not collapse GX */
+ #define GMU_BOOT_SLUMBER_OPTION R(0x23f8)       /* in the GMU DTCM */
+ #define GMU_GX_VOTE_IDX         R(0x23f9)
+@@ -2481,8 +2483,10 @@
+ 	case 2:  *value = 0x100000; return true;                /* GMEM_SIZE */
+ 	case 3:  *value = 0x06030001; return true;              /* CHIP_ID */
+ 	case 4:  *value = 710000000ull; return true;            /* MAX_FREQ (the GPU runs at 257 MHz: docs/GPU_KERNEL.md) */
+-	case 5:  *value = (uint64_t)gpu_r(A6XX_CP_ALWAYS_ON_COUNTER) |
+-	    ((uint64_t)gpu_r(A6XX_CP_ALWAYS_ON_COUNTER + 1) << 32); return true;    /* TIMESTAMP, 19.2 MHz */
++	case 5:  /* TIMESTAMP: the GMU always-on counter (19.2 MHz), what Linux a6xx_get_timestamp reads; the CP's own
++	          * copy read over AHB did not advance on hardware (docs/GPU_KERNEL.md) */
++		*value = (uint64_t)gpu_rd(gmu, GMU_AO_COUNTER_L) | ((uint64_t)gpu_rd(gmu, GMU_AO_COUNTER_H) << 32);
++		return true;
+ 	case 6:  *value = 0x100000; return true;                /* GMEM_BASE */
+ 	case 7:  *value = 1; return true;                       /* PRIORITIES */
+ 	case 8:  *value = 0; return true;                       /* PP_PGTABLE */
+@@ -2510,17 +2514,87 @@
+ 	return (int32_t)(v - fence) >= 0;
+ }
+ 
+-/* What the CP says when a submission does not come back. */
++/*
++ * Read-only state dump (docs/GPU_KERNEL.md, SWEET_GPU_SEL_DEBUG). GMU, gpucc and SMMU words are always read
++ * (CX is up); the GPU core is only read when the GX GDSC and the gfx3d clock are on, so a collapsed GX
++ * produces numbers instead of a bus hang. Index meaning is in sweet_adreno_abi.h.
++ */
++#define DBG_N 40
+ void
++sweet_gpu_debug(uint32_t *w)
++{
++	if (!cc || !gmu) {
++		bzero(w, DBG_N * sizeof(uint32_t));
++		return;
++	}
++	uint32_t gx = gpu_rd(cc, GPUCC_GX_GDSCR), gfx = gpu_rd(cc, gpucc_cbcr[CC_GX_GFX3D].off);
++	bool core = (gx & GDSC_PWR_ON) && !(gfx & CBCR_CLK_OFF) && gpu_regs;
++
++	bzero(w, DBG_N * sizeof(uint32_t));
++	w[0] = (core ? 1u : 0u) | (a630_dev.lost ? 2u : 0u) | (a630_dev.ready ? 4u : 0u);
++	w[1] = gpu_rd(gmu, GMU_RPMH_POWER_STATE);
++	w[2] = gpu_rd(gmu, GMU_SPTPRAC_PWR_CLK_STATUS);
++	w[3] = gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL);
++	w[4] = gpu_rd(gmu, GMU_AHB_FENCE_STATUS);
++	w[5] = gx;
++	w[6] = gpu_rd(cc, GPUCC_CX_GDSCR);
++	w[7] = gfx;
++	w[8] = gpu_rd(gmu, GMU_AO_COUNTER_L);
++	w[9] = gpu_rd(gmu, GMU_AO_COUNTER_H);
++	w[10] = gpu_rd(gmu, GMU_GMU2HOST_INTR_INFO);
++	w[11] = gpu_rd(gmu, GMU_HFI_CTRL_STATUS);
++	w[12] = gpu_rd(gmu, GMU_CM3_SYSRESET);
++	w[13] = gpu_rd(gmu, GMU_PWR_COL_KEEPALIVE);
++	w[14] = gpu_rd(gmu, GMU_AO_HOST_INTERRUPT_STATUS);
++	w[15] = a630_dev.seqno;
++	w[16] = ring_wptr;
++	w[17] = cp_memory ? *(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE) : 0;
++	w[18] = gpu_rd(gmu, GMU_CM3_FW_INIT_RESULT);
++	if (smmu_base) {
++		vm_offset_t b = smmu_base + SMMU_CB(CP_CB);
++		w[19] = gpu_rd(b, SMMU_CB_FSR);
++		w[20] = gpu_rd(b, SMMU_CB_FAR);
++		w[21] = gpu_rd(b, SMMU_CB_FAR + 4);
++		w[22] = gpu_rd(b, SMMU_CB_FSYNR0);
++		w[23] = gpu_rd(smmu_base, SMMU_sGFSR);
++		w[24] = gpu_rd(smmu_base, SMMU_sGFSYNR0);
++		w[25] = gpu_rd(b, SMMU_CB_SCTLR);
++	}
++	if (core) {
++		w[26] = gpu_r(A6XX_CP_RB_RPTR);
++		w[27] = gpu_r(A6XX_CP_RB_WPTR);
++		w[28] = gpu_r(A6XX_CP_STATUS_1);
++		w[29] = gpu_r(A6XX_RBBM_STATUS);
++		w[30] = gpu_r(A6XX_CP_HW_FAULT);
++		w[31] = gpu_r(A6XX_CP_INTERRUPT_STATUS);
++		w[32] = gpu_r(A6XX_RBBM_INT_0_STATUS);
++		w[33] = gpu_r(A6XX_CP_SQE_CNTL);
++		w[34] = gpu_r(A6XX_CP_PROTECT_STATUS);
++		w[35] = gpu_r(0x0928);          /* CP_IB1_BASE lo */
++		w[36] = gpu_r(0x0929);          /* CP_IB1_BASE hi */
++		w[37] = gpu_r(0x092a);          /* CP_IB1_REM_SIZE */
++		w[38] = gpu_r(A6XX_CP_ALWAYS_ON_COUNTER);
++		w[39] = gpu_r(A6XX_CP_RB_BASE);
++	}
++}
++
++/* What the CP says when a submission does not come back (kernel log, safe on a collapsed GX). */
++void
+ sweet_gpu_report(const char *why)
+ {
+-	printf("SWEET GPU: %s: submitted %u, completed %u; ring RPTR %u WPTR %u RBBM_STATUS %#x CP_STATUS_1 %#x HW_FAULT %#x CP_IRQ %#x PROTECT %#x RBBM_IRQ %#x\n",
+-	    why, a630_dev.seqno, *(volatile uint32_t *)(cp_memory + SCRATCH_OFF + SCRATCH_FENCE),
+-	    gpu_r(A6XX_CP_RB_RPTR), ring_wptr, gpu_r(A6XX_RBBM_STATUS), gpu_r(A6XX_CP_STATUS_1),
+-	    gpu_r(A6XX_CP_HW_FAULT), gpu_r(A6XX_CP_INTERRUPT_STATUS), gpu_r(A6XX_CP_PROTECT_STATUS),
+-	    gpu_r(A6XX_RBBM_INT_0_STATUS));
+-	gpu_smmu_cb_faults(CP_CB);
+-	gpu_smmu_faults();
++	uint32_t w[DBG_N];
++
++	sweet_gpu_debug(w);
++	printf("SWEET GPU: %s: core-readable %u lost %u; GMU RPMH_POWER_STATE %#x SPTPRAC %#x AHB_FENCE ctrl %#x dropped %#x KEEPALIVE %u AO counter %#x%08x HOST_INT %#x\n",
++	    why, w[0] & 1, (w[0] >> 1) & 1, w[1], w[2], w[3], w[4], w[13], w[9], w[8], w[14]);
++	printf("SWEET GPU: %s: GX gdscr %#x gfx3d cbcr %#x CX gdscr %#x; submitted %u completed %u soft WPTR %u\n",
++	    why, w[5], w[7], w[6], w[15], w[17], w[16]);
++	printf("SWEET GPU: %s: SMMU CB1 FSR %#x FAR %#x%08x FSYNR0 %#x SCTLR %#x sGFSR %#x sGFSYNR0 %#x\n",
++	    why, w[19], w[21], w[20], w[22], w[25], w[23], w[24]);
++	if (w[0] & 1) {
++		printf("SWEET GPU: %s: CP RPTR %u WPTR %u SQE_CNTL %#x STATUS_1 %#x RBBM_STATUS %#x HW_FAULT %#x CP_IRQ %#x PROTECT %#x RBBM_IRQ %#x IB1 %#x%08x rem %u\n",
++		    why, w[26], w[27], w[33], w[28], w[29], w[30], w[31], w[34], w[32], w[36], w[35], w[37]);
++	}
+ 	sweet_log_sync();
+ }
+ 
+@@ -2548,6 +2622,15 @@
+ 	if (!sweet_gpu_ready() || count == 0 || count > 128) {
+ 		return 0;
+ 	}
++	/* GPU registers are only touched while GX is on and the AHB fence allows them (never a hang, never a silent drop). */
++	if (!(gpu_rd(cc, GPUCC_GX_GDSCR) & GDSC_PWR_ON) || (gpu_rd(cc, gpucc_cbcr[CC_GX_GFX3D].off) & CBCR_CLK_OFF)) {
++		sweet_gpu_report("submit refused: GX is off");
++		return 0;
++	}
++	if (gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL) != 0) {
++		printf("SWEET GPU: submit: AHB fence was %#x (not ALLOW); set to ALLOW\n", gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL));
++		gpu_wr(gmu, GMU_AO_AHB_FENCE_CTRL, 0);
++	}
+ 	for (unsigned i = 0; i < 20000; i++) {
+ 		uint32_t rptr = gpu_r(A6XX_CP_RB_RPTR);
+ 		room = (rptr + RING_SIZE / 4 - ring_wptr - 1) % (RING_SIZE / 4);
+@@ -2578,8 +2661,15 @@
+ 	ring_emit((uint32_t)(SCRATCH_VA + SCRATCH_FENCE));
+ 	ring_emit(0);
+ 	ring_emit(a630_dev.seqno);
++	uint32_t wbefore = ring_wptr;
+ 	ring_flush();
+ 	a630_dev.submissions++;
++	if (a630_dev.submissions <= 8 || gpu_r(A6XX_CP_RB_WPTR) != ring_wptr) {
++		printf("SWEET GPU: submit %u: %u IB(s) first %#llx/%u dw, ring %u dw -> WPTR %u, reads back WPTR %u RPTR %u; AHB fence %#x dropped %#x RPMH %#x\n",
++		    a630_dev.seqno, count, (unsigned long long)ib_iova[0], ib_dwords[0], (ring_wptr + RING_SIZE / 4 - (wbefore % (RING_SIZE / 4))) % (RING_SIZE / 4),
++		    ring_wptr, gpu_r(A6XX_CP_RB_WPTR), gpu_r(A6XX_CP_RB_RPTR), gpu_rd(gmu, GMU_AO_AHB_FENCE_CTRL),
++		    gpu_rd(gmu, GMU_AHB_FENCE_STATUS), gpu_rd(gmu, GMU_RPMH_POWER_STATE));
++	}
+ 	return a630_dev.seqno;
+ }
+ 
+diff --git a/iokit/Kernel/arm/SweetAdreno.cpp b/iokit/Kernel/arm/SweetAdreno.cpp
+--- a/iokit/Kernel/arm/SweetAdreno.cpp
++++ b/iokit/Kernel/arm/SweetAdreno.cpp
+@@ -53,6 +53,7 @@
+ uint32_t sweet_gpu_fence_last(void);
+ void sweet_gpu_mark_lost(void);
+ void sweet_gpu_report(const char *why);
++void sweet_gpu_debug(uint32_t *w);
+ void SweetAdrenoPublish(void);
+ }
+ 
+@@ -276,6 +277,11 @@
+ 			return false;
+ 		}
+ 		if (waited >= limit || waited >= cap) {
++			static uint32_t reported;
++			if (ns >= 100 * NSEC_PER_MSEC && reported != fence) {
++				reported = fence;
++				sweet_gpu_report("wait timed out");
++			}
+ 			if (ns >= NSEC_PER_SEC && waited >= cap) {
+ 				sweet_gpu_mark_lost();
+ 			}
+@@ -805,6 +811,7 @@
+ 		struct sweet_gpu_info info;
+ 		struct sweet_gpu_surface_bo surface;
+ 		struct sweet_gpu_bo_sync sync;
++		struct sweet_gpu_debug debug;
+ 		uint32_t queueId;
+ 	} r;
+ 	size_t in = args->structureInputSize;
+@@ -819,7 +826,7 @@
+ 	if (in != 0) {
+ 		memcpy(&r, args->structureInput, in);
+ 	}
+-	if (!sweet_gpu_ready() && selector != SWEET_GPU_SEL_INFO) {
++	if (!sweet_gpu_ready() && selector != SWEET_GPU_SEL_INFO && selector != SWEET_GPU_SEL_DEBUG) {
+ 		return kIOReturnNotReady;
+ 	}
+ 
+@@ -930,6 +937,12 @@
+ 		NEED(struct sweet_gpu_surface_bo);
+ 		ret = surfaceBo(&r.surface);
+ 		outLen = sizeof(r.surface);
++		break;
++	case SWEET_GPU_SEL_DEBUG:
++		IOLockLock(gAdrenoLock);
++		sweet_gpu_debug(r.debug.w);
++		IOLockUnlock(gAdrenoLock);
++		outLen = sizeof(r.debug);
+ 		break;
+ 	case SWEET_GPU_SEL_BO_SYNC:
+ 		NEED(struct sweet_gpu_bo_sync);
+diff --git a/iokit/Kernel/arm/SweetAdrenoABI.h b/iokit/Kernel/arm/SweetAdrenoABI.h
+--- a/iokit/Kernel/arm/SweetAdrenoABI.h
++++ b/iokit/Kernel/arm/SweetAdrenoABI.h
+@@ -44,6 +44,7 @@
+ 	SWEET_GPU_SEL_INFO              = 0x70, /* struct sweet_gpu_info (out) */
+ 	SWEET_GPU_SEL_SURFACE_BO        = 0x71, /* struct sweet_gpu_surface_bo (in/out): IOSurface memory as a BO */
+ 	SWEET_GPU_SEL_BO_SYNC           = 0x72, /* struct sweet_gpu_bo_sync: clean+invalidate the CPU alias of a BO */
++	SWEET_GPU_SEL_DEBUG             = 0x73, /* struct sweet_gpu_debug (out): read-only register snapshot, safe when GX is off */
+ };
+ 
+ /* Memory mapping: IOConnectMapMemory64(conn, memoryType = BO handle, task, &addr, &size,
+@@ -189,6 +190,20 @@
+ 	uint32_t flags;         /* 0 */
+ 	uint64_t offset;        /* byte range inside the BO; size 0 = to the end */
+ 	uint64_t size;
++};
++
++/* SWEET_GPU_SEL_DEBUG: word index -> meaning. GPU-core words (26..39) are 0 unless w[0] bit0 is set.
++ *  0 flags: bit0 GPU core readable (GX GDSC on + gfx3d clock on), bit1 lost, bit2 ready
++ *  1 GMU RPMH_POWER_STATE (0xf = hardware slumber)   2 SPTPRAC_PWR_CLK_STATUS   3 AO_AHB_FENCE_CTRL (0 = allow)
++ *  4 AHB_FENCE_STATUS (dropped accesses)   5 gpucc GX GDSCR (bit31 = on)   6 gpucc CX GDSCR   7 gx_gfx3d CBCR (bit31 = off)
++ *  8/9 GMU always-on counter lo/hi (19.2 MHz)   10 GMU2HOST_INTR_INFO   11 HFI_CTRL_STATUS   12 CM3_SYSRESET
++ *  13 PWR_COL_KEEPALIVE   14 AO_HOST_INTERRUPT_STATUS   15 last submitted seqno   16 soft ring WPTR   17 completed seqno (fence word)
++ *  18 CM3_FW_INIT_RESULT   19 SMMU CB1 FSR   20/21 CB1 FAR lo/hi   22 CB1 FSYNR0   23 sGFSR   24 sGFSYNR0   25 CB1 SCTLR
++ *  26 CP_RB_RPTR  27 CP_RB_WPTR  28 CP_STATUS_1  29 RBBM_STATUS  30 CP_HW_FAULT  31 CP_INTERRUPT_STATUS  32 RBBM_INT_0_STATUS
++ *  33 CP_SQE_CNTL  34 CP_PROTECT_STATUS  35/36 CP_IB1_BASE lo/hi  37 CP_IB1_REM_SIZE  38 CP_ALWAYS_ON_COUNTER  39 CP_RB_BASE */
++#define SWEET_GPU_DEBUG_WORDS           40
++struct sweet_gpu_debug {
++	uint32_t w[SWEET_GPU_DEBUG_WORDS];
+ };
+ 
+ /* ---- msm constants used above (values of msm_drm.h) ---- */

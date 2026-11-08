@@ -1,0 +1,48 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index c091c53d79e080ec4cea6ed474e26e9812f7eff8..918ad4df298449351b147beb3a10698582e71b7a 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -540,6 +540,27 @@ struct sweet_amfi_dyld_policy_req {
+ 	user_addr_t     output_flags;
+ };
+ 
++/*
++ * Op 0x66 = amfi_launch_constraint_matches_process(audit_token, lwcr, lwcr_len, result): does a process satisfy a
++ * lightweight code requirement (iOS 26 libxpc peer requirements, e.g. backboardd's LSSXPCService "entitlement
++ * exists"). libamfi (23G90) passes struct { audit_token_t token; user_addr_t lwcr; uint32_t lwcr_len;
++ * user_addr_t result; uint32_t result_size (0x404); } and reports a match only for a 0 return AND result->error_code
++ * 0 (AICMR_MATCH); libxpc asserts the two agree, so ENOPOLICY with libxpc's zeroed result aborted backboardd
++ * ("matched == (match_result.error_code == AICMR_MATCH)"). No real AMFI here, every requirement matches, as every
++ * other AMFI question on this kernel is answered permissively.
++ */
++#define SWEET_AMFI_OP_LWCR_MATCHES      0x66
++
++struct sweet_amfi_lwcr_req {
++	uint8_t         token[32];
++	user_addr_t     lwcr;
++	uint32_t        lwcr_len;
++	uint32_t        pad0;
++	user_addr_t     result;
++	uint32_t        result_size;
++	uint32_t        pad1;
++};
++
+ extern bool sweet_arm64e_enabled(void);
+ extern bool sweet_proc_is_arm64e(struct proc *p);
+ static uint64_t sweet_amfi_ops_seen[4];
+@@ -557,6 +578,15 @@ sweet_amfi_name_syscall(struct proc *p, int call, user_addr_t arg)
+ 		uint64_t state = 0x86;
+ 		return copyout(&state, arg, sizeof(state));
+ 	}
++	if (call == SWEET_AMFI_OP_LWCR_MATCHES) {
++		struct sweet_amfi_lwcr_req req;
++		uint32_t match = 0;     /* AICMR_MATCH */
++		int error = copyin(arg, &req, sizeof(req));
++		if (error == 0 && req.result != 0 && req.result_size >= sizeof(match)) {
++			error = copyout(&match, req.result, sizeof(match));
++		}
++		return error;
++	}
+ 	if (call == SWEET_AMFI_OP_DYLD_POLICY && sweet_arm64e_enabled() && sweet_proc_is_arm64e(p)) {
+ 		struct sweet_amfi_dyld_policy_req req;
+ 		uint64_t allow = SWEET_AMFI_DYLD_ALLOW_ALL;

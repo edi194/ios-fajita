@@ -1,0 +1,92 @@
+diff --git a/bsd/dev/sweet_spmi.c b/bsd/dev/sweet_spmi.c
+index 928c6a8..69f46a0 100644
+--- a/bsd/dev/sweet_spmi.c
++++ b/bsd/dev/sweet_spmi.c
+@@ -5,9 +5,11 @@
+  * Battery APIDs are disjoint from the existing keys' 008/4c1 APIDs.
+  *
+  * The one write path (sweet_spmi_write, Poco F1 only) exists for the
+- * backlight fade (SweetFramebuffer.cpp, sweetfb_blfade): it can only reach
+- * the PMI8998 WLED sink brightness bytes and the sink sync register, and
+- * only through an APID the application processor's EE owns.
++ * backlight fade (SweetFramebuffer.cpp, sweetfb_blfade), the reboot reason
++ * and the charger limits (sweet_charger.c, sweetcharger=2; locked until it
++ * calls sweet_spmi_charger_writes()): it can only reach the registers listed
++ * at sp_write_allowed, and only through an APID the application processor's
++ * EE owns.
+  */
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+@@ -151,8 +153,10 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+ 	if (sweet_board_beryllium()) {
+ 		/* SID 3: PMI8998 WLED ctrl 0xd8 / sink 0xd9 (backlight fade, reads only here) */
+ 		/* SID 0: PM8998 PON 0x08 (reboot reason read-modify-write, sweet_reboot.c) */
++		/* SID 2: SMB2 charger CHGR 0x10 / USBIN 0x13 / MISC 0x16, FG 0x40 / 0x41, RRADC 0x45 (USBIN I and V) */
+ 		allowed = (sid == 2 && (peripheral == 0x10 || peripheral == 0x13 ||
+-		    peripheral == 0x40 || peripheral == 0x41)) ||
++		    peripheral == 0x16 || peripheral == 0x40 || peripheral == 0x41 ||
++		    peripheral == 0x45)) ||
+ 		    (sid == 3 && (peripheral == 0xd8 || peripheral == 0xd9)) ||
+ 		    (sid == 0 && peripheral == 0x08);
+ 	} else {
+@@ -202,13 +206,47 @@ sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out)
+  * Nothing in the control module (0xd8: MOD_EN, OVP, boost) is writable.
+  * SID 0: PM8998 PON_SOFT_RB_SPARE (0x88f, one byte) only, the reboot reason
+  * of qcom-pon.c (written by sweet_reboot.c, read-modify-write).
++ * SID 2: PMI8998 SMB2 charger, single bytes, only after sweet_charger.c
++ * unlocked them (sweetcharger=2); offsets of qcom_smbx.c / downstream
++ * smb-reg.h on the 0x1000 base of pmi8998.dtsi:
++ *   0x1042 CHARGING_ENABLE_CMD     0x1061 FAST_CHARGE_CURRENT_CFG
++ *   0x1070 FLOAT_VOLTAGE_CFG       0x1340 USBIN_CMD_IL (suspend bit)
++ *   0x1365 USBIN_LOAD_CFG          0x1366 USBIN_ICL_OPTIONS
++ *   0x1370 USBIN_CURRENT_LIMIT_CFG
++ * Nothing else of the charger (HVDCP/QC, type-C role, watchdog, JEITA,
++ * termination, OTG) is writable.
+  */
++static bool sp_charger_writes;
++
++void
++sweet_spmi_charger_writes(void)
++{
++	sp_charger_writes = true;
++}
++
+ static bool
+ sp_write_allowed(unsigned sid, unsigned addr, unsigned len)
+ {
+ 	if (!sweet_board_beryllium() || len < 1 || len > 2) {
+ 		return false;
+ 	}
++	if (sid == 2) {
++		if (!sp_charger_writes || len != 1) {
++			return false;
++		}
++		switch (addr) {
++		case 0x1042u:
++		case 0x1061u:
++		case 0x1070u:
++		case 0x1340u:
++		case 0x1365u:
++		case 0x1366u:
++		case 0x1370u:
++			return true;
++		default:
++			return false;
++		}
++	}
+ 	if (sid == 0) {
+ 		return addr == 0x088fu && len == 1;
+ 	}
+diff --git a/bsd/dev/sweet_spmi.h b/bsd/dev/sweet_spmi.h
+index cb2b3c8..65f8c56 100644
+--- a/bsd/dev/sweet_spmi.h
++++ b/bsd/dev/sweet_spmi.h
+@@ -13,6 +13,8 @@ int sweet_spmi_read(unsigned sid, unsigned addr, uint8_t *out);
+  * brightness/sync registers (see sweet_spmi.c). Thread context only.
+  */
+ int sweet_spmi_write(unsigned sid, unsigned addr, const uint8_t *data, unsigned len);
++/* Poco F1: unlock the seven PMI8998 charger registers of sweet_spmi_write (sweetcharger=2 only). */
++void sweet_spmi_charger_writes(void);
+ /* Thread context: prepare a whitelisted write for later atomic use (0 ok). */
+ int sweet_spmi_prepare_write(unsigned sid, unsigned addr);
+ /* Reset time: no more sleeping locks or mappings in this module. */

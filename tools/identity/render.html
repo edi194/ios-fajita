@@ -1,0 +1,33 @@
+<!doctype html>
+<!-- Text rasteriser for tools/identity/mkidentity.py: white on black, so the screenshot's luminance is the coverage.
+     Query: ?font=archivo|jbm&size=PX&weight=N&stretch=PCT&track=EM&text=URI  (a single run of text)
+            ?atlas=1&font=jbm&size=PX&weight=N&cellw=PX&cellh=PX&chars=URI  (one fixed cell per character, left to right) -->
+<html><head><meta charset="utf-8">
+<style>
+@font-face { font-family: "Archivo"; src: url("fonts/archivo.woff2") format("woff2"); font-weight: 100 900; font-stretch: 62% 125%; }
+@font-face { font-family: "JBM"; src: url("fonts/jetbrains-mono.woff2") format("woff2"); font-weight: 100 800; }
+html, body { margin: 0; background: #000; }
+#out { position: absolute; left: 32px; top: 32px; color: #fff; white-space: pre; line-height: 1; }
+.cell { display: inline-block; overflow: hidden; vertical-align: top; }
+</style></head>
+<body><div id="out"></div>
+<script>
+const q = new URLSearchParams(location.search);
+const out = document.getElementById('out');
+const fam = q.get('font') === 'jbm' ? 'JBM' : 'Archivo';
+out.style.fontFamily = fam;
+out.style.fontSize = q.get('size') + 'px';
+out.style.fontWeight = q.get('weight') || '400';
+out.style.fontStretch = (q.get('stretch') || '100') + '%';
+out.style.letterSpacing = (q.get('track') || '0') + 'em';
+if (q.get('atlas')) {
+  const w = q.get('cellw'), h = q.get('cellh');
+  for (const ch of q.get('chars')) {
+    const c = document.createElement('span');
+    c.className = 'cell'; c.style.width = w + 'px'; c.style.height = h + 'px'; c.style.lineHeight = h + 'px';
+    c.textContent = ch; out.appendChild(c);
+  }
+} else {
+  out.textContent = q.get('text');
+}
+</script></body></html>

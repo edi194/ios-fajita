@@ -1,0 +1,412 @@
+diff --git a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+index 9b59cfad5158f044ad5952e284d5a76ffb9b8ff3..d87e7f54456a14150c6d337636721bbcc095af2a 100644
+--- a/osfmk/arm64/sleh.c
++++ b/osfmk/arm64/sleh.c
+@@ -39,6 +39,7 @@
+ #include <kern/cpc.h>
+ #include <arm64/instructions.h>
+ #include <arm64/sweet_fjcvtzs.h>
++#include <arm64/sweet_pacemu.h>
+ 
+ #include <kern/debug.h>
+ #include <kern/exc_guard.h>
+@@ -175,6 +176,8 @@ static void handle_kernel_breakpoint(arm_saved_state_t *, uint64_t);
+ 
+ /* kern_exec.c: boot-arg sweetarm64e=1 (iOS 18 arm64e userland on a CPU without PAuth/JSCVT) */
+ extern bool sweet_arm64e_enabled(void);
++/* bsd: process name for the PAC emulation log */
++extern char *proc_name_address(void *p);
+ 
+ static void handle_user_breakpoint(arm_saved_state_t *, uint64_t) __dead2;
+ 
+@@ -1222,6 +1225,101 @@ sweet_emulate_fjcvtzs(arm_saved_state_t *state, uint32_t instr)
+ 	return true;
+ }
+ 
++/*
++ * SWEET: emulate the non-HINT pointer-authentication instructions (ARMv8.3-PAuth,
++ * absent on SDM845's Kryo 385) for 64-bit EL0 threads, exactly as Renegade's
++ * pacstrip rewrites them offline (osfmk/arm64/sweet_pacemu.h). A runtime safety
++ * net for arm64e code that was not stripped (new tools, JIT); every trap costs
++ * about a microsecond, so hot code should still be stripped.
++ */
++static int
++sweet_pac_copyin64(void *ctx __unused, uint64_t addr, uint64_t *value)
++{
++	/* TCR_EL1.TBI0: the LDR would ignore the top byte, copyio refuses tagged addresses */
++	return copyin((user_addr_t)VM_USER_STRIP_TBI(addr), (char *)value, sizeof(*value));
++}
++
++/* LDRAA/LDRAB could not read addr: the EXC_BAD_ACCESS (SIGSEGV) the LDR would have raised */
++static void __dead2
++sweet_pac_fault(arm_saved_state_t *state, uint64_t addr)
++{
++	thread_t thread = current_thread();
++	mach_exception_data_type_t codes[2] = {KERN_INVALID_ADDRESS, (mach_exception_data_type_t)addr};
++
++	if (thread->machine.recover_esr != 0) {
++		/* copyin took a fault the VM could not resolve: report it as an EL0 data abort */
++		uint64_t esr = thread->machine.recover_esr & ~ESR_EC_MASK;
++		set_saved_state_esr(state, esr | (ESR_EC_DABORT_EL0 << ESR_EC_SHIFT));
++		set_saved_state_far(state, addr);
++	}
++	exception_triage(EXC_BAD_ACCESS, codes, 2);
++	__builtin_unreachable();
++}
++
++static bool
++sweet_emulate_pac(arm_saved_state_t *state, uint32_t instr)
++{
++	static uint32_t sweet_pac_logged[SWEET_PACC_COUNT];
++	static uint64_t sweet_pac_count[SWEET_PACC_COUNT];     /* statistics: racy on purpose, no atomics */
++	thread_t thread = current_thread();
++	struct sweet_pac_insn in;
++	struct sweet_pac_cpu cpu;
++	uint64_t fault_addr = 0;
++
++	if (!sweet_pac_decode(instr, &in)) {
++		return false;
++	}
++
++	for (unsigned i = 0; i < 29; i++) {
++		cpu.x[i] = (uint64_t)get_saved_state_reg(state, i);
++	}
++	cpu.x[29] = (uint64_t)get_saved_state_fp(state);
++	cpu.x[30] = (uint64_t)get_saved_state_lr(state);
++	cpu.sp = (uint64_t)get_saved_state_sp(state);
++	cpu.pc = (uint64_t)get_saved_state_pc(state);
++	const uint64_t pc = cpu.pc;
++
++	thread->machine.recover_esr = 0;
++	thread->machine.recover_far = 0;
++	switch (sweet_pac_execute(instr, &cpu, sweet_pac_copyin64, NULL, &fault_addr)) {
++	case SWEET_PAC_DONE:
++		break;
++	case SWEET_PAC_FAULT:
++		sweet_pac_fault(state, fault_addr);
++	default:
++		return false;
++	}
++
++	for (uint32_t m = cpu.written; m != 0; m &= m - 1) {
++		const unsigned r = (unsigned)__builtin_ctz(m);
++		if (r < 29) {
++			set_saved_state_reg(state, r, (register_t)cpu.x[r]);
++		} else if (r == 29) {
++			set_saved_state_fp(state, (register_t)cpu.x[29]);
++		} else if (r == 30) {
++			set_user_saved_state_lr(state, (register_t)cpu.x[30]);
++		} else {
++			set_saved_state_sp(state, (register_t)cpu.sp);
++		}
++	}
++	set_saved_state_pc(state, (register_t)cpu.pc);
++
++	/*
++	 * Profile: the first four of each class, then every power of two from 1024 on, with the
++	 * process that got there. Each trap costs ~1 us; whatever shows up here should be stripped.
++	 */
++	const uint64_t n = ++sweet_pac_count[in.cls];
++	if ((sweet_pac_logged[in.cls] < 4 && os_atomic_inc_orig(&sweet_pac_logged[in.cls], relaxed) < 4) ||
++	    (n >= 1024 && (n & (n - 1)) == 0)) {
++		task_t task = current_task();
++		void *bsd_info = get_bsdtask_info(task);
++		printf("SWEET: emulating %s 0x%08x at pc=0x%llx in %s[%d] (%llu so far)\n", sweet_pac_class_name(in.cls),
++		    instr, (unsigned long long)pc, bsd_info ? proc_name_address(bsd_info) : "?", task_pid(task),
++		    (unsigned long long)n);
++	}
++	return true;
++}
++
+ /*
+  * Uncategorized exceptions are a catch-all for general execution errors.
+  * ARM64_TODO: For now, we assume this is for undefined instruction exceptions.
+@@ -1307,6 +1405,15 @@ handle_uncategorized(arm_saved_state_t *state)
+ 		return;
+ 	}
+ 
++	/*
++	 * sweetarm64e=1: a PAC instruction that pacstrip did not rewrite (RETAB, BLRAA,
++	 * LDRAA, PACIA, PACGA, ...): emulate it as the rewrite would.
++	 */
++	if (PSR64_IS_USER64(get_saved_state_cpsr(state)) && sweet_arm64e_enabled() &&
++	    sweet_emulate_pac(state, instr)) {
++		return;
++	}
++
+ 	/*
+ 	 * Check for GDB breakpoint via illegal opcode.
+ 	 */
+diff --git a/osfmk/arm64/sweet_pacemu.h b/osfmk/arm64/sweet_pacemu.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..382443239e6a50344b9f2cbcaf04a5221510079f
+--- /dev/null
++++ b/osfmk/arm64/sweet_pacemu.h
+@@ -0,0 +1,267 @@
++/*
++ * SWEET (Poco F1, SDM845 Kryo 385 = ARMv8.2): trap-and-emulate for the non-HINT
++ * pointer-authentication instructions (ARMv8.3-PAuth).
++ *
++ * iOS 26 userland is arm64e. Renegade's pacstrip (tools/renegade/pacstrip.py,
++ * pacstrip_cache.py) rewrites every PAC instruction of the shared cache and of the
++ * system executables offline; the HINT-space ones (PACIBSP, AUTIBSP, PACIA1716,
++ * XPACLRI, BTI, ...) are NOPs on this CPU anyway. Anything that was not rewritten
++ * (a new tool, a binary added after the root build, JIT code) raises an undefined
++ * instruction exception at its first RETAB/BLRAA/... . sleh.c (handle_uncategorized)
++ * emulates those for EL0 threads when the boot-arg sweetarm64e=1 is set, with
++ * exactly the semantics of the static rewrite (docs/IOS18_FEASIBILITY.md section 3.1):
++ *
++ *   RETAA/RETAB                         -> RET
++ *   BRAA/BRAB/BRAAZ/BRABZ   Xn{, Xm|SP} -> BR  Xn             (modifier ignored)
++ *   BLRAA/BLRAB/BLRAAZ/BLRABZ           -> BLR Xn             (LR = PC + 4)
++ *   LDRAA/LDRAB Xt, [Xn|SP, #simm10*8]{!} -> LDR Xt, [Xn|SP, #off]{!}
++ *   PACIA/PACIB/PACDA/PACDB (+Z forms)  -> NOP                (Xd stays a plain pointer)
++ *   AUTIA/AUTIB/AUTDA/AUTDB (+Z forms)  -> NOP
++ *   XPACI/XPACD                         -> NOP
++ *   PACGA Xd, Xn, Xm                    -> EOR Xd, Xn, Xm, ROR #13
++ *   PACGA Xd, Xn, SP                    -> MOV Xd, Xn
++ *
++ * PACGA: the value is pacstrip's on purpose, not "a" deterministic MAC. A MAC
++ * computed in a stripped image and checked in an unstripped one (or the other way
++ * round) must agree, so there must be exactly one PACGA function in the system.
++ * It is deterministic and does not depend on the register numbers (Foundation's
++ * _NSThreadData tag is computed and re-verified with different registers,
++ * docs/IOS18_XPCPROXY.md). Unlike real PACGA its low 32 bits are not zero; no
++ * user of the 502 PACGA sites in the iOS 18 cache depends on that.
++ *
++ * Decoding is strict (Arm ARM, DDI 0487): the Z forms require Rm (branches) or Rn
++ * (PAC*Z/AUT*Z) = 11111, anything else is unallocated and stays SIGILL. pacstrip
++ * is more lenient there; compilers never emit those words. ERETAA/ERETAB (kernel
++ * only) and the v8.9 forms (RETAASPPC, AUTIASPPC, ...) are not handled.
++ *
++ * LDRAA/LDRAB with writeback and Rt == Rn is CONSTRAINED UNPREDICTABLE; here (as
++ * in pacstrip's LDR pre-index) the base is written first and the loaded value wins.
++ *
++ * Plain C with no kernel dependency so that the decoder and the executor can be
++ * unit-tested on the host (tools/pacemu/check.sh).
++ */
++#ifndef _ARM64_SWEET_PACEMU_H_
++#define _ARM64_SWEET_PACEMU_H_
++
++#include <stdint.h>
++#include <stdbool.h>
++
++enum sweet_pac_op {
++	SWEET_PAC_NONE = 0,     /* not an instruction handled here */
++	SWEET_PAC_RET,          /* PC = X30 */
++	SWEET_PAC_BR,           /* PC = Xn */
++	SWEET_PAC_BLR,          /* X30 = PC + 4, PC = Xn */
++	SWEET_PAC_LDR,          /* Xt = [Xn|SP + imm], optional writeback */
++	SWEET_PAC_NOP,          /* PAC*, AUT*, XPAC* */
++	SWEET_PAC_PACGA,        /* Xd = Xn ^ ROR(Xm, 13); Xm = SP: Xd = Xn */
++};
++
++/* instruction classes, for the log and the tests */
++enum sweet_pac_class {
++	SWEET_PACC_RETA = 0,    /* RETAA, RETAB */
++	SWEET_PACC_BRA,         /* BRAA, BRAB, BRAAZ, BRABZ */
++	SWEET_PACC_BLRA,        /* BLRAA, BLRAB, BLRAAZ, BLRABZ */
++	SWEET_PACC_LDRA,        /* LDRAA, LDRAB */
++	SWEET_PACC_PAC,         /* PACIA ... PACDZB */
++	SWEET_PACC_AUT,         /* AUTIA ... AUTDZB */
++	SWEET_PACC_XPAC,        /* XPACI, XPACD */
++	SWEET_PACC_PACGA,
++	SWEET_PACC_COUNT
++};
++
++struct sweet_pac_insn {
++	uint8_t op;             /* enum sweet_pac_op */
++	uint8_t cls;            /* enum sweet_pac_class */
++	uint8_t rd;             /* Xd / Xt (31 = XZR) */
++	uint8_t rn;             /* Xn (BR/BLR/PACGA: 31 = XZR; LDR: 31 = SP) */
++	uint8_t rm;             /* PACGA modifier (31 = SP) */
++	bool    writeback;      /* LDR pre-index */
++	bool    key_b;          /* B key (BRAB, LDRAB, ...) */
++	int32_t imm;            /* LDR byte offset, -4096 .. 4088 */
++};
++
++/*
++ * Decode one instruction word. Returns true and fills *out for the instructions
++ * listed above, false (op = SWEET_PAC_NONE) for everything else.
++ */
++static inline bool
++sweet_pac_decode(uint32_t w, struct sweet_pac_insn *out)
++{
++	const uint8_t rd = (uint8_t)(w & 31), rn = (uint8_t)((w >> 5) & 31), rm = (uint8_t)(w & 31);
++
++	*out = (struct sweet_pac_insn){ .op = SWEET_PAC_NONE };
++
++	/* RETAA / RETAB: 1101011 0 0 10 11111 00001 M 11111 11111 */
++	if ((w & 0xFFFFFBFFu) == 0xD65F0BFFu) {
++		*out = (struct sweet_pac_insn){ .op = SWEET_PAC_RET, .cls = SWEET_PACC_RETA, .rn = 30,
++			                        .key_b = (w >> 10) & 1 };
++		return true;
++	}
++
++	/*
++	 * BRAA/BRAB, BLRAA/BLRAB:     1101011 1 0 0 opc 11111 00001 M Rn Rm   (opc 00 = BR, 01 = BLR)
++	 * BRAAZ/BRABZ, BLRAAZ/BLRABZ: 1101011 0 0 0 opc 11111 00001 M Rn 11111
++	 */
++	if ((w & 0xFEDFF800u) == 0xD61F0800u) {
++		const bool z = ((w >> 24) & 1) == 0;
++		if (z && rm != 31) {
++			return false;
++		}
++		const bool link = (w >> 21) & 1;
++		*out = (struct sweet_pac_insn){ .op = link ? SWEET_PAC_BLR : SWEET_PAC_BR,
++			                        .cls = link ? SWEET_PACC_BLRA : SWEET_PACC_BRA,
++			                        .rn = rn, .rm = rm, .key_b = (w >> 10) & 1 };
++		return true;
++	}
++
++	/* PACxx/AUTxx Xd, Xn|SP: 1 1 0 11010110 00001 0 Z opc(3) Rn Rd; Z forms need Rn = 11111 */
++	if ((w & 0xFFFFC000u) == 0xDAC10000u) {
++		const bool z = (w >> 13) & 1;
++		if (z && rn != 31) {
++			return false;
++		}
++		const bool aut = (w >> 12) & 1;
++		*out = (struct sweet_pac_insn){ .op = SWEET_PAC_NOP, .cls = aut ? SWEET_PACC_AUT : SWEET_PACC_PAC,
++			                        .rd = rd, .rn = rn, .key_b = (w >> 10) & 1 };
++		return true;
++	}
++
++	/* XPACI / XPACD Xd: 1 1 0 11010110 00001 0 1000 D 11111 Rd */
++	if ((w & 0xFFFFFBE0u) == 0xDAC143E0u) {
++		*out = (struct sweet_pac_insn){ .op = SWEET_PAC_NOP, .cls = SWEET_PACC_XPAC, .rd = rd };
++		return true;
++	}
++
++	/* PACGA Xd, Xn, Xm|SP: 1 0 0 11010110 Rm 001100 Rn Rd */
++	if ((w & 0xFFE0FC00u) == 0x9AC03000u) {
++		*out = (struct sweet_pac_insn){ .op = SWEET_PAC_PACGA, .cls = SWEET_PACC_PACGA,
++			                        .rd = rd, .rn = rn, .rm = (uint8_t)((w >> 16) & 31) };
++		return true;
++	}
++
++	/* LDRAA/LDRAB Xt, [Xn|SP, #simm10 * 8]{!}: 11 111 0 00 M S 1 imm9 W 1 Rn Rt */
++	if ((w & 0xFF200400u) == 0xF8200400u) {
++		const uint32_t s10 = ((w >> 22) & 1) << 9 | ((w >> 12) & 0x1FF);
++		const int32_t off = ((int32_t)(s10 << 22) >> 22) * 8;
++		*out = (struct sweet_pac_insn){ .op = SWEET_PAC_LDR, .cls = SWEET_PACC_LDRA, .rd = rd, .rn = rn,
++			                        .writeback = (w >> 11) & 1, .key_b = (w >> 23) & 1, .imm = off };
++		return true;
++	}
++
++	return false;
++}
++
++/* The one PACGA of the system: the same function as pacstrip's rewrite. */
++static inline uint64_t
++sweet_pacga(uint64_t xn, uint64_t xm, unsigned rm)
++{
++	if (rm == 31) {
++		return xn;                              /* MOV Xd, Xn */
++	}
++	return xn ^ ((xm >> 13) | (xm << (64 - 13)));   /* EOR Xd, Xn, Xm, ROR #13 */
++}
++
++/* the general-purpose register state the executor works on */
++struct sweet_pac_cpu {
++	uint64_t x[31];         /* x0 .. x30 */
++	uint64_t sp;
++	uint64_t pc;
++	uint32_t written;       /* set by sweet_pac_execute: bit r = x[r] written, bit 31 = sp */
++};
++
++enum sweet_pac_result {
++	SWEET_PAC_DONE = 0,     /* emulated, *cpu updated (PC included) */
++	SWEET_PAC_FAULT,        /* LDR could not read *fault_addr; *cpu unchanged */
++	SWEET_PAC_UNHANDLED,    /* not an instruction handled here; *cpu unchanged */
++};
++
++/* reads 8 bytes from user address addr; returns 0 on success */
++typedef int (*sweet_pac_load64_t)(void *ctx, uint64_t addr, uint64_t *value);
++
++static inline uint64_t
++sweet_pac_xzr(const struct sweet_pac_cpu *c, unsigned r)
++{
++	return r == 31 ? 0 : c->x[r];
++}
++
++static inline void
++sweet_pac_set_xzr(struct sweet_pac_cpu *c, unsigned r, uint64_t v)
++{
++	if (r != 31) {
++		c->x[r] = v;
++		c->written |= 1u << r;
++	}
++}
++
++/*
++ * Emulate instr (at cpu->pc). cpu->written tells the caller which registers to write back
++ * (the PC always changes), so it needs no copy of the state to compare against.
++ */
++static inline enum sweet_pac_result
++sweet_pac_execute(uint32_t instr, struct sweet_pac_cpu *cpu, sweet_pac_load64_t load, void *ctx,
++    uint64_t *fault_addr)
++{
++	struct sweet_pac_insn in;
++
++	if (!sweet_pac_decode(instr, &in)) {
++		return SWEET_PAC_UNHANDLED;
++	}
++
++	cpu->written = 0;
++	switch (in.op) {
++	case SWEET_PAC_RET:
++		cpu->pc = cpu->x[30];
++		break;
++	case SWEET_PAC_BR:
++		cpu->pc = sweet_pac_xzr(cpu, in.rn);
++		break;
++	case SWEET_PAC_BLR: {
++		const uint64_t target = sweet_pac_xzr(cpu, in.rn);   /* before LR is written: BLRAAZ X30 */
++		sweet_pac_set_xzr(cpu, 30, cpu->pc + 4);
++		cpu->pc = target;
++		break;
++	}
++	case SWEET_PAC_NOP:
++		cpu->pc += 4;
++		break;
++	case SWEET_PAC_PACGA:
++		sweet_pac_set_xzr(cpu, in.rd,
++		    sweet_pacga(sweet_pac_xzr(cpu, in.rn), in.rm == 31 ? cpu->sp : cpu->x[in.rm], in.rm));
++		cpu->pc += 4;
++		break;
++	case SWEET_PAC_LDR: {
++		const uint64_t base = in.rn == 31 ? cpu->sp : cpu->x[in.rn];
++		const uint64_t addr = base + (uint64_t)(int64_t)in.imm;
++		uint64_t v = 0;
++		if (load(ctx, addr, &v) != 0) {
++			*fault_addr = addr;
++			return SWEET_PAC_FAULT;
++		}
++		if (in.writeback) {
++			if (in.rn == 31) {
++				cpu->sp = addr;
++				cpu->written |= 1u << 31;
++			} else {
++				sweet_pac_set_xzr(cpu, in.rn, addr);
++			}
++		}
++		sweet_pac_set_xzr(cpu, in.rd, v);
++		cpu->pc += 4;
++		break;
++	}
++	default:
++		return SWEET_PAC_UNHANDLED;
++	}
++	return SWEET_PAC_DONE;
++}
++
++static inline const char *
++sweet_pac_class_name(unsigned cls)
++{
++	static const char *const names[SWEET_PACC_COUNT] = {
++		"RETA*", "BRA*", "BLRA*", "LDRA*", "PAC*", "AUT*", "XPAC*", "PACGA",
++	};
++	return cls < SWEET_PACC_COUNT ? names[cls] : "?";
++}
++
++#endif /* _ARM64_SWEET_PACEMU_H_ */

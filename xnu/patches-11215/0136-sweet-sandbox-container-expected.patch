@@ -1,0 +1,71 @@
+diff --git a/bsd/kern/sweet_amfi.c b/bsd/kern/sweet_amfi.c
+index 1e4fd2e96fe33984de2a9ab3507f9cc4474be974..a3ad16a5ab63288f0da51b0ffdaa58b8f5279246 100644
+--- a/bsd/kern/sweet_amfi.c
++++ b/bsd/kern/sweet_amfi.c
+@@ -293,10 +293,11 @@ sweet_amfi_vnode_check_signature(struct vnode *vp, __unused struct label *label,
+  * assetsd died with "assetsd requires TCCPhotosService access". Issue now
+  * returns an opaque token and consume a handle. docs/CSOPS.md.
+  */
+-static uint64_t sweet_sandbox_seen;
++static uint64_t sweet_sandbox_seen[4];
+ 
+ #define SWEET_SBX_OP_EXT_ISSUE          5
+ #define SWEET_SBX_OP_EXT_CONSUME        6
++#define SWEET_SBX_OP_CONTAINER_EXPECTED 0x43
+ #define SWEET_SBX_EXT_LOG_MAX           8
+ 
+ static uint64_t _Atomic sweet_sandbox_ext_serial;
+@@ -356,22 +357,48 @@ sweet_sandbox_extension_consume(user_addr_t arg)
+ 	return copyout(&handle, (user_addr_t)a[2], sizeof(handle));
+ }
+ 
++/*
++ * Op 0x43, sandbox_get_container_expected(bool *a, bool *b) (identical in
++ * iOS 16.7 and 18.7 libsystem_sandbox, disassembled): __sandbox_ms("Sandbox",
++ * 0x43, args) with args = { uint64_t *out_a, uint64_t *out_b }, both outputs
++ * pre-zeroed by the caller; the library returns -1 if the syscall fails and
++ * otherwise *a = (out_a != 0), *b = (out_b != 0). _container_init() (libSystem
++ * initializer in iOS 18) aborts on -1 ("sandbox_get_container_expected()
++ * failed: -1") and, on success with a == 0, skips container setup: that is
++ * the right answer for a process with no sandbox container. ENOENT, the old
++ * answer, only worked for iOS 16 because its caller reaches the call rarely.
++ */
++static int
++sweet_sandbox_container_expected(user_addr_t arg)
++{
++	user_addr_t out[2];
++	uint64_t zero = 0;
++	int error = copyin(arg, out, sizeof(out));
++	for (int i = 0; error == 0 && i < 2; i++) {
++		if (out[i] != 0) {
++			error = copyout(&zero, out[i], sizeof(zero));
++		}
++	}
++	return error;
++}
++
+ static int
+ sweet_sandbox_syscall(struct proc *p, int call, user_addr_t arg)
+ {
+-	if (call >= 0 && call < 64 && !(sweet_sandbox_seen & (1ULL << call))) {
+-		sweet_sandbox_seen |= 1ULL << call;
++	if (call >= 0 && call < 256 && !(sweet_sandbox_seen[call / 64] & (1ULL << (call % 64)))) {
++		sweet_sandbox_seen[call / 64] |= 1ULL << (call % 64);
+ 		char name[32];
+ 		proc_name(proc_pid(p), name, sizeof(name));
+-		printf("SWEET Sandbox: %s op %d\n", name, call);
++		printf("SWEET Sandbox: %s op %d (0x%x)\n", name, call, call);
+ 	}
+ 	switch (call) {
+ 	case SWEET_SBX_OP_EXT_ISSUE:
+ 		return sweet_sandbox_extension_issue(p, arg);
+ 	case SWEET_SBX_OP_EXT_CONSUME:
+ 		return sweet_sandbox_extension_consume(arg);
+-	case 4:         /* container path (audit token / pid) */
+-	case 0x43:      /* container expected */
++	case SWEET_SBX_OP_CONTAINER_EXPECTED:
++		return sweet_sandbox_container_expected(arg);
++	case 4:         /* container path (audit token / pid): "not in a container" */
+ 		return ENOENT;
+ 	default:
+ 		return 0;

@@ -1,0 +1,19 @@
+{
+  // Static site on Cloudflare Workers: / is the landing page, /flash/ the flasher. The only Worker code is
+  // worker/index.ts: /api/fcs-key hands the page Apple's published AEA key (see there); everything else is assets.
+  // Nothing from Apple or Qualcomm is ever part of dist/: users bring their own files and everything runs locally.
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "bergamota-web",
+  // the account that owns the zesmoi.com.br zone
+  "account_id": "8e07b3d20205c2672fcb3334f7797ac8",
+  "compatibility_date": "2026-10-01",
+  "main": "worker/index.ts",
+  "assets": {
+    "directory": "./dist",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"],
+    "html_handling": "auto-trailing-slash",
+    "not_found_handling": "404-page"
+  },
+  "routes": [{ "pattern": "bergamota.zesmoi.com.br", "custom_domain": true }]
+}

@@ -1,0 +1,511 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -2207,7 +2207,7 @@
+ 	bool intent_asked;
+ 	uint32_t next_liid;
+ 	uint32_t node;                  /* the modem's QRTR node, learned from its packets */
+-	bool hello_seen, announced, tftp, pdm, wlfw_seen, wlfw, ce, wmi;
++	bool hello_seen, announced, tftp, pdm, wlfw_seen, wlfw, ce, wmi, scan;
+ 	unsigned pdm_reqs;
+ 	char notes[3072];               /* the stage's key events, printed again at the end (ipc_note) */
+ 	uint32_t notes_len;
+@@ -3610,11 +3610,12 @@
+        WF_MSA_READY_IND = 0x2b, WF_MSA_INFO = 0x2d, WF_MSA_READY = 0x2e };
+ enum { WS_OFF, WS_IND, WS_MSA_INFO, WS_MSA_READY, WS_CAP, WS_WAIT_MSA_IND, WS_BDF, WS_CAL, WS_WAIT_FW_READY, WS_READY,
+        WS_CFG, WS_MODE, WS_CE, WS_HTC_READY, WS_HTC_CONNECT, WS_WMI_WAIT_SVC, WS_WMI_SVC_READY, WS_WMI_INIT,
+-       WS_WMI_READY, WS_MODE_OFF, WS_FAILED };
++       WS_WMI_READY, WS_SCAN_SETUP, WS_SCANNING, WS_SCAN_DONE, WS_MODE_OFF, WS_FAILED };
+ static const char *const wf_state_name[] = { "off", "ind-register", "msa-info", "msa-ready", "cap", "wait msa-ready-ind",
+ 	                                     "bdf", "cal-report", "wait fw-ready-ind", "FW READY", "wlan-cfg", "mode-on",
+ 	                                     "wait HTC ready", "HTC READY", "HTC connect", "wait WMI service-ready",
+-	                                     "WMI service-ready", "WMI init", "WMI READY", "mode-off", "failed" };
++	                                     "WMI service-ready", "WMI init", "WMI READY", "scan setup", "scanning",
++	                                     "scan done", "mode-off", "failed" };
+ 
+ static struct {
+ 	int state;
+@@ -3854,10 +3855,12 @@
+ 	unsigned ce, n;
+ 	bool src;
+ 	uint32_t ring, bufs, dmax;
+-} wce_ring[4] = {
++} wce_ring[5] = {
+ 	{ 0, 16, true, 0x1000, 0x40000, 2048 }, { 3, 32, true, 0x2000, 0x48000, 2048 },
+ 	{ 1, 32, false, 0x3000, 0x10000, 0 }, { 2, 64, false, 0x4000, 0x20000, 0 },
++	{ 4, 16, true, 0x5000, 0x58000, 256 },  /* HTT host->target, sweetscan=1 only (CE4 dmax 256) */
+ };
++#define WCE_NRINGS              (ipc.scan ? 5u : 4u)
+ 
+ struct wce_desc {                       /* struct ce_desc_64 */
+ 	uint64_t addr;
+@@ -3870,7 +3873,7 @@
+ 	vm_offset_t regs, pool;
+ 	bool pool_ok, mode_on, mode_sent, rings;
+ 	int prev_state;                 /* the state to report again after mode off */
+-	uint32_t sw[4], wr[4];
++	uint32_t sw[5], wr[5];
+ 	unsigned msgs, logged, wmi_events, htt_msgs, wmi_credits, nchunks;
+ 	uint16_t credits, credit_size, conn_svc;
+ 	uint8_t max_ep, htc_version, htt_eid, wmi_eid, seq[8], mac[6];
+@@ -3970,7 +3973,7 @@
+ 	for (unsigned ce = 0; ce < 12; ce++) {
+ 		wl_wr(m, WCE_BASE(ce) + CE_CTRL1, wl_rd(m, WCE_BASE(ce) + CE_CTRL1) | CE_CTRL1_UPD);
+ 	}
+-	for (unsigned r = 0; r < 4; r++) {
++	for (unsigned r = 0; r < WCE_NRINGS; r++) {
+ 		uint32_t b = WCE_BASE(wce_ring[r].ce), n = wce_ring[r].n, mask = n - 1;
+ 		uint64_t pa = WCE_POOL_PA + wce_ring[r].ring;
+ 		uint32_t c1 = wl_rd(m, b + CE_CTRL1);
+@@ -4050,9 +4053,14 @@
+ static bool
+ wce_send(unsigned r, uint8_t eid, const void *payload, uint32_t plen)
+ {
+-	if (!wce.rings || r > 1 || 8 + plen > CE_RX_BUF) {
++	if (!wce.rings || r >= WCE_NRINGS || !wce_ring[r].src || 8 + plen > wce_ring[r].dmax) {
+ 		return false;
+ 	}
++	if (eid && eid == wce.wmi_eid) {
++		if (!wce.wmi_credits) {
++			return false;           /* one WMI command in flight: wait for the credit report */
++		}
++	}
+ 	uint32_t b = WCE_BASE(wce_ring[r].ce), mask = wce_ring[r].n - 1, wr = wce.wr[r];
+ 	uint32_t srri = wl_rd(wce.regs, b + CE_CURRENT_SRRI) & mask;
+ 	if (((srri - 1 - wr) & mask) == 0) {
+@@ -4077,7 +4085,11 @@
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	wr = (wr + 1) & mask;
+ 	wce.wr[r] = wr;
+-	wl_wr(wce.regs, wce_ring[r].ce == 0 ? 0x32000u : 0x3200cu, wr);
++	/* shadow_sr_wr_ind_addr(): CE0 0x32000, CE3 0x3200c, CE4 0x32010 */
++	wl_wr(wce.regs, wce_ring[r].ce == 0 ? 0x32000u : (wce_ring[r].ce == 3 ? 0x3200cu : 0x32010u), wr);
++	if (eid && eid == wce.wmi_eid) {
++		wce.wmi_credits--;
++	}
+ 	return true;
+ }
+ 
+@@ -4303,6 +4315,329 @@
+ 	wf.sent_ms = ms_now_ms();       /* SERVICE_AVAILABLE usually follows at once; INIT goes after it or 300 ms */
+ }
+ 
++/*
++ * ---- first scan (sweetscan=1, after WMI READY): what ath10k mac.c sends before a scan for a station, in order
++ * (docs/WIFI_IOS26.md 5.25): HTT VERSION_REQ on CE4 (VERSION_CONF on CE1, 3 s), PDEV_SET_PARAM tx/rx chain mask
++ * = 3 (2 RF chains), SCAN_CHAN_LIST, PDEV_SET_REGDOMAIN, VDEV_CREATE (station 0, the ADT's wlan local-mac-address),
++ * VDEV_SET_PARAM tx_encap_type native wifi, START_SCAN. Every channel is PASSIVE: the chip only listens, nothing
++ * is transmitted. One WMI command in flight (one credit, returned in HTC trailers). Beacons and probe responses
++ * come back as WMI MGMT_RX events; each BSS is logged once and listed at the end. HTT RX ring / frag-desc / aggr
++ * configuration are not sent (management frames come over WMI).
++ */
++#define SCAN_MAX_BSS            48u
++static const uint8_t scan_mac[6] = { 0x02, 0x00, 0x5e, 0x77, 0xe0, 0x01 };     /* ADT arm-io/wlan local-mac-address */
++/* 2.4 GHz 1-13, 5 GHz 36-64 (52-64 DFS) and 149-165: the channels of regdomain 0x809c (CN, APL1) */
++static const uint16_t scan_chans[] = {
++	2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472,
++	5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5745, 5765, 5785, 5805, 5825,
++};
++#define SCAN_NCHAN              (sizeof(scan_chans) / sizeof(scan_chans[0]))
++
++static struct {
++	unsigned step, beacons, foreign, nbss, events;
++	uint64_t step_ms;
++	bool htt_conf, started, completed, vdev;
++	uint8_t htt_major, htt_minor;
++	uint32_t reason;
++	struct {
++		uint8_t bssid[6];
++		uint16_t mhz;
++		int8_t rssi;
++		uint8_t ssid_len;
++		char ssid[33];
++	} bss[SCAN_MAX_BSS];
++} scan;
++
++/* one WMI command: u32 id, then one TLV {u16 len, u16 tag} (more TLVs appended by the caller) */
++static uint32_t
++scan_cmd(uint8_t *c, uint32_t id, uint16_t tag, const void *v, uint16_t len)
++{
++	memcpy(c, &id, 4);
++	memcpy(c + 4, &len, 2);
++	memcpy(c + 6, &tag, 2);
++	memcpy(c + 8, v, len);
++	return 8u + len;
++}
++
++static void
++scan_tlv(uint8_t *c, uint32_t *n, uint16_t tag, const void *v, uint16_t len)
++{
++	memcpy(c + *n, &len, 2);
++	memcpy(c + *n + 2, &tag, 2);
++	if (len) {
++		memcpy(c + *n + 4, v, len);
++	}
++	*n += 4u + len;
++}
++
++/* the next command of the sequence once the WMI credit is back; false = nothing sent this time */
++static bool
++scan_step(void)
++{
++	uint8_t c[1024];
++	uint32_t n = 0;
++	const char *what = NULL;
++	switch (scan.step) {
++	case 0: {                               /* HTT VERSION_REQ: msg type 0 + 3 pad, HTT endpoint (CE4) */
++		uint8_t m[4] = { 0, 0, 0, 0 };
++		if (!wce_send(4, wce.htt_eid, m, sizeof(m))) {
++			return false;
++		}
++		printf("SWEET IPC: scan: HTT version request sent\n");
++		scan.step++;
++		scan.step_ms = ms_now_ms();
++		wf.sent_ms = ms_now_ms();
++		return true;
++	}
++	case 1:                                 /* wait for VERSION_CONF (ath10k: 3 s) */
++		if (!scan.htt_conf && ms_now_ms() < scan.step_ms + 3000) {
++			return false;
++		}
++		if (!scan.htt_conf) {
++			printf("SWEET IPC: scan: no HTT VERSION_CONF in 3 s: continuing (scan results come over WMI)\n");
++		}
++		scan.step++;
++		return true;
++	case 2:
++	case 3: {                               /* PDEV_SET_PARAM tx_chain_mask (1) / rx_chain_mask (2) = 3 */
++		uint32_t p[3] = { 0, scan.step == 2 ? 1u : 2u, 3 };
++		n = scan_cmd(c, 0x4003, 82, p, 12);
++		what = scan.step == 2 ? "pdev tx chain mask 3" : "pdev rx chain mask 3";
++		break;
++	}
++	case 4: {                               /* SCAN_CHAN_LIST: num_scan_chans, then ARRAY_STRUCT of CHANNEL TLVs */
++		uint32_t num = SCAN_NCHAN;
++		n = scan_cmd(c, 0x3003, 79, &num, 4);
++		uint16_t al = (uint16_t)(SCAN_NCHAN * 28), tg = 18;
++		memcpy(c + n, &al, 2);
++		memcpy(c + n + 2, &tg, 2);
++		n += 4;
++		for (unsigned k = 0; k < SCAN_NCHAN; k++) {
++			uint32_t ch[6];
++			bool g5 = scan_chans[k] > 5000, dfs = scan_chans[k] >= 5260 && scan_chans[k] <= 5320;
++			memset(ch, 0, sizeof(ch));
++			ch[0] = scan_chans[k];
++			ch[1] = scan_chans[k];
++			/* mode 11G (1) / 11A (0), flags PASSIVE | ALLOW_HT | ALLOW_VHT (| DFS) */
++			ch[3] = (g5 ? 0u : 1u) | (1u << 7) | (1u << 11) | (1u << 12) | (dfs ? (1u << 10) : 0);
++			ch[4] = 0u | (40u << 8) | (40u << 16);   /* min 0, max 20 dBm, reg 20 dBm (0.5 dBm units), class 0 */
++			ch[5] = 0u | (40u << 8);                 /* antenna_max 0, max_tx_power 20 dBm */
++			scan_tlv(c, &n, 80, ch, 24);
++		}
++		what = "scan channel list (all passive)";
++		break;
++	}
++	case 5: {                               /* PDEV_SET_REGDOMAIN: APL1 (0x52), CTL 2 GHz ETSI 0x30, 5 GHz FCC 0x10 */
++		uint32_t r[6] = { 0, 0x52, 0x52, 0x52, 0x30, 0x10 };
++		n = scan_cmd(c, 0x4001, 81, r, 24);
++		what = "pdev regdomain 0x52";
++		break;
++	}
++	case 6: {                               /* VDEV_CREATE vdev 0, station (2), no subtype, MAC */
++		uint32_t v[5] = { 0, 2, 0, 0, 0 };
++		memcpy(&v[3], scan_mac, 6);
++		n = scan_cmd(c, 0x5001, 86, v, 20);
++		what = "vdev 0 create (station)";
++		scan.vdev = true;
++		break;
++	}
++	case 7: {                               /* VDEV_SET_PARAM tx_encap_type (0x30) = native wifi (1) */
++		uint32_t v[3] = { 0, 0x30, 1 };
++		n = scan_cmd(c, 0x5008, 95, v, 12);
++		what = "vdev tx encap native wifi";
++		break;
++	}
++	case 8: {                               /* START_SCAN, passive, ath10k defaults */
++		uint32_t s[25];
++		memset(s, 0, sizeof(s));
++		s[0] = 0xa000;                  /* scan_id */
++		s[1] = 0xa001;                  /* scan_req_id */
++		s[2] = 0;                       /* vdev */
++		s[3] = 1;                       /* priority low */
++		s[4] = 0x11f;                   /* notify: started completed bss foreign dequeued foreign-exit */
++		s[5] = 50;                      /* dwell active */
++		s[6] = 150;                     /* dwell passive */
++		s[7] = 50;                      /* min rest */
++		s[8] = 500;                     /* max rest */
++		s[12] = 20000;                  /* max scan time */
++		s[13] = 5;                      /* probe delay */
++		s[14] = 0x31;                   /* CHAN_STAT_EVENT | PASSIVE, FILTER_PROBE_REQ inverted for TLV */
++		s[16] = SCAN_NCHAN;
++		s[17] = 1;                      /* num_bssids: broadcast */
++		s[18] = 0;                      /* num_ssids: passive */
++		s[20] = 3;                      /* num_probes */
++		n = scan_cmd(c, 0x3001, 77, s, 100);
++		uint32_t f[SCAN_NCHAN];
++		for (unsigned k = 0; k < SCAN_NCHAN; k++) {
++			f[k] = scan_chans[k];
++		}
++		scan_tlv(c, &n, 16, f, (uint16_t)sizeof(f));   /* channel list, MHz */
++		scan_tlv(c, &n, 19, NULL, 0);                  /* ssids: none */
++		uint8_t bc[8] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0 };
++		scan_tlv(c, &n, 19, bc, 8);                    /* bssids: broadcast */
++		scan_tlv(c, &n, 17, NULL, 0);                  /* ie: none */
++		what = "start scan (passive)";
++		break;
++	}
++	default:
++		return false;
++	}
++	if (!wce.wmi_credits || !wce_send(1, wce.wmi_eid, c, n)) {
++		return false;                   /* no credit yet: try again on the next poll */
++	}
++	printf("SWEET IPC: scan: %s (%u bytes)\n", what, n);
++	ipc_note(" scan %s;", what);
++	scan.step++;
++	scan.step_ms = ms_now_ms();
++	wf.sent_ms = ms_now_ms();               /* each step gets its own 30 s */
++	if (scan.step == 9) {
++		wf.state = WS_SCANNING;
++		wf.sent_ms = ms_now_ms();
++	}
++	return true;
++}
++
++/* SCAN_EVENT (tag 36: type, reason, freq, req id, scan id, vdev) */
++static void
++scan_event(const uint8_t *t, uint32_t len)
++{
++	uint16_t tl, tag;
++	if (len < 4 + 24) {
++		return;
++	}
++	memcpy(&tl, t, 2);
++	memcpy(&tag, t + 2, 2);
++	if (tag != 36 || tl < 24) {
++		return;
++	}
++	uint32_t e[6];
++	memcpy(e, t + 4, 24);
++	scan.events++;
++	if (e[0] & 0x8) {
++		scan.foreign++;
++	}
++	if (e[0] & 0x1) {
++		scan.started = true;
++		printf("SWEET IPC: scan: STARTED (scan id %#x)\n", e[4]);
++	}
++	if (e[0] & 0x40) {
++		printf("SWEET IPC: scan: START FAILED (reason %u)\n", e[1]);
++		wf_fail("scan start failed", (uint16_t)e[1]);
++	}
++	if (e[0] & 0x2) {
++		scan.completed = true;
++		scan.reason = e[1];
++		printf("SWEET IPC: scan: COMPLETED reason %u after %u channel visits: %u beacons/probe responses, %u BSS\n",
++		    e[1], scan.foreign, scan.beacons, scan.nbss);
++		ipc_note(" scan done r%u: %u ch, %u frames, %u bss;", e[1], scan.foreign, scan.beacons, scan.nbss);
++		wf.state = WS_SCAN_DONE;
++	}
++}
++
++/* MGMT_RX (tag 44 header: channel, snr, rate, phy mode, buf_len, status, rssi[4]; tag 17: the 802.11 frame) */
++static void
++scan_mgmt_rx(const uint8_t *t, uint32_t len)
++{
++	const uint8_t *h = NULL, *fr = NULL;
++	uint32_t frl = 0;
++	for (uint32_t o = 0; o + 4 <= len;) {
++		uint16_t l, tag;
++		memcpy(&l, t + o, 2);
++		memcpy(&tag, t + o + 2, 2);
++		if (o + 4 + l > len) {
++			break;
++		}
++		if (tag == 44 && l >= 40) {
++			h = t + o + 4;
++		} else if (tag == 17) {
++			fr = t + o + 4;
++			frl = l;
++		}
++		o += 4u + l;
++	}
++	if (!h || !fr) {
++		return;
++	}
++	uint32_t hd[6];
++	memcpy(hd, h, 24);
++	frl = MIN(frl, hd[4]);
++	if ((hd[5] & 0x29) || frl < 36) {       /* CRC / decrypt / key-cache errors, or too short for a beacon */
++		return;
++	}
++	uint8_t fc = fr[0];
++	if (fc != 0x80 && fc != 0x50) {         /* beacon, probe response */
++		return;
++	}
++	scan.beacons++;
++	uint16_t mhz = hd[0] > 196 ? (uint16_t)hd[0] : (uint16_t)(hd[0] == 14 ? 2484 : hd[0] <= 13 ? 2407 + 5 * hd[0] :
++	    5000 + 5 * hd[0]);
++	int rssi = (int)hd[1] - 95;
++	const uint8_t *bssid = fr + 16;
++	for (unsigned k = 0; k < scan.nbss; k++) {
++		if (memcmp(scan.bss[k].bssid, bssid, 6) == 0) {
++			return;
++		}
++	}
++	if (scan.nbss >= SCAN_MAX_BSS) {
++		return;
++	}
++	unsigned k = scan.nbss++;
++	memcpy(scan.bss[k].bssid, bssid, 6);
++	scan.bss[k].mhz = mhz;
++	scan.bss[k].rssi = (int8_t)MAX(-128, MIN(127, rssi));
++	/* IEs after timestamp (8), interval (2), capabilities (2): SSID = element 0 */
++	for (uint32_t o = 36; o + 2 <= frl;) {
++		uint8_t id = fr[o], l = fr[o + 1];
++		if (o + 2 + l > frl) {
++			break;
++		}
++		if (id == 0) {
++			scan.bss[k].ssid_len = MIN(l, 32);
++			for (unsigned i = 0; i < scan.bss[k].ssid_len; i++) {
++				uint8_t ch = fr[o + 2 + i];
++				scan.bss[k].ssid[i] = ch >= 0x20 && ch < 0x7f ? (char)ch : '?';
++			}
++			scan.bss[k].ssid[scan.bss[k].ssid_len] = 0;
++			break;
++		}
++		o += 2u + l;
++	}
++	printf("SWEET IPC: scan: bss %u %02x:%02x:%02x:%02x:%02x:%02x %u MHz %d dBm \"%s\"%s\n", k, bssid[0], bssid[1],
++	    bssid[2], bssid[3], bssid[4], bssid[5], mhz, rssi, scan.bss[k].ssid, scan.bss[k].ssid_len ? "" : " (hidden)");
++}
++
++/* T2H HTT on CE1: VERSION_CONF = type 0, minor, major */
++static void
++scan_htt(const uint8_t *pl, uint32_t plen)
++{
++	if (plen >= 4 && pl[0] == 0 && !scan.htt_conf) {
++		scan.htt_conf = true;
++		scan.htt_minor = pl[1];
++		scan.htt_major = pl[2];
++		printf("SWEET IPC: scan: HTT version %u.%u\n", scan.htt_major, scan.htt_minor);
++		ipc_note(" htt v%u.%u;", scan.htt_major, scan.htt_minor);
++	}
++}
++
++/* the BSS list again at the end of the stage (the console may have dropped lines) */
++static void
++scan_summary(void)
++{
++	if (!ipc.scan) {
++		return;
++	}
++	printf("SWEET IPC: scan summary: htt %u.%u, %s, %u events, %u channel visits, %u beacons/probe responses, %u BSS\n",
++	    scan.htt_major, scan.htt_minor, scan.completed ? "completed" : (scan.started ? "started, not completed" :
++	    "not started"), scan.events, scan.foreign, scan.beacons, scan.nbss);
++	for (unsigned k = 0; k < scan.nbss; k++) {
++		printf("SWEET IPC: scan summary bss %u: %02x:%02x:%02x:%02x:%02x:%02x %u MHz %d dBm \"%s\"\n", k,
++		    scan.bss[k].bssid[0], scan.bss[k].bssid[1], scan.bss[k].bssid[2], scan.bss[k].bssid[3], scan.bss[k].bssid[4],
++		    scan.bss[k].bssid[5], scan.bss[k].mhz, scan.bss[k].rssi, scan.bss[k].ssid);
++		sweet_log_sync();
++		wl_sleep(20);
++	}
++}
++
+ /* one received HTC message: control (endpoint 0), WMI events, HTT (logged) */
+ static void
+ wce_htc(unsigned ce, const uint8_t *p, uint32_t len)
+@@ -4337,7 +4672,7 @@
+ 		}
+ 		for (uint32_t k = 0; rid == 1 && k + 4 <= rl; k += 4) {
+ 			if (pl[o + 4 + k] == wce.wmi_eid && wce.wmi_eid) {
+-				wce.wmi_credits += pl[o + 4 + k + 1];
++				wce.wmi_credits = MIN(wce.wmi_credits + pl[o + 4 + k + 1], 1u);   /* one in flight */
+ 			}
+ 		}
+ 		o += 4u + rl;
+@@ -4383,7 +4718,7 @@
+ 					wf.sent_ms = ms_now_ms();
+ 				}
+ 			}
+-		} else {
++		} else if (plen >= 2) {         /* plen 0: a credit report in the trailer only */
+ 			printf("SWEET IPC: wce: HTC control message %u (%u bytes) in state %s\n", id, plen, wf_state_name[wf.state]);
+ 		}
+ 		return;
+@@ -4436,13 +4771,27 @@
+ 			ipc_note(" wmi READY st %u mac %02x:%02x:%02x:%02x:%02x:%02x;", st, wce.mac[0], wce.mac[1], wce.mac[2],
+ 			    wce.mac[3], wce.mac[4], wce.mac[5]);
+ 			wf.state = WS_WMI_READY;
++			if (ipc.scan) {
++				memset(&scan, 0, sizeof(scan));
++				wf.state = WS_SCAN_SETUP;
++				wf.sent_ms = ms_now_ms();
++			}
++		} else if (ev == 0x3001 && ipc.scan) {
++			scan_event(pl + 4, plen - 4);
++		} else if (ev == 0x7001 && ipc.scan) {
++			scan_mgmt_rx(pl + 4, plen - 4);
+ 		} else if (wce.wmi_events <= 16) {
+ 			printf("SWEET IPC: wmi: event %#x (%u bytes) in state %s\n", ev, plen, wf_state_name[wf.state]);
+ 		}
+ 		return;
+ 	}
+-	if (p[0] == wce.htt_eid && wce.htt_eid && wce.htt_msgs++ < 8) {
+-		printf("SWEET IPC: wmi: HTT message type %u (%u bytes)\n", pl[0], plen);
++	if (p[0] == wce.htt_eid && wce.htt_eid) {
++		if (ipc.scan) {
++			scan_htt(pl, plen);
++		}
++		if (wce.htt_msgs++ < 8) {
++			printf("SWEET IPC: wmi: HTT message type %u (%u bytes)\n", pl[0], plen);
++		}
+ 	}
+ }
+ 
+@@ -4453,7 +4802,7 @@
+ 	if (!wce.rings) {
+ 		return;
+ 	}
+-	for (unsigned r = 0; r < 4; r++) {
++	for (unsigned r = 0; r < WCE_NRINGS; r++) {
+ 		if (wce_ring[r].src) {
+ 			continue;
+ 		}
+@@ -4806,10 +5155,14 @@
+ 	if (wf.state == WS_WMI_SVC_READY && (wce.svc_avail || ms_now_ms() > wf.sent_ms + 300)) {
+ 		wmi_send_init();
+ 	}
+-	bool waiting = wf.pending || wf.state == WS_WAIT_MSA_IND || wf.state == WS_WAIT_FW_READY || wf.state == WS_CE ||
+-	    wf.state == WS_HTC_CONNECT || wf.state == WS_WMI_WAIT_SVC || wf.state == WS_WMI_INIT;
++	if (wf.state == WS_SCAN_SETUP) {
++		(void)scan_step();
++	}
++	bool waiting = wf.pending || wf.state == WS_WAIT_MSA_IND || wf.state == WS_WAIT_FW_READY || wf.state == WS_CE ||
++	    wf.state == WS_HTC_CONNECT || wf.state == WS_WMI_WAIT_SVC || wf.state == WS_WMI_INIT ||
++	    wf.state == WS_SCAN_SETUP || wf.state == WS_SCANNING;
+ 	if (ipc.wlfw && waiting && wf.state != WS_FAILED && ms_now_ms() > wf.sent_ms + WLFW_TIMEOUT_MS) {
+-		wf_fail(wf.pending ? "no response" : (wf.state >= WS_CE && wf.state <= WS_WMI_INIT ? "no target message" : "no indication"), wf.pending);
++		wf_fail(wf.pending ? "no response" : (wf.state >= WS_CE && wf.state <= WS_SCANNING ? "no target message" : "no indication"), wf.pending);
+ 	}
+ }
+ 
+@@ -4951,6 +5304,9 @@
+ 	int wmi = 0;
+ 	(void)PE_parse_boot_argn("sweetwmi", &wmi, sizeof(wmi));
+ 	ipc.wmi = ipc.ce && wmi == 1;
++	int scn = 0;
++	(void)PE_parse_boot_argn("sweetscan", &scn, sizeof(scn));
++	ipc.scan = ipc.wmi && scn == 1;
+ 	memset(&wf, 0, sizeof(wf));
+ 	if (ipc.wlfw && !wf_rails()) {
+ 		ipc.wlfw = false;
+@@ -5029,6 +5385,7 @@
+ 		    wce.htt_eid, wce.wmi_eid, wce.wmi_events, wce.nchunks, wce.mac[0], wce.mac[1], wce.mac[2], wce.mac[3],
+ 		    wce.mac[4], wce.mac[5]);
+ 	}
++	scan_summary();
+ 	if (alive) {
+ 		wf_shutdown();
+ 	} else {

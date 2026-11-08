@@ -1,0 +1,124 @@
+diff --git a/bsd/dev/beryllium_wlan.c b/bsd/dev/beryllium_wlan.c
+index c03ee4c5c2fba56397b740727eaf8ff3e05a52e3..51a75a012091c230a8938a3e069d2abff33348ea 100644
+--- a/bsd/dev/beryllium_wlan.c
++++ b/bsd/dev/beryllium_wlan.c
+@@ -983,6 +983,27 @@ static struct {
+ 
+ static const char *const ms_arc_res[3] = { "cx.lvl", "mx.lvl", "mss.lvl" };
+ 
++/*
++ * Boot 32: the console stopped right after the stage-4 banner (USB console and persistent log are
++ * buffered, so the stop may be a few steps later). Every step now logs, flushes the persistent log
++ * and waits 1.5 s for the USB console; sweetmssstep=N stops after step N (then tears down).
++ */
++static int ms_step_max = 99;
++
++static bool
++ms_step(int n, const char *what)
++{
++	printf("SWEET MSS: step %d: %s\n", n, what);
++	sweet_log_sync();
++	wl_sleep(1500);
++	if (n > ms_step_max) {
++		printf("SWEET MSS: stopping before step %d (sweetmssstep=%d)\n", n, ms_step_max);
++		sweet_log_sync();
++		return false;
++	}
++	return true;
++}
++
+ /* ---- SCM: SMCCC SIP, std (yielding) 64-bit call with the x6 continuation token */
+ struct ms_scm {
+ 	uint64_t a[7];
+@@ -1135,6 +1156,7 @@ ms_qmp_open(void)
+ 	ms.qmp_size = wl_rd(ms.qmp, 0x34);
+ 	printf("SWEET MSS: QMP magic %#x version %u mcore mailbox %#x+%#x\n", magic, version, ms.qmp_off,
+ 	    ms.qmp_size);
++	sweet_log_sync();
+ 	if (magic != 0x4d41494cu || version != 1 || ms.qmp_size < 68 || ms.qmp_off + ms.qmp_size > 0x400) {
+ 		return false;
+ 	}
+@@ -1350,6 +1372,7 @@ wl_mss(void)
+ 
+ 	(void)PE_parse_boot_argn("sweetmss", &gate, sizeof(gate));
+ 	(void)PE_parse_boot_argn("sweetmsskeep", &keep, sizeof(keep));
++	(void)PE_parse_boot_argn("sweetmssstep", &ms_step_max, sizeof(ms_step_max));
+ 	if (gate != 1) {
+ 		printf("SWEET MSS: stage 4 needs sweetmss=1 as well (first TrustZone/hypervisor step): not run\n");
+ 		return;
+@@ -1357,6 +1380,9 @@ wl_mss(void)
+ 	printf("SWEET MSS: stage 4: power the modem DSP and boot its MBA, stop at \"MBA alive\"%s\n",
+ 	    keep ? " (sweetmsskeep=1: leave it running)" : ", then tear down");
+ 	sweet_log_sync();
++	if (!ms_step(1, "map MMIO (no access)")) {
++		return;
++	}
+ 	ms.q6 = ml_io_map(MSS_QDSP6_PA, 0x1000);
+ 	ms.rmb = ml_io_map(MSS_RMB_PA, 0x1000);
+ 	ms.aoss = ml_io_map(MSS_AOSS_RESTART_PA, 0x1000);
+@@ -1368,6 +1394,9 @@ wl_mss(void)
+ 		printf("SWEET MSS: MMIO mapping failed\n");
+ 		return;
+ 	}
++	if (!ms_step(2, "read mba.mbn from the modem partition")) {
++		return;
++	}
+ 	mba = ms_read_mba(&mba_len);
+ 	if (mba == NULL) {
+ 		return;
+@@ -1375,9 +1404,15 @@ wl_mss(void)
+ 	printf("SWEET MSS: mba.mbn %u bytes read from the modem partition\n", mba_len);
+ 
+ 	/* qcom_q6v5_prepare(): AOSS load_state, then the proxy power domains */
++	if (!ms_step(3, "AOSS QMP open + load_state on")) {
++		goto out;
++	}
+ 	if (!ms_qmp_open() || !ms_qmp_send("{class: image, res: load_state, name: modem, val: on}")) {
+ 		goto out;
+ 	}
++	if (!ms_step(4, "RPMh ARC votes cx/mx/mss")) {
++		goto out;
++	}
+ 	for (int i = 0; i < 3; i++) {
+ 		if (sweet_rpmh_arc_vote(ms_arc_res[i], true) != 0) {
+ 			goto out;
+@@ -1390,6 +1425,9 @@ wl_mss(void)
+ 		    wl_rd(wl.gcc, 0x8a000), wl_rd(wl.gcc, 0x34004), wl_rd(wl.gcc, 0x38004), wl_rd(wl.gcc, 0x8a004));
+ 		goto out;
+ 	}
++	if (!ms_step(5, "snoc_axi clock, alt reset deassert, active clocks")) {
++		goto out;
++	}
+ 	ms.snoc = true;                         /* set even if it fails: teardown clears the enable */
+ 	if (!ms_branch(0x8a150, true, false)) {
+ 		goto out;
+@@ -1413,6 +1451,9 @@ wl_mss(void)
+ 	    wl_rd(wl.gcc, 0x8a004));
+ 
+ 	/* the MBA image goes in while the kernel still owns the carve-out, then both regions go to the Q6 */
++	if (!ms_step(6, "copy MBA into its carve-out")) {
++		goto out;
++	}
+ 	vm_offset_t mba_va = ml_io_map_wcomb(MSS_MBA_PA, MSS_MBA_SIZE);
+ 	if (!mba_va) {
+ 		printf("SWEET MSS: MBA carve-out mapping failed\n");
+@@ -1422,6 +1463,9 @@ wl_mss(void)
+ 	__asm__ volatile ("dsb sy" ::: "memory");
+ 	ml_io_unmap(mba_va, MSS_MBA_SIZE);      /* no kernel mapping may exist once the Q6 owns it */
+ 	mba_va = 0;
++	if (!ms_step(7, "hyp-assign MPSS and MBA to the modem (SCM)")) {
++		goto out;
++	}
+ 	if (!ms_assign("mpss", MSS_MPSS_PA, MSS_MPSS_SIZE, SCM_VMID_HLOS, SCM_VMID_MSS_MSA, SCM_PERM_RW)) {
+ 		goto out;
+ 	}
+@@ -1432,6 +1476,9 @@ wl_mss(void)
+ 	ms.mba_assigned = true;
+ 	wl_wr(ms.rmb, RMB_MBA_IMAGE, (uint32_t)MSS_MBA_PA);
+ 
++	if (!ms_step(8, "QDSP6 boot FSM, PBL and MBA status")) {
++		goto out;
++	}
+ 	/* q6v5proc_reset(), MSS_SDM845 */
+ 	wl_wr(ms.q6, QDSP6SS_SLEEP, wl_rd(ms.q6, QDSP6SS_SLEEP) | 1u);
+ 	unsigned i;
