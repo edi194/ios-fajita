@@ -292,6 +292,8 @@ jobs:
             dxb/xnu/iokit/Kernel/arm/hid/SweetHID.cpp
             dxb/xnu/bsd/dev/sweet_surface.c
             dxb/xnu/bsd/dev/sweet_battery.c
+            dxb/xnu/bsd/dev/sweet_rpmh.c
+            dxb/xnu/osfmk/arm64/sweet_early.c
           retention-days: 7
           if-no-files-found: warn
 
