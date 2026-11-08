@@ -1,0 +1,17 @@
+--- a/bsd/dev/sweet_rpmh.c
++++ b/bsd/dev/sweet_rpmh.c
+@@ -328,8 +328,12 @@
+ sweet_rpmh_vreg_enable(const char *res, unsigned mv)
+ {
+ 	/* Board-specific helper: do not apply PMIC5-LDO policy to arbitrary resources. */
+-	if (!res || strcmp(res, "ldoc11") || mv < 2950 || mv > 3400) {
+-		printf("SWEET RPMH: expected ldoc11 and 2950..3400 mV\n");
++	/*
++	 * ldoc11 is the Poco F1's touch rail (PM6150L), ldoa28 the OnePlus 6T's (PM8998, 3.008 V). Both are
++	 * ordinary LDO ARC resources with the same command encoding and mV units.
++	 */
++	if (!res || (strcmp(res, "ldoc11") && strcmp(res, "ldoa28")) || mv < 2950 || mv > 3400) {
++		printf("SWEET RPMH: expected ldoc11 or ldoa28 and 2950..3400 mV\n");
+ 		return EINVAL;
+ 	}
+ 	if (__atomic_exchange_n(&rh_lock, 1, __ATOMIC_ACQUIRE)) {
