@@ -46,6 +46,20 @@ BOARDS = {
         compat=['xiaomi,sweet', 'qcom,sm7150'],
         # 0-5 Cortex-A55, 6-7 Cortex-A76
         cpu_compat='qcom,kryo470', big_from=6, freqs=(1804800000, 2304000000)),
+    'fajita': dict(
+        # OnePlus 6T: reserved-memory cont_splash_region@9d400000 (36 MiB), panel 1080x2340
+        fb=(0x9d400000, 0x2400000), fb_wh=(1080, 2340),
+        # 'xiaomi,sweet' stays: SweetPlatformExpert matches it (same SDM845 layout as beryllium)
+        compat=['oneplus,fajita', 'xiaomi,sweet', 'qcom,sdm845'],
+        # 0-3 Kryo 385 Silver (A55), 4-7 Gold (A75): the SDM845 arrangement
+        cpu_compat='qcom,kryo385', big_from=4, freqs=(1766400000, 2803200000),
+        # Same low-bank window as beryllium: above cont_splash (ends 0x9f800000), below ramoops
+        mem=(0x9f800000, 0x0f800000),
+        chosen_extra=[
+            ('mac-address-wifi0', bytes([0x02, 0x00, 0x5e, 0x77, 0xe1, 0x01])),
+            ('mac-address-bluetooth0', BT_MAC),
+        ],
+        bluetooth=False),
     'beryllium': dict(
         # cont_splash_mem@9d400000, simple-framebuffer 1080x2246 (mainline beryllium-common)
         fb=(0x9d400000, 0x2400000), fb_wh=(1080, 2246),

@@ -12,6 +12,14 @@
 #define FB_H			2246
 /* sdm845 imem@146bf000, restart_reason@65c */
 #define IMEM_RESTART_REASON	0x146bf65cUL
+#elif defined(BOARD_FAJITA)
+#define BOARD_NAME		"fajita"
+/* OnePlus 6T: reserved-memory cont_splash_region@9d400000, 36 MiB; panel is 1080x2340 */
+#define FB_BASE			0x9d400000UL
+#define FB_W			1080
+#define FB_H			2340
+/* sdm845 imem@146bf000, rest of the block shared with beryllium */
+#define IMEM_RESTART_REASON	0x146bf65cUL
 #else
 #define BOARD_NAME		"sweet"
 /* reserved-memory cont_splash_region@9c000000 */
