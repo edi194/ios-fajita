@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_touch.c
 +++ b/bsd/dev/sweet_touch.c
-@@ -47,6 +47,21 @@
+@@ -47,6 +47,37 @@
  #define TOUCH_FTS        2
  #define TOUCH_NVT        3
  #define TOUCH_FT8719     4
@@ -19,10 +19,26 @@
 +#define FJ_GPIO_RESET    99u
 +#define FJ_GPIO_VIO      88u
 +#define FJ_VOTE_MASK     ((1u << 20) | (1u << 21) | (1u << 26))
++
++/*
++ * fajita: the kernel console is drawn into the same framebuffer SpringBoard later owns, so a line printed
++ * after the GUI starts is invisible. The early console (osfmk/arm64/sweet_early.c) writes straight to the
++ * panel and is what printed SWEET EARLY 1..20, so the touch bring-up reports through it as well.
++ */
++static void
++fj_note(const char *s)
++{
++	extern void sweet_early_string(const char *);
++	extern void sweet_early_putc(char);
++
++	sweet_early_string("FJ: ");
++	sweet_early_string(s);
++	sweet_early_putc('\n');
++}
  /* FT8719 (Focaltech TDDI, EBBG Poco F1) */
  #define FT_ADDR          0x38u
  #define FT_ID_REG        0xa3u  /* chip id high: 0x87 */
-@@ -122,7 +137,7 @@
+@@ -122,7 +153,7 @@
  #define SE_PACK1        0x000ffefeu
  
  static struct {
@@ -31,7 +47,7 @@
  	bool started, dead, probing, bitbang;
  	int kind, irq_hint;
  	uint32_t irq_status, irq_last, active;
-@@ -183,6 +198,23 @@
+@@ -183,6 +214,23 @@
  	touch_wr(st.gpio, off, cfg);
  }
  
@@ -55,7 +71,7 @@
  static bool
  touch_clocks(void)
  {
-@@ -1042,6 +1074,305 @@
+@@ -1042,6 +1090,314 @@
  	return true;
  }
  
@@ -241,6 +257,7 @@
 +		ts_xraw = 1080;
 +		ts_yraw = 2340;
 +	}
++	fj_note("thread start");
 +	printf("SWEET TS: fajita RMI4, starting in %u s (raw %dx%d)\n", delay_s, ts_xraw, ts_yraw);
 +	touch_wait(delay_s * 1000u);
 +
@@ -267,12 +284,14 @@
 +	    (void *)st.gcc, (void *)st.gpio, (void *)st.gpio_s, (void *)st.gpio_e,
 +	    (void *)st.se);
 +	if (!st.gcc || !st.gpio || !st.gpio_s || !st.gpio_e || !st.se) {
++		fj_note("mmio map FAILED");
 +		printf("SWEET TS: MMIO mapping failed\n");
 +		goto out;
 +	}
 +	if (!norail) {
 +		perr = sweet_rpmh_vreg_enable("ldoa28", 3008);
 +	}
++	fj_note("mmio mapped");
 +	printf("SWEET TS: ldoa28 vote -> %d%s\n", perr, norail ? " (skipped)" : "");
 +	if (nogpio) {
 +		printf("SWEET TS: gpio writes skipped (sweetts_nogpio=1)\n");
@@ -299,21 +318,27 @@
 +	if (noclk) {
 +		printf("SWEET TS: clocks skipped (sweetts_noclk=1)\n");
 +	} else if (!fajita_clocks()) {
++		fj_note("clocks FAILED");
 +		goto out;
 +	}
++	fj_note("clocks ok");
 +	if (nose) {
 +		printf("SWEET TS: SE init skipped (sweetts_nose=1)\n");
 +		goto out;
 +	}
 +	if (!touch_se_init()) {
++		fj_note("se_init FAILED");
 +		goto out;
 +	}
++	fj_note("se ok");
 +	st.probing = true;
 +	bool ok = rmi_pdt() && rmi_f01_init();
 +	st.probing = false;
 +	if (!ok) {
++		fj_note("rmi probe FAILED");
 +		goto out;
 +	}
++	fj_note("rmi ready");
 +	printf("SWEET TS: F01 q=%#x d=%#x | F12 q=%#x c=%#x d=%#x\n",
 +	    f01_query, f01_data, f12_query, f12_ctrl, f12_data);
 +	uint8_t q[32] = {0};
@@ -361,7 +386,7 @@
  static void
  touch_thread(void *arg, wait_result_t result)
  {
-@@ -1203,6 +1534,19 @@
+@@ -1203,6 +1559,19 @@
  		tb = &touch_beryllium;
  		st.irq_hint = 1; /* bit-banged reads are slow: only on IRQ edges or while touched */
  	}
