@@ -56,3 +56,34 @@ framebuffer console, early pmap and the ADT all work on fajita.
    `main`.
 3. **GPU**: Bergamota's path is EAGL → Mesa freedreno → Turnip (`gpu/eagl`, `docs/GPU_EAGL.md`), not Metal. The
    a630 work on `main` (GMU/SMMU/CP/zap, buffer memory, PTEs) is the reference for that driver.
+
+## Milestone: iOS 18.7.8 boots to the lock screen on the OnePlus 6T
+
+2026-11-08 ~19:10. The iOS 18.7.8 (22H352) root was built with Renegade (`renegade fetch` for iPhone11,8,
+`renegade root`, then `renegade sparse`), flashed into `userdata` (16 sparse chunks, 824 s, through Bergamota
+fastboot) and booted with the Heartwood kernel from this branch plus the fajita ADT:
+
+```
+fastboot boot ios18-fajita-full.img      # rd=ufsroot0, ufsrw=1, rootrw=1, sweetarm64e=1
+```
+
+Result: **lock screen with the clock**, and the power key wakes it. The screen going black after a while is
+the display timeout, not a crash: the kernel has no touch driver for this phone yet, so nothing counts as
+input.
+
+What that proves on fajita: UFS + HFS+ mounting of the 20 GB iOS root, XNU 11215 userland (arm64e rewritten
+by Renegade) running launchd, backboardd and SpringBoard on the panel, PM8998 keys.
+
+### Next: touch (RMI4), then GPU
+
+Our RMI4 driver for this phone lives in `main` (`bsd/dev/sweet_touch.c`, the `rmi_*` block plus
+`fajita_clocks` and `touch_fajita_thread`). Bergamota's own `sweet_touch.c` has the same lineage but diverged:
+it carries `touch_msg()` (one I2C transfer), `touch_report()` (HID), `touch_thread()`, and per-device starters
+(`touch_focaltech`, `touch_goodix`, `touch_novatek`, `touch_beryllium_start`) selected by `st.kind`.
+
+So the port is: add the RMI4 block to their file, map `touch_msg_run(addr, tx, nt, rx, nr, stretch)` onto their
+`touch_msg(...)`, report through their `touch_report()`, and add a `TOUCH_RMI4` kind plus a fajita starter that
+programs the panel clocks (RPMh LDOA28 + GCC) the way `fajita_clocks()` does.
+
+After touch: the key map for this phone (power already works), auto-lock off for testing, then the GPU path
+(`gpu/eagl`, Mesa freedreno, Turnip) — the point of the whole exercise.
