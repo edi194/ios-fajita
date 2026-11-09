@@ -129,3 +129,36 @@ Bergamota's path is EAGL -> Mesa freedreno -> Turnip (`gpu/eagl/`, `docs/GPU_EAG
 framebuffer currently copies every frame on the CPU (`mode=copy`); the goal is their `bglrender` payload
 drawing through the Adreno 630, which is what the a6xx work on `main` (GMU/SMMU/CP/zap, buffer memory,
 PTEs) is the reference for.
+
+## Milestone: the Adreno 630 comes up on the 6T (Bergamota's driver, stage 8 passed)
+
+2026-11-09 ~20:30, after `0256` opened the probe gate for this board (`sweetts=1`), with the firmware in
+`/usr/local/share/firmware` of the root:
+
+```
+GMU firmware 32768 bytes, 0 words differ on readback; CM3_FW_INIT_RESULT 0xbabeface; version 0x10070000 1.7
+CX GDSC on (0xf8228000), gx/gx_gmu/gx_gfx3d clocks on
+zap: SCM PAS 13 INIT_IMAGE, MEM_SETUP, AUTH_AND_RESET all result 0 -> "signed zap authenticated and started"
+CP configured, SQE enabled, CP_ME_INIT ring idle
+CP NOP test PASSED (CP_MEM_WRITE read back, CACHE_FLUSH_TS timestamp)
+CP fill test PASSED (64 of 64 words)
+KEPT UP: GX on (OOB_GPU held, GMU keep-alive), ring 8192 dwords, client VA 0x80000000-0x100000000, 1028 table pages
+SweetAdreno630 published (user client class SweetAdrenoUserClient)
+```
+
+So GMU, the GX rail, the GPU SMMU, the signed zap through TrustZone, the CP and the ring all work on this
+phone with Bergamota's own driver - the first time their stage 8 has run on hardware, and it ran here.
+
+The display is still CPU-composited (`SWEET FB: mode=copy hw=0`): the GPU is up but nothing draws through it
+yet. That is their userspace half - EAGL -> Mesa freedreno -> Turnip, the `bglrender` payload that comes
+with `berga-tools.zip` and is enabled by the boot-arg `bglrender=1`.
+
+### Boot image that produced it
+
+`enxerto/out/enxerto-boot.img` from `tools/mkpayload.py` + `enxerto/build.sh BOARD=fajita` with
+
+```
+... sweetts=1 sweettouch=1 sweettouchdelay=5 sweetgpu=8
+```
+
+and the fajita ADT (iPhone X identity, 1080x2340 1:1, `sweetfb_scale=1`).
