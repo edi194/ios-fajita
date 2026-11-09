@@ -1,0 +1,21 @@
+--- a/bsd/dev/sweet_a630.c
++++ b/bsd/dev/sweet_a630.c
+@@ -3954,7 +3954,17 @@
+ 	thread_t thread;
+ 
+ 	if (!sweet_board_beryllium()) {
+-		return;
++		/*
++		 * fajita (OnePlus 6T) is the other SDM845 board in this tree, with the same Adreno 630 and the
++		 * same firmware already in the root. This check exists because the bring-up was written for the
++		 * Poco F1; sweetts=1 selects the fajita port (touch, RPMh, and now the GPU too), so let the
++		 * probe run there as well.
++		 */
++		int fajita = 0;
++
++		if (!PE_parse_boot_argn("sweetts", &fajita, sizeof(fajita)) || fajita == 0) {
++			return;
++		}
+ 	}
+ 	(void)PE_parse_boot_argn("sweetgpu", &mode, sizeof(mode));
+ 	if (mode <= 0) {
