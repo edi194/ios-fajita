@@ -162,3 +162,40 @@ with `berga-tools.zip` and is enabled by the boot-arg `bglrender=1`.
 ```
 
 and the fajita ADT (iPhone X identity, 1080x2340 1:1, `sweetfb_scale=1`).
+
+## The userspace GL half: it starts, and stops where theirs stops
+
+With the root tweaks applied (`renegade update`, bglrender payload from `berga-tools-v3` installed into
+`/usr/local/lib/bergamota-gl`, backboardd's job pointed at `bgl-launch`) and `bglrender=1` on the command
+line:
+
+```
+exec bgl-launch                        <- the launcher runs
+SWEET GPU: KEPT UP ... SweetAdreno630 published
+SWEET ADRENO count: 0                  <- nothing ever opened the GPU user client
+SWEET FB: stats ... mode=copy hw=0     <- still CPU-composited
+```
+
+That is exactly the state their own notes describe for the same payload on the Poco F1: "backboardd
+restarted as backboardd.real with the shim injected ... BUT: (1) the GPU service had 0 clients, (2) the
+shim logged no screen creation, (3) the UI had no blur" (`docs/GPU_EAGL.md`). So the kernel half is done on
+this phone and the remaining gap is upstream's open problem in the EAGL shim, not a fajita port defect.
+
+Their newest GPU release is not EAGL but **Chlorophyll/bgmtl** (`bgmtl-dylibs-20261025`), and that tweak
+installs the three dylibs into **Mercury** (PosterBoard's wallpaper renderer) with `/private/var/tmp/
+bgmtl.arm`; it is the wallpaper, not the UI, that would render through BGMtlDevice.
+
+### Where this leaves the port
+
+Working on the 6T with Bergamota's stack: iOS 18.7.8 userland to SpringBoard, touch, keys, CPU-composited
+display, the full a630 bring-up (GMU, SMMU, zap, CP, self-tests, keep-up, user client published), and a
+readable kernel log from the UFS ring. The UI still draws on the CPU, for the same reason it does on the
+Poco F1.
+
+### Reading the shim's own log (needed to go further)
+
+`bgl-launch` writes `/private/var/tmp/bgl-backboardd.log` and honours `bgldebug=1` (plus
+`SWEET_GPU_DEBUG=1`, `EAGL_SHIM_DEBUG=1`). That file is inside the flashed `userdata`, so reading it needs
+a shell on the running system (their SSH-over-USB needs a CDC-ECM host; Windows has no driver for it and
+WSL's kernel here has no `vhci_hcd`, so usbipd cannot help). Two ways out: attach the phone's USB to a
+Linux host, or make the launcher print to the kernel log.
