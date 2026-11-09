@@ -230,3 +230,32 @@ has no `vhci_hcd`, so usbipd cannot attach it either). Cheapest ways to get that
 2. attach the phone's USB to a Linux host and use their `sweet-usbnet.sh`;
 3. compare our `main` branch's `bgmtl` bundle (which reached 5-6 submits with fence timeouts on our own
    kernel ABI) against their kernel's ABI: the difference will name the call that opens the device.
+
+## ABI comparison: the shim matches by name, and the name is published
+
+Read from their own sources and binaries rather than guessed:
+
+* `libdrm.2.dylib` (their stand-in, from `berga-tools-v3`) opens the device with
+  `IOServiceMatching("SweetAdreno630")` + `IOServiceOpen(svc, mach_task_self(), 0, &g_conn)`, then reads
+  `INFO.abi_minor`; every failing call prints `sweet_drm: selector %#x -> %#x` to its own stderr.
+* `bgmtl-inject.dylib` prints `BGMTLDevice registered in this process (kernel ABI minor %u)` once it is in.
+* `iokit/Kernel/arm/SweetAdreno.cpp` (patch 0182) publishes exactly that name with
+  `attach(platform)` + `registerService()` and logs `SWEET GPU: SweetAdreno630 published`.
+
+So the two ends agree on the name, and the kernel log shows no selector call at all - which means the shim
+never gets a connection (matching or open fails) or never runs its screen path. Their own GPU_EAGL notes
+record the same on the Poco ("0 clients", "no screen creation"), so this is where upstream stopped.
+
+A kernel-side registry self-check (`IOServiceGetMatchingService` right after publishing) would separate the
+two, but it needs IOKit headers this C file does not include; the patch was written, failed to compile
+(`io_service_t`/`OSDictionary` unknown) and is parked at `~/src/0257.parked` rather than left in the tree.
+
+### Next, in order of cost
+
+1. From the shim side: a `bgl-launch` that also mirrors its stderr to `/dev/klog`, so the first
+   `sweet_drm: ...` line lands in the ring we can read. The payload is prebuilt, but a replacement launcher
+   is ~50 lines of C plus `pacstrip --sign`.
+2. From the kernel side: do the registry check in C++ (`SweetAdreno.cpp`, where IOKit types are natural) and
+   log both the match and `start()`/`newUserClient()`.
+3. Compare with `main`'s Metal path: there the same userland did reach the user client (selectors, submits,
+   fences), so its opening sequence against our ABI is the reference for what theirs is missing.
