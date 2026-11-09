@@ -87,3 +87,45 @@ programs the panel clocks (RPMh LDOA28 + GCC) the way `fajita_clocks()` does.
 
 After touch: the key map for this phone (power already works), auto-lock off for testing, then the GPU path
 (`gpu/eagl`, Mesa freedreno, Turnip) — the point of the whole exercise.
+
+## Milestone: iOS 18.7.8 with working touch on the OnePlus 6T
+
+2026-11-09. The lock screen, then the home screen (SpringBoard loading widget extensions), with a finger
+that moves the cursor:
+
+```
+SWEET TS: raw max x=1016 y=2321 irq=0     <- real coordinates from the RMI4 frame reader
+SWEET FB: stats ... mode=copy hz=30 ... swaps=359 swaps_s=9.70 copy_frames=270
+```
+
+The display is still CPU-composited (`mode=copy`, `hw=0`): the GPU path is the next piece of work.
+
+### What the touch port needed (the whole chain, for the next session)
+
+1. **0252-fajita-rmi4-touch.patch** - the RMI4 driver itself, grafted onto Bergamota's `sweet_touch.c`
+   behind `sweetts=1`: FJ_* constants (QUPv3 SE12 at 0xa90000, I2C 0x20, ATTN gpio125 and reset gpio99,
+   the VIO enable on gpio88 in the east TLMM tile), `touch_gpio_at()` because the existing `touch_gpio()`
+   only ever programs the north tile, the PDT/F01/F12 code and a thread that runs after
+   `sweettouchdelay` seconds.
+2. **0254-rpmh-ldoa28.patch** - `sweet_rpmh_vreg_enable()` only accepted `ldoc11` (the Poco's rail) and
+   returned EINVAL for `ldoa28`, so the touch rail was never voted and the controller NAKed every
+   transfer (`probe xfer addr=0x20 err=6`, `PDT read 0xe9 failed`).
+3. **0255-rpmh-fajita-bases.patch** - with the rail vote actually happening the machine died before the
+   log thread's first flush: `sweet_rpmh.c` programmed the *SM7150* RSC/TCS bases (0x18220000/0x18220d00)
+   because only `sweet_board_beryllium()` selects the SDM845 ones. SDM845 - both phones - keeps them at
+   0x179e0000/0x179e0d00, and a TCS write at the wrong base hangs the bus. `sweetts=1` now selects the
+   SDM845 branch as well.
+
+### Reading the log is what made this possible
+
+Bergamota keeps the 4 MiB console ring at the end of `userdata` and ships `tools/sweet-log-pull.sh` +
+`tools/sweet-log.py`. Pulling it from OrangeFox shows every `printf` of the kernel - including the touch
+driver's - without filming the screen, which is what the panel console stopped being once SpringBoard
+took the framebuffer.
+
+## Next: the GPU
+
+Bergamota's path is EAGL -> Mesa freedreno -> Turnip (`gpu/eagl/`, `docs/GPU_EAGL.md`), not Metal. The
+framebuffer currently copies every frame on the CPU (`mode=copy`); the goal is their `bglrender` payload
+drawing through the Adreno 630, which is what the a6xx work on `main` (GMU/SMMU/CP/zap, buffer memory,
+PTEs) is the reference for.
