@@ -199,3 +199,34 @@ Poco F1.
 a shell on the running system (their SSH-over-USB needs a CDC-ECM host; Windows has no driver for it and
 WSL's kernel here has no `vhci_hcd`, so usbipd cannot help). Two ways out: attach the phone's USB to a
 Linux host, or make the launcher print to the kernel log.
+
+## bgmtl (Chlorophyll) on the 6T: the same wall
+
+The `bgmtl-dylibs-20261025` release installed cleanly (`renegade update`: dylibs in `/usr/local/lib/bgmtl`,
+`MercuryPosterExtension` re-signed ad hoc with `LC_LOAD_DYLIB bgmtl-inject.dylib`, `/private/var/tmp/
+bgmtl.arm` written) and the phone boots with `sweetgpu=8` and no `bglrender`. Result: **no wallpaper** and,
+in the kernel log,
+
+```
+SWEET ADRENO count: 0                  <- the GPU user client is never opened
+SWEET FB: stats ... mode=copy hw=0     <- still CPU-composited
+SWEET FB: empty IOAcceleratorES published (no 30 s wait in CAMetalContextCreate)
+```
+
+The last line is the important one: the port publishes an *empty* `IOAcceleratorES`, so CoreAnimation sees no
+Metal device and renders on the CPU; the shims are supposed to bypass that by opening `SweetAdreno630`
+directly, and they do not. That is the same "0 clients" state as their EAGL attempt, so both of their
+userspace GPU paths stop at the same place on this phone.
+
+### What this means for the next session
+
+The kernel is no longer the problem. What is missing is visibility into the userland shim: its logs go to
+`/private/var/tmp/bgl-backboardd.log` and the unified log, both inside the flashed `userdata`, and there is
+no shell on the running system (their SSH rides CDC-ECM, which Windows has no driver for; this WSL kernel
+has no `vhci_hcd`, so usbipd cannot attach it either). Cheapest ways to get that channel, in order:
+
+1. a `bgl-launch` replacement that also writes its own stdout to `/dev/klog` (tiny C, signed with their
+   `tools/renegade/pacstrip.py`), so the shim's first lines land in the ring we already read;
+2. attach the phone's USB to a Linux host and use their `sweet-usbnet.sh`;
+3. compare our `main` branch's `bgmtl` bundle (which reached 5-6 submits with fence timeouts on our own
+   kernel ABI) against their kernel's ABI: the difference will name the call that opens the device.
