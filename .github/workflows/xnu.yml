@@ -294,6 +294,7 @@ jobs:
             dxb/xnu/bsd/dev/sweet_battery.c
             dxb/xnu/bsd/dev/sweet_rpmh.c
             dxb/xnu/osfmk/arm64/sweet_early.c
+            dxb/xnu/bsd/dev/sweet_a630.c
           retention-days: 7
           if-no-files-found: warn
 
