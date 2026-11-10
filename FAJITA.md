@@ -307,3 +307,30 @@ OrangeFox's kernel has no hfsplus, so the phone's root cannot be mounted in reco
 `adb exec-out dd` at 1 MiB granularity and feeds `tools/renegade/hfsx.py`; the catalog costs ~240 MiB of
 reads (a couple of minutes). This is how `bgmtl.log`, `bgmtl-bb.state`, the crash-log directory and the
 launchd cache were read while the phone was in recovery.
+
+### Why there was no wallpaper: PosterBoard refuses to create its store on an HFS root
+
+The poster tools were only half of it. `sweetposterset` answered every call with
+
+```
+fetch selected failed: Error Domain=com.apple.PosterBoard.generalErrorDomain Code=0
+"Data store could not be created for an unknown reason which evades explanation."
+```
+
+which is their own documented iOS 18 HFS problem (`tools/sweetnet/sweetfp.m`): the HFS+ root has no data
+protection classes, so `setResourceValue:forKey:NSURLFileProtectionKey` succeeds but reading it back returns
+nil; PosterBoard's `pbf_URLIsReachableAndConformToResourceValues:` then fails, the 59 -> 61 migration fails
+("Failed to migrate to Version 61 from 59") and **no wallpaper store exists** - hence no poster, no wallpaper,
+and the SpringBoard "Customize" crash in `PaperBoardUI`.
+
+The fix is their `sweetfp.dylib` (keeps the protection class in an xattr so the validation is consistent),
+linked into a re-signed `/Applications/PosterBoard.app/PosterBoard`: the Renegade `posterboard` feature, which
+this image had skipped because `research/sweetnet` was empty. Installed now with
+`RENEGADE_SWEETNET=<berga-tools cache>/sweetnet` (48 entitlements kept, identifier unchanged).
+
+The poster itself is set by the `org.bergamota.renegade-firstboot` job. Two dead ends worth recording:
+`sweetuicache`/the app-registration step blocked the job for the whole boot (so the wallpaper step never
+ran), and `sweetopen com.sweet.run` returned 3 on every attempt even though `SweetRun` does get exec'd and
+proceeds to the poster step (its `posix_spawn` of `/bin/sh` produces no log, path unexplained). Running
+`sweetposterset` straight from the root job does reach PosterBoard - the store error above is PosterBoard's
+own, not a client privilege problem - so the job now calls the tool directly.
