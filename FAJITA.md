@@ -259,3 +259,51 @@ two, but it needs IOKit headers this C file does not include; the patch was writ
    log both the match and `start()`/`newUserClient()`.
 3. Compare with `main`'s Metal path: there the same userland did reach the user client (selectors, submits,
    fences), so its opening sequence against our ABI is the reference for what theirs is missing.
+
+## Chlorophyll in backboardd: the UI runs on the Adreno 630 (2026-11-10)
+
+The a630 bring-up was already passing, but nothing opened the GPU user client. The missing half was not the
+board and not the kernel: on iOS 18 the Renegade `bgmtl` tweak only links the inject into
+`MercuryPosterExtension`, while the *UI* path is backboardd, and upstream does that by hand. Reproduced here:
+
+1. `/usr/libexec/backboardd` gets an extra `LC_LOAD_DYLIB /usr/local/lib/bgmtl/bgmtl-inject.dylib`
+   (`tools/sweetnet/addlc.py` + `pacstrip.py --sign`; entitlements and identifier kept, original saved as
+   `backboardd.orig`). backboardd has slack for one more load command.
+2. `/private/var/tmp/bgmtl-bb.arm` arms the backboardd path.
+3. The **environment** gate matters: the `bgmtl-dylibs-20261025` release does **not** know
+   `bgmtl-bb.direct` (that file is a later `develop` addition), so its constructor returns silently unless
+   `BGMTL_BB` is in the environment. Set it in the job itself
+   (`EnvironmentVariables = {BGMTL_BB: 1}` in the launchd.plist cache entry for `com.apple.backboardd`), the
+   same way upstream passes `BT_HCI_TRANSPORT` to bluetoothd. Without it there is **no log at all**, which is
+   why the earlier attempts looked like a GPU problem.
+
+Their own log (`/private/var/tmp/bgmtl.log`) after this boot:
+
+```
+[60] backboardd: devices before registration: 0
+[60] backboardd: Chlorophyll device registered (kernel ABI minor 2)
+[60] UNIMPLEMENTED (answered zero): setCompletionQueue:
+[60] backboardd: first command buffer completed
+[60] backboardd: healthy (10 s after the first completed command buffer, no failure)
+```
+
+So Chlorophyll (Metal -> Mesa freedreno -> ir3 -> Adreno 630) is the system compositor on fajita.
+`bgmtl-bb.state` says `alive=1` for that boot and no kill switch was written.
+
+### Wallpaper
+
+The wallpaper was never a Mercury problem: the image had **no** `/usr/local/bin/sweetposterset`,
+`/usr/local/bin/sweetopen`, `/Applications/SweetRun.app` and no `/bin/sh` (dash comes from the ssh tweak), so
+Renegade's first-boot job never existed and **no poster was ever selected** - the previous "wallpaper" was
+the system's built-in default. Now installed: dash as `/bin/sh`, the three poster tools, `SweetRun.app`,
+`sweetuicache`, `/usr/local/libexec/renegade-firstboot.sh` and the job `org.bergamota.renegade-firstboot`
+(`/bin/sh <script>`, RunAtLoad, UserName root), which registers apps and selects the poster as mobile through
+SweetRun: `com.apple.MercuryPoster:fluidity.two` (the iOS 18 default) because a Metal device exists now.
+
+### Tooling added: reading the iOS root without a driver
+
+OrangeFox's kernel has no hfsplus, so the phone's root cannot be mounted in recovery. `~/src/remote-hfs.py`
+(not in git, like the other private tooling) implements `ls`/`cat`/`stat` on `/dev/block/sda17` through
+`adb exec-out dd` at 1 MiB granularity and feeds `tools/renegade/hfsx.py`; the catalog costs ~240 MiB of
+reads (a couple of minutes). This is how `bgmtl.log`, `bgmtl-bb.state`, the crash-log directory and the
+launchd cache were read while the phone was in recovery.
