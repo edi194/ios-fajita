@@ -334,3 +334,43 @@ ran), and `sweetopen com.sweet.run` returned 3 on every attempt even though `Swe
 proceeds to the poster step (its `posix_spawn` of `/bin/sh` produces no log, path unexplained). Running
 `sweetposterset` straight from the root job does reach PosterBoard - the store error above is PosterBoard's
 own, not a client privilege problem - so the job now calls the tool directly.
+
+## Display identity and the MDP hardware scaler (2026-11-12)
+
+What works on the 6T now: iOS 18.7.8 userland, SpringBoard, touch, GPU compositing through Chlorophyll,
+wallpaper, 60 Hz, and the **hardware scaler**: patch 0258 lets `sweetfb_hw=1` and MDP page flipping through on
+fajita (`sweetts=1`), and the log confirms
+
+```
+hw scaler: canvas 1125x2436 (stride 4544) -> 1080x2338 at 0,1, qseed3 v0x1003, PE regs written
+page flipping on VIG0: frames 0x9d400000 0x9de00000 0x9e900000 (11069184 bytes each back buffer, 30 restore regs)
+presented as 1125x2436
+```
+
+so the canvas is scaled down by QSEED3 instead of by `presentScaled` (the software downscale is broken: at
+`sweetfb_scale=1|2` the frame lands in a narrow centred strip, at `scancopy=1` the layout looks wrong).
+
+### The red rdar:45025538 bar is still there
+
+Every configuration tried keeps UIKit's fallback status bar ("No status bar visual provider for screen"):
+
+| ADT identity | canvas | scan-out | UI size | rdar |
+|---|---|---|---|---|
+| iPhone X (D22AP) | 1125x2436 | software (strip/"iPad") | wrong | gone once, later back |
+| iPhone X (D22AP) | 1125x2436 | QSEED3 (0258) | correct | present |
+| iPhone 13 mini (D16AP, real tree) | 1080x2340 | copy | correct | present |
+| iPhone 13 mini (D16AP) | 1125x2436 | QSEED3 | correct | present |
+
+The bar therefore is not the canvas geometry alone. `Settings > About` hangs in all of them, which points at
+MobileGestalt: SpringBoard cannot build its status bar from a MobileGestalt that never answers. mkadt does
+filter the flagged syscfg placeholders out of /product, so the unresolved-`syscfg/...` theory is not what
+`/product` carries, and the next probe should be MobileGestalt itself (which DT node or root file it waits on).
+
+### Tooling
+
+* the real iPhone 13 mini device tree is in the tree now: fetched with `tools/remotezip.py` straight out of
+  the 18.6.2 IPSW (`DeviceTree.d16ap.im4p`, 49 KB), IM4P-extracted and bvx2-decompressed with the `lzfse` pip
+  module (243 KB), then added to `mkadt.py` as identity `d16ap` (kept out of git like the other Apple files);
+* `sweetshot` + a launchd job (`org.bergamota.shot`) take a frame 60 s and 90 s after boot, because the volume
+  buttons do not work yet. The first file it wrote was zero-filled, so the screenshot pipeline still needs work
+  (the sysctl format is documented in patch 0224: 'SHOT' magic + w/h/bpr + BGRA).
