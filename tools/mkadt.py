@@ -102,6 +102,10 @@ D22AP_ADT = os.path.join(os.path.dirname(os.path.abspath(__file__)), '../researc
 #   ipsw extract -r --dtree -o DIR <OTA URL>; ipsw img4 im4p extract DIR/.../DeviceTree.n104ap.im4p -o n104ap.adt
 IDENTITIES = {
     'd22ap': dict(target='D22AP', machine='iPhone10,3', target_type='D22', adt=D22AP_ADT),
+    # iPhone 13 mini: the panel of the OnePlus 6T is 1080x2340, the same as this device; its tree has
+    # artwork-device-subtype 2340 and artwork-scale-factor 3, so the native canvas matches UIKit's expectations
+    'd16ap': dict(target='D16AP', machine='iPhone14,4', target_type='D16',
+                   adt=os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ios18/d16ap.adt')),
     'n104ap': dict(target='N104AP', machine='iPhone12,1', target_type='N104',
                    adt=os.path.join(os.path.dirname(os.path.abspath(__file__)), '../research/ios26/n104ap.adt')),
 }

@@ -1,0 +1,45 @@
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -522,6 +522,24 @@
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++/*
++ * Hardware scan-out (MDP page flipping + the QSEED3 scaler) is an SDM845 feature, not a Poco one: the
++ * OnePlus 6T has the same MDSS block at 0x0ae00000 and the same VIG0/QSEED3 scaler, so the canvas
++ * (1125x2436, patch 0100) can be scaled into the 1080x2340 panel in hardware instead of by the CPU.
++ * sweet_board_beryllium() only matches the Poco's compatible string; sweetts=1 selects the fajita board,
++ * the same switch patches 0252 (touch) and 0255 (RPMh bases) use.
++ */
++static bool
++sweet_fb_sdm845_scanout(void)
++{
++	int fajita = 0;
++
++	if (sweet_board_beryllium()) {
++		return true;
++	}
++	return PE_parse_boot_argn("sweetts", &fajita, sizeof(fajita)) && fajita != 0;
++}
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -585,7 +603,7 @@
+ 	}
+ 	int hwReq = 0;
+ 	int directReq = 0;
+-	if (sweet_board_beryllium()) {
++	if (sweet_fb_sdm845_scanout()) {
+ 		PE_parse_boot_argn("sweetfb_hw", &hwReq, sizeof(hwReq));
+ 		PE_parse_boot_argn("sweetfb_direct", &directReq, sizeof(directReq));
+ 		if (directReq) {
+@@ -653,7 +671,7 @@
+ 			IOLog("SWEET FB: sweetfb_hud=%d: performance HUD %s (sysctl kern.sweet_fb_hud)\n", hud, hud ? "on" : "off");
+ 		}
+ 	}
+-	if (sweet_board_beryllium()) {
++	if (sweet_fb_sdm845_scanout()) {
+ 		mdpProbe();
+ 		int flip = 0;
+ 		PE_parse_boot_argn("sweetfb_flip", &flip, sizeof(flip));
