@@ -398,3 +398,31 @@ the decision. The screenshot job also fired too early (40 s = still Enxerto's bo
 Given the effort already spent, the red bar stays open as cosmetic (the layout, wallpaper, dock, 60 Hz and the
 hardware scaler all work); the functional gaps in the review (USB data, fuel gauge, volume buttons, RTC) come
 from the `sweet_board_beryllium()` gating and are the next real work.
+
+## The red status bar: everything tried on hardware (2026-11-14)
+
+UIKit draws its fallback ("No status bar visual provider for screen ... Please see rdar://45025538",
+found in the dyld shared cache) and `Settings > About` shows an empty model/regulatory model in every
+configuration, so MobileGestalt is not giving UIKit a complete product. What was tested on the phone:
+
+| test | result |
+|---|---|
+| canvas 1080x2340 / 1125x2436 (360 / 375 pt) | bar |
+| real tree of the iPhone X (D22AP) | bar |
+| real tree of the iPhone 13 mini (D16AP) | bar |
+| real tree of the iPhone 11 Pro (D421AP) | bar (and this identity does not always boot) |
+| `/chosen/display-corner-radius = 44` | bar |
+| `debug-enabled=0`, `certificate-production-status=1` (retail) | bar, and iOS goes to Setup (activation) |
+| ADT **without** `/product` | bar |
+| the iOS 16 `fajita.adt` verbatim | no bar known, but it lacks iOS 18 keys (unique-chip-id, chip-id, boot-manifest-hash, crypto-hash-method) and the screen stays black |
+| `/product` filled with model-number/regulatory-model/region (A2160, D42AP) | SpringBoard stops presenting (`swaps=0`), black screen |
+
+The unified log (`sweetlog` from the launchd job) shows MobileGestalt answering normally (`fast-path`, 255
+answers) and SpringBoard setting up a notched status bar, but the provider message itself never appears in
+either the unified log or SpringBoard's stderr - so the decision inputs cannot be read from the device.
+
+Observations that matter for whoever picks this up: the ADT from the working iOS 16 builds has **no**
+`/product` node at all, while every ADT for iOS 18 does; About showing an empty model points at the
+syscfg-filled `/product` properties (model-number, regulatory-model-number, model-config), which iBoot fills
+on a real device and which mkadt drops because they are flagged placeholders. A kernel-side
+`IOPlatformSerialNumber` (like `unique-chip-id` -> IOPlatformUUID) is the other candidate nobody has tested.
