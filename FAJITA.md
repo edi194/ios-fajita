@@ -374,3 +374,27 @@ filter the flagged syscfg placeholders out of /product, so the unresolved-`syscf
 * `sweetshot` + a launchd job (`org.bergamota.shot`) take a frame 60 s and 90 s after boot, because the volume
   buttons do not work yet. The first file it wrote was zero-filled, so the screenshot pipeline still needs work
   (the sysctl format is documented in patch 0224: 'SHOT' magic + w/h/bpr + BGRA).
+
+### Unified log on the phone (works) and what it said about the status bar
+
+`sweetlog <seconds> [words...]` now runs from the launchd job `org.bergamota.shot` (installed with
+`/usr/local/bin/sweetshot` and `/bin/toybox` + `sleep`), which writes `/private/var/tmp/uni-boot.txt`
+(everything, 90 s) and `uni-mg.txt` (filtered: MobileGestalt/SpringBoard/statusbar/UIKit/About). The job's
+`sh -c` argument must be **one** string with no surrounding quotes: the first version passed the whole command
+quoted, the shell looked for a program named `"sleep 40; ..."` and wrote nothing.
+
+What the log shows:
+
+* SpringBoard sets the status bar up normally: `Using SBNotchedStatusBarProximityBacklightPolicy`,
+  `SBStatusBarSettings ... style = UIStatusBarStyleLightContent`, `SBHomeScreenStatusBar`;
+* the string `45025538` never appears, and neither does any "no visual provider" message - the radar text and
+  the red background are drawn silently (the interesting UIKit lines are `<private>`);
+* MobileGestalt fast-path calls succeed in the first 90 s (no errors, no timeouts in that window).
+
+So the red bar is not a plain "provider missing" case as their iOS 16 notes describe, and the logs do not name
+the decision. The screenshot job also fired too early (40 s = still Enxerto's boot logo, which is why the first
+"shot.png" was the BERGAMOTA splash): the frame has to be taken at 150 s and later.
+
+Given the effort already spent, the red bar stays open as cosmetic (the layout, wallpaper, dock, 60 Hz and the
+hardware scaler all work); the functional gaps in the review (USB data, fuel gauge, volume buttons, RTC) come
+from the `sweet_board_beryllium()` gating and are the next real work.
